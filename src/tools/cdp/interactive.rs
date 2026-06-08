@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -45,7 +45,7 @@ pub async fn run(app: Option<&str>) -> Result<()> {
     let mut frames = client::subscribe(&record, BACKFILL_MS).await?;
     let (async_tx, mut async_rx) = mpsc::unbounded_channel::<Async>();
 
-    let mut session = Session::open()?;
+    let mut session = Session::open_with_mouse()?;
     let mut events = EventReader::start();
     let mut repl = Repl::new(record);
     let mut redraw = time::interval(REDRAW);
@@ -65,6 +65,7 @@ pub async fn run(app: Option<&str>) -> Result<()> {
                     Flow::Quit => break,
                     Flow::Continue => {}
                 },
+                Some(Event::Mouse(mouse)) => repl.on_mouse(mouse),
                 None => break,
                 _ => {}
             },
@@ -109,7 +110,9 @@ struct Repl {
     feed: Vec<FeedItem>,
     /// Absolute top line of the viewport. `None` = pinned to the bottom (following live).
     view_top: Option<usize>,
+    /// Rendered feed geometry from the last frame — what scrolling needs to clamp against.
     feed_height: usize,
+    feed_total: usize,
     input: LineEditor,
     history: Vec<String>,
     history_pos: Option<usize>,
@@ -132,6 +135,7 @@ impl Repl {
             feed: Vec::new(),
             view_top: None,
             feed_height: 0,
+            feed_total: 0,
             input: LineEditor::default(),
             history,
             history_pos: None,
@@ -215,14 +219,31 @@ impl Repl {
             KeyCode::Enter => return self.submit(async_tx),
             // Tab on an empty prompt opens the target picker; (completion-while-typing is deferred).
             KeyCode::Tab if self.input.value().is_empty() => self.open_picker(async_tx),
+            // Up/Down walk command history; Shift+Up/Down scroll the timeline a line at a time, so
+            // the keyboard can scroll without giving up the familiar REPL history on the bare arrows.
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => self.scroll_by(-1),
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => self.scroll_by(1),
             KeyCode::Up => self.history_prev(),
             KeyCode::Down => self.history_next(),
-            KeyCode::PageUp => self.scroll_up(),
-            KeyCode::PageDown => self.scroll_down(),
+            KeyCode::PageUp => self.page_up(),
+            KeyCode::PageDown => self.page_down(),
             KeyCode::End | KeyCode::Esc => self.view_top = None,
             _ => self.input.apply_key(key),
         }
         Flow::Continue
+    }
+
+    /// Mouse-wheel scrolling of the timeline. Modal overlays swallow it (they have their own keys).
+    fn on_mouse(&mut self, mouse: MouseEvent) {
+        const WHEEL_STEP: isize = 3;
+        if self.picker.is_some() || self.help_open {
+            return;
+        }
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.scroll_by(-WHEEL_STEP),
+            MouseEventKind::ScrollDown => self.scroll_by(WHEEL_STEP),
+            _ => {}
+        }
     }
 
     fn submit(&mut self, async_tx: &UnboundedSender<Async>) -> Flow {
@@ -412,17 +433,23 @@ impl Repl {
 
     // --- scroll + view ---
 
-    fn scroll_up(&mut self) {
-        let step = self.feed_height.max(1);
-        let current = self.view_top.unwrap_or(usize::MAX);
-        self.view_top = Some(current.saturating_sub(step));
+    /// The topmost line index when pinned to the bottom — the anchor scrolling moves away from.
+    fn max_top(&self) -> usize {
+        self.feed_total.saturating_sub(self.feed_height)
     }
 
-    fn scroll_down(&mut self) {
-        let step = self.feed_height.max(1);
-        if let Some(top) = self.view_top {
-            self.view_top = Some(top + step);
-        }
+    fn page_up(&mut self) {
+        self.scroll_by(-(self.feed_height.max(1) as isize));
+    }
+
+    fn page_down(&mut self) {
+        self.scroll_by(self.feed_height.max(1) as isize);
+    }
+
+    /// Move the viewport by `delta` lines (negative = toward older). Reaching the bottom re-pins so
+    /// the feed follows live again; `None` view_top always means pinned.
+    fn scroll_by(&mut self, delta: isize) {
+        self.view_top = scrolled(self.view_top, self.max_top(), delta);
     }
 
     fn visible_lines(&self) -> Vec<Line<'static>> {
@@ -446,6 +473,14 @@ impl Repl {
             && self.view_tracks.as_ref().is_none_or(|tracks| tracks.contains(&event.track.kind()))
             && self.target.as_ref().is_none_or(|focus| label_matches(&event.target, focus))
     }
+}
+
+/// New viewport top after moving `delta` lines from `view_top` (`None` = pinned at `max_top`).
+/// Clamps to `[0, max_top]` and returns `None` once the move reaches the bottom, re-pinning to live.
+fn scrolled(view_top: Option<usize>, max_top: usize, delta: isize) -> Option<usize> {
+    let current = view_top.unwrap_or(max_top) as isize;
+    let next = (current + delta).clamp(0, max_top as isize) as usize;
+    (next < max_top).then_some(next)
 }
 
 /// Fill a command's `--target` with the focused target when the line didn't specify one.
@@ -696,8 +731,10 @@ fn render(frame: &mut TuiFrame, repl: &mut Repl) {
     .split(area);
 
     render_header(frame, chunks[0], repl);
+    let lines = repl.visible_lines();
     repl.feed_height = chunks[1].height.saturating_sub(2) as usize;
-    render_feed(frame, chunks[1], repl);
+    repl.feed_total = lines.len();
+    render_feed(frame, chunks[1], repl, lines);
     render_input(frame, chunks[2], repl);
     render_hint(frame, chunks[3]);
 
@@ -736,8 +773,7 @@ fn render_header(frame: &mut TuiFrame, area: Rect, repl: &Repl) {
     frame.render_widget(Paragraph::new(body).block(panel(" kit cdp ")), area);
 }
 
-fn render_feed(frame: &mut TuiFrame, area: Rect, repl: &Repl) {
-    let lines = repl.visible_lines();
+fn render_feed(frame: &mut TuiFrame, area: Rect, repl: &Repl, lines: Vec<Line<'static>>) {
     let inner_height = area.height.saturating_sub(2) as usize;
     let max_top = lines.len().saturating_sub(inner_height);
     let top = repl.view_top.map_or(max_top, |top| top.min(max_top));
@@ -771,7 +807,7 @@ fn render_hint(frame: &mut TuiFrame, area: Rect) {
         key("⏎"), Span::raw(" run  "),
         key("⇥"), Span::raw(" pick target  "),
         key("↑↓"), Span::raw(" history  "),
-        key("PgUp/PgDn"), Span::raw(" scroll  "),
+        key("wheel/⇧↑↓/PgUp"), Span::raw(" scroll  "),
         key("help"), Span::raw(" commands  "),
         key("^D"), Span::raw(" quit"),
     ]);
@@ -1068,5 +1104,19 @@ mod tests {
         assert!(label_matches("mine - workspace - modular", "workspace"));
         assert!(label_matches("VSCODE-WEBVIEW://abc", "webview"));
         assert!(!label_matches("modular://background-worker", "workspace"));
+    }
+
+    #[test]
+    fn scrolling_up_from_pinned_actually_moves() {
+        // The bug: pinned (None) scrolled up did nothing because it clamped back to the bottom.
+        assert_eq!(scrolled(None, 10, -1), Some(9));
+        assert_eq!(scrolled(None, 10, -3), Some(7));
+    }
+
+    #[test]
+    fn scrolling_clamps_and_repins() {
+        assert_eq!(scrolled(Some(2), 10, -5), Some(0)); // clamp at the top
+        assert_eq!(scrolled(Some(8), 10, 5), None); // reaching the bottom re-pins to live
+        assert_eq!(scrolled(None, 0, -1), None); // nothing to scroll when it all fits
     }
 }
