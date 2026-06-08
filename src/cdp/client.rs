@@ -54,7 +54,8 @@ impl CdpConnection {
         tokio::spawn(write_loop(sink, outgoing_rx));
         tokio::spawn(read_loop(stream, Arc::clone(&pending), event_tx));
 
-        let connection = Self { outgoing: outgoing_tx, pending, next_id: Arc::new(AtomicU64::new(1)) };
+        let connection =
+            Self { outgoing: outgoing_tx, pending, next_id: Arc::new(AtomicU64::new(1)) };
         Ok((connection, event_rx))
     }
 
@@ -85,7 +86,10 @@ impl CdpConnection {
     }
 }
 
-async fn write_loop(mut sink: SplitSink<Ws, Message>, mut outgoing: mpsc::UnboundedReceiver<Message>) {
+async fn write_loop(
+    mut sink: SplitSink<Ws, Message>,
+    mut outgoing: mpsc::UnboundedReceiver<Message>,
+) {
     while let Some(message) = outgoing.recv().await {
         if sink.send(message).await.is_err() {
             break;
@@ -93,7 +97,11 @@ async fn write_loop(mut sink: SplitSink<Ws, Message>, mut outgoing: mpsc::Unboun
     }
 }
 
-async fn read_loop(mut stream: SplitStream<Ws>, pending: Pending, events: mpsc::UnboundedSender<CdpEvent>) {
+async fn read_loop(
+    mut stream: SplitStream<Ws>,
+    pending: Pending,
+    events: mpsc::UnboundedSender<CdpEvent>,
+) {
     while let Some(Ok(message)) = stream.next().await {
         let Message::Text(text) = message else { continue };
         let Ok(value) = serde_json::from_str::<Value>(text.as_str()) else { continue };
@@ -164,7 +172,10 @@ pub async fn probe_metrics(connection: &CdpConnection, session: Option<&str>) ->
     let dom = connection.call(session, "Memory.getDOMCounters", json!({})).await.ok();
     TargetMetrics {
         js_heap_kib,
-        documents: dom.as_ref().and_then(|value| value.pointer("/documents")).and_then(Value::as_u64),
+        documents: dom
+            .as_ref()
+            .and_then(|value| value.pointer("/documents"))
+            .and_then(Value::as_u64),
         dom_nodes: dom.as_ref().and_then(|value| value.pointer("/nodes")).and_then(Value::as_u64),
         listeners: dom
             .as_ref()

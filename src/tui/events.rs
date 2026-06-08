@@ -29,11 +29,7 @@ impl EventReader {
         let thread_running = Arc::clone(&running);
         let handle = thread::spawn(move || pump(sender, thread_running));
 
-        Self {
-            receiver,
-            running,
-            handle: Some(handle),
-        }
+        Self { receiver, running, handle: Some(handle) }
     }
 
     /// Awaits the next terminal event. `None` once the reader thread has stopped.

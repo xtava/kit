@@ -19,7 +19,8 @@ pub fn scan_fleet(marker: &str) -> Vec<Instance> {
 
     let mut groups: HashMap<u32, Vec<u32>> = HashMap::new();
     for child in all.values() {
-        let is_app_child = classify::process_type(&child.args).is_some() && is_app_binary(&child.args, &marker);
+        let is_app_child =
+            classify::process_type(&child.args).is_some() && is_app_binary(&child.args, &marker);
         if is_app_child {
             if let Some(main) = main_of(child.pid, &all) {
                 groups.entry(main).or_default().push(child.pid);
@@ -40,7 +41,11 @@ pub fn total_pss(instance: &Instance) -> u64 {
     instance.processes.iter().map(|process| process.pss_kib).sum()
 }
 
-fn build_instance(main_pid: u32, child_pids: Vec<u32>, all: &HashMap<u32, RawProc>) -> Option<Instance> {
+fn build_instance(
+    main_pid: u32,
+    child_pids: Vec<u32>,
+    all: &HashMap<u32, RawProc>,
+) -> Option<Instance> {
     let main = all.get(&main_pid)?;
 
     let mut processes: Vec<Process> = std::iter::once(main_pid)
@@ -63,7 +68,9 @@ fn build_instance(main_pid: u32, child_pids: Vec<u32>, all: &HashMap<u32, RawPro
     processes.sort_by(|a, b| b.pss_kib.cmp(&a.pss_kib));
 
     Some(Instance {
-        name: classify::wm_class(&main.args).map(str::to_owned).unwrap_or_else(|| binary_name(&main.args)),
+        name: classify::wm_class(&main.args)
+            .map(str::to_owned)
+            .unwrap_or_else(|| binary_name(&main.args)),
         root_pid: main_pid,
         debug_port: classify::debug_port(&main.args),
         processes,
@@ -91,8 +98,5 @@ fn is_app_binary(args: &[String], marker: &str) -> bool {
 }
 
 fn binary_name(args: &[String]) -> String {
-    args.first()
-        .and_then(|arg| arg.rsplit('/').next())
-        .unwrap_or("electron")
-        .to_owned()
+    args.first().and_then(|arg| arg.rsplit('/').next()).unwrap_or("electron").to_owned()
 }

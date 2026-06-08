@@ -86,10 +86,7 @@ async fn server_for_tld(tld: &str) -> WhoisServer {
     {
         let cached = cache.lock().await;
         if let Some(server) = cached.get(&key) {
-            return server
-                .clone()
-                .map(WhoisServer::Found)
-                .unwrap_or(WhoisServer::NoReferral);
+            return server.clone().map(WhoisServer::Found).unwrap_or(WhoisServer::NoReferral);
         }
     }
 
@@ -101,9 +98,7 @@ async fn server_for_tld(tld: &str) -> WhoisServer {
 
     let mut cached = cache.lock().await;
     cached.insert(key, server.clone());
-    server
-        .map(WhoisServer::Found)
-        .unwrap_or(WhoisServer::NoReferral)
+    server.map(WhoisServer::Found).unwrap_or(WhoisServer::NoReferral)
 }
 
 enum WhoisServer {
@@ -117,13 +112,10 @@ async fn whois_ask(server: &str, query: &str, timeout_after: Duration) -> Result
         .await
         .context("connection timed out")?
         .with_context(|| format!("connect to {server}:43"))?;
-    timeout(
-        timeout_after,
-        stream.write_all(format!("{query}\r\n").as_bytes()),
-    )
-    .await
-    .context("write timed out")?
-    .with_context(|| format!("write WHOIS query to {server}:43"))?;
+    timeout(timeout_after, stream.write_all(format!("{query}\r\n").as_bytes()))
+        .await
+        .context("write timed out")?
+        .with_context(|| format!("write WHOIS query to {server}:43"))?;
 
     let mut data = Vec::new();
     let mut buffer = [0_u8; 4096];
@@ -192,10 +184,7 @@ mod tests {
     fn classifies_free_markers_before_taken_markers() {
         let response = "Registrar: example\nStatus: AVAILABLE\n";
 
-        assert!(matches!(
-            classify_whois_marker(response),
-            WhoisClassification::Free(_)
-        ));
+        assert!(matches!(classify_whois_marker(response), WhoisClassification::Free(_)));
     }
 
     #[test]
@@ -203,30 +192,21 @@ mod tests {
         let response =
             "Domain Name: EXAMPLE.COM\nCreation Date: 1995-01-01\nName Server: A.IANA-SERVERS.NET";
 
-        assert!(matches!(
-            classify_whois_marker(response),
-            WhoisClassification::Taken(_)
-        ));
+        assert!(matches!(classify_whois_marker(response), WhoisClassification::Taken(_)));
     }
 
     #[test]
     fn classifies_ambiguous_records_as_inconclusive() {
         let response = "Terms of use apply. Please try again later.";
 
-        assert_eq!(
-            classify_whois_marker(response),
-            WhoisClassification::Ambiguous
-        );
+        assert_eq!(classify_whois_marker(response), WhoisClassification::Ambiguous);
     }
 
     #[test]
     fn parses_referral_by_slicing_from_the_first_colon() {
         let referral = "domain: ai\nwhois: whois.example:43\nremarks: keep colons\n";
 
-        assert_eq!(
-            parse_whois_referral(referral),
-            Some("whois.example:43".to_owned())
-        );
+        assert_eq!(parse_whois_referral(referral), Some("whois.example:43".to_owned()));
     }
 
     #[test]

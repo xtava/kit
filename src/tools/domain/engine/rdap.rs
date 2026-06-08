@@ -139,15 +139,11 @@ fn read_fresh_cache() -> Result<Option<String>> {
         return Ok(None);
     }
 
-    fs::read_to_string(path)
-        .map(Some)
-        .context("read RDAP bootstrap cache")
+    fs::read_to_string(path).map(Some).context("read RDAP bootstrap cache")
 }
 
 fn is_fresh(modified: Option<SystemTime>) -> bool {
-    modified
-        .and_then(|modified| modified.elapsed().ok())
-        .is_some_and(|age| age <= CACHE_TTL)
+    modified.and_then(|modified| modified.elapsed().ok()).is_some_and(|age| age <= CACHE_TTL)
 }
 
 fn cache_path() -> PathBuf {
@@ -228,12 +224,7 @@ async fn check_endpoint(client: &Client, domain: &str, endpoint: &str) -> Endpoi
 
 async fn request_endpoint(client: &Client, domain: &str, endpoint: &str) -> EndpointCheck {
     let url = format!("{}/domain/{domain}", endpoint.trim_end_matches('/'));
-    let response = match client
-        .get(&url)
-        .header("accept", "application/rdap+json")
-        .send()
-        .await
-    {
+    let response = match client.get(&url).header("accept", "application/rdap+json").send().await {
         Ok(response) => response,
         Err(error) => {
             return EndpointCheck::Inconclusive(format!(
@@ -251,17 +242,11 @@ async fn request_endpoint(client: &Client, domain: &str, endpoint: &str) -> Endp
         StatusCode::OK => {
             let body = response.text().await.unwrap_or_default();
             let record = parse_record(&body);
-            let evidence = match record
-                .as_ref()
-                .and_then(|record| record.expires_on.as_deref())
-            {
+            let evidence = match record.as_ref().and_then(|record| record.expires_on.as_deref()) {
                 Some(expiration) => format!("registry RDAP 200, exp {expiration}"),
                 None => "registry RDAP 200".to_owned(),
             };
-            EndpointCheck::Conclusive {
-                outcome: Outcome::taken(evidence),
-                record,
-            }
+            EndpointCheck::Conclusive { outcome: Outcome::taken(evidence), record }
         }
         status => {
             EndpointCheck::Inconclusive(format!("registry RDAP {} at {endpoint}", status.as_u16()))
@@ -270,17 +255,12 @@ async fn request_endpoint(client: &Client, domain: &str, endpoint: &str) -> Endp
 }
 
 fn is_retryable_detail(detail: &str) -> bool {
-    [" 429 ", " 500 ", " 502 ", " 503 "]
-        .iter()
-        .any(|needle| detail.contains(needle))
+    [" 429 ", " 500 ", " 502 ", " 503 "].iter().any(|needle| detail.contains(needle))
 }
 
 #[derive(Debug)]
 enum EndpointCheck {
-    Conclusive {
-        outcome: Outcome,
-        record: Option<DomainRecord>,
-    },
+    Conclusive { outcome: Outcome, record: Option<DomainRecord> },
     Inconclusive(String),
 }
 
@@ -356,12 +336,9 @@ fn event_date(events: &[RdapEvent], action: &str) -> Option<String> {
 }
 
 fn registrar_name(entities: &[RdapEntity]) -> Option<String> {
-    let registrar = entities.iter().find(|entity| {
-        entity
-            .roles
-            .iter()
-            .any(|role| role.eq_ignore_ascii_case("registrar"))
-    })?;
+    let registrar = entities
+        .iter()
+        .find(|entity| entity.roles.iter().any(|role| role.eq_ignore_ascii_case("registrar")))?;
     vcard_full_name(registrar.vcard_array.as_ref()?)
 }
 
@@ -389,9 +366,7 @@ fn vcard_full_name(vcard: &Value) -> Option<String> {
 }
 
 fn is_https(endpoint: &str) -> bool {
-    endpoint
-        .get(..8)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+    endpoint.get(..8).is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
 }
 
 fn push_unique(out: &mut Vec<String>, value: String) {
@@ -417,10 +392,7 @@ mod tests {
 
         assert_eq!(
             bootstrap.endpoints_for_domain("modkit.com"),
-            vec![
-                "https://rdap.example".to_owned(),
-                "http://rdap.example".to_owned()
-            ]
+            vec!["https://rdap.example".to_owned(), "http://rdap.example".to_owned()]
         );
         assert_eq!(
             bootstrap.endpoints_for_domain("modkit.ai"),
@@ -486,10 +458,7 @@ mod tests {
         assert_eq!(record.registrar.as_deref(), Some("Example Registrar, LLC"));
         assert_eq!(
             record.statuses,
-            vec![
-                "client transfer prohibited".to_owned(),
-                "redemption period".to_owned()
-            ]
+            vec!["client transfer prohibited".to_owned(), "redemption period".to_owned()]
         );
         assert_eq!(
             record.nameservers,

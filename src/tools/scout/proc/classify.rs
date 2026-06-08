@@ -65,7 +65,10 @@ mod tests {
         assert_eq!(role(&args(&["x", "--type=fileWatcher"]), 5_000), Role::FileWatcher);
         assert_eq!(role(&args(&["x", "--type=broker"]), 1_000), Role::Broker);
         assert_eq!(
-            role(&args(&["x", "--type=utility", "--utility-sub-type=node.mojom.NodeService"]), 50_000),
+            role(
+                &args(&["x", "--type=utility", "--utility-sub-type=node.mojom.NodeService"]),
+                50_000
+            ),
             Role::Utility(UtilityKind::Node)
         );
     }
@@ -75,5 +78,4 @@ mod tests {
         assert_eq!(role(&args(&["x", "--type=zygote"]), 200_000), Role::Renderer);
         assert_eq!(role(&args(&["x", "--type=zygote"]), 4_000), Role::Zygote);
     }
-
 }

@@ -135,10 +135,7 @@ mod tests {
 
     #[test]
     fn parses_tlds_as_canonical_suffixes() -> Result<()> {
-        assert_eq!(
-            parse_tlds(" .COM.,co.uk,com ")?,
-            vec!["com".to_owned(), "co.uk".to_owned()]
-        );
+        assert_eq!(parse_tlds(" .COM.,co.uk,com ")?, vec!["com".to_owned(), "co.uk".to_owned()]);
         Ok(())
     }
 

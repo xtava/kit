@@ -72,7 +72,8 @@ async fn probe_all(raw: Vec<cdp::Target>) -> Vec<Target> {
 /// Map a generic engine target to scout's recon-flavoured kind — the workspace/workbench meaning
 /// the engine deliberately doesn't carry.
 fn classify(target: &cdp::Target) -> TargetKind {
-    if target.url.starts_with("vscode-webview://") || target.url.starts_with("chrome-extension://") {
+    if target.url.starts_with("vscode-webview://") || target.url.starts_with("chrome-extension://")
+    {
         TargetKind::ExtensionWebview
     } else if let Some(workspace) = workspace_id(&target.url) {
         TargetKind::Workbench { workspace }

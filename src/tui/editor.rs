@@ -76,19 +76,11 @@ impl LineEditor {
 }
 
 fn previous_boundary(value: &str, cursor: usize) -> usize {
-    value[..cursor]
-        .char_indices()
-        .next_back()
-        .map(|(index, _)| index)
-        .unwrap_or(0)
+    value[..cursor].char_indices().next_back().map(|(index, _)| index).unwrap_or(0)
 }
 
 fn next_boundary(value: &str, cursor: usize) -> usize {
-    value[cursor..]
-        .chars()
-        .next()
-        .map(|ch| cursor + ch.len_utf8())
-        .unwrap_or(cursor)
+    value[cursor..].chars().next().map(|ch| cursor + ch.len_utf8()).unwrap_or(cursor)
 }
 
 #[cfg(test)]

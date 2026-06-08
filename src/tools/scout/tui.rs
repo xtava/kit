@@ -226,8 +226,9 @@ impl Row {
 }
 
 fn render(frame: &mut Frame, app: &mut App) {
-    let chunks = Layout::vertical([Constraint::Length(3), Constraint::Min(1), Constraint::Length(1)])
-        .split(frame.area());
+    let chunks =
+        Layout::vertical([Constraint::Length(3), Constraint::Min(1), Constraint::Length(1)])
+            .split(frame.area());
     render_header(frame, chunks[0], app);
     render_tree(frame, chunks[1], app);
     render_footer(frame, chunks[2]);
@@ -261,7 +262,8 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_tree(frame: &mut Frame, area: Rect, app: &mut App) {
     let width = area.width.saturating_sub(4) as usize;
-    let items: Vec<ListItem> = app.rows.iter().map(|row| ListItem::new(row_line(row, width))).collect();
+    let items: Vec<ListItem> =
+        app.rows.iter().map(|row| ListItem::new(row_line(row, width))).collect();
     let list = List::new(items)
         .block(panel(" fleet "))
         .highlight_style(Style::default().bg(Color::Rgb(40, 44, 52)).add_modifier(Modifier::BOLD))
@@ -272,10 +274,14 @@ fn render_tree(frame: &mut Frame, area: Rect, app: &mut App) {
 
 fn render_footer(frame: &mut Frame, area: Rect) {
     let footer = Paragraph::new(Line::from(vec![
-        key("↑↓"), Span::raw(" nav  "),
-        key("⏎"), Span::raw(" expand  "),
-        key("r"), Span::raw(" refresh  "),
-        key("q"), Span::raw(" quit"),
+        key("↑↓"),
+        Span::raw(" nav  "),
+        key("⏎"),
+        Span::raw(" expand  "),
+        key("r"),
+        Span::raw(" refresh  "),
+        key("q"),
+        Span::raw(" quit"),
     ]))
     .style(Style::default().fg(Color::DarkGray))
     .alignment(Alignment::Center);

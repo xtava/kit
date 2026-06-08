@@ -17,7 +17,10 @@ pub enum ParsedInput {
     /// Free text — the tool's primary action (a domain query, a search).
     Query(String),
     /// A recognized `/command`, resolved to its canonical `name` plus the trailing `args`.
-    Command { name: &'static str, args: String },
+    Command {
+        name: &'static str,
+        args: String,
+    },
     /// A `/word` that matched no command.
     Unknown(String),
 }
@@ -51,10 +54,7 @@ impl CommandSet {
         let name = name.to_lowercase();
 
         match self.spec(&name) {
-            Some(spec) => ParsedInput::Command {
-                name: spec.name,
-                args: args.to_owned(),
-            },
+            Some(spec) => ParsedInput::Command { name: spec.name, args: args.to_owned() },
             None => ParsedInput::Unknown(name),
         }
     }
@@ -94,11 +94,8 @@ impl CommandSet {
             return None;
         }
 
-        let mut matches = self
-            .suggestions(trimmed)
-            .into_iter()
-            .map(|spec| spec.name)
-            .collect::<Vec<_>>();
+        let mut matches =
+            self.suggestions(trimmed).into_iter().map(|spec| spec.name).collect::<Vec<_>>();
         matches.sort_unstable();
         matches.dedup();
 
@@ -109,9 +106,7 @@ impl CommandSet {
     }
 
     fn spec(&self, name: &str) -> Option<&'static CommandSpec> {
-        self.specs
-            .iter()
-            .find(|spec| spec.name == name || spec.aliases.contains(&name))
+        self.specs.iter().find(|spec| spec.name == name || spec.aliases.contains(&name))
     }
 }
 

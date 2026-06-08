@@ -61,7 +61,10 @@ re-exports, no two implementations of one concern coexisting.
 
 **Visual rhythm.** One blank line between unrelated blocks. Imports grouped std /
 external / crate, sorted within each. No trailing whitespace. `cargo fmt` is not
-optional.
+optional — and it follows the house style in `rustfmt.toml` (`use_small_heuristics
+= "Max"`): wide single-line chains, calls, and struct literals, capped at 100
+columns. Run `cargo fmt`, never a bare `rustfmt` with default settings — the
+defaults break every chain across multiple lines and fight the whole codebase.
 
 ## Before you call it done
 

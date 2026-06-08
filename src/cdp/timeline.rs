@@ -391,14 +391,40 @@ mod tests {
     #[test]
     fn every_track_variant_roundtrips_over_the_wire() {
         let cases = [
-            Track::Console(ConsoleLine { level: "log".into(), text: "x".into(), url: None, line: None }),
+            Track::Console(ConsoleLine {
+                level: "log".into(),
+                text: "x".into(),
+                url: None,
+                line: None,
+            }),
             Track::Exception(ExceptionInfo { text: "boom".into(), url: None, line: None }),
-            Track::Log(LogEntry { level: "info".into(), source: "network".into(), text: "x".into(), url: None, line: None }),
-            Track::Network(NetEvent { phase: NetPhase::Response, request_id: "1".into(), method: None, url: Some("u".into()), status: Some(200), mime: None, error: None }),
-            Track::Ws(WsFrame { dir: WsDir::Sent, opcode: Some(1), len: Some(8), preview: Some("hi".into()), url: None }),
+            Track::Log(LogEntry {
+                level: "info".into(),
+                source: "network".into(),
+                text: "x".into(),
+                url: None,
+                line: None,
+            }),
+            Track::Network(NetEvent {
+                phase: NetPhase::Response,
+                request_id: "1".into(),
+                method: None,
+                url: Some("u".into()),
+                status: Some(200),
+                mime: None,
+                error: None,
+            }),
+            Track::Ws(WsFrame {
+                dir: WsDir::Sent,
+                opcode: Some(1),
+                len: Some(8),
+                preview: Some("hi".into()),
+                url: None,
+            }),
         ];
         for track in cases {
-            let event = TimelineEvent { at_ms: 1, source: Source::Renderer, target: "t".into(), track };
+            let event =
+                TimelineEvent { at_ms: 1, source: Source::Renderer, target: "t".into(), track };
             let json = serde_json::to_string(&event).unwrap();
             serde_json::from_str::<TimelineEvent>(&json)
                 .unwrap_or_else(|error| panic!("does not round-trip: {json}\n  {error}"));

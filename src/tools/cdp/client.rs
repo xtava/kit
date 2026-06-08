@@ -49,7 +49,8 @@ pub async fn subscribe(record: &Record, since_ms: u64) -> Result<UnboundedReceiv
         .await
         .with_context(|| format!("subscribe to attachment '{}'", record.name))?;
     let mut reader = BufReader::new(stream);
-    let mut line = serde_json::to_string(&Query { command: Command::Subscribe { since_ms }, json: false })?;
+    let mut line =
+        serde_json::to_string(&Query { command: Command::Subscribe { since_ms }, json: false })?;
     line.push('\n');
     reader.get_mut().write_all(line.as_bytes()).await?;
 
@@ -184,7 +185,12 @@ pub async fn overview(json: bool) -> Result<()> {
         println!("  (none — launch the app with a remote debugging port)");
     }
     for instance in &instances {
-        println!("  {:<16} {:<12} :{}", instance.name(), instance.endpoint.app, instance.endpoint.port);
+        println!(
+            "  {:<16} {:<12} :{}",
+            instance.name(),
+            instance.endpoint.app,
+            instance.endpoint.port
+        );
     }
     println!("\nattachments:");
     if live.is_empty() {
@@ -237,7 +243,9 @@ fn pick(instances: Vec<cdp::Instance>, app: Option<&str>) -> Result<cdp::Instanc
             .with_context(|| format!("no instance matches '{selector}'")),
         None if instances.len() == 1 => Ok(instances.into_iter().next().unwrap()),
         None => {
-            if let Some(dev) = instances.iter().find(|instance| instance.endpoint.app.contains("dev")).cloned() {
+            if let Some(dev) =
+                instances.iter().find(|instance| instance.endpoint.app.contains("dev")).cloned()
+            {
                 Ok(dev)
             } else {
                 instances.into_iter().next().context("no instance")
@@ -246,7 +254,13 @@ fn pick(instances: Vec<cdp::Instance>, app: Option<&str>) -> Result<cdp::Instanc
     }
 }
 
-fn spawn_daemon(name: &str, selector: &str, port: u16, root_pid: u32, tracks: &[TrackKind]) -> Result<()> {
+fn spawn_daemon(
+    name: &str,
+    selector: &str,
+    port: u16,
+    root_pid: u32,
+    tracks: &[TrackKind],
+) -> Result<()> {
     std::fs::create_dir_all(registry::dir()).context("create runtime dir")?;
     let exe = std::env::current_exe().context("resolve own path")?;
     let log = std::fs::File::create(registry::log_path(name)).context("open daemon log")?;

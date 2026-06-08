@@ -11,9 +11,12 @@ use serde_json::json;
 
 #[tokio::main]
 async fn main() {
-    let pid: u32 = std::env::args().nth(1).and_then(|a| a.parse().ok()).expect("usage: main_inspector <pid>");
+    let pid: u32 =
+        std::env::args().nth(1).and_then(|a| a.parse().ok()).expect("usage: main_inspector <pid>");
 
-    let endpoint = cdp::node_endpoint(pid).await.expect("no node inspector on that pid — launch it with --inspect");
+    let endpoint = cdp::node_endpoint(pid)
+        .await
+        .expect("no node inspector on that pid — launch it with --inspect");
     println!("discovered node inspector on :{} ({})", endpoint.port, endpoint.ws_url);
 
     let (conn, mut events) = CdpConnection::connect(&endpoint.ws_url).await.expect("connect");

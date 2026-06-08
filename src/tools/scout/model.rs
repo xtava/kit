@@ -118,7 +118,9 @@ pub struct Target {
 #[derive(Debug, Clone, Serialize)]
 pub enum TargetKind {
     /// A workbench window. `workspace` is the workspace id pulled from the url.
-    Workbench { workspace: String },
+    Workbench {
+        workspace: String,
+    },
     /// An extension webview (`vscode-webview://…`). JS-light, but each is its own renderer process —
     /// the cost is process count, not heap.
     ExtensionWebview,

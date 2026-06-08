@@ -37,11 +37,7 @@ impl CheckClient {
 
         let dns_start = Instant::now();
         let dns = dns_stage(&self.dns, &domain).await;
-        attempts.push(attempt_from(
-            Source::Dns,
-            &dns,
-            dns_start.elapsed().as_millis(),
-        ));
+        attempts.push(attempt_from(Source::Dns, &dns, dns_start.elapsed().as_millis()));
         if let StageResult::Verdict { outcome, record } = dns {
             return finish(
                 domain,
@@ -55,11 +51,7 @@ impl CheckClient {
 
         let rdap_start = Instant::now();
         let rdap = rdap_stage(&self.http, &domain, &tld).await;
-        attempts.push(attempt_from(
-            Source::Rdap,
-            &rdap,
-            rdap_start.elapsed().as_millis(),
-        ));
+        attempts.push(attempt_from(Source::Rdap, &rdap, rdap_start.elapsed().as_millis()));
         if let StageResult::Verdict { outcome, record } = rdap {
             return finish(
                 domain,
@@ -79,14 +71,7 @@ impl CheckClient {
             outcome.evidence.clone(),
             whois_start.elapsed().as_millis(),
         ));
-        finish(
-            domain,
-            Source::Whois,
-            outcome,
-            None,
-            start.elapsed().as_millis(),
-            attempts,
-        )
+        finish(domain, Source::Whois, outcome, None, start.elapsed().as_millis(), attempts)
     }
 
     pub async fn check_many(&self, domains: Vec<String>, limit: usize) -> Vec<CheckResult> {
@@ -121,10 +106,7 @@ impl CheckClient {
 }
 
 enum StageResult {
-    Verdict {
-        outcome: Outcome,
-        record: Option<DomainRecord>,
-    },
+    Verdict { outcome: Outcome, record: Option<DomainRecord> },
     Continue(String),
     Skip(String),
 }
@@ -155,20 +137,16 @@ async fn rdap_stage(client: &Client, domain: &str, tld: &str) -> StageResult {
 
     let checked = rdap::check(client, domain, &endpoints).await;
     match checked.outcome {
-        Some(outcome) => StageResult::Verdict {
-            outcome,
-            record: checked.record,
-        },
+        Some(outcome) => StageResult::Verdict { outcome, record: checked.record },
         None => StageResult::Continue(checked.evidence),
     }
 }
 
 fn attempt_from(source: Source, result: &StageResult, ms: u128) -> CheckAttempt {
     let (status, evidence) = match result {
-        StageResult::Verdict { outcome, .. } => (
-            AttemptStatus::from_verdict(outcome.verdict),
-            outcome.evidence.clone(),
-        ),
+        StageResult::Verdict { outcome, .. } => {
+            (AttemptStatus::from_verdict(outcome.verdict), outcome.evidence.clone())
+        }
         StageResult::Continue(evidence) => (AttemptStatus::Inconclusive, evidence.clone()),
         StageResult::Skip(evidence) => (AttemptStatus::Skipped, evidence.clone()),
     };
@@ -183,27 +161,15 @@ fn finish(
     ms: u128,
     attempts: Vec<CheckAttempt>,
 ) -> CheckResult {
-    CheckResult::new(
-        domain,
-        outcome.verdict,
-        source,
-        outcome.evidence,
-        ms,
-        attempts,
-        record,
-    )
+    CheckResult::new(domain, outcome.verdict, source, outcome.evidence, ms, attempts, record)
 }
 
 fn invalid_input_result(input: &str, error: DomainNameError, start: Instant) -> CheckResult {
     let domain = display_input(input);
     let evidence = format!("invalid domain syntax: {error}");
     let ms = start.elapsed().as_millis();
-    let attempt = CheckAttempt::new(
-        Source::Input,
-        AttemptStatus::Inconclusive,
-        evidence.clone(),
-        ms,
-    );
+    let attempt =
+        CheckAttempt::new(Source::Input, AttemptStatus::Inconclusive, evidence.clone(), ms);
     CheckResult::new(
         domain,
         Verdict::Inconclusive,
@@ -237,15 +203,7 @@ impl CheckResult {
         attempts: Vec<CheckAttempt>,
         record: Option<DomainRecord>,
     ) -> Self {
-        Self {
-            domain,
-            verdict,
-            source,
-            evidence: evidence.into(),
-            ms,
-            attempts,
-            record,
-        }
+        Self { domain, verdict, source, evidence: evidence.into(), ms, attempts, record }
     }
 
     pub fn disposition(&self) -> Option<Disposition> {
@@ -263,12 +221,7 @@ pub struct CheckAttempt {
 
 impl CheckAttempt {
     fn new(source: Source, status: AttemptStatus, evidence: impl Into<String>, ms: u128) -> Self {
-        Self {
-            source,
-            status,
-            evidence: evidence.into(),
-            ms,
-        }
+        Self { source, status, evidence: evidence.into(), ms }
     }
 }
 
@@ -473,10 +426,7 @@ fn parking_service(nameservers: &[String]) -> Option<ParkingService> {
     ];
 
     nameservers.iter().find_map(|nameserver| {
-        PARKERS
-            .iter()
-            .find(|(needle, _)| nameserver.contains(needle))
-            .map(|(_, service)| *service)
+        PARKERS.iter().find(|(needle, _)| nameserver.contains(needle)).map(|(_, service)| *service)
     })
 }
 
@@ -488,24 +438,15 @@ pub(crate) struct Outcome {
 
 impl Outcome {
     pub(crate) fn available(evidence: impl Into<String>) -> Self {
-        Self {
-            verdict: Verdict::Available,
-            evidence: evidence.into(),
-        }
+        Self { verdict: Verdict::Available, evidence: evidence.into() }
     }
 
     pub(crate) fn taken(evidence: impl Into<String>) -> Self {
-        Self {
-            verdict: Verdict::Taken,
-            evidence: evidence.into(),
-        }
+        Self { verdict: Verdict::Taken, evidence: evidence.into() }
     }
 
     pub(crate) fn inconclusive(evidence: impl Into<String>) -> Self {
-        Self {
-            verdict: Verdict::Inconclusive,
-            evidence: evidence.into(),
-        }
+        Self { verdict: Verdict::Inconclusive, evidence: evidence.into() }
     }
 }
 
@@ -569,10 +510,7 @@ pub fn canonicalize_suffix(input: &str) -> Option<String> {
     }
 
     let domain = CanonicalDomain::parse(format!("example.{suffix}")).ok()?;
-    domain
-        .as_str()
-        .strip_prefix("example.")
-        .map(ToOwned::to_owned)
+    domain.as_str().strip_prefix("example.").map(ToOwned::to_owned)
 }
 
 fn push_domain_candidate(out: &mut Vec<String>, candidate: String) {
@@ -613,10 +551,8 @@ impl CanonicalDomain {
             return Err(DomainNameError::InvalidSyntax);
         }
 
-        let tld_start = ascii
-            .rfind('.')
-            .map(|index| index + 1)
-            .ok_or(DomainNameError::MissingTld)?;
+        let tld_start =
+            ascii.rfind('.').map(|index| index + 1).ok_or(DomainNameError::MissingTld)?;
 
         Ok(Self { ascii, tld_start })
     }
@@ -684,22 +620,13 @@ mod tests {
 
     #[test]
     fn canonicalizes_idn_domains_to_ascii() {
-        assert_eq!(
-            canonicalize_domain("Bücher.example"),
-            Ok("xn--bcher-kva.example".to_owned())
-        );
+        assert_eq!(canonicalize_domain("Bücher.example"), Ok("xn--bcher-kva.example".to_owned()));
     }
 
     #[test]
     fn canonicalizes_query_tokens_for_favorites() {
-        assert_eq!(
-            canonicalize_query_token(" Bücher "),
-            Ok("xn--bcher-kva".to_owned())
-        );
-        assert_eq!(
-            canonicalize_query_token(" Example.COM. "),
-            Ok("example.com".to_owned())
-        );
+        assert_eq!(canonicalize_query_token(" Bücher "), Ok("xn--bcher-kva".to_owned()));
+        assert_eq!(canonicalize_query_token(" Example.COM. "), Ok("example.com".to_owned()));
     }
 
     #[test]
@@ -719,14 +646,8 @@ mod tests {
 
     #[test]
     fn rejects_invalid_domain_syntax() {
-        assert_eq!(
-            canonicalize_domain("example..com"),
-            Err(DomainNameError::InvalidSyntax)
-        );
-        assert_eq!(
-            canonicalize_domain("localhost"),
-            Err(DomainNameError::MissingTld)
-        );
+        assert_eq!(canonicalize_domain("example..com"), Err(DomainNameError::InvalidSyntax));
+        assert_eq!(canonicalize_domain("localhost"), Err(DomainNameError::MissingTld));
     }
 
     #[tokio::test]
@@ -751,28 +672,19 @@ mod tests {
             "ns1.dan.com".to_owned(),
             "ns2.dan.com".to_owned(),
         ]);
-        assert_eq!(
-            parked.disposition(),
-            Disposition::Parked(ParkingService::Dan)
-        );
+        assert_eq!(parked.disposition(), Disposition::Parked(ParkingService::Dan));
 
         let afternic = DomainRecord::from_nameservers(vec![
             "ns1.afternic.com".to_owned(),
             "ns2.afternic.com".to_owned(),
         ]);
-        assert_eq!(
-            afternic.disposition(),
-            Disposition::Parked(ParkingService::Afternic)
-        );
+        assert_eq!(afternic.disposition(), Disposition::Parked(ParkingService::Afternic));
 
         let buydomains = DomainRecord::from_nameservers(vec![
             "ns.buydomains.com".to_owned(),
             "this-domain-for-sale.com".to_owned(),
         ]);
-        assert_eq!(
-            buydomains.disposition(),
-            Disposition::Parked(ParkingService::BuyDomains)
-        );
+        assert_eq!(buydomains.disposition(), Disposition::Parked(ParkingService::BuyDomains));
 
         let active = DomainRecord::from_nameservers(vec![
             "kip.ns.cloudflare.com".to_owned(),
@@ -801,25 +713,13 @@ mod tests {
             nameservers: vec!["ns1.dan.com".to_owned()],
         };
 
-        assert_eq!(
-            record.disposition(),
-            Disposition::Expiring(ExpiryStage::Redemption)
-        );
+        assert_eq!(record.disposition(), Disposition::Expiring(ExpiryStage::Redemption));
     }
 
     #[test]
     fn maps_expiry_statuses_to_stages() {
-        assert_eq!(
-            expiry_stage(&["pending delete".to_owned()]),
-            Some(ExpiryStage::PendingDelete)
-        );
-        assert_eq!(
-            expiry_stage(&["client hold".to_owned()]),
-            Some(ExpiryStage::Hold)
-        );
-        assert_eq!(
-            expiry_stage(&["client transfer prohibited".to_owned()]),
-            None
-        );
+        assert_eq!(expiry_stage(&["pending delete".to_owned()]), Some(ExpiryStage::PendingDelete));
+        assert_eq!(expiry_stage(&["client hold".to_owned()]), Some(ExpiryStage::Hold));
+        assert_eq!(expiry_stage(&["client transfer prohibited".to_owned()]), None);
     }
 }

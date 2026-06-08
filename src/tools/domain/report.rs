@@ -2,12 +2,8 @@ use super::engine::{CheckAttempt, CheckResult, Disposition};
 
 /// Headless text rendering — one aligned line per result, with a disposition tag and a trace line.
 pub fn print_results(results: &[CheckResult]) {
-    let domain_width = results
-        .iter()
-        .map(|result| result.domain.len())
-        .max()
-        .unwrap_or(6)
-        .max("domain".len());
+    let domain_width =
+        results.iter().map(|result| result.domain.len()).max().unwrap_or(6).max("domain".len());
 
     for result in results {
         println!(
@@ -42,10 +38,7 @@ fn format_attempts(attempts: &[CheckAttempt]) -> String {
     attempts
         .iter()
         .map(|attempt| {
-            format!(
-                "{} {} {}ms {}",
-                attempt.source, attempt.status, attempt.ms, attempt.evidence
-            )
+            format!("{} {} {}ms {}", attempt.source, attempt.status, attempt.ms, attempt.evidence)
         })
         .collect::<Vec<_>>()
         .join(" -> ")

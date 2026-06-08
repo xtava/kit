@@ -7,16 +7,48 @@ use serde::Serialize;
 use serde_json::Value;
 
 const INTERACTIVE: &[&str] = &[
-    "button", "link", "textbox", "checkbox", "radio", "combobox", "listbox", "menuitem",
-    "menuitemcheckbox", "menuitemradio", "option", "searchbox", "slider", "spinbutton", "switch",
-    "tab", "treeitem", "scrollbar",
+    "button",
+    "link",
+    "textbox",
+    "checkbox",
+    "radio",
+    "combobox",
+    "listbox",
+    "menuitem",
+    "menuitemcheckbox",
+    "menuitemradio",
+    "option",
+    "searchbox",
+    "slider",
+    "spinbutton",
+    "switch",
+    "tab",
+    "treeitem",
+    "scrollbar",
 ];
 const CONTENT: &[&str] = &[
-    "heading", "cell", "columnheader", "rowheader", "listitem", "img", "article", "banner",
-    "navigation", "main", "complementary", "contentinfo", "form", "region", "alert", "alertdialog",
-    "dialog", "status", "tooltip",
+    "heading",
+    "cell",
+    "columnheader",
+    "rowheader",
+    "listitem",
+    "img",
+    "article",
+    "banner",
+    "navigation",
+    "main",
+    "complementary",
+    "contentinfo",
+    "form",
+    "region",
+    "alert",
+    "alertdialog",
+    "dialog",
+    "status",
+    "tooltip",
 ];
-const SKIP: &[&str] = &["InlineTextBox", "LineBreak", "StaticText", "none", "generic", "GenericContainer"];
+const SKIP: &[&str] =
+    &["InlineTextBox", "LineBreak", "StaticText", "none", "generic", "GenericContainer"];
 const STRUCTURAL: &[&str] = &["RootWebArea", "WebArea", "document"];
 
 #[derive(Serialize)]
@@ -203,8 +235,16 @@ fn properties(node: &Value) -> Vec<(String, String)> {
             };
             let keep = matches!(
                 name,
-                "checked" | "expanded" | "selected" | "disabled" | "pressed" | "required"
-                    | "level" | "valuenow" | "haspopup" | "invalid"
+                "checked"
+                    | "expanded"
+                    | "selected"
+                    | "disabled"
+                    | "pressed"
+                    | "required"
+                    | "level"
+                    | "valuenow"
+                    | "haspopup"
+                    | "invalid"
             ) && rendered != "false"
                 && rendered != "none";
             keep.then(|| (name.to_owned(), rendered))
@@ -213,7 +253,11 @@ fn properties(node: &Value) -> Vec<(String, String)> {
 }
 
 fn ax_string(node: &Value, field: &str) -> String {
-    node.get(field).and_then(|field| field.get("value")).and_then(Value::as_str).unwrap_or_default().to_owned()
+    node.get(field)
+        .and_then(|field| field.get("value"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
 }
 
 fn ax_opt(node: &Value, field: &str) -> Option<String> {

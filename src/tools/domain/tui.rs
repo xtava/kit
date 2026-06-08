@@ -170,10 +170,7 @@ fn start_query(
     }
 
     app.generation = app.generation.wrapping_add(1);
-    app.status = ResultsStatus::Checking {
-        query: query.clone(),
-        domains: domains.clone(),
-    };
+    app.status = ResultsStatus::Checking { query: query.clone(), domains: domains.clone() };
     app.spinner = 0;
 
     let generation = app.generation;
@@ -181,11 +178,7 @@ fn start_query(
     let result_tx = result_tx.clone();
     tokio::spawn(async move {
         let results = client.check_many(domains, 8).await;
-        let _ = result_tx.send(QueryResult {
-            generation,
-            query,
-            results,
-        });
+        let _ = result_tx.send(QueryResult { generation, query, results });
     });
 }
 
@@ -224,11 +217,7 @@ fn render(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
     let vertical = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(4),
-            Constraint::Min(1),
-            Constraint::Length(8),
-        ])
+        .constraints([Constraint::Length(4), Constraint::Min(1), Constraint::Length(8)])
         .split(area);
 
     render_header(frame, vertical[0]);
@@ -239,17 +228,9 @@ fn render(frame: &mut Frame<'_>, app: &App) {
 fn render_header(frame: &mut Frame<'_>, area: Rect) {
     let header = Paragraph::new(vec![
         Line::from(vec![
-            Span::styled(
-                "domain",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Span::styled("domain", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
             Span::raw("  "),
-            Span::styled(
-                "authoritative registration checker",
-                Style::default().fg(Color::Gray),
-            ),
+            Span::styled("authoritative registration checker", Style::default().fg(Color::Gray)),
         ]),
         Line::styled(
             "DNS delegation -> registry RDAP -> registry WHOIS",
@@ -267,9 +248,8 @@ fn render_results(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(block, area);
 
     let lines = app.result_lines(inner.width as usize);
-    let paragraph = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .style(Style::default().fg(Color::White));
+    let paragraph =
+        Paragraph::new(lines).wrap(Wrap { trim: false }).style(Style::default().fg(Color::White));
 
     frame.render_widget(paragraph, inner);
 }
@@ -377,12 +357,7 @@ impl App {
     fn footer(&self) -> Line<'static> {
         let tlds = self.config.tlds().join(", ");
         let mut spans = vec![
-            Span::styled(
-                "TLDs:",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Span::styled("TLDs:", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
             Span::raw(" "),
             Span::styled(tlds, Style::default().fg(Color::White)),
             Span::styled("  |  ", Style::default().fg(Color::DarkGray)),
@@ -431,10 +406,7 @@ impl App {
 
         let matches = COMMANDS.suggestions(self.input.value());
         if matches.is_empty() {
-            return vec![Line::styled(
-                "No matching command.",
-                Style::default().fg(Color::Yellow),
-            )];
+            return vec![Line::styled("No matching command.", Style::default().fg(Color::Yellow))];
         }
 
         matches
@@ -444,9 +416,7 @@ impl App {
                 Line::from(vec![
                     Span::styled(
                         spec.usage,
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                     ),
                     Span::styled("  ", Style::default().fg(Color::DarkGray)),
                     Span::styled(spec.description, Style::default().fg(Color::Gray)),
@@ -469,10 +439,7 @@ impl App {
         let mut lines = Vec::new();
 
         if let Some(notice) = &self.notice {
-            lines.push(Line::styled(
-                notice.clone(),
-                Style::default().fg(Color::Green),
-            ));
+            lines.push(Line::styled(notice.clone(), Style::default().fg(Color::Green)));
             lines.push(Line::raw(""));
         }
 
@@ -490,9 +457,7 @@ impl App {
             ResultsStatus::Help => {
                 lines.push(Line::styled(
                     "Slash commands",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                 ));
                 lines.push(Line::styled(
                     "Lines beginning with / are commands; everything else is a domain query.",
@@ -513,9 +478,7 @@ impl App {
             ResultsStatus::Favorites => {
                 lines.push(Line::styled(
                     "Favorites",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                 ));
                 lines.push(Line::styled(
                     "Press Ctrl-F after a check to save the current name.",
@@ -545,9 +508,7 @@ impl App {
                 lines.push(Line::from(vec![
                     Span::styled(
                         spinner,
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(" checking "),
                     Span::styled(query.clone(), Style::default().add_modifier(Modifier::BOLD)),
@@ -571,11 +532,8 @@ impl App {
                 ]));
                 lines.push(Line::raw(""));
 
-                let domain_width = results
-                    .iter()
-                    .map(|result| result.domain.len())
-                    .max()
-                    .unwrap_or(6);
+                let domain_width =
+                    results.iter().map(|result| result.domain.len()).max().unwrap_or(6);
                 for result in results {
                     lines.push(result_line(result, domain_width, width));
                     if let Some(trace) = trace_line(result, width) {
@@ -583,10 +541,8 @@ impl App {
                     }
                 }
 
-                let available = results
-                    .iter()
-                    .filter(|result| result.verdict == Verdict::Available)
-                    .count();
+                let available =
+                    results.iter().filter(|result| result.verdict == Verdict::Available).count();
                 lines.push(Line::raw(""));
                 lines.push(Line::styled(
                     format!("{available}/{} available", results.len()),
@@ -730,14 +686,8 @@ enum ResultsStatus {
     Empty,
     Help,
     Favorites,
-    Checking {
-        query: String,
-        domains: Vec<String>,
-    },
-    Ready {
-        query: String,
-        results: Vec<CheckResult>,
-    },
+    Checking { query: String, domains: Vec<String> },
+    Ready { query: String, results: Vec<CheckResult> },
 }
 
 impl ResultsStatus {
@@ -764,29 +714,19 @@ fn visible_domain_count(width: usize) -> usize {
 fn result_line(result: &CheckResult, domain_width: usize, width: usize) -> Line<'static> {
     let (symbol, verdict_style) = match result.verdict {
         Verdict::Available => ("✓", Style::default().fg(Color::Green)),
-        Verdict::Taken => (
-            "✗",
-            Style::default().fg(Color::Red).add_modifier(Modifier::DIM),
-        ),
+        Verdict::Taken => ("✗", Style::default().fg(Color::Red).add_modifier(Modifier::DIM)),
         Verdict::Inconclusive => ("?", Style::default().fg(Color::Yellow)),
     };
 
     let badge = disposition_badge(result);
     let meta = format!("{} · {}ms · {}", result.source, result.ms, result.evidence);
 
-    let left = format!(
-        "{symbol} {:<domain_width$}  {:<12}",
-        result.domain, result.verdict
-    );
-    let badge_cells = badge
-        .as_ref()
-        .map(|(text, _)| 2 + UnicodeWidthStr::width(text.as_str()))
-        .unwrap_or(0);
+    let left = format!("{symbol} {:<domain_width$}  {:<12}", result.domain, result.verdict);
+    let badge_cells =
+        badge.as_ref().map(|(text, _)| 2 + UnicodeWidthStr::width(text.as_str())).unwrap_or(0);
     let left_width = UnicodeWidthStr::width(left.as_str());
     let meta_width = UnicodeWidthStr::width(meta.as_str());
-    let gap = width
-        .saturating_sub(left_width + badge_cells + meta_width)
-        .max(2);
+    let gap = width.saturating_sub(left_width + badge_cells + meta_width).max(2);
 
     let mut spans = vec![
         Span::styled(symbol, verdict_style.add_modifier(Modifier::BOLD)),
@@ -805,12 +745,8 @@ fn result_line(result: &CheckResult, domain_width: usize, width: usize) -> Line<
     }
 
     spans.push(Span::raw(" ".repeat(gap)));
-    spans.push(Span::styled(
-        meta,
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::DIM),
-    ));
+    spans
+        .push(Span::styled(meta, Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM)));
 
     Line::from(spans)
 }
@@ -823,20 +759,12 @@ fn disposition_badge(result: &CheckResult) -> Option<(String, Style)> {
             Some((disposition.to_string(), Style::default().fg(Color::Magenta)))
         }
         Disposition::Expiring(_) => {
-            let text = match result
-                .record
-                .as_ref()
-                .and_then(|record| record.expires_on.as_deref())
+            let text = match result.record.as_ref().and_then(|record| record.expires_on.as_deref())
             {
                 Some(expiration) => format!("{disposition} (exp {expiration})"),
                 None => disposition.to_string(),
             };
-            Some((
-                text,
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ))
+            Some((text, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)))
         }
     }
 }
@@ -850,21 +778,13 @@ fn trace_line(result: &CheckResult, width: usize) -> Option<Line<'static>> {
         .attempts
         .iter()
         .map(|attempt| {
-            format!(
-                "{} {} {}ms {}",
-                attempt.source, attempt.status, attempt.ms, attempt.evidence
-            )
+            format!("{} {} {}ms {}", attempt.source, attempt.status, attempt.ms, attempt.evidence)
         })
         .collect::<Vec<_>>()
         .join(" -> ");
     let text = truncate_width(&format!("  trace: {summary}"), width);
 
-    Some(Line::styled(
-        text,
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::DIM),
-    ))
+    Some(Line::styled(text, Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM)))
 }
 
 fn truncate_width(text: &str, max_width: usize) -> String {
@@ -893,4 +813,3 @@ fn truncate_width(text: &str, max_width: usize) -> String {
     out.push_str(marker);
     out
 }
-

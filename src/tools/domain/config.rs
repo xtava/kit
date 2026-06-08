@@ -72,10 +72,7 @@ impl Config {
     }
 
     fn save(&self) -> Result<()> {
-        let stored = Stored {
-            tlds: self.tlds.clone(),
-            favorites: self.favorites.clone(),
-        };
+        let stored = Stored { tlds: self.tlds.clone(), favorites: self.favorites.clone() };
         self.store.save(TOOL, &stored)
     }
 }
@@ -144,7 +141,8 @@ mod tests {
 
     #[test]
     fn adds_favorites_without_duplicates_and_persists() -> Result<()> {
-        let dir = std::env::temp_dir().join(format!("kit-domain-config-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("kit-domain-config-test-{}", std::process::id()));
         let mut config = Config {
             store: ConfigStore::rooted(dir.clone()),
             tlds: default_tlds(),

@@ -1,0 +1,5 @@
+# kit house style: wide single-line chains, calls, and struct literals (the codebase is
+# written this way), capped at 100 columns. `use_small_heuristics = "Max"` raises the
+# per-construct width limits to max_width instead of rustfmt's narrow defaults.
+edition = "2021"
+use_small_heuristics = "Max"
