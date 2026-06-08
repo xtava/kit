@@ -3,4 +3,5 @@
 # Internal docs — not for the public repo
 /CONTEXT.md
 /docs/plan.md
+/plans/
 /docs/adr/

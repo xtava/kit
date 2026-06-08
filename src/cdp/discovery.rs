@@ -64,6 +64,46 @@ pub async fn is_cdp(port: u16) -> bool {
     browser_endpoint(port).await.is_some()
 }
 
+/// The Electron main process's V8 inspector — a `node.js/...` endpoint opened with `--inspect`.
+/// It serves the same protocol but exposes the Node main, not the browser's windows.
+#[derive(Debug, Clone)]
+pub struct NodeEndpoint {
+    pub port: u16,
+    pub ws_url: String,
+}
+
+/// Find the node inspector among the ports `pid` is listening on — the `Browser: node.js/...`
+/// counterpart to [`browser_endpoint`]. Returns `None` unless the process was launched `--inspect`.
+pub async fn node_endpoint(pid: u32) -> Option<NodeEndpoint> {
+    let ports = ports::listening_ports(&[pid]).remove(&pid)?;
+    for port in ports {
+        if !is_node_inspector(port).await {
+            continue;
+        }
+        // The node inspector's ws_url lives in its target list, not /json/version.
+        let Ok(body) = http::get(port, "/json/list").await else {
+            continue;
+        };
+        if let Some(ws_url) = serde_json::from_str::<Vec<RawTarget>>(&body)
+            .ok()
+            .and_then(|targets| targets.into_iter().find_map(|target| target.ws_url))
+        {
+            return Some(NodeEndpoint { port, ws_url });
+        }
+    }
+    None
+}
+
+async fn is_node_inspector(port: u16) -> bool {
+    let Ok(body) = http::get(port, "/json/version").await else {
+        return false;
+    };
+    serde_json::from_str::<VersionInfo>(&body)
+        .ok()
+        .and_then(|version| version.browser)
+        .is_some_and(|browser| browser.starts_with("node.js/"))
+}
+
 pub async fn targets(port: u16) -> Result<Vec<Target>> {
     let body = http::get(port, "/json").await.context("fetch /json")?;
     let raw: Vec<RawTarget> = serde_json::from_str(&body).context("parse /json")?;

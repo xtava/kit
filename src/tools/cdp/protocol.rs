@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::cdp::TrackKind;
+use crate::cdp::{Source, TrackKind};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Query {
@@ -20,14 +20,22 @@ pub enum Command {
     Ping,
     Status,
     Targets,
-    Tail { since_ms: u64, tracks: Option<Vec<TrackKind>> },
+    Tail { since_ms: u64, tracks: Option<Vec<TrackKind>>, source: Option<Source> },
     Eval { target: Option<String>, expr: String },
     Heap { target: Option<String> },
     Snap { target: Option<String>, interactive: bool },
     Click { target: Option<String>, reference: String },
     Fill { target: Option<String>, reference: String, text: String },
     Lens { target: Option<String>, source: String, args: Vec<String> },
+    Ignore(IgnoreOp),
     Detach,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum IgnoreOp {
+    Add(String),
+    List,
+    Clear,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

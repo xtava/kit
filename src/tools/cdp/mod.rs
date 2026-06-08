@@ -18,10 +18,10 @@ use anyhow::{bail, Context as _, Result};
 use async_trait::async_trait;
 use clap::{ArgMatches, Command as ClapCommand, CommandFactory, FromArgMatches, Parser, Subcommand};
 
-use crate::cdp::TrackKind;
+use crate::cdp::{Source, TrackKind};
 use crate::framework::{Context, Tool, ToolMeta};
 
-use protocol::Command;
+use protocol::{Command, IgnoreOp};
 
 pub fn tool() -> CdpTool {
     CdpTool
@@ -41,6 +41,10 @@ RECIPES
       # …save the file / reload the window…
       kit cdp console --since 30s --app dev
       kit cdp tail --track exception --since 30s --app dev
+
+  Split the Electron main process from the web renderer:
+    kit cdp tail --source main --app dev      Node main only (needs --inspect)
+    kit cdp console --source renderer --app dev
 
   Inspect & drive a target (refs come from snap):
     kit cdp snap -i --app dev
@@ -97,21 +101,30 @@ enum CdpCommand {
         /// Restrict to tracks, comma-separated.
         #[arg(long)]
         track: Option<String>,
+        /// Restrict to one process side: `main` (Electron main) or `renderer` (web).
+        #[arg(long)]
+        source: Option<String>,
     },
     /// Timeline, console tracks only (console · exceptions · log).
     Console {
         #[arg(long)]
         since: Option<String>,
+        #[arg(long)]
+        source: Option<String>,
     },
     /// Timeline, network requests only.
     Net {
         #[arg(long)]
         since: Option<String>,
+        #[arg(long)]
+        source: Option<String>,
     },
     /// Timeline, websocket frames only (your realtime/RPC wire).
     Ws {
         #[arg(long)]
         since: Option<String>,
+        #[arg(long)]
+        source: Option<String>,
     },
     /// Evaluate JS in a Target and return its value.
     Eval {
@@ -146,6 +159,14 @@ enum CdpCommand {
         text: Vec<String>,
         #[arg(long)]
         target: Option<String>,
+    },
+    /// Suppress noise from the Timeline — add a substring, `--list`, or `--clear` (per attachment).
+    Ignore {
+        pattern: Vec<String>,
+        #[arg(long)]
+        list: bool,
+        #[arg(long)]
+        clear: bool,
     },
     /// Run a saved lens script inside a Target.
     Lens {
@@ -205,23 +226,36 @@ impl Tool for CdpTool {
             Some(CdpCommand::Gc) => client::gc(json),
 
             Some(CdpCommand::Targets) => finish(client::query(app, json, Command::Targets).await?),
-            Some(CdpCommand::Tail { since, track }) => {
-                let command = Command::Tail { since_ms: parse_since(since.as_deref()), tracks: track.map(parse_tracks) };
-                finish(client::query(app, json, command).await?)
-            }
-            Some(CdpCommand::Console { since }) => {
+            Some(CdpCommand::Tail { since, track, source }) => {
                 let command = Command::Tail {
                     since_ms: parse_since(since.as_deref()),
-                    tracks: Some(vec![TrackKind::Console, TrackKind::Exception, TrackKind::Log]),
+                    tracks: track.map(parse_tracks),
+                    source: parse_source(source.as_deref())?,
                 };
                 finish(client::query(app, json, command).await?)
             }
-            Some(CdpCommand::Net { since }) => {
-                let command = Command::Tail { since_ms: parse_since(since.as_deref()), tracks: Some(vec![TrackKind::Network]) };
+            Some(CdpCommand::Console { since, source }) => {
+                let command = Command::Tail {
+                    since_ms: parse_since(since.as_deref()),
+                    tracks: Some(vec![TrackKind::Console, TrackKind::Exception, TrackKind::Log]),
+                    source: parse_source(source.as_deref())?,
+                };
                 finish(client::query(app, json, command).await?)
             }
-            Some(CdpCommand::Ws { since }) => {
-                let command = Command::Tail { since_ms: parse_since(since.as_deref()), tracks: Some(vec![TrackKind::Ws]) };
+            Some(CdpCommand::Net { since, source }) => {
+                let command = Command::Tail {
+                    since_ms: parse_since(since.as_deref()),
+                    tracks: Some(vec![TrackKind::Network]),
+                    source: parse_source(source.as_deref())?,
+                };
+                finish(client::query(app, json, command).await?)
+            }
+            Some(CdpCommand::Ws { since, source }) => {
+                let command = Command::Tail {
+                    since_ms: parse_since(since.as_deref()),
+                    tracks: Some(vec![TrackKind::Ws]),
+                    source: parse_source(source.as_deref())?,
+                };
                 finish(client::query(app, json, command).await?)
             }
 
@@ -239,6 +273,16 @@ impl Tool for CdpTool {
             Some(CdpCommand::Fill { reference, text, target }) => {
                 let text = text.join(" ");
                 finish(client::query(app, json, Command::Fill { target, reference, text }).await?)
+            }
+            Some(CdpCommand::Ignore { pattern, list, clear }) => {
+                let op = if clear {
+                    IgnoreOp::Clear
+                } else if list || pattern.is_empty() {
+                    IgnoreOp::List
+                } else {
+                    IgnoreOp::Add(pattern.join(" "))
+                };
+                finish(client::query(app, json, Command::Ignore(op)).await?)
             }
             Some(CdpCommand::Lens { name, args, target }) => {
                 let source = load_lens(&name)?;
@@ -305,6 +349,16 @@ fn lens_dir() -> PathBuf {
 /// Parse a comma-separated track list, skipping unknown names.
 fn parse_tracks(csv: String) -> Vec<TrackKind> {
     csv.split(',').filter_map(TrackKind::parse).collect()
+}
+
+/// `main` / `renderer`, or an error on a typo — silently returning everything would be a quiet lie.
+fn parse_source(value: Option<&str>) -> Result<Option<Source>> {
+    match value {
+        None => Ok(None),
+        Some(value) => Source::parse(value)
+            .map(Some)
+            .with_context(|| format!("unknown source '{value}' — expected 'main' or 'renderer'")),
+    }
 }
 
 /// Parsed tracks, falling back to all of them when none are given.

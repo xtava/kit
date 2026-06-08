@@ -16,9 +16,11 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 use tokio::time::{interval, sleep};
 
-use crate::cdp::{self, CdpConnection, CdpEvent, LogEntry, Target, Timeline, TimelineEvent, Track, TrackKind};
+use crate::cdp::{
+    self, CdpConnection, CdpEvent, LogEntry, Source, Target, Timeline, TimelineEvent, Track, TrackKind,
+};
 
-use super::protocol::{Command, Query, Reply};
+use super::protocol::{Command, IgnoreOp, Query, Reply};
 use super::registry::{self, Record};
 use super::{format, snapshot};
 
@@ -45,6 +47,7 @@ struct State {
     refs: HashMap<String, HashMap<String, i64>>,
     timeline: Timeline,
     tracks: Vec<TrackKind>,
+    ignore: Vec<String>,
     start: Instant,
     last_activity: Instant,
 }
@@ -101,12 +104,15 @@ pub async fn serve(name: String, selector: String, port: u16, root_pid: u32, tra
         refs: HashMap::new(),
         timeline: Timeline::new(TIMELINE_CAP),
         tracks: tracks.clone(),
+        ignore: Vec::new(),
         start: Instant::now(),
         last_activity: Instant::now(),
     }));
 
     setup_capture(&conn).await.context("enable target discovery")?;
     registry::write(&state.lock().unwrap().record())?;
+
+    tokio::spawn(main_process_pump(state.clone()));
 
     let socket = registry::socket_path(&name);
     let _ = std::fs::remove_file(&socket);
@@ -161,7 +167,7 @@ async fn event_pump(state: Shared, mut events: mpsc::UnboundedReceiver<CdpEvent>
         match reconnect(&state).await {
             Some(new_events) => {
                 events = new_events;
-                push_marker(&state, "reconnected to instance");
+                push_marker(&state, Source::Renderer, "reconnected to instance");
             }
             None => {
                 let _ = shutdown.send(()).await;
@@ -231,7 +237,7 @@ async fn apply_event(state: &Shared, event: &CdpEvent, tracks: &[TrackKind]) {
                 let mut state = state.lock().unwrap();
                 let at_ms = state.now_ms();
                 let label = state.label(&event.session);
-                state.timeline.push(TimelineEvent { at_ms, target: label, track });
+                state.timeline.push(TimelineEvent { at_ms, source: Source::Renderer, target: label, track });
             }
         }
     }
@@ -253,6 +259,47 @@ async fn enable_session(conn: &CdpConnection, session: &str, tracks: &[TrackKind
             )
             .await;
     }
+}
+
+const MAIN_LABEL: &str = "main";
+
+/// Fold the Electron main process's V8 inspector (`--inspect`) into the Timeline, labeled `main`.
+/// Silent and idempotent when the main isn't inspectable — it just keeps trying within the window.
+async fn main_process_pump(state: Shared) {
+    let mut delay = RECONNECT_MIN;
+    let mut deadline = Instant::now() + RECONNECT_WINDOW;
+    loop {
+        let root_pid = state.lock().unwrap().root_pid;
+        match connect_main(root_pid).await {
+            Some(mut events) => {
+                push_marker(&state, Source::Main, "main process console attached");
+                while let Some(event) = events.recv().await {
+                    if let Some(track) = Track::from_event(&event) {
+                        let mut state = state.lock().unwrap();
+                        let at_ms = state.now_ms();
+                        state.timeline.push(TimelineEvent { at_ms, source: Source::Main, target: MAIN_LABEL.to_owned(), track });
+                    }
+                }
+                delay = RECONNECT_MIN;
+                deadline = Instant::now() + RECONNECT_WINDOW;
+            }
+            None => {
+                if Instant::now() >= deadline {
+                    return;
+                }
+                sleep(delay).await;
+                delay = (delay * 2).min(RECONNECT_MAX);
+            }
+        }
+    }
+}
+
+async fn connect_main(root_pid: u32) -> Option<mpsc::UnboundedReceiver<CdpEvent>> {
+    let endpoint = cdp::node_endpoint(root_pid).await?;
+    let (conn, events) = CdpConnection::connect(&endpoint.ws_url).await.ok()?;
+    // Node's V8 inspector implements Runtime (console + exceptions) but not the browser-only Log domain.
+    conn.call(None, "Runtime.enable", json!({})).await.ok()?;
+    Some(events)
 }
 
 async fn reconnect(state: &Shared) -> Option<mpsc::UnboundedReceiver<CdpEvent>> {
@@ -323,7 +370,7 @@ async fn dispatch(state: &Shared, command: Command, json: bool, shutdown: &mpsc:
         Command::Ping => Reply::ok("pong"),
         Command::Status => status_reply(state, json),
         Command::Targets => targets_reply(state, json),
-        Command::Tail { since_ms, tracks } => tail_reply(state, since_ms, tracks, json),
+        Command::Tail { since_ms, tracks, source } => tail_reply(state, since_ms, tracks, source, json),
         Command::Eval { target, expr } => {
             run_in_target(state, target, json, |conn, session| evaluate(conn, session, expr)).await
         }
@@ -331,6 +378,7 @@ async fn dispatch(state: &Shared, command: Command, json: bool, shutdown: &mpsc:
             let expr = wrap_lens(&source, &args);
             run_in_target(state, target, json, |conn, session| evaluate(conn, session, expr)).await
         }
+        Command::Ignore(op) => ignore_reply(state, op, json),
         Command::Heap { target } => heap_reply(state, target, json).await,
         Command::Snap { target, interactive } => snap_reply(state, target, interactive, json).await,
         Command::Click { target, reference } => click_reply(state, target, reference).await,
@@ -362,11 +410,31 @@ fn targets_reply(state: &Shared, json: bool) -> Reply {
     Reply::ok(format::targets(&targets, json))
 }
 
-fn tail_reply(state: &Shared, since_ms: u64, tracks: Option<Vec<TrackKind>>, json: bool) -> Reply {
+fn tail_reply(
+    state: &Shared,
+    since_ms: u64,
+    tracks: Option<Vec<TrackKind>>,
+    source: Option<Source>,
+    json: bool,
+) -> Reply {
     let state = state.lock().unwrap();
     let now = state.now_ms();
-    let events = state.timeline.since(now, since_ms, tracks.as_deref());
-    Reply::ok(format::events(&events, json))
+    let events = state.timeline.since(now, since_ms, tracks.as_deref(), source);
+    Reply::ok(format::events(&events, &state.ignore, json))
+}
+
+fn ignore_reply(state: &Shared, op: IgnoreOp, json: bool) -> Reply {
+    let mut state = state.lock().unwrap();
+    match op {
+        IgnoreOp::Add(pattern) => {
+            if !state.ignore.contains(&pattern) {
+                state.ignore.push(pattern);
+            }
+        }
+        IgnoreOp::Clear => state.ignore.clear(),
+        IgnoreOp::List => {}
+    }
+    Reply::ok(format::ignore(&state.ignore, json))
 }
 
 async fn heap_reply(state: &Shared, target: Option<String>, json: bool) -> Reply {
@@ -532,6 +600,7 @@ fn norm_ref(reference: &str) -> String {
 fn navigation_marker(at_ms: u64, url: &str) -> TimelineEvent {
     TimelineEvent {
         at_ms,
+        source: Source::Renderer,
         target: "kit".to_owned(),
         track: Track::Log(LogEntry {
             level: "info".to_owned(),
@@ -591,11 +660,12 @@ fn wrap_lens(source: &str, args: &[String]) -> String {
     format!("(function(args){{ {source} }})({args_json})")
 }
 
-fn push_marker(state: &Shared, text: &str) {
+fn push_marker(state: &Shared, source: Source, text: &str) {
     let mut state = state.lock().unwrap();
     let at_ms = state.now_ms();
     state.timeline.push(TimelineEvent {
         at_ms,
+        source,
         target: "kit".to_owned(),
         track: Track::Log(LogEntry {
             level: "info".to_owned(),

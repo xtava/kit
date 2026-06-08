@@ -13,10 +13,12 @@ mod target;
 mod timeline;
 
 pub use client::{probe_metrics, probe_target, CdpConnection, CdpEvent, TargetMetrics};
-pub use discovery::{browser_endpoint, discover, is_cdp, targets, BrowserEndpoint, Instance};
+pub use discovery::{
+    browser_endpoint, discover, is_cdp, node_endpoint, targets, BrowserEndpoint, Instance, NodeEndpoint,
+};
 pub use ports::listening_ports;
 pub use target::{select, Target, TargetKind};
 pub use timeline::{
-    ConsoleLine, ExceptionInfo, LogEntry, NetEvent, NetPhase, Timeline, TimelineEvent, Track,
-    TrackKind, WsDir, WsFrame,
+    ConsoleLine, ExceptionInfo, LogEntry, NetEvent, NetPhase, Source, Timeline, TimelineEvent,
+    Track, TrackKind, WsDir, WsFrame,
 };

@@ -46,15 +46,23 @@ pub fn targets(targets: &[Target], json: bool) -> String {
         .join("\n")
 }
 
-/// A Timeline slice.
-pub fn events(events: &[TimelineEvent], json: bool) -> String {
+/// A Timeline slice. `ignore` drops any event whose rendered line contains one of the substrings.
+pub fn events(events: &[TimelineEvent], ignore: &[String], json: bool) -> String {
+    let lines: Vec<String> = events.iter().map(event_line).collect();
+    let kept: Vec<(&TimelineEvent, &String)> = events
+        .iter()
+        .zip(&lines)
+        .filter(|(_, line)| !ignore.iter().any(|pattern| line.contains(pattern.as_str())))
+        .collect();
+
     if json {
-        return pretty(events);
+        let events: Vec<&TimelineEvent> = kept.iter().map(|(event, _)| *event).collect();
+        return pretty(&events);
     }
-    if events.is_empty() {
+    if kept.is_empty() {
         return "(no events in window)".to_owned();
     }
-    events.iter().map(event_line).collect::<Vec<_>>().join("\n")
+    kept.iter().map(|(_, line)| line.as_str()).collect::<Vec<_>>().join("\n")
 }
 
 #[derive(Serialize)]
@@ -116,6 +124,16 @@ pub fn heap(target: &str, metrics: &TargetMetrics, json: bool) -> String {
         opt(metrics.listeners),
         opt(metrics.documents),
     )
+}
+
+pub fn ignore(patterns: &[String], json: bool) -> String {
+    if json {
+        return pretty(patterns);
+    }
+    if patterns.is_empty() {
+        return "no ignore patterns".to_owned();
+    }
+    patterns.iter().map(|pattern| format!("- {pattern}")).collect::<Vec<_>>().join("\n")
 }
 
 fn event_line(event: &TimelineEvent) -> String {

@@ -9,13 +9,32 @@ use serde_json::Value;
 
 use super::client::CdpEvent;
 
-/// One event on the Timeline: when (ms since attach), which Target, and what.
+/// One event on the Timeline: when (ms since attach), which process side, which Target, and what.
 #[derive(Debug, Clone, Serialize)]
 pub struct TimelineEvent {
     pub at_ms: u64,
+    pub source: Source,
     pub target: String,
     #[serde(flatten)]
     pub track: Track,
+}
+
+/// Which side of the Electron app an event came from: the Node main process or a web renderer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Source {
+    Main,
+    Renderer,
+}
+
+impl Source {
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_lowercase().as_str() {
+            "main" => Some(Self::Main),
+            "renderer" | "render" | "web" => Some(Self::Renderer),
+            _ => None,
+        }
+    }
 }
 
 /// One category of Timeline event.
@@ -270,12 +289,19 @@ impl Timeline {
 
     /// Events within the last `window_ms` (by the same clock as `now_ms`), optionally restricted to
     /// a set of Track kinds.
-    pub fn since(&self, now_ms: u64, window_ms: u64, kinds: Option<&[TrackKind]>) -> Vec<TimelineEvent> {
+    pub fn since(
+        &self,
+        now_ms: u64,
+        window_ms: u64,
+        kinds: Option<&[TrackKind]>,
+        source: Option<Source>,
+    ) -> Vec<TimelineEvent> {
         let floor = now_ms.saturating_sub(window_ms);
         self.events
             .iter()
             .filter(|event| event.at_ms >= floor)
             .filter(|event| kinds.is_none_or(|kinds| kinds.contains(&event.track.kind())))
+            .filter(|event| source.is_none_or(|source| event.source == source))
             .cloned()
             .collect()
     }
