@@ -126,38 +126,8 @@ fn split_command(command_text: &str) -> (&str, &str) {
 fn fuzzy_match(spec: &'static CommandSpec, needle: &str) -> Option<u16> {
     std::iter::once(spec.name)
         .chain(spec.aliases.iter().copied())
-        .filter_map(|candidate| fuzzy_score(candidate, needle))
+        .filter_map(|candidate| super::fuzzy::score(candidate, needle))
         .min()
-}
-
-fn fuzzy_score(candidate: &str, needle: &str) -> Option<u16> {
-    if candidate == needle {
-        return Some(0);
-    }
-    if candidate.starts_with(needle) {
-        return Some(10 + candidate.len().saturating_sub(needle.len()) as u16);
-    }
-    subsequence_score(candidate, needle).map(|score| 100 + score)
-}
-
-fn subsequence_score(candidate: &str, needle: &str) -> Option<u16> {
-    let mut score = 0_u16;
-    let mut last_match = None;
-    let mut chars = candidate.char_indices();
-
-    for needle_char in needle.chars() {
-        let (index, _) = chars.find(|(_, candidate_char)| *candidate_char == needle_char)?;
-        score = score.saturating_add(index as u16);
-
-        if let Some(last_index) = last_match {
-            score = score.saturating_add(index.saturating_sub(last_index + 1) as u16);
-        }
-
-        last_match = Some(index);
-    }
-
-    score = score.saturating_add(candidate.len().saturating_sub(needle.len()) as u16);
-    Some(score)
 }
 
 #[cfg(test)]

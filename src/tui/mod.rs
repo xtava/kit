@@ -8,6 +8,7 @@
 mod commandline;
 mod editor;
 mod events;
+pub mod fuzzy;
 mod session;
 
 pub use commandline::{CommandSet, CommandSpec, ParsedInput};
