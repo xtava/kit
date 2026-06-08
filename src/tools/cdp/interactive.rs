@@ -546,6 +546,7 @@ fn apply_target(command: &mut Command, target: &Option<String>) {
     };
     let slot = match command {
         Command::Eval { target, .. }
+        | Command::Ready { target }
         | Command::Heap { target }
         | Command::Snap { target, .. }
         | Command::Click { target, .. }
@@ -939,6 +940,7 @@ fn render_help(frame: &mut TuiFrame, area: Rect) {
         entry("console · net · ws", "track-filtered slices"),
         section("PROBE"),
         entry("eval <expr> · heap · targets · snap [-i]", "one-shot queries"),
+        entry("ready", "is the workbench up? selected target + why"),
         section("INTERACT"),
         entry("click @ref · fill @ref <text>", "drive the target (refs from snap)"),
         section("FOCUS & FILTER"),

@@ -10,6 +10,7 @@ mod daemon;
 mod format;
 mod interactive;
 mod protocol;
+mod readiness;
 mod registry;
 mod snapshot;
 
@@ -17,7 +18,9 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Context as _, Result};
 use async_trait::async_trait;
-use clap::{ArgMatches, Command as ClapCommand, CommandFactory, FromArgMatches, Parser, Subcommand};
+use clap::{
+    ArgMatches, Command as ClapCommand, CommandFactory, FromArgMatches, Parser, Subcommand,
+};
 
 use crate::cdp::{Source, TrackKind};
 use crate::framework::{Context, Tool, ToolMeta};
@@ -32,6 +35,7 @@ const HELP_RECIPES: &str = "\
 RECIPES
   Orient, then probe — everything lazy-attaches and stays warm:
     kit cdp                                 instances + live attachments
+    kit cdp ready --app dev                  is the workbench up? which target won, and why
     kit cdp eval 'location.href' --app dev
     kit cdp tail --since 3s --app dev        all tracks on one clock
 
@@ -136,6 +140,12 @@ enum CdpCommand {
         expr: Vec<String>,
         #[arg(long)]
         file: Option<PathBuf>,
+        #[arg(long)]
+        target: Option<String>,
+    },
+    /// Is the workbench up? Reports the selected Target, its document state, recent errors, and the
+    /// ranked candidate field with why each won or lost.
+    Ready {
         #[arg(long)]
         target: Option<String>,
     },
@@ -262,13 +272,22 @@ fn session_command(command: CdpCommand) -> Result<Command> {
             tracks: Some(vec![TrackKind::Ws]),
             source: parse_source(source.as_deref())?,
         },
-        CdpCommand::Eval { expr, file, target } => Command::Eval { target, expr: read_expr(expr, file)? },
+        CdpCommand::Eval { expr, file, target } => {
+            Command::Eval { target, expr: read_expr(expr, file)? }
+        }
+        CdpCommand::Ready { target } => Command::Ready { target },
         CdpCommand::Heap { target } => Command::Heap { target },
         CdpCommand::Snap { interactive, target } => Command::Snap { target, interactive },
         CdpCommand::Click { reference, target } => Command::Click { target, reference },
-        CdpCommand::Fill { reference, text, target } => Command::Fill { target, reference, text: text.join(" ") },
-        CdpCommand::Ignore { pattern, list, clear } => Command::Ignore(ignore_op(pattern, list, clear)),
-        CdpCommand::Lens { name, args, target } => Command::Lens { target, source: load_lens(&name)?, args },
+        CdpCommand::Fill { reference, text, target } => {
+            Command::Fill { target, reference, text: text.join(" ") }
+        }
+        CdpCommand::Ignore { pattern, list, clear } => {
+            Command::Ignore(ignore_op(pattern, list, clear))
+        }
+        CdpCommand::Lens { name, args, target } => {
+            Command::Lens { target, source: load_lens(&name)?, args }
+        }
         CdpCommand::Attach { .. }
         | CdpCommand::Detach { .. }
         | CdpCommand::Ls
@@ -307,29 +326,40 @@ fn read_expr(expr: Vec<String>, file: Option<PathBuf>) -> Result<String> {
     Ok(expr.join(" "))
 }
 
+/// Lenses that ship in the binary. A user file of the same name in `lens_dir()` shadows the builtin,
+/// so these are starting points, not walls — `kit cdp lens workbench` works with zero setup, and a
+/// `workbench.js` dropped in the config dir overrides it.
+const BUILTIN_LENSES: &[(&str, &str)] = &[("workbench", include_str!("lenses/workbench.js"))];
+
+/// Load a lens by name: a user file first (the override), then a builtin, else an error that lists
+/// what *is* available.
 fn load_lens(name: &str) -> Result<String> {
-    let dir = lens_dir();
-    let path = dir.join(format!("{name}.js"));
-    std::fs::read_to_string(&path).with_context(|| {
-        let available = list_lenses(&dir);
-        format!("no lens '{name}' at {}{available}", path.display())
-    })
+    let path = lens_dir().join(format!("{name}.js"));
+    if let Ok(source) = std::fs::read_to_string(&path) {
+        return Ok(source);
+    }
+    if let Some((_, source)) = BUILTIN_LENSES.iter().find(|(lens, _)| *lens == name) {
+        return Ok((*source).to_owned());
+    }
+    Err(anyhow::anyhow!("no lens '{name}'{}", available_lenses()))
 }
 
-fn list_lenses(dir: &std::path::Path) -> String {
-    let names: Vec<String> = std::fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|entry| {
+/// The lens names a user can run — builtins plus every `*.js` in the config dir, deduped and sorted.
+fn available_lenses() -> String {
+    let mut names: Vec<String> =
+        BUILTIN_LENSES.iter().map(|(name, _)| (*name).to_owned()).collect();
+    if let Ok(entries) = std::fs::read_dir(lens_dir()) {
+        for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().is_some_and(|ext| ext == "js") {
-                path.file_stem().map(|stem| stem.to_string_lossy().into_owned())
-            } else {
-                None
+                if let Some(stem) = path.file_stem() {
+                    names.push(stem.to_string_lossy().into_owned());
+                }
             }
-        })
-        .collect();
+        }
+    }
+    names.sort();
+    names.dedup();
     if names.is_empty() {
         String::new()
     } else {

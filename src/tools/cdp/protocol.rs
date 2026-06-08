@@ -22,20 +22,50 @@ pub enum Command {
     Ping,
     Status,
     Targets,
-    Tail { since_ms: u64, tracks: Option<Vec<TrackKind>>, source: Option<Source> },
-    Eval { target: Option<String>, expr: String },
-    Heap { target: Option<String> },
-    Snap { target: Option<String>, interactive: bool },
-    Click { target: Option<String>, reference: String },
-    Fill { target: Option<String>, reference: String, text: String },
-    Lens { target: Option<String>, source: String, args: Vec<String> },
+    Tail {
+        since_ms: u64,
+        tracks: Option<Vec<TrackKind>>,
+        source: Option<Source>,
+    },
+    Eval {
+        target: Option<String>,
+        expr: String,
+    },
+    /// Readiness verdict: resolve the workbench Target, probe its live document state, and report the
+    /// ranked candidate field with the reason each was chosen or rejected.
+    Ready {
+        target: Option<String>,
+    },
+    Heap {
+        target: Option<String>,
+    },
+    Snap {
+        target: Option<String>,
+        interactive: bool,
+    },
+    Click {
+        target: Option<String>,
+        reference: String,
+    },
+    Fill {
+        target: Option<String>,
+        reference: String,
+        text: String,
+    },
+    Lens {
+        target: Option<String>,
+        source: String,
+        args: Vec<String>,
+    },
     Ignore(IgnoreOp),
     /// The target picker's data source: every Target joined with its Timeline event volume, ranked
     /// active-first. Returns a JSON `Vec<TargetActivity>` in the [`Reply`] output.
     TargetList,
     /// Open a live subscription: the daemon replies with a [`Frame`] stream (not a [`Reply`]) and
     /// holds the socket open, pushing each new Timeline event until the client disconnects.
-    Subscribe { since_ms: u64 },
+    Subscribe {
+        since_ms: u64,
+    },
     Detach,
 }
 
@@ -108,12 +138,21 @@ mod tests {
             Command::Targets,
             Command::TargetList,
             Command::Detach,
-            Command::Tail { since_ms: 5000, tracks: Some(vec![TrackKind::Network]), source: Some(Source::Main) },
+            Command::Tail {
+                since_ms: 5000,
+                tracks: Some(vec![TrackKind::Network]),
+                source: Some(Source::Main),
+            },
             Command::Eval { target: target.clone(), expr: "1+1".to_owned() },
+            Command::Ready { target: target.clone() },
             Command::Heap { target: target.clone() },
             Command::Snap { target: target.clone(), interactive: true },
             Command::Click { target: target.clone(), reference: "e1".to_owned() },
-            Command::Fill { target: target.clone(), reference: "e1".to_owned(), text: "x".to_owned() },
+            Command::Fill {
+                target: target.clone(),
+                reference: "e1".to_owned(),
+                text: "x".to_owned(),
+            },
             Command::Lens { target, source: "return 1".to_owned(), args: vec!["a".to_owned()] },
             Command::Ignore(IgnoreOp::Add("noise".to_owned())),
             Command::Subscribe { since_ms: 30_000 },
@@ -139,7 +178,13 @@ mod tests {
             at_ms: 1,
             source: Source::Renderer,
             target: "t".to_owned(),
-            track: Track::Log(LogEntry { level: "info".to_owned(), source: "network".to_owned(), text: "x".to_owned(), url: None, line: None }),
+            track: Track::Log(LogEntry {
+                level: "info".to_owned(),
+                source: "network".to_owned(),
+                text: "x".to_owned(),
+                url: None,
+                line: None,
+            }),
         };
         survives(&Frame::Backfill(vec![event.clone()]));
         survives(&Frame::Event(event));

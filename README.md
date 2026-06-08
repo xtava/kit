@@ -6,7 +6,8 @@ new tool is *only* its own logic.
 
 ```
 kit                        # list tools
-kit cdp tail --since 3s    # warm CDP debugger — correlated timeline of a running fleet
+kit cdp ready              # warm CDP debugger — is the workbench up? selected target + why
+kit cdp tail --since 3s    # …correlated timeline of a running fleet
 kit cdp eval 'location'    # …probe a live target (lazy-attaches, stays warm)
 kit scout                  # live Electron memory recon   (TUI when interactive)
 kit scout --once           # …one survey, headless table
@@ -31,7 +32,7 @@ src/
 ├─ tui/               Session (panic-safe terminal) · EventReader · LineEditor · CommandSet
 ├─ cdp/               Chrome DevTools Protocol engine — client · discovery · target · timeline
 └─ tools/
-   ├─ cdp/            warm CDP debugger — daemon · client · registry · snapshot · lenses
+   ├─ cdp/            warm CDP debugger — daemon · client · snapshot · readiness · lenses
    ├─ scout/          proc · cdp (via kit::cdp) · survey · correlate · report · tui · dive
    └─ domain/         engine{dns,rdap,whois} · config · report · tui
 ```

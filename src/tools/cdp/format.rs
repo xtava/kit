@@ -39,7 +39,7 @@ pub fn targets(targets: &[Target], json: bool) -> String {
         .enumerate()
         .map(|(index, target)| {
             let marker = if index == 0 { "* " } else { "  " };
-            let label = target_label(target);
+            let label = truncate(&target.label(), 70);
             format!("{marker}{:<14} {label}", target.kind.as_str())
         })
         .collect::<Vec<_>>()
@@ -153,7 +153,10 @@ pub(crate) fn event_line(event: &TimelineEvent) -> String {
             let method = net.method.as_deref().unwrap_or("");
             let status = net.status.map(|code| code.to_string()).unwrap_or_default();
             let what = net.url.as_deref().or(net.error.as_deref()).unwrap_or("");
-            format!("net {phase} {method} {status} {what}").split_whitespace().collect::<Vec<_>>().join(" ")
+            format!("net {phase} {method} {status} {what}")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
         }
         Track::Ws(frame) => {
             let dir = match frame.dir {
@@ -167,14 +170,6 @@ pub(crate) fn event_line(event: &TimelineEvent) -> String {
         }
     };
     format!("{head} {body}")
-}
-
-fn target_label(target: &Target) -> String {
-    if !target.title.is_empty() {
-        truncate(&target.title, 70)
-    } else {
-        truncate(&target.url, 70)
-    }
 }
 
 fn location(url: &Option<String>, line: Option<u64>) -> String {

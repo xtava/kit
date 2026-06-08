@@ -17,10 +17,12 @@ use tokio::sync::mpsc;
 use tokio::time::{interval, sleep};
 
 use crate::cdp::{
-    self, CdpConnection, CdpEvent, LogEntry, Source, Target, Timeline, TimelineEvent, Track, TrackKind,
+    self, CdpConnection, CdpEvent, LogEntry, Source, Target, Timeline, TimelineEvent, Track,
+    TrackKind,
 };
 
 use super::protocol::{Command, Frame, IgnoreOp, Query, Reply, TargetActivity};
+use super::readiness::{self, DocState, Readiness};
 use super::registry::{self, Record};
 use super::{format, snapshot};
 
@@ -79,10 +81,14 @@ impl State {
         }
     }
 
-    /// Resolve a Target selector to a `(sessionId, target)` against the live target set.
+    /// Resolve a Target selector to a `(sessionId, target)` against the live target set, ranked by
+    /// the engine's static score *and* live Timeline activity — so a bare selector lands on the
+    /// workbench that is actually streaming, not an idle sibling, and re-resolves fresh on every
+    /// command (a reload that swaps the target id is invisible to the caller).
     fn resolve(&self, selector: Option<&str>) -> Option<(String, Target)> {
         let targets: Vec<Target> = self.sessions.values().cloned().collect();
-        let chosen = cdp::select(&targets, selector)?;
+        let activity = self.timeline.counts_by_target();
+        let chosen = cdp::select_active(&targets, selector, &activity)?;
         self.sessions
             .iter()
             .find(|(_, target)| target.id == chosen.id)
@@ -93,7 +99,7 @@ impl State {
         session
             .as_ref()
             .and_then(|session| self.sessions.get(session))
-            .map(target_label)
+            .map(Target::label)
             .unwrap_or_else(|| "browser".to_owned())
     }
 
@@ -111,9 +117,16 @@ impl State {
     }
 }
 
-pub async fn serve(name: String, selector: String, port: u16, root_pid: u32, tracks: Vec<TrackKind>) -> Result<()> {
+pub async fn serve(
+    name: String,
+    selector: String,
+    port: u16,
+    root_pid: u32,
+    tracks: Vec<TrackKind>,
+) -> Result<()> {
     let endpoint = cdp::browser_endpoint(port).await.context("instance is not a CDP endpoint")?;
-    let (conn, events) = CdpConnection::connect(&endpoint.ws_url).await.context("connect browser endpoint")?;
+    let (conn, events) =
+        CdpConnection::connect(&endpoint.ws_url).await.context("connect browser endpoint")?;
 
     let state: Shared = Arc::new(Mutex::new(State {
         name: name.clone(),
@@ -139,7 +152,8 @@ pub async fn serve(name: String, selector: String, port: u16, root_pid: u32, tra
 
     let socket = registry::socket_path(&name);
     let _ = std::fs::remove_file(&socket);
-    let listener = UnixListener::bind(&socket).with_context(|| format!("bind {}", socket.display()))?;
+    let listener =
+        UnixListener::bind(&socket).with_context(|| format!("bind {}", socket.display()))?;
 
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
     tokio::spawn(event_pump(state.clone(), events, tracks, shutdown_tx.clone()));
@@ -181,7 +195,12 @@ async fn setup_capture(conn: &CdpConnection) -> Result<()> {
     Ok(())
 }
 
-async fn event_pump(state: Shared, mut events: mpsc::UnboundedReceiver<CdpEvent>, tracks: Vec<TrackKind>, shutdown: mpsc::Sender<()>) {
+async fn event_pump(
+    state: Shared,
+    mut events: mpsc::UnboundedReceiver<CdpEvent>,
+    tracks: Vec<TrackKind>,
+    shutdown: mpsc::Sender<()>,
+) {
     loop {
         while let Some(event) = events.recv().await {
             apply_event(&state, &event, &tracks).await;
@@ -300,7 +319,12 @@ async fn main_process_pump(state: Shared) {
                     if let Some(track) = Track::from_event(&event) {
                         let mut state = state.lock().unwrap();
                         let at_ms = state.now_ms();
-                        state.emit(TimelineEvent { at_ms, source: Source::Main, target: MAIN_LABEL.to_owned(), track });
+                        state.emit(TimelineEvent {
+                            at_ms,
+                            source: Source::Main,
+                            target: MAIN_LABEL.to_owned(),
+                            track,
+                        });
                     }
                 }
                 delay = RECONNECT_MIN;
@@ -395,7 +419,8 @@ async fn handle_client(stream: UnixStream, state: Shared, shutdown: mpsc::Sender
 }
 
 async fn write_reply(reader: &mut BufReader<UnixStream>, reply: &Reply) {
-    let mut payload = serde_json::to_string(reply).unwrap_or_else(|_| String::from("{\"ok\":false,\"output\":\"encode error\"}"));
+    let mut payload = serde_json::to_string(reply)
+        .unwrap_or_else(|_| String::from("{\"ok\":false,\"output\":\"encode error\"}"));
     payload.push('\n');
     let _ = reader.get_mut().write_all(payload.as_bytes()).await;
 }
@@ -436,15 +461,23 @@ async fn write_frame(reader: &mut BufReader<UnixStream>, frame: &Frame) -> std::
     reader.get_mut().write_all(payload.as_bytes()).await
 }
 
-async fn dispatch(state: &Shared, command: Command, json: bool, shutdown: &mpsc::Sender<()>) -> Reply {
+async fn dispatch(
+    state: &Shared,
+    command: Command,
+    json: bool,
+    shutdown: &mpsc::Sender<()>,
+) -> Reply {
     match command {
         Command::Ping => Reply::ok("pong"),
         Command::Status => status_reply(state, json),
         Command::Targets => targets_reply(state, json),
-        Command::Tail { since_ms, tracks, source } => tail_reply(state, since_ms, tracks, source, json),
+        Command::Tail { since_ms, tracks, source } => {
+            tail_reply(state, since_ms, tracks, source, json)
+        }
         Command::Eval { target, expr } => {
             run_in_target(state, target, json, |conn, session| evaluate(conn, session, expr)).await
         }
+        Command::Ready { target } => ready_reply(state, target, json).await,
         Command::Lens { target, source, args } => {
             let expr = wrap_lens(&source, &args);
             run_in_target(state, target, json, |conn, session| evaluate(conn, session, expr)).await
@@ -454,7 +487,9 @@ async fn dispatch(state: &Shared, command: Command, json: bool, shutdown: &mpsc:
         Command::Heap { target } => heap_reply(state, target, json).await,
         Command::Snap { target, interactive } => snap_reply(state, target, interactive, json).await,
         Command::Click { target, reference } => click_reply(state, target, reference).await,
-        Command::Fill { target, reference, text } => fill_reply(state, target, reference, text).await,
+        Command::Fill { target, reference, text } => {
+            fill_reply(state, target, reference, text).await
+        }
         Command::Detach => {
             let _ = shutdown.send(()).await;
             Reply::ok("detached")
@@ -493,7 +528,7 @@ fn target_list_reply(state: &Shared) -> Reply {
         .sessions
         .values()
         .map(|target| {
-            let label = target_label(target);
+            let label = target.label();
             let events = counts.get(&label).copied().unwrap_or(0);
             let activity = TargetActivity {
                 label,
@@ -549,16 +584,76 @@ fn ignore_reply(state: &Shared, op: IgnoreOp, json: bool) -> Reply {
 async fn heap_reply(state: &Shared, target: Option<String>, json: bool) -> Reply {
     let resolved = {
         let state = state.lock().unwrap();
-        state.resolve(target.as_deref()).map(|(session, target)| (state.conn.clone(), session, target))
+        state
+            .resolve(target.as_deref())
+            .map(|(session, target)| (state.conn.clone(), session, target))
     };
     let Some((conn, session, target)) = resolved else {
         return Reply::fail(no_target());
     };
     let metrics = cdp::probe_metrics(&conn, Some(&session)).await;
-    Reply::ok(format::heap(&target_label(&target), &metrics, json))
+    Reply::ok(format::heap(&target.label(), &metrics, json))
 }
 
-async fn snap_reply(state: &Shared, target: Option<String>, interactive: bool, json: bool) -> Reply {
+/// How far back `ready` looks for fatal errors, and how many it shows — recent failures that would
+/// explain a workbench that loaded but doesn't work.
+const READY_ERROR_WINDOW_MS: u64 = 60_000;
+const READY_ERROR_CAP: usize = 8;
+
+/// A generic document-readiness probe — no app knowledge, just the DOM signals that say whether a
+/// target is loaded, shown, and populated. App state (the `__testAPI` bridge, workspace/editor) is a
+/// lens, never here.
+const READY_PROBE: &str = "(()=>{const b=document.body;return{\
+    href:location.href,title:document.title,readyState:document.readyState,\
+    visibility:document.visibilityState,focused:document.hasFocus(),\
+    bodyTextLen:((b&&b.innerText)||'').trim().length};})()";
+
+async fn ready_reply(state: &Shared, target: Option<String>, json: bool) -> Reply {
+    let (name, candidates, resolved, recent_errors) = {
+        let state = state.lock().unwrap();
+        let targets: Vec<Target> = state.sessions.values().cloned().collect();
+        let activity = state.timeline.counts_by_target();
+        let candidates = readiness::rank(&targets, &activity, target.as_deref());
+        let resolved =
+            state.resolve(target.as_deref()).map(|(session, _)| (state.conn.clone(), session));
+        let now = state.now_ms();
+        let recent_errors = state
+            .timeline
+            .since(now, READY_ERROR_WINDOW_MS, Some(&[TrackKind::Exception]), None)
+            .iter()
+            .rev()
+            .take(READY_ERROR_CAP)
+            .rev()
+            // One line per error — the readiness glance wants "what failed", not full stacks.
+            .map(|event| format::event_line(event).lines().next().unwrap_or_default().to_owned())
+            .collect();
+        (state.name.clone(), candidates, resolved, recent_errors)
+    };
+
+    let document = match resolved {
+        Some((conn, session)) => probe_document(&conn, &session).await,
+        None => None,
+    };
+
+    Reply::ok(readiness::render(
+        &Readiness { instance: name, document, candidates, recent_errors },
+        json,
+    ))
+}
+
+/// Run the generic readiness probe in a target and decode it. A failed probe (a target mid-reload,
+/// say) degrades to `None` rather than failing the whole verdict — the candidate table still prints.
+async fn probe_document(conn: &CdpConnection, session: &str) -> Option<DocState> {
+    let value = evaluate(conn.clone(), session.to_owned(), READY_PROBE.to_owned()).await.ok()?;
+    serde_json::from_value(value).ok()
+}
+
+async fn snap_reply(
+    state: &Shared,
+    target: Option<String>,
+    interactive: bool,
+    json: bool,
+) -> Reply {
     let resolved = {
         let state = state.lock().unwrap();
         state.resolve(target.as_deref()).map(|(session, _)| (state.conn.clone(), session))
@@ -601,7 +696,12 @@ async fn click_reply(state: &Shared, target: Option<String>, reference: String) 
     }
 }
 
-async fn fill_reply(state: &Shared, target: Option<String>, reference: String, text: String) -> Reply {
+async fn fill_reply(
+    state: &Shared,
+    target: Option<String>,
+    reference: String,
+    text: String,
+) -> Reply {
     let key = norm_ref(&reference);
     let Some((conn, session, backend)) = locate(state, target, &key) else {
         return Reply::fail(no_target());
@@ -616,7 +716,11 @@ async fn fill_reply(state: &Shared, target: Option<String>, reference: String, t
 }
 
 /// Resolve `(conn, session, backend-node-for-ref)` for an interaction, without holding the lock.
-fn locate(state: &Shared, target: Option<String>, ref_key: &str) -> Option<(CdpConnection, String, Option<i64>)> {
+fn locate(
+    state: &Shared,
+    target: Option<String>,
+    ref_key: &str,
+) -> Option<(CdpConnection, String, Option<i64>)> {
     let state = state.lock().unwrap();
     let (session, _) = state.resolve(target.as_deref())?;
     let backend = state.refs.get(&session).and_then(|refs| refs.get(ref_key).copied());
@@ -651,7 +755,12 @@ async fn click_at(conn: &CdpConnection, session: &str, backend: i64) -> Result<(
     Ok(())
 }
 
-async fn fill_at(conn: &CdpConnection, session: &str, backend: i64, text: &str) -> Result<(), String> {
+async fn fill_at(
+    conn: &CdpConnection,
+    session: &str,
+    backend: i64,
+    text: &str,
+) -> Result<(), String> {
     let object = resolve_object(conn, session, backend).await?;
     let call = |declaration: &'static str| {
         conn.call(
@@ -663,14 +772,20 @@ async fn fill_at(conn: &CdpConnection, session: &str, backend: i64, text: &str) 
     call("function(){ this.focus && this.focus(); if ('value' in this) { this.value=''; } else if (this.isContentEditable) { this.textContent=''; } }")
         .await
         .map_err(|error| error.to_string())?;
-    conn.call(Some(session), "Input.insertText", json!({ "text": text })).await.map_err(|error| error.to_string())?;
+    conn.call(Some(session), "Input.insertText", json!({ "text": text }))
+        .await
+        .map_err(|error| error.to_string())?;
     call("function(){ this.dispatchEvent(new Event('input',{bubbles:true})); this.dispatchEvent(new Event('change',{bubbles:true})); }")
         .await
         .map_err(|error| error.to_string())?;
     Ok(())
 }
 
-async fn box_center(conn: &CdpConnection, session: &str, backend: i64) -> Result<(f64, f64), String> {
+async fn box_center(
+    conn: &CdpConnection,
+    session: &str,
+    backend: i64,
+) -> Result<(f64, f64), String> {
     let model = conn
         .call(Some(session), "DOM.getBoxModel", json!({ "backendNodeId": backend }))
         .await
@@ -686,7 +801,11 @@ async fn box_center(conn: &CdpConnection, session: &str, backend: i64) -> Result
     Ok(((at(0) + at(2) + at(4) + at(6)) / 4.0, (at(1) + at(3) + at(5) + at(7)) / 4.0))
 }
 
-async fn resolve_object(conn: &CdpConnection, session: &str, backend: i64) -> Result<String, String> {
+async fn resolve_object(
+    conn: &CdpConnection,
+    session: &str,
+    backend: i64,
+) -> Result<String, String> {
     let resolved = conn
         .call(Some(session), "DOM.resolveNode", json!({ "backendNodeId": backend }))
         .await
@@ -701,7 +820,9 @@ async fn resolve_object(conn: &CdpConnection, session: &str, backend: i64) -> Re
 fn norm_ref(reference: &str) -> String {
     let trimmed = reference.trim().trim_start_matches('@');
     match trimmed.strip_prefix('e') {
-        Some(rest) if !rest.is_empty() && rest.chars().all(|ch| ch.is_ascii_digit()) => trimmed.to_owned(),
+        Some(rest) if !rest.is_empty() && rest.chars().all(|ch| ch.is_ascii_digit()) => {
+            trimmed.to_owned()
+        }
         _ => format!("e{trimmed}"),
     }
 }
@@ -796,14 +917,6 @@ fn target_from_info(info: &Value) -> Target {
     }
 }
 
-fn target_label(target: &Target) -> String {
-    if target.title.is_empty() {
-        target.url.clone()
-    } else {
-        target.title.clone()
-    }
-}
-
 fn string_at(value: &Value, key: &str) -> String {
     value.get(key).and_then(Value::as_str).unwrap_or_default().to_owned()
 }
@@ -813,5 +926,8 @@ fn no_target() -> String {
 }
 
 fn now_unix_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|elapsed| elapsed.as_millis() as u64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
 }
