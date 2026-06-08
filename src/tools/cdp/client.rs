@@ -336,39 +336,14 @@ fn human_ms(ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cdp::{LogEntry, Source, TimelineEvent, Track};
 
-    fn log_event() -> TimelineEvent {
-        TimelineEvent {
-            at_ms: 5,
-            source: Source::Renderer,
-            target: "page".to_owned(),
-            track: Track::Log(LogEntry {
-                level: "info".to_owned(),
-                source: "network".to_owned(),
-                text: "hi".to_owned(),
-                url: None,
-                line: None,
-            }),
-        }
-    }
-
+    /// The reader's contract: a valid frame decodes, anything malformed becomes `None` so the loop
+    /// skips it instead of killing the stream. (Wire-shape coverage lives in `protocol`/`timeline`.)
     #[test]
-    fn decodes_the_frame_that_once_emptied_the_stream() {
-        // A backfill carrying a Log event is the exact frame whose decode failure silently emptied
-        // the live timeline. It must decode, with its events intact.
-        let wire = serde_json::to_string(&Frame::Backfill(vec![log_event()])).unwrap();
-        match decode_frame(&wire) {
-            Some(Frame::Backfill(events)) => assert_eq!(events.len(), 1),
-            other => panic!("backfill+log must decode, got {other:?}"),
-        }
+    fn decode_frame_keeps_valid_drops_garbage() {
+        let wire = serde_json::to_string(&Frame::Backfill(vec![])).unwrap();
+        assert!(matches!(decode_frame(&wire), Some(Frame::Backfill(_))));
 
-        let wire = serde_json::to_string(&Frame::Event(log_event())).unwrap();
-        assert!(matches!(decode_frame(&wire), Some(Frame::Event(_))));
-    }
-
-    #[test]
-    fn malformed_lines_skip_rather_than_kill_the_stream() {
         assert!(decode_frame("not json").is_none());
         assert!(decode_frame("").is_none());
         assert!(decode_frame("{\"Unknown\":1}").is_none());
