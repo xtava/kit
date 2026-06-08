@@ -1,1 +1,6 @@
 /target
+
+# Internal docs — not for the public repo
+/CONTEXT.md
+/docs/plan.md
+/docs/adr/

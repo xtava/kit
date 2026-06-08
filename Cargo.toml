@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "A personal toolbelt — one binary, many sharp tools."
 license = "MIT"
+readme = "README.md"
+repository = "https://github.com/xtava/kit"
+keywords = ["cli", "cdp", "electron", "devtools", "toolbelt"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 anyhow = "1"
@@ -16,7 +20,7 @@ directories = "6"
 unicode-width = "0.2"
 thiserror = "2"
 
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "process"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "process", "signal"] }
 
 ratatui = "0.30"
 crossterm = "0.29"
@@ -27,6 +31,8 @@ idna = "1.1"
 
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
+
+libc = "0.2"
 
 [profile.dev]
 debug = "line-tables-only"

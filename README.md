@@ -5,13 +5,14 @@ that hosts small utilities as plug-in subcommands over a shared framework, so ea
 new tool is *only* its own logic.
 
 ```
-kit                       # list tools
-kit scout                 # live Electron memory recon   (TUI when interactive)
-kit scout --once          # …one survey, headless table
-kit scout --json          # …headless, machine-readable
-kit scout dive            # capture a window's heap snapshot → memlab
-kit domain ari.io studio  # authoritative domain checker
-kit domain                # …its TUI
+kit                        # list tools
+kit cdp tail --since 3s    # warm CDP debugger — correlated timeline of a running fleet
+kit cdp eval 'location'    # …probe a live target (lazy-attaches, stays warm)
+kit scout                  # live Electron memory recon   (TUI when interactive)
+kit scout --once           # …one survey, headless table
+kit scout dive             # capture a window's heap snapshot → memlab
+kit domain example.com io  # authoritative domain checker
+kit domain                 # …its TUI
 ```
 
 Every tool inherits the same spine for free: a global `--json`, headless-vs-TUI
@@ -21,15 +22,17 @@ a tool is a module under `src/tools/` plus one `register()` line.
 ## Layout
 
 One crate; the layers are modules, and the module dependency direction *is* the
-architecture (`tools → framework`/`tui`, never tool↔tool, never `framework → tui`):
+architecture (`tools → framework | tui | cdp`, never tool↔tool, never `spine → tools`):
 
 ```
 src/
-├─ main.rs            Registry::new().register(scout::tool()).register(domain::tool()).dispatch()
+├─ main.rs            Registry::new().register(cdp::tool()).register(scout::tool())….dispatch()
 ├─ framework/         Tool · Context · Output · ConfigStore · Registry   — the spine (no UI deps)
 ├─ tui/               Session (panic-safe terminal) · EventReader · LineEditor · CommandSet
+├─ cdp/               Chrome DevTools Protocol engine — client · discovery · target · timeline
 └─ tools/
-   ├─ scout/          proc · cdp · survey · correlate · report · tui · dive
+   ├─ cdp/            warm CDP debugger — daemon · client · registry · snapshot · lenses
+   ├─ scout/          proc · cdp (via kit::cdp) · survey · correlate · report · tui · dive
    └─ domain/         engine{dns,rdap,whois} · config · report · tui
 ```
 

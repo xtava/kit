@@ -40,7 +40,7 @@ struct ScoutArgs {
     command: Option<ScoutCommand>,
 
     /// Scope the survey to processes whose cmdline contains this marker.
-    #[arg(long, default_value = "modular", global = true)]
+    #[arg(long, default_value = "electron", global = true)]
     app: String,
 
     /// Take one survey and print it, instead of opening the live TUI.

@@ -51,11 +51,13 @@ async fn get_inner(port: u16, path: &str) -> Result<String> {
             }
             body.truncate(length);
         }
-        None => {
-            while stream.read(&mut chunk).await.context("read body")? != 0 {
-                body.extend_from_slice(&chunk);
+        None => loop {
+            let read = stream.read(&mut chunk).await.context("read body")?;
+            if read == 0 {
+                break;
             }
-        }
+            body.extend_from_slice(&chunk[..read]);
+        },
     }
 
     Ok(String::from_utf8_lossy(&body).into_owned())

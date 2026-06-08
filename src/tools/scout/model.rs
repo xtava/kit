@@ -29,7 +29,7 @@ pub struct SystemMemory {
 /// One Electron application: a browser (main) process and the child-process fleet it spawned.
 #[derive(Debug, Clone, Serialize)]
 pub struct Instance {
-    /// Display name, e.g. "modular-canary", "modular-dev". Derived from `--class=` or the binary path.
+    /// Display name, e.g. "myapp", "myapp-dev". Derived from `--class=` or the binary path.
     pub name: String,
     /// The main/browser process pid — the root of the fleet.
     pub root_pid: u32,

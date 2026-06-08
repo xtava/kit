@@ -85,7 +85,7 @@ fn main_of(start: u32, all: &HashMap<u32, RawProc>) -> Option<u32> {
 }
 
 /// True when the process's argv0 (the executable) is the app binary — case-insensitive, so an
-/// installed "Modular Canary" matches a `--app modular` survey just as a dev build does.
+/// installed "MyApp Canary" matches a `--app myapp` survey just as a dev build does.
 fn is_app_binary(args: &[String], marker: &str) -> bool {
     args.first().map(|argv0| argv0.to_lowercase().contains(marker)).unwrap_or(false)
 }

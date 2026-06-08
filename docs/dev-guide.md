@@ -70,7 +70,7 @@ Consequences that shape how you work:
 ```bash
 cargo watch -x check        # tight loop: instant type errors on every save (cargo-watch is installed)
 cargo run -- scout          # run a tool   (kit scout)
-cargo run -- domain ari.io  # run a tool with args
+cargo run -- domain example.io  # run a tool with args
 cargo test                  # unit tests (engine logic — no network, no /proc needed)
 cargo clippy --all-targets  # lints
 cargo fmt                   # format
@@ -89,16 +89,18 @@ The handful that matter for a dev tool — no enterprise ceremony.
 - **`lib.rs` + a thin `main.rs`.** All logic lives in the library; `main` only
   parses argv and dispatches. This is what makes the engine testable without a
   terminal.
-- **Keep each tool's engine pure.** The probe logic (`scout`'s `proc`/`cdp`,
-  `domain`'s `dns`/`rdap`/`whois`) takes data and returns data — no framework, no
-  globals. That's what lets a unit test run it with zero network and zero `/proc`.
-  UI and I/O live in the thin shell around it (`run`, `tui`).
+- **Keep each tool's engine pure.** The probe logic (`scout`'s `proc`, the shared
+  `cdp` engine, `domain`'s `dns`/`rdap`/`whois`) takes data and returns data — no
+  framework, no globals. That's what lets a unit test run it with zero network and
+  zero `/proc`. UI and I/O live in the thin shell around it (`run`, `tui`).
 - **Errors: `anyhow` in the app, `thiserror` in the engine.** The engine returns
   precise typed errors; the app layer flattens them into `anyhow::Result` for
   reporting.
-- **The module DAG is the architecture.** `tools/* → framework` / `tools/* → tui`,
-  and **never** `tools/a → tools/b`. Tools are blind to each other. `framework`
-  never reaches up into `tui`. (See [plan.md](./plan.md) for the full picture.)
+- **The module DAG is the architecture.** `tools/* → framework | tui | cdp`, and
+  **never** `tools/a → tools/b`. Tools are blind to each other; the spine modules
+  never reach up into `tools`. `cdp` (the Chrome DevTools Protocol engine) is a peer
+  capability both `scout` and `cdp`-the-tool build on — see `docs/adr/0001`. (Full
+  picture in [plan.md](./plan.md).)
 - **Doc-comment the public surface.** `///` on the types and `pub` items that
   carry meaning; let good names and shapes do the rest. No narration inside
   function bodies.

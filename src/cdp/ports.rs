@@ -30,6 +30,39 @@ pub fn listening_ports(pids: &[u32]) -> HashMap<u32, Vec<u16>> {
     by_pid
 }
 
+/// Every localhost listening port paired with an owning pid — the discovery sweep when we don't yet
+/// know which pids to look at. Deduped to one (smallest) pid per port.
+pub fn all_listening() -> Vec<(u16, u32)> {
+    let inode_to_port = parse_listeners();
+    let mut found: Vec<(u16, u32)> = Vec::new();
+
+    let Ok(procs) = std::fs::read_dir("/proc") else {
+        return found;
+    };
+    for proc in procs.flatten() {
+        let Ok(pid) = proc.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+            continue;
+        };
+        for fd in fds.flatten() {
+            let Ok(link) = std::fs::read_link(fd.path()) else {
+                continue;
+            };
+            if let Some(inode) = link.to_str().and_then(socket_inode) {
+                if let Some(&port) = inode_to_port.get(&inode) {
+                    found.push((port, pid));
+                }
+            }
+        }
+    }
+
+    found.sort_unstable();
+    found.dedup_by_key(|(port, _)| *port);
+    found
+}
+
 const TCP_STATE_LISTEN: &str = "0A";
 
 fn parse_listeners() -> HashMap<u64, u16> {

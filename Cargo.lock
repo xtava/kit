@@ -1309,6 +1309,7 @@ dependencies = [
  "futures-util",
  "hickory-resolver",
  "idna",
+ "libc",
  "ratatui",
  "reqwest",
  "serde",

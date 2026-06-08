@@ -1,20 +1,20 @@
-//! Target plane: for each instance that exposes a CDP port, discover its windows/webviews/workers,
-//! probe each for JS heap + DOM, and best-effort correlate the heaviest renderers to them.
-
-mod client;
-mod discovery;
-mod http;
-mod ports;
+//! scout's target plane: for each instance that exposes a CDP port, list its targets via the shared
+//! [`crate::cdp`] engine, probe each for JS heap + DOM, classify them into scout's recon-flavoured
+//! [`TargetKind`] (Workbench/workspace), and best-effort correlate the heaviest renderers to them.
+//!
+//! The protocol lives in `crate::cdp`; what's scout-specific is the *recon meaning* — the workspace
+//! grouping and the renderer↔window correlation.
 
 use futures_util::{stream, StreamExt};
 
+use crate::cdp;
 use crate::tools::scout::model::{Instance, Role, Target, TargetKind};
 
 const PROBE_CONCURRENCY: usize = 8;
 
 pub async fn enrich(instances: &mut [Instance]) {
     let mains: Vec<u32> = instances.iter().map(|instance| instance.root_pid).collect();
-    let ports_by_pid = ports::listening_ports(&mains);
+    let ports_by_pid = cdp::listening_ports(&mains);
 
     for instance in instances.iter_mut() {
         let Some(port) = resolve_cdp_port(ports_by_pid.get(&instance.root_pid)).await else {
@@ -22,10 +22,11 @@ pub async fn enrich(instances: &mut [Instance]) {
         };
         instance.debug_port = Some(port);
 
-        let probeable: Vec<discovery::RawTarget> = discovery::fetch_targets(port)
+        let probeable: Vec<cdp::Target> = cdp::targets(port)
             .await
+            .unwrap_or_default()
             .into_iter()
-            .filter(discovery::RawTarget::is_probeable)
+            .filter(cdp::Target::is_inspectable)
             .collect();
 
         let mut targets = probe_all(probeable).await;
@@ -35,25 +36,23 @@ pub async fn enrich(instances: &mut [Instance]) {
     }
 }
 
-/// The first of a main's listening ports that actually speaks CDP.
+/// The first of a main's listening ports that actually speaks browser-level CDP.
 async fn resolve_cdp_port(candidates: Option<&Vec<u16>>) -> Option<u16> {
     for &port in candidates? {
-        if discovery::is_cdp(port).await {
+        if cdp::is_cdp(port).await {
             return Some(port);
         }
     }
     None
 }
 
-async fn probe_all(raw: Vec<discovery::RawTarget>) -> Vec<Target> {
+async fn probe_all(raw: Vec<cdp::Target>) -> Vec<Target> {
     stream::iter(raw)
         .map(|target| async move {
-            let metrics = match &target.ws_url {
-                Some(ws_url) => client::probe(ws_url).await,
-                None => return None,
-            };
+            let ws_url = target.ws_url.clone()?;
+            let metrics = cdp::probe_target(&ws_url).await;
             Some(Target {
-                kind: target.classify(),
+                kind: classify(&target),
                 js_heap_kib: metrics.js_heap_kib,
                 dom_nodes: metrics.dom_nodes,
                 listeners: metrics.listeners,
@@ -68,6 +67,29 @@ async fn probe_all(raw: Vec<discovery::RawTarget>) -> Vec<Target> {
         .filter_map(|target| async move { target })
         .collect()
         .await
+}
+
+/// Map a generic engine target to scout's recon-flavoured kind — the workspace/workbench meaning
+/// the engine deliberately doesn't carry.
+fn classify(target: &cdp::Target) -> TargetKind {
+    if target.url.starts_with("vscode-webview://") || target.url.starts_with("chrome-extension://") {
+        TargetKind::ExtensionWebview
+    } else if let Some(workspace) = workspace_id(&target.url) {
+        TargetKind::Workbench { workspace }
+    } else if target.url.contains("background-worker") {
+        TargetKind::BackgroundWorker
+    } else if matches!(
+        target.kind,
+        cdp::TargetKind::Worker | cdp::TargetKind::SharedWorker | cdp::TargetKind::ServiceWorker
+    ) {
+        TargetKind::Worker
+    } else if target.kind == cdp::TargetKind::Webview {
+        TargetKind::Webview
+    } else if matches!(target.kind, cdp::TargetKind::Page | cdp::TargetKind::Iframe) {
+        TargetKind::Page
+    } else {
+        TargetKind::Other
+    }
 }
 
 /// Rank-match: the heaviest workbench windows belong to the heaviest renderer processes. CDP gives
@@ -101,4 +123,9 @@ fn correlate(instance: &mut Instance, targets: &mut [Target]) {
             process.target_id = Some(targets[index].id.clone());
         }
     }
+}
+
+fn workspace_id(url: &str) -> Option<String> {
+    let id = url.split("/workspace/").nth(1)?.split('/').next()?;
+    (!id.is_empty()).then(|| id.to_owned())
 }
