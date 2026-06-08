@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::Parser;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
@@ -25,7 +25,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::time;
 
 use crate::cdp::{Source, TargetKind, TimelineEvent, TrackKind};
-use crate::tui::{fuzzy, EventReader, LineEditor, Session};
+use crate::tui::{clipboard, fuzzy, EventReader, LineEditor, Session};
 
 use super::client;
 use super::protocol::{Command, Frame, Reply, TargetActivity};
@@ -216,21 +216,36 @@ impl Repl {
                     self.view_top = None;
                     Flow::Continue
                 }
+                // Command history — the readline pairing, kept off the arrows so it never contends
+                // with scrolling the feed.
+                KeyCode::Char('p') => {
+                    self.history_prev();
+                    Flow::Continue
+                }
+                KeyCode::Char('n') => {
+                    self.history_next();
+                    Flow::Continue
+                }
                 _ => Flow::Continue,
             };
+        }
+        // While scrolled (reviewing history), `c`/`y` yank the view — they can't shadow typing here
+        // because the prompt isn't in compose mode. Pinned to live, they're ordinary characters.
+        if self.view_top.is_some() && matches!(key.code, KeyCode::Char('c' | 'y')) {
+            self.copy_view();
+            return Flow::Continue;
         }
         match key.code {
             KeyCode::Enter => return self.submit(async_tx),
             // Tab on an empty prompt opens the target picker; (completion-while-typing is deferred).
             KeyCode::Tab if self.input.value().is_empty() => self.open_picker(async_tx),
-            // Bare ↑/↓ ←/→ drive the input (history, cursor); Shift+arrows scroll the timeline —
-            // vertically a line at a time, horizontally to read lines wider than the pane.
-            KeyCode::Up if shift(&key) => self.scroll_by(-1),
-            KeyCode::Down if shift(&key) => self.scroll_by(1),
-            KeyCode::Left if shift(&key) => self.view_left = self.view_left.saturating_sub(PAN_STEP),
-            KeyCode::Right if shift(&key) => self.view_left = self.view_left.saturating_add(PAN_STEP),
-            KeyCode::Up => self.history_prev(),
-            KeyCode::Down => self.history_next(),
+            // The arrows drive the feed — ↑/↓ scroll (the first press from live enters the scrolled
+            // state), ←/→ pan wide lines once scrolled. Command history is on Ctrl+P/N (below), the
+            // readline pairing, so it never contends with scrolling.
+            KeyCode::Up => self.scroll_by(-1),
+            KeyCode::Down => self.scroll_by(1),
+            KeyCode::Left if self.view_top.is_some() => self.view_left = self.view_left.saturating_sub(PAN_STEP),
+            KeyCode::Right if self.view_top.is_some() => self.view_left = self.view_left.saturating_add(PAN_STEP),
             KeyCode::PageUp => self.page_up(),
             KeyCode::PageDown => self.page_down(),
             // Back to the home view: pinned to live, panned fully left.
@@ -449,6 +464,21 @@ impl Repl {
         self.view_top = scrolled(self.view_top, self.max_top(), delta);
     }
 
+    /// Yank the current timeline view to the clipboard — exactly the lines on screen, as plain text.
+    fn copy_view(&mut self) {
+        let text = self
+            .visible_lines()
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lines = text.lines().count();
+        match clipboard::copy(&text) {
+            Ok(()) => self.notice(format!("copied {lines} line(s) to clipboard")),
+            Err(error) => self.notice(format!("clipboard write failed: {error}")),
+        }
+    }
+
     fn visible_lines(&self) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         for item in &self.feed {
@@ -470,10 +500,6 @@ impl Repl {
             && self.view_tracks.as_ref().is_none_or(|tracks| tracks.contains(&event.track.kind()))
             && self.target.as_ref().is_none_or(|focus| label_matches(&event.target, focus))
     }
-}
-
-fn shift(key: &KeyEvent) -> bool {
-    key.modifiers.contains(KeyModifiers::SHIFT)
 }
 
 /// New viewport top after moving `delta` lines from `view_top` (`None` = pinned at `max_top`).
@@ -727,7 +753,6 @@ fn render(frame: &mut TuiFrame, repl: &mut Repl) {
         Constraint::Length(3),
         Constraint::Min(1),
         Constraint::Length(1),
-        Constraint::Length(1),
     ])
     .split(area);
 
@@ -737,7 +762,6 @@ fn render(frame: &mut TuiFrame, repl: &mut Repl) {
     repl.feed_total = lines.len();
     render_feed(frame, chunks[1], repl, lines);
     render_input(frame, chunks[2], repl);
-    render_hint(frame, chunks[3]);
 
     if repl.help_open {
         render_help(frame, area);
@@ -799,21 +823,6 @@ fn render_input(frame: &mut TuiFrame, area: Rect, repl: &Repl) {
         let cursor_x = area.x + 5 + repl.input.value()[..repl.input.cursor()].chars().count() as u16;
         frame.set_cursor_position((cursor_x, area.y));
     }
-}
-
-fn render_hint(frame: &mut TuiFrame, area: Rect) {
-    let hint = Line::from(vec![
-        key("⏎"), Span::raw(" run  "),
-        key("⇥"), Span::raw(" pick target  "),
-        key("↑↓"), Span::raw(" history  "),
-        key("⇧↑↓←→/PgUp"), Span::raw(" scroll  "),
-        key("help"), Span::raw(" commands  "),
-        key("^D"), Span::raw(" quit"),
-    ]);
-    frame.render_widget(
-        Paragraph::new(hint).style(Style::default().fg(Color::DarkGray)).alignment(Alignment::Center),
-        area,
-    );
 }
 
 fn render_picker(frame: &mut TuiFrame, area: Rect, picker: &Picker) {
@@ -890,8 +899,10 @@ fn render_help(frame: &mut TuiFrame, area: Rect) {
         entry("source main | renderer | all", "filter the live pane by side"),
         entry("ignore <substr> · clear · help · quit", "noise, this help, exit"),
         section("MOVE & COPY"),
-        entry("⇧↑↓ · PgUp/PgDn · End", "scroll the timeline; End re-pins to live"),
-        entry("⇧←→", "pan to read lines wider than the pane"),
+        entry("↑↓ · PgUp/PgDn", "scroll the timeline · End re-pins to live"),
+        entry("←→", "pan to read lines wider than the pane"),
+        entry("^P · ^N", "previous / next command in history"),
+        entry("c · y  (while reviewing)", "yank the timeline view to the clipboard"),
         entry("drag to select", "the mouse is free — copy any line natively"),
         Line::from(""),
         Line::from(Span::styled("  any key to dismiss", Style::default().fg(Color::DarkGray))),
@@ -992,10 +1003,6 @@ fn truncate(text: &str, max: usize) -> String {
     }
     let kept: String = text.chars().take(max.saturating_sub(1)).collect();
     format!("{kept}…")
-}
-
-fn key(label: &'static str) -> Span<'static> {
-    Span::styled(label, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
 }
 
 fn panel(title: &'static str) -> Block<'static> {

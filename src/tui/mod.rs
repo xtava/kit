@@ -5,6 +5,7 @@
 //! [`EventReader`] that bridges events into async, the [`LineEditor`], and the slash-command
 //! [`CommandSet`].
 
+pub mod clipboard;
 mod commandline;
 mod editor;
 mod events;
