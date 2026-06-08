@@ -60,18 +60,25 @@ pub async fn subscribe(record: &Record, since_ms: u64) -> Result<UnboundedReceiv
             buffer.clear();
             match reader.read_line(&mut buffer).await {
                 Ok(0) | Err(_) => break,
+                // A frame that fails to decode is skipped, never fatal — one malformed frame must
+                // not silently kill the whole live stream (it once did: a wire-type collision).
                 Ok(_) => {
-                    let Ok(frame) = serde_json::from_str::<Frame>(buffer.trim()) else {
-                        break;
-                    };
-                    if sender.send(frame).is_err() {
-                        break;
+                    if let Some(frame) = decode_frame(buffer.trim()) {
+                        if sender.send(frame).is_err() {
+                            break;
+                        }
                     }
                 }
             }
         }
     });
     Ok(receiver)
+}
+
+/// Decode one subscription line into a [`Frame`], or `None` if it doesn't parse. The seam the
+/// reader skips on and the wire-contract tests exercise.
+fn decode_frame(line: &str) -> Option<Frame> {
+    serde_json::from_str(line).ok()
 }
 
 /// `kit cdp attach` — pre-warm an Attachment with a chosen Track set (idempotent).
@@ -323,5 +330,47 @@ fn human_ms(ms: u64) -> String {
         format!("{}m", seconds / 60)
     } else {
         format!("{}h{}m", seconds / 3600, (seconds % 3600) / 60)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cdp::{LogEntry, Source, TimelineEvent, Track};
+
+    fn log_event() -> TimelineEvent {
+        TimelineEvent {
+            at_ms: 5,
+            source: Source::Renderer,
+            target: "page".to_owned(),
+            track: Track::Log(LogEntry {
+                level: "info".to_owned(),
+                source: "network".to_owned(),
+                text: "hi".to_owned(),
+                url: None,
+                line: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn decodes_the_frame_that_once_emptied_the_stream() {
+        // A backfill carrying a Log event is the exact frame whose decode failure silently emptied
+        // the live timeline. It must decode, with its events intact.
+        let wire = serde_json::to_string(&Frame::Backfill(vec![log_event()])).unwrap();
+        match decode_frame(&wire) {
+            Some(Frame::Backfill(events)) => assert_eq!(events.len(), 1),
+            other => panic!("backfill+log must decode, got {other:?}"),
+        }
+
+        let wire = serde_json::to_string(&Frame::Event(log_event())).unwrap();
+        assert!(matches!(decode_frame(&wire), Some(Frame::Event(_))));
+    }
+
+    #[test]
+    fn malformed_lines_skip_rather_than_kill_the_stream() {
+        assert!(decode_frame("not json").is_none());
+        assert!(decode_frame("").is_none());
+        assert!(decode_frame("{\"Unknown\":1}").is_none());
     }
 }
