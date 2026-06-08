@@ -2,7 +2,7 @@
 //! on one clock. Every CDP event maps to a [`Track`]; queries slice the bounded ring by age and
 //! Track. This is generic protocol decoding — app meaning is a lens, never here.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -10,7 +10,7 @@ use serde_json::Value;
 use super::client::CdpEvent;
 
 /// One event on the Timeline: when (ms since attach), which process side, which Target, and what.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimelineEvent {
     pub at_ms: u64,
     pub source: Source,
@@ -31,14 +31,14 @@ impl Source {
     pub fn parse(name: &str) -> Option<Self> {
         match name.trim().to_lowercase().as_str() {
             "main" => Some(Self::Main),
-            "renderer" | "render" | "web" => Some(Self::Renderer),
+            "renderer" | "render" => Some(Self::Renderer),
             _ => None,
         }
     }
 }
 
 /// One category of Timeline event.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "track", rename_all = "snake_case")]
 pub enum Track {
     Console(ConsoleLine),
@@ -94,7 +94,7 @@ impl TrackKind {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsoleLine {
     pub level: String,
     pub text: String,
@@ -104,7 +104,7 @@ pub struct ConsoleLine {
     pub line: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExceptionInfo {
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -113,7 +113,7 @@ pub struct ExceptionInfo {
     pub line: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
     pub level: String,
     pub source: String,
@@ -124,7 +124,7 @@ pub struct LogEntry {
     pub line: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NetPhase {
     Request,
@@ -133,7 +133,7 @@ pub enum NetPhase {
     Failed,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetEvent {
     pub phase: NetPhase,
     pub request_id: String,
@@ -149,7 +149,7 @@ pub struct NetEvent {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WsDir {
     Sent,
@@ -157,7 +157,7 @@ pub enum WsDir {
     Created,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WsFrame {
     pub dir: WsDir,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -285,6 +285,16 @@ impl Timeline {
 
     pub fn is_empty(&self) -> bool {
         self.events.is_empty()
+    }
+
+    /// Event volume per target label across the whole ring — how the target picker tells a target
+    /// that's actually streaming from one that's merely present.
+    pub fn counts_by_target(&self) -> HashMap<String, usize> {
+        let mut counts = HashMap::new();
+        for event in &self.events {
+            *counts.entry(event.target.clone()).or_insert(0) += 1;
+        }
+        counts
     }
 
     /// Events within the last `window_ms` (by the same clock as `now_ms`), optionally restricted to

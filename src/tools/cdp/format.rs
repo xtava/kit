@@ -46,23 +46,16 @@ pub fn targets(targets: &[Target], json: bool) -> String {
         .join("\n")
 }
 
-/// A Timeline slice. `ignore` drops any event whose rendered line contains one of the substrings.
-pub fn events(events: &[TimelineEvent], ignore: &[String], json: bool) -> String {
-    let lines: Vec<String> = events.iter().map(event_line).collect();
-    let kept: Vec<(&TimelineEvent, &String)> = events
-        .iter()
-        .zip(&lines)
-        .filter(|(_, line)| !ignore.iter().any(|pattern| line.contains(pattern.as_str())))
-        .collect();
-
+/// A Timeline slice. Suppression (the `ignore` list) is applied by the daemon before this — the
+/// renderer's only job is to render.
+pub fn events(events: &[TimelineEvent], json: bool) -> String {
     if json {
-        let events: Vec<&TimelineEvent> = kept.iter().map(|(event, _)| *event).collect();
-        return pretty(&events);
+        return pretty(events);
     }
-    if kept.is_empty() {
+    if events.is_empty() {
         return "(no events in window)".to_owned();
     }
-    kept.iter().map(|(_, line)| line.as_str()).collect::<Vec<_>>().join("\n")
+    events.iter().map(event_line).collect::<Vec<_>>().join("\n")
 }
 
 #[derive(Serialize)]
@@ -136,7 +129,9 @@ pub fn ignore(patterns: &[String], json: bool) -> String {
     patterns.iter().map(|pattern| format!("- {pattern}")).collect::<Vec<_>>().join("\n")
 }
 
-fn event_line(event: &TimelineEvent) -> String {
+/// Render one Timeline event to its canonical one-line form — shared by `tail`, the ignore
+/// predicate, and the interactive live pane, so all three read identically.
+pub(crate) fn event_line(event: &TimelineEvent) -> String {
     let head = format!("+{:>6}ms [{}]", event.at_ms, truncate(&event.target, 16));
     let body = match &event.track {
         Track::Console(line) => {

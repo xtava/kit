@@ -62,6 +62,52 @@ return { title: document.title, url: location.href };
 
 Starters ship under that dir: `styles`, `overflow`.
 
+## Interactive mode
+
+`kit cdp -i` drops you *inside* an Instance: a full-screen split with the Timeline
+streaming live on top and a command line on the bottom. The first command resolves
+and lazy-attaches like any other; from then on every line runs against that same
+warm Attachment, and command output lands inline on the feed — so an `eval` and the
+network calls it triggers sit next to each other on one clock.
+
+```
+┌─ kit cdp ─ modular-dev :9223 ─ ● live ──────────────────┐
+│ track: all   ·   source: all   ·   target: * main       │
+├─ timeline ─ ● live ─────────────────────────────────────┤
+│ +1203ms [main]  console.log user {id: 5}                 │
+│ +1410ms [main]  net ← 200 /api/me                        │
+│ ┌ eval document.title                                    │
+│ │ "Workspace · ari"                                      │
+│ └                                                        │
+├─────────────────────────────────────────────────────────┤
+│ cdp› snap -i                                             │
+└─ ⏎ run · ⇥ complete · ↑↓ history · PgUp/PgDn · ^D quit ──┘
+```
+
+Two grammars meet at the prompt:
+
+- **Session commands** are the *exact* CLI grammar — `eval 'location.href'`,
+  `tail --since 3s`, `snap -i`, `click @e5`, `ignore <substr>`. Flags and `--help`
+  work identically; a bad flag prints the error into the feed, it never crashes the
+  session.
+- **Meta commands** are interactive-only view state:
+  - **`Tab`** (empty prompt) opens the **target picker** — a fuzzy, activity-ranked
+    list of every target in the instance. Type to narrow (`work`→workspace), `↑↓`
+    to move, `⏎` to focus, `Esc` to cancel. **Focus** is the DevTools-context model:
+    the chosen target both *filters the feed* and becomes the *default `--target`*
+    for `eval`/`snap`/`click`. The `✸ all targets` row clears focus.
+  - `target <text>` focuses by fuzzy text directly (no modal); `target main` clears.
+  - `track net,ws` / `track all` — filter the live pane by track (instant, no
+    re-subscribe).
+  - `source main` / `source renderer` / `source all` — filter by process side.
+  - `clear` · `help` · `quit`.
+
+Keys: `⏎` run · `⇥` complete the command word · `↑↓` history (persisted under the
+config dir) · `PgUp`/`PgDn` scroll the feed · `End`/`Esc` re-pin to live · `^L`
+clear · `^D` quit. The feed header shows `● live` when pinned and `▲ N below` when
+you've scrolled up. The live pane survives HMR reloads and app restarts on the same
+subscription (`docs/adr/0004`).
+
 ## How it stays out of your way
 
 - **Reloads** don't drop the Attachment — it re-binds the recreated Target and

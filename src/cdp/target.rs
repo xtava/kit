@@ -4,10 +4,10 @@
 //! This model is deliberately *generic*: no `Workbench`/workspace flavour lives here. App-specific
 //! meaning is a `scout` recon concern or a [`crate::cdp`] lens — never the engine's.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// One debuggable surface inside an Instance.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Target {
     pub id: String,
     pub kind: TargetKind,
@@ -19,7 +19,7 @@ pub struct Target {
 }
 
 /// What a target *is*, from CDP's `type`. Pure protocol vocabulary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TargetKind {
     Page,

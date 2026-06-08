@@ -20,7 +20,7 @@ use crate::cdp::{
     self, CdpConnection, CdpEvent, LogEntry, Source, Target, Timeline, TimelineEvent, Track, TrackKind,
 };
 
-use super::protocol::{Command, IgnoreOp, Query, Reply};
+use super::protocol::{Command, Frame, IgnoreOp, Query, Reply, TargetActivity};
 use super::registry::{self, Record};
 use super::{format, snapshot};
 
@@ -48,6 +48,9 @@ struct State {
     timeline: Timeline,
     tracks: Vec<TrackKind>,
     ignore: Vec<String>,
+    /// Live `Subscribe` clients. Each gets every emitted event; senders to dropped clients are
+    /// pruned on the next `emit`.
+    subscribers: Vec<mpsc::UnboundedSender<TimelineEvent>>,
     start: Instant,
     last_activity: Instant,
 }
@@ -55,6 +58,25 @@ struct State {
 impl State {
     fn now_ms(&self) -> u64 {
         self.start.elapsed().as_millis() as u64
+    }
+
+    /// The single path an event enters the Timeline. Every source — renderer, main process, and
+    /// markers — funnels through here, so the live fan-out and `tail` can never disagree about
+    /// what happened. Suppressed (ignored) events reach neither.
+    fn emit(&mut self, event: TimelineEvent) {
+        if !self.subscribers.is_empty() && !self.is_suppressed(&event) {
+            self.subscribers.retain(|client| client.send(event.clone()).is_ok());
+        }
+        self.timeline.push(event);
+    }
+
+    /// Whether an event is hidden by the attachment's `ignore` list — matched on its rendered line,
+    /// the same predicate `tail` uses, so suppression is identical everywhere.
+    fn is_suppressed(&self, event: &TimelineEvent) -> bool {
+        !self.ignore.is_empty() && {
+            let line = format::event_line(event);
+            self.ignore.iter().any(|pattern| line.contains(pattern.as_str()))
+        }
     }
 
     /// Resolve a Target selector to a `(sessionId, target)` against the live target set.
@@ -105,6 +127,7 @@ pub async fn serve(name: String, selector: String, port: u16, root_pid: u32, tra
         timeline: Timeline::new(TIMELINE_CAP),
         tracks: tracks.clone(),
         ignore: Vec::new(),
+        subscribers: Vec::new(),
         start: Instant::now(),
         last_activity: Instant::now(),
     }));
@@ -228,7 +251,7 @@ async fn apply_event(state: &Shared, event: &CdpEvent, tracks: &[TrackKind]) {
                 }
                 if !navigated.is_empty() {
                     let at_ms = state.now_ms();
-                    state.timeline.push(navigation_marker(at_ms, &updated.url));
+                    state.emit(navigation_marker(at_ms, &updated.url));
                 }
             }
         }
@@ -237,7 +260,7 @@ async fn apply_event(state: &Shared, event: &CdpEvent, tracks: &[TrackKind]) {
                 let mut state = state.lock().unwrap();
                 let at_ms = state.now_ms();
                 let label = state.label(&event.session);
-                state.timeline.push(TimelineEvent { at_ms, source: Source::Renderer, target: label, track });
+                state.emit(TimelineEvent { at_ms, source: Source::Renderer, target: label, track });
             }
         }
     }
@@ -277,7 +300,7 @@ async fn main_process_pump(state: Shared) {
                     if let Some(track) = Track::from_event(&event) {
                         let mut state = state.lock().unwrap();
                         let at_ms = state.now_ms();
-                        state.timeline.push(TimelineEvent { at_ms, source: Source::Main, target: MAIN_LABEL.to_owned(), track });
+                        state.emit(TimelineEvent { at_ms, source: Source::Main, target: MAIN_LABEL.to_owned(), track });
                     }
                 }
                 delay = RECONNECT_MIN;
@@ -352,17 +375,65 @@ async fn handle_client(stream: UnixStream, state: Shared, shutdown: mpsc::Sender
         return;
     }
 
-    let reply = match serde_json::from_str::<Query>(line.trim()) {
-        Ok(query) => {
-            state.lock().unwrap().last_activity = Instant::now();
-            dispatch(&state, query.command, query.json, &shutdown).await
+    let query = match serde_json::from_str::<Query>(line.trim()) {
+        Ok(query) => query,
+        Err(error) => {
+            write_reply(&mut reader, &Reply::fail(format!("bad query: {error}"))).await;
+            return;
         }
-        Err(error) => Reply::fail(format!("bad query: {error}")),
     };
+    state.lock().unwrap().last_activity = Instant::now();
 
-    let mut payload = serde_json::to_string(&reply).unwrap_or_else(|_| String::from("{\"ok\":false,\"output\":\"encode error\"}"));
+    // A subscription is not request/reply — it streams frames and holds the socket open.
+    if let Command::Subscribe { since_ms } = query.command {
+        stream_subscription(reader, state, since_ms).await;
+        return;
+    }
+
+    let reply = dispatch(&state, query.command, query.json, &shutdown).await;
+    write_reply(&mut reader, &reply).await;
+}
+
+async fn write_reply(reader: &mut BufReader<UnixStream>, reply: &Reply) {
+    let mut payload = serde_json::to_string(reply).unwrap_or_else(|_| String::from("{\"ok\":false,\"output\":\"encode error\"}"));
     payload.push('\n');
     let _ = reader.get_mut().write_all(payload.as_bytes()).await;
+}
+
+/// Serve a live subscription: register a sender, send the backfill window, then forward every
+/// emitted event until the client disconnects (a failed write). The sender is pruned from `State`
+/// by the next `emit` once this returns and the receiver drops.
+async fn stream_subscription(mut reader: BufReader<UnixStream>, state: Shared, since_ms: u64) {
+    let (sender, mut receiver) = mpsc::unbounded_channel::<TimelineEvent>();
+    let backfill = {
+        let mut state = state.lock().unwrap();
+        let now = state.now_ms();
+        let events: Vec<TimelineEvent> = state
+            .timeline
+            .since(now, since_ms, None, None)
+            .into_iter()
+            .filter(|event| !state.is_suppressed(event))
+            .collect();
+        state.subscribers.push(sender);
+        events
+    };
+
+    if write_frame(&mut reader, &Frame::Backfill(backfill)).await.is_err() {
+        return;
+    }
+    while let Some(event) = receiver.recv().await {
+        if write_frame(&mut reader, &Frame::Event(event)).await.is_err() {
+            break;
+        }
+    }
+}
+
+async fn write_frame(reader: &mut BufReader<UnixStream>, frame: &Frame) -> std::io::Result<()> {
+    let Ok(mut payload) = serde_json::to_string(frame) else {
+        return Ok(());
+    };
+    payload.push('\n');
+    reader.get_mut().write_all(payload.as_bytes()).await
 }
 
 async fn dispatch(state: &Shared, command: Command, json: bool, shutdown: &mpsc::Sender<()>) -> Reply {
@@ -379,6 +450,7 @@ async fn dispatch(state: &Shared, command: Command, json: bool, shutdown: &mpsc:
             run_in_target(state, target, json, |conn, session| evaluate(conn, session, expr)).await
         }
         Command::Ignore(op) => ignore_reply(state, op, json),
+        Command::TargetList => target_list_reply(state),
         Command::Heap { target } => heap_reply(state, target, json).await,
         Command::Snap { target, interactive } => snap_reply(state, target, interactive, json).await,
         Command::Click { target, reference } => click_reply(state, target, reference).await,
@@ -387,6 +459,8 @@ async fn dispatch(state: &Shared, command: Command, json: bool, shutdown: &mpsc:
             let _ = shutdown.send(()).await;
             Reply::ok("detached")
         }
+        // Intercepted in `handle_client` before dispatch; never reaches here.
+        Command::Subscribe { .. } => Reply::fail("subscribe is a streaming command"),
     }
 }
 
@@ -410,6 +484,36 @@ fn targets_reply(state: &Shared, json: bool) -> Reply {
     Reply::ok(format::targets(&targets, json))
 }
 
+/// The picker's data source: every Target joined with its Timeline event volume, sorted active-first
+/// (then by how main-window-like it is). Always JSON — the client renders it.
+fn target_list_reply(state: &Shared) -> Reply {
+    let state = state.lock().unwrap();
+    let counts = state.timeline.counts_by_target();
+    let mut rows: Vec<(TargetActivity, i32)> = state
+        .sessions
+        .values()
+        .map(|target| {
+            let label = target_label(target);
+            let events = counts.get(&label).copied().unwrap_or(0);
+            let activity = TargetActivity {
+                label,
+                kind: target.kind,
+                title: target.title.clone(),
+                url: target.url.clone(),
+                events,
+            };
+            (activity, target.main_rank())
+        })
+        .collect();
+    rows.sort_by(|a, b| b.0.events.cmp(&a.0.events).then(b.1.cmp(&a.1)));
+
+    let list: Vec<TargetActivity> = rows.into_iter().map(|(activity, _)| activity).collect();
+    match serde_json::to_string(&list) {
+        Ok(json) => Reply::ok(json),
+        Err(error) => Reply::fail(format!("encode targets: {error}")),
+    }
+}
+
 fn tail_reply(
     state: &Shared,
     since_ms: u64,
@@ -419,8 +523,13 @@ fn tail_reply(
 ) -> Reply {
     let state = state.lock().unwrap();
     let now = state.now_ms();
-    let events = state.timeline.since(now, since_ms, tracks.as_deref(), source);
-    Reply::ok(format::events(&events, &state.ignore, json))
+    let events: Vec<TimelineEvent> = state
+        .timeline
+        .since(now, since_ms, tracks.as_deref(), source)
+        .into_iter()
+        .filter(|event| !state.is_suppressed(event))
+        .collect();
+    Reply::ok(format::events(&events, json))
 }
 
 fn ignore_reply(state: &Shared, op: IgnoreOp, json: bool) -> Reply {
@@ -663,7 +772,7 @@ fn wrap_lens(source: &str, args: &[String]) -> String {
 fn push_marker(state: &Shared, source: Source, text: &str) {
     let mut state = state.lock().unwrap();
     let at_ms = state.now_ms();
-    state.timeline.push(TimelineEvent {
+    state.emit(TimelineEvent {
         at_ms,
         source,
         target: "kit".to_owned(),

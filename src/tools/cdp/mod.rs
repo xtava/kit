@@ -8,6 +8,7 @@
 mod client;
 mod daemon;
 mod format;
+mod interactive;
 mod protocol;
 mod registry;
 mod snapshot;
@@ -69,6 +70,10 @@ pub struct CdpTool;
 struct CdpArgs {
     #[command(subcommand)]
     command: Option<CdpCommand>,
+
+    /// Enter the live interactive debugger — a streaming Timeline you drive with commands.
+    #[arg(short, long)]
+    interactive: bool,
 
     /// Instance selector — app name, worktree, instance id, or port. Picks which Attachment to use.
     #[arg(long, global = true)]
@@ -212,6 +217,7 @@ impl Tool for CdpTool {
         let app = args.app.as_deref();
 
         match args.command {
+            None if args.interactive => interactive::run(app).await,
             None => client::overview(json).await,
 
             Some(CdpCommand::Serve { name, selector, port, root_pid, track }) => {
@@ -225,70 +231,61 @@ impl Tool for CdpTool {
             Some(CdpCommand::Ls) => client::ls(json),
             Some(CdpCommand::Gc) => client::gc(json),
 
-            Some(CdpCommand::Targets) => finish(client::query(app, json, Command::Targets).await?),
-            Some(CdpCommand::Tail { since, track, source }) => {
-                let command = Command::Tail {
-                    since_ms: parse_since(since.as_deref()),
-                    tracks: track.map(parse_tracks),
-                    source: parse_source(source.as_deref())?,
-                };
-                finish(client::query(app, json, command).await?)
-            }
-            Some(CdpCommand::Console { since, source }) => {
-                let command = Command::Tail {
-                    since_ms: parse_since(since.as_deref()),
-                    tracks: Some(vec![TrackKind::Console, TrackKind::Exception, TrackKind::Log]),
-                    source: parse_source(source.as_deref())?,
-                };
-                finish(client::query(app, json, command).await?)
-            }
-            Some(CdpCommand::Net { since, source }) => {
-                let command = Command::Tail {
-                    since_ms: parse_since(since.as_deref()),
-                    tracks: Some(vec![TrackKind::Network]),
-                    source: parse_source(source.as_deref())?,
-                };
-                finish(client::query(app, json, command).await?)
-            }
-            Some(CdpCommand::Ws { since, source }) => {
-                let command = Command::Tail {
-                    since_ms: parse_since(since.as_deref()),
-                    tracks: Some(vec![TrackKind::Ws]),
-                    source: parse_source(source.as_deref())?,
-                };
-                finish(client::query(app, json, command).await?)
-            }
-
-            Some(CdpCommand::Eval { expr, file, target }) => {
-                let expression = read_expr(expr, file)?;
-                finish(client::query(app, json, Command::Eval { target, expr: expression }).await?)
-            }
-            Some(CdpCommand::Heap { target }) => finish(client::query(app, json, Command::Heap { target }).await?),
-            Some(CdpCommand::Snap { interactive, target }) => {
-                finish(client::query(app, json, Command::Snap { target, interactive }).await?)
-            }
-            Some(CdpCommand::Click { reference, target }) => {
-                finish(client::query(app, json, Command::Click { target, reference }).await?)
-            }
-            Some(CdpCommand::Fill { reference, text, target }) => {
-                let text = text.join(" ");
-                finish(client::query(app, json, Command::Fill { target, reference, text }).await?)
-            }
-            Some(CdpCommand::Ignore { pattern, list, clear }) => {
-                let op = if clear {
-                    IgnoreOp::Clear
-                } else if list || pattern.is_empty() {
-                    IgnoreOp::List
-                } else {
-                    IgnoreOp::Add(pattern.join(" "))
-                };
-                finish(client::query(app, json, Command::Ignore(op)).await?)
-            }
-            Some(CdpCommand::Lens { name, args, target }) => {
-                let source = load_lens(&name)?;
-                finish(client::query(app, json, Command::Lens { target, source, args }).await?)
-            }
+            Some(session) => finish(client::query(app, json, session_command(session)?).await?),
         }
+    }
+}
+
+/// Map a parsed session subcommand to its wire [`Command`]. Shared by the one-shot CLI and the
+/// interactive session, so a typed `eval` in the REPL and `kit cdp eval` are the same grammar.
+/// Lifecycle subcommands (attach/detach/ls/gc/serve) are routed before this and never reach it.
+fn session_command(command: CdpCommand) -> Result<Command> {
+    Ok(match command {
+        CdpCommand::Targets => Command::Targets,
+        CdpCommand::Tail { since, track, source } => Command::Tail {
+            since_ms: parse_since(since.as_deref()),
+            tracks: track.map(parse_tracks),
+            source: parse_source(source.as_deref())?,
+        },
+        CdpCommand::Console { since, source } => Command::Tail {
+            since_ms: parse_since(since.as_deref()),
+            tracks: Some(vec![TrackKind::Console, TrackKind::Exception, TrackKind::Log]),
+            source: parse_source(source.as_deref())?,
+        },
+        CdpCommand::Net { since, source } => Command::Tail {
+            since_ms: parse_since(since.as_deref()),
+            tracks: Some(vec![TrackKind::Network]),
+            source: parse_source(source.as_deref())?,
+        },
+        CdpCommand::Ws { since, source } => Command::Tail {
+            since_ms: parse_since(since.as_deref()),
+            tracks: Some(vec![TrackKind::Ws]),
+            source: parse_source(source.as_deref())?,
+        },
+        CdpCommand::Eval { expr, file, target } => Command::Eval { target, expr: read_expr(expr, file)? },
+        CdpCommand::Heap { target } => Command::Heap { target },
+        CdpCommand::Snap { interactive, target } => Command::Snap { target, interactive },
+        CdpCommand::Click { reference, target } => Command::Click { target, reference },
+        CdpCommand::Fill { reference, text, target } => Command::Fill { target, reference, text: text.join(" ") },
+        CdpCommand::Ignore { pattern, list, clear } => Command::Ignore(ignore_op(pattern, list, clear)),
+        CdpCommand::Lens { name, args, target } => Command::Lens { target, source: load_lens(&name)?, args },
+        CdpCommand::Attach { .. }
+        | CdpCommand::Detach { .. }
+        | CdpCommand::Ls
+        | CdpCommand::Gc
+        | CdpCommand::Serve { .. } => {
+            bail!("not a session command — manage attachments from the shell, not in interactive mode")
+        }
+    })
+}
+
+fn ignore_op(pattern: Vec<String>, list: bool, clear: bool) -> IgnoreOp {
+    if clear {
+        IgnoreOp::Clear
+    } else if list || pattern.is_empty() {
+        IgnoreOp::List
+    } else {
+        IgnoreOp::Add(pattern.join(" "))
     }
 }
 

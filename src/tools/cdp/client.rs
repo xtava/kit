@@ -10,9 +10,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::time::sleep;
 
+use tokio::sync::mpsc::{self, UnboundedReceiver};
+
 use crate::cdp::{self, TrackKind};
 
-use super::protocol::{Command, Query, Reply};
+use super::protocol::{Command, Frame, Query, Reply};
 use super::registry::{self, Record};
 
 const READY_TRIES: u32 = 60;
@@ -25,6 +27,51 @@ pub async fn query(app: Option<&str>, json: bool, command: Command) -> Result<bo
     let reply = send(&record, &Query { command, json }).await?;
     println!("{}", reply.output);
     Ok(reply.ok)
+}
+
+/// Resolve the warm Attachment for `app`, lazily attaching with all tracks if none is live. The
+/// entry point for the interactive session, which then reuses the returned record for every command.
+pub async fn ensure_attached(app: Option<&str>) -> Result<Record> {
+    ensure(app, &TrackKind::ALL).await
+}
+
+/// Run one command against a known Attachment and return its `Reply` verbatim (no printing) — the
+/// interactive session renders the result itself.
+pub async fn run_one(record: &Record, command: Command, json: bool) -> Result<Reply> {
+    send(record, &Query { command, json }).await
+}
+
+/// Open a live Timeline subscription to an Attachment. Sends `Subscribe`, then reads `Frame`s off
+/// the socket on a spawned task into the returned channel; the channel closes when the daemon
+/// disconnects or the socket dies.
+pub async fn subscribe(record: &Record, since_ms: u64) -> Result<UnboundedReceiver<Frame>> {
+    let stream = UnixStream::connect(registry::socket_path(&record.name))
+        .await
+        .with_context(|| format!("subscribe to attachment '{}'", record.name))?;
+    let mut reader = BufReader::new(stream);
+    let mut line = serde_json::to_string(&Query { command: Command::Subscribe { since_ms }, json: false })?;
+    line.push('\n');
+    reader.get_mut().write_all(line.as_bytes()).await?;
+
+    let (sender, receiver) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut buffer = String::new();
+        loop {
+            buffer.clear();
+            match reader.read_line(&mut buffer).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let Ok(frame) = serde_json::from_str::<Frame>(buffer.trim()) else {
+                        break;
+                    };
+                    if sender.send(frame).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    Ok(receiver)
 }
 
 /// `kit cdp attach` — pre-warm an Attachment with a chosen Track set (idempotent).
