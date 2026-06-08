@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -39,13 +39,15 @@ const REDRAW: time::Duration = time::Duration::from_secs(1);
 const FEED_CAP: usize = 10_000;
 /// Cap on persisted history lines.
 const HISTORY_CAP: usize = 1_000;
+/// Columns panned per Shift+Left/Right.
+const PAN_STEP: u16 = 12;
 
 pub async fn run(app: Option<&str>) -> Result<()> {
     let record = client::ensure_attached(app).await?;
     let mut frames = client::subscribe(&record, BACKFILL_MS).await?;
     let (async_tx, mut async_rx) = mpsc::unbounded_channel::<Async>();
 
-    let mut session = Session::open_with_mouse()?;
+    let mut session = Session::open()?;
     let mut events = EventReader::start();
     let mut repl = Repl::new(record);
     let mut redraw = time::interval(REDRAW);
@@ -65,7 +67,6 @@ pub async fn run(app: Option<&str>) -> Result<()> {
                     Flow::Quit => break,
                     Flow::Continue => {}
                 },
-                Some(Event::Mouse(mouse)) => repl.on_mouse(mouse),
                 None => break,
                 _ => {}
             },
@@ -110,6 +111,8 @@ struct Repl {
     feed: Vec<FeedItem>,
     /// Absolute top line of the viewport. `None` = pinned to the bottom (following live).
     view_top: Option<usize>,
+    /// Horizontal pan, in columns — for reading lines wider than the pane (long ws frames, urls).
+    view_left: u16,
     /// Rendered feed geometry from the last frame — what scrolling needs to clamp against.
     feed_height: usize,
     feed_total: usize,
@@ -134,6 +137,7 @@ impl Repl {
             view_source: None,
             feed: Vec::new(),
             view_top: None,
+            view_left: 0,
             feed_height: 0,
             feed_total: 0,
             input: LineEditor::default(),
@@ -219,31 +223,24 @@ impl Repl {
             KeyCode::Enter => return self.submit(async_tx),
             // Tab on an empty prompt opens the target picker; (completion-while-typing is deferred).
             KeyCode::Tab if self.input.value().is_empty() => self.open_picker(async_tx),
-            // Up/Down walk command history; Shift+Up/Down scroll the timeline a line at a time, so
-            // the keyboard can scroll without giving up the familiar REPL history on the bare arrows.
-            KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => self.scroll_by(-1),
-            KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => self.scroll_by(1),
+            // Bare ↑/↓ ←/→ drive the input (history, cursor); Shift+arrows scroll the timeline —
+            // vertically a line at a time, horizontally to read lines wider than the pane.
+            KeyCode::Up if shift(&key) => self.scroll_by(-1),
+            KeyCode::Down if shift(&key) => self.scroll_by(1),
+            KeyCode::Left if shift(&key) => self.view_left = self.view_left.saturating_sub(PAN_STEP),
+            KeyCode::Right if shift(&key) => self.view_left = self.view_left.saturating_add(PAN_STEP),
             KeyCode::Up => self.history_prev(),
             KeyCode::Down => self.history_next(),
             KeyCode::PageUp => self.page_up(),
             KeyCode::PageDown => self.page_down(),
-            KeyCode::End | KeyCode::Esc => self.view_top = None,
+            // Back to the home view: pinned to live, panned fully left.
+            KeyCode::End | KeyCode::Esc => {
+                self.view_top = None;
+                self.view_left = 0;
+            }
             _ => self.input.apply_key(key),
         }
         Flow::Continue
-    }
-
-    /// Mouse-wheel scrolling of the timeline. Modal overlays swallow it (they have their own keys).
-    fn on_mouse(&mut self, mouse: MouseEvent) {
-        const WHEEL_STEP: isize = 3;
-        if self.picker.is_some() || self.help_open {
-            return;
-        }
-        match mouse.kind {
-            MouseEventKind::ScrollUp => self.scroll_by(-WHEEL_STEP),
-            MouseEventKind::ScrollDown => self.scroll_by(WHEEL_STEP),
-            _ => {}
-        }
     }
 
     fn submit(&mut self, async_tx: &UnboundedSender<Async>) -> Flow {
@@ -473,6 +470,10 @@ impl Repl {
             && self.view_tracks.as_ref().is_none_or(|tracks| tracks.contains(&event.track.kind()))
             && self.target.as_ref().is_none_or(|focus| label_matches(&event.target, focus))
     }
+}
+
+fn shift(key: &KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::SHIFT)
 }
 
 /// New viewport top after moving `delta` lines from `view_top` (`None` = pinned at `max_top`).
@@ -779,13 +780,11 @@ fn render_feed(frame: &mut TuiFrame, area: Rect, repl: &Repl, lines: Vec<Line<'s
     let top = repl.view_top.map_or(max_top, |top| top.min(max_top));
     let below = max_top - top;
 
-    let title = if below == 0 {
-        " timeline ─ ● live ".to_owned()
-    } else {
-        format!(" timeline ─ ▲ {below} below ")
-    };
+    let vertical = if below == 0 { "● live".to_owned() } else { format!("▲ {below} below") };
+    let pan = if repl.view_left > 0 { format!(" ─ → {}", repl.view_left) } else { String::new() };
+    let title = format!(" timeline ─ {vertical}{pan} ");
 
-    let feed = Paragraph::new(lines).block(panel_titled(title)).scroll((top as u16, 0));
+    let feed = Paragraph::new(lines).block(panel_titled(title)).scroll((top as u16, repl.view_left));
     frame.render_widget(feed, area);
 }
 
@@ -807,7 +806,7 @@ fn render_hint(frame: &mut TuiFrame, area: Rect) {
         key("⏎"), Span::raw(" run  "),
         key("⇥"), Span::raw(" pick target  "),
         key("↑↓"), Span::raw(" history  "),
-        key("wheel/⇧↑↓/PgUp"), Span::raw(" scroll  "),
+        key("⇧↑↓←→/PgUp"), Span::raw(" scroll  "),
         key("help"), Span::raw(" commands  "),
         key("^D"), Span::raw(" quit"),
     ]);
@@ -890,6 +889,10 @@ fn render_help(frame: &mut TuiFrame, area: Rect) {
         entry("track <list> | all", "filter the live pane by track"),
         entry("source main | renderer | all", "filter the live pane by side"),
         entry("ignore <substr> · clear · help · quit", "noise, this help, exit"),
+        section("MOVE & COPY"),
+        entry("⇧↑↓ · PgUp/PgDn · End", "scroll the timeline; End re-pins to live"),
+        entry("⇧←→", "pan to read lines wider than the pane"),
+        entry("drag to select", "the mouse is free — copy any line natively"),
         Line::from(""),
         Line::from(Span::styled("  any key to dismiss", Style::default().fg(Color::DarkGray))),
     ];
