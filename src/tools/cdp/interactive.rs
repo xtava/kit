@@ -25,7 +25,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::time;
 
 use crate::cdp::{Source, TargetKind, TimelineEvent, TrackKind};
-use crate::tui::{clipboard, fuzzy, EventReader, LineEditor, Session};
+use crate::tui::{fuzzy, EventReader, LineEditor, Session};
 
 use super::client;
 use super::protocol::{Command, Frame, Reply, TargetActivity};
@@ -70,6 +70,11 @@ pub async fn run(app: Option<&str>) -> Result<()> {
                 None => break,
                 _ => {}
             },
+        }
+
+        if let Some(text) = repl.take_pending_copy() {
+            let outcome = session.copy(&text).map(|()| text.lines().count());
+            repl.copied(outcome);
         }
     }
 
@@ -124,6 +129,8 @@ struct Repl {
     picker: Option<Picker>,
     connected: bool,
     history_path: Option<PathBuf>,
+    /// A clipboard yank awaiting the event loop, which owns the terminal the OSC 52 write goes to.
+    pending_copy: Option<String>,
 }
 
 impl Repl {
@@ -148,6 +155,7 @@ impl Repl {
             picker: None,
             connected: true,
             history_path,
+            pending_copy: None,
         }
     }
 
@@ -155,7 +163,9 @@ impl Repl {
 
     fn ingest(&mut self, frame: Frame) {
         match frame {
-            Frame::Backfill(events) => events.into_iter().for_each(|event| self.push(FeedItem::Event(event))),
+            Frame::Backfill(events) => {
+                events.into_iter().for_each(|event| self.push(FeedItem::Event(event)))
+            }
             Frame::Event(event) => self.push(FeedItem::Event(event)),
         }
     }
@@ -244,8 +254,12 @@ impl Repl {
             // readline pairing, so it never contends with scrolling.
             KeyCode::Up => self.scroll_by(-1),
             KeyCode::Down => self.scroll_by(1),
-            KeyCode::Left if self.view_top.is_some() => self.view_left = self.view_left.saturating_sub(PAN_STEP),
-            KeyCode::Right if self.view_top.is_some() => self.view_left = self.view_left.saturating_add(PAN_STEP),
+            KeyCode::Left if self.view_top.is_some() => {
+                self.view_left = self.view_left.saturating_sub(PAN_STEP)
+            }
+            KeyCode::Right if self.view_top.is_some() => {
+                self.view_left = self.view_left.saturating_add(PAN_STEP)
+            }
             KeyCode::PageUp => self.page_up(),
             KeyCode::PageDown => self.page_down(),
             // Back to the home view: pinned to live, panned fully left.
@@ -307,7 +321,12 @@ impl Repl {
         self.notice(format!("focus → {shown}"));
     }
 
-    fn run_command(&mut self, mut command: Command, label: &str, async_tx: &UnboundedSender<Async>) {
+    fn run_command(
+        &mut self,
+        mut command: Command,
+        label: &str,
+        async_tx: &UnboundedSender<Async>,
+    ) {
         apply_target(&mut command, &self.target);
         let record = self.record.clone();
         let label = label.to_owned();
@@ -464,7 +483,8 @@ impl Repl {
         self.view_top = scrolled(self.view_top, self.max_top(), delta);
     }
 
-    /// Yank the current timeline view to the clipboard — exactly the lines on screen, as plain text.
+    /// Queue a yank of the current timeline view — exactly the lines on screen, as plain text. The
+    /// event loop performs the OSC 52 write (it owns the terminal) and reports the outcome.
     fn copy_view(&mut self) {
         let text = self
             .visible_lines()
@@ -472,9 +492,18 @@ impl Repl {
             .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n");
-        let lines = text.lines().count();
-        match clipboard::copy(&text) {
-            Ok(()) => self.notice(format!("copied {lines} line(s) to clipboard")),
+        self.pending_copy = Some(text);
+    }
+
+    /// Hand the queued yank to the caller (the event loop), clearing it.
+    fn take_pending_copy(&mut self) -> Option<String> {
+        self.pending_copy.take()
+    }
+
+    /// Report a completed yank back onto the feed.
+    fn copied(&mut self, result: Result<usize>) {
+        match result {
+            Ok(lines) => self.notice(format!("copied {lines} line(s) to clipboard")),
             Err(error) => self.notice(format!("clipboard write failed: {error}")),
         }
     }
@@ -548,7 +577,12 @@ struct TargetEntry {
 
 impl TargetEntry {
     fn from_activity(activity: TargetActivity) -> Self {
-        Self { label: activity.label, kind: activity.kind, url: activity.url, events: activity.events }
+        Self {
+            label: activity.label,
+            kind: activity.kind,
+            url: activity.url,
+            events: activity.events,
+        }
     }
 
     fn is_active(&self) -> bool {
@@ -622,7 +656,12 @@ impl Picker {
                 .entries
                 .iter()
                 .enumerate()
-                .filter_map(|(index, entry)| entry.as_ref().and_then(|entry| entry.score(&needle)).map(|score| (score, index)))
+                .filter_map(|(index, entry)| {
+                    entry
+                        .as_ref()
+                        .and_then(|entry| entry.score(&needle))
+                        .map(|score| (score, index))
+                })
                 .collect();
             scored.sort_by_key(|(score, index)| (*score, *index));
             self.filtered = scored.into_iter().map(|(_, index)| index).collect();
@@ -730,7 +769,11 @@ fn parse_track_filter(rest: &[String]) -> Result<Option<Vec<TrackKind>>, String>
     for name in joined.split(',').filter(|name| !name.is_empty()) {
         match TrackKind::parse(name) {
             Some(track) => tracks.push(track),
-            None => return Err(format!("unknown track '{name}' — console, exception, log, network, ws")),
+            None => {
+                return Err(format!(
+                    "unknown track '{name}' — console, exception, log, network, ws"
+                ))
+            }
         }
     }
     Ok(Some(tracks))
@@ -749,12 +792,9 @@ fn parse_source_filter(rest: &[String]) -> Result<Option<Source>, String> {
 
 fn render(frame: &mut TuiFrame, repl: &mut Repl) {
     let area = frame.area();
-    let chunks = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Min(1),
-        Constraint::Length(1),
-    ])
-    .split(area);
+    let chunks =
+        Layout::vertical([Constraint::Length(3), Constraint::Min(1), Constraint::Length(1)])
+            .split(area);
 
     render_header(frame, chunks[0], repl);
     let lines = repl.visible_lines();
@@ -805,10 +845,12 @@ fn render_feed(frame: &mut TuiFrame, area: Rect, repl: &Repl, lines: Vec<Line<'s
     let below = max_top - top;
 
     let vertical = if below == 0 { "● live".to_owned() } else { format!("▲ {below} below") };
-    let pan = if repl.view_left > 0 { format!(" ─ → {}", repl.view_left) } else { String::new() };
+    let pan =
+        if repl.view_left > 0 { format!(" ─ → {}", repl.view_left) } else { String::new() };
     let title = format!(" timeline ─ {vertical}{pan} ");
 
-    let feed = Paragraph::new(lines).block(panel_titled(title)).scroll((top as u16, repl.view_left));
+    let feed =
+        Paragraph::new(lines).block(panel_titled(title)).scroll((top as u16, repl.view_left));
     frame.render_widget(feed, area);
 }
 
@@ -820,7 +862,8 @@ fn render_input(frame: &mut TuiFrame, area: Rect, repl: &Repl) {
     frame.render_widget(Paragraph::new(line), area);
 
     if repl.picker.is_none() && !repl.help_open {
-        let cursor_x = area.x + 5 + repl.input.value()[..repl.input.cursor()].chars().count() as u16;
+        let cursor_x =
+            area.x + 5 + repl.input.value()[..repl.input.cursor()].chars().count() as u16;
         frame.set_cursor_position((cursor_x, area.y));
     }
 }
@@ -853,12 +896,17 @@ fn render_picker(frame: &mut TuiFrame, area: Rect, picker: &Picker) {
         )));
     }
 
-    let streaming = picker.filtered.iter().filter(|&&index| picker.entries[index].is_some()).count();
+    let streaming =
+        picker.filtered.iter().filter(|&&index| picker.entries[index].is_some()).count();
     let title = format!(" pick target ─ {streaming} streaming ");
     frame.render_widget(Paragraph::new(lines).block(panel_titled(title)), popup);
 }
 
-fn picker_row(entry: &Option<TargetEntry>, current: &Option<String>, active: bool) -> Line<'static> {
+fn picker_row(
+    entry: &Option<TargetEntry>,
+    current: &Option<String>,
+    active: bool,
+) -> Line<'static> {
     let marker = if active { "▌ " } else { "  " };
     let base = if active {
         Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
@@ -968,7 +1016,10 @@ fn describe_source(source: Option<Source>) -> &'static str {
 }
 
 fn section(title: &'static str) -> Line<'static> {
-    Line::from(Span::styled(format!("  {title}"), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)))
+    Line::from(Span::styled(
+        format!("  {title}"),
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    ))
 }
 
 fn entry(command: &'static str, description: &'static str) -> Line<'static> {
