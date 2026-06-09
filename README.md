@@ -9,6 +9,7 @@ kit                        # list tools
 kit cdp ready              # warm CDP debugger — is the workbench up? selected target + why
 kit cdp tail --since 3s    # …correlated timeline of a running fleet
 kit cdp eval 'location'    # …probe a live target (lazy-attaches, stays warm)
+kit cdp ext doctor <id>    # …diagnose a Modular extension view/webview runtime
 kit scout                  # live Electron memory recon   (TUI when interactive)
 kit scout --once           # …one survey, headless table
 kit scout dive             # capture a window's heap snapshot → memlab

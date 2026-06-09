@@ -32,13 +32,17 @@ to any command for structured output; pipe text output to `grep`/`head` freely.
 |---|---|---|
 | Lifecycle | `attach [--track …]` · `detach [--all]` · `ls` · `gc` | manage Attachments (attach is optional) |
 | Observe | `tail [--since 5s] [--track …]` · `console` · `net` · `ws` | slice the Timeline |
+| Triage | `errors [--explain]` | what's broken — error-shaped events deduped to `error (N×)`, with a `⚠` banner when the view is lossy |
 | Probe | `snap [-i]` · `eval <expr>/--file` · `heap` · `targets` | live one-shot query |
 | Interact | `click @ref` · `fill @ref <text>` | drive a Target (refs come from `snap`) |
 | Lens | `lens <name> [-- args]` | run a scriptable lens in a Target |
+| Extensions | `ext doctor <id>` · `ext bundle <id>` | diagnose a Modular extension runtime view |
 
 Selectors: `--app <instance>` picks the Attachment (app name / worktree / instance
 id / port); `--target <selector>` picks the Target (defaults to the main app
-window). `--since` takes `500ms` / `2s` / `5m`.
+window). Timeline slices accept `--source main|renderer`, `--target <selector>`,
+`--grep <text>`, `--extension <id>`, and `--limit <n>`. `--since` takes `500ms`
+/ `2s` / `5m`.
 
 ## Tracks
 
@@ -60,7 +64,35 @@ model, a sync engine's state, the app's routes. The script body receives `args` 
 return { title: document.title, url: location.href };
 ```
 
-Starters ship under that dir: `styles`, `overflow`.
+Starters ship in the binary and can be shadowed by files of the same name in that
+directory.
+
+Built-in lenses:
+
+- `workbench` — generic Modular workbench orientation: page state, workspace id,
+  active editor when the test bridge exposes it, and recent app errors when present.
+- `extensions` — Modular extension runtime diagnosis from the workbench test
+  bridge. It reads `window.__testAPI.runtimeGraph.getSnapshot()` plus webview-live
+  probes when available, joins that with CDP webview target metadata, and reports
+  view health, document load, bridge status, HMR state, blockers, actions, and
+  recent runtime events.
+
+Useful extension flows:
+
+```bash
+kit cdp attach --app modular-dev
+kit cdp ready --app modular-dev --json
+kit cdp targets --app modular-dev --json
+kit cdp lens extensions --app modular-dev -- modular.local-sdk-view-showcase
+kit cdp ext doctor modular.local-sdk-view-showcase --app modular-dev --json
+kit cdp ext bundle modular.local-sdk-view-showcase --since 60s --limit 50 --app modular-dev --json
+kit cdp console --extension modular.local-sdk-view-showcase --since 5m --app modular-dev
+```
+
+`ext bundle` is the agent handoff shape: it returns the same extension diagnosis as
+`ext doctor` plus a bounded Timeline slice filtered to that extension id. Use it
+after pre-warming the Attachment and reproducing the issue so console/network/HMR
+events are captured on the same clock.
 
 ## Interactive mode
 

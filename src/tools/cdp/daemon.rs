@@ -21,7 +21,7 @@ use crate::cdp::{
     TrackKind,
 };
 
-use super::protocol::{Command, Frame, IgnoreOp, Query, Reply, TargetActivity};
+use super::protocol::{Command, Frame, IgnoreOp, Query, Reply, TargetActivity, TimelineQuery};
 use super::readiness::{self, DocState, Readiness};
 use super::registry::{self, Record};
 use super::{format, snapshot};
@@ -49,6 +49,9 @@ struct State {
     refs: HashMap<String, HashMap<String, i64>>,
     timeline: Timeline,
     tracks: Vec<TrackKind>,
+    /// Error-domain CDP events (`Runtime.exceptionThrown`, error-level `Log.entryAdded`) the decoder
+    /// saw but did not model — surfaced by the `errors` view so an un-decoded error type can't hide.
+    undecoded_errors: usize,
     ignore: Vec<String>,
     /// Live `Subscribe` clients. Each gets every emitted event; senders to dropped clients are
     /// pruned on the next `emit`.
@@ -139,6 +142,7 @@ pub async fn serve(
         refs: HashMap::new(),
         timeline: Timeline::new(TIMELINE_CAP),
         tracks: tracks.clone(),
+        undecoded_errors: 0,
         ignore: Vec::new(),
         subscribers: Vec::new(),
         start: Instant::now(),
@@ -275,13 +279,36 @@ async fn apply_event(state: &Shared, event: &CdpEvent, tracks: &[TrackKind]) {
             }
         }
         _ => {
-            if let Some(track) = Track::from_event(event) {
-                let mut state = state.lock().unwrap();
-                let at_ms = state.now_ms();
-                let label = state.label(&event.session);
-                state.emit(TimelineEvent { at_ms, source: Source::Renderer, target: label, track });
+            let mut state = state.lock().unwrap();
+            match Track::from_event(event) {
+                Some(track) => {
+                    let at_ms = state.now_ms();
+                    let label = state.label(&event.session);
+                    state.emit(TimelineEvent {
+                        at_ms,
+                        source: Source::Renderer,
+                        target: label,
+                        track,
+                    });
+                }
+                // An error-domain event we couldn't decode is invisible to every view — count it so
+                // `errors` can disclose the blind spot rather than imply the field is empty.
+                None if is_error_domain_event(event) => state.undecoded_errors += 1,
+                None => {}
             }
         }
+    }
+}
+
+/// Whether a CDP event belongs to a domain that carries errors (`Runtime.exceptionThrown`, an
+/// error-level `Log.entryAdded`) — the events whose silent loss the `errors` view must own up to.
+fn is_error_domain_event(event: &CdpEvent) -> bool {
+    match event.method.as_str() {
+        "Runtime.exceptionThrown" => true,
+        "Log.entryAdded" => {
+            event.params.pointer("/entry/level").and_then(Value::as_str) == Some("error")
+        }
+        _ => false,
     }
 }
 
@@ -471,16 +498,18 @@ async fn dispatch(
         Command::Ping => Reply::ok("pong"),
         Command::Status => status_reply(state, json),
         Command::Targets => targets_reply(state, json),
-        Command::Tail { since_ms, tracks, source } => {
-            tail_reply(state, since_ms, tracks, source, json)
-        }
+        Command::Tail(query) => tail_reply(state, query, json),
+        Command::Errors { query, explain } => errors_reply(state, query, explain, json),
         Command::Eval { target, expr } => {
             run_in_target(state, target, json, |conn, session| evaluate(conn, session, expr)).await
         }
         Command::Ready { target } => ready_reply(state, target, json).await,
         Command::Lens { target, source, args } => {
-            let expr = wrap_lens(&source, &args);
+            let expr = wrap_lens(&source, &args, &lens_context(state));
             run_in_target(state, target, json, |conn, session| evaluate(conn, session, expr)).await
+        }
+        Command::ExtensionBundle { target, source, extension_id, query } => {
+            extension_bundle_reply(state, target, source, extension_id, query, json).await
         }
         Command::Ignore(op) => ignore_reply(state, op, json),
         Command::TargetList => target_list_reply(state),
@@ -536,6 +565,8 @@ fn target_list_reply(state: &Shared) -> Reply {
                 title: target.title.clone(),
                 url: target.url.clone(),
                 events,
+                extension_id: query_param(&target.url, "extensionId"),
+                purpose: query_param(&target.url, "purpose"),
             };
             (activity, target.main_rank())
         })
@@ -549,22 +580,104 @@ fn target_list_reply(state: &Shared) -> Reply {
     }
 }
 
-fn tail_reply(
-    state: &Shared,
-    since_ms: u64,
-    tracks: Option<Vec<TrackKind>>,
-    source: Option<Source>,
-    json: bool,
-) -> Reply {
+fn tail_reply(state: &Shared, query: TimelineQuery, json: bool) -> Reply {
+    let events = collect_timeline(state, &query);
+    Reply::ok(format::events(&events, json))
+}
+
+fn errors_reply(state: &Shared, query: TimelineQuery, explain: bool, json: bool) -> Reply {
+    let guard = state.lock().unwrap();
+    let now = guard.now_ms();
+    let saturated = guard.timeline.is_saturated_for(now, query.since_ms);
+    let evicted = guard.timeline.evicted();
+    let undecoded = guard.undecoded_errors;
+    drop(guard);
+
+    let report = cdp::ErrorReport {
+        groups: cdp::group_errors(&collect_timeline(state, &query)),
+        evicted: Some(evicted),
+        undecoded,
+        saturated,
+    };
+    Reply::ok(format::errors(&report, explain, json))
+}
+
+fn collect_timeline(state: &Shared, query: &TimelineQuery) -> Vec<TimelineEvent> {
     let state = state.lock().unwrap();
     let now = state.now_ms();
-    let events: Vec<TimelineEvent> = state
+    let mut events: Vec<TimelineEvent> = state
         .timeline
-        .since(now, since_ms, tracks.as_deref(), source)
+        .since(now, query.since_ms, query.tracks.as_deref(), query.source)
         .into_iter()
         .filter(|event| !state.is_suppressed(event))
+        .filter(|event| event_matches(event, query))
         .collect();
-    Reply::ok(format::events(&events, json))
+
+    if let Some(limit) = query.limit {
+        if events.len() > limit {
+            events = events.split_off(events.len() - limit);
+        }
+    }
+
+    events
+}
+
+fn event_matches(event: &TimelineEvent, query: &TimelineQuery) -> bool {
+    if query.target.as_ref().is_some_and(|needle| !contains_ci(&event.target, needle)) {
+        return false;
+    }
+
+    let line = format::event_line(event);
+    if query.grep.as_ref().is_some_and(|needle| !contains_ci(&line, needle)) {
+        return false;
+    }
+
+    if query
+        .extension
+        .as_ref()
+        .is_some_and(|needle| !contains_ci(&event.target, needle) && !contains_ci(&line, needle))
+    {
+        return false;
+    }
+
+    true
+}
+
+fn contains_ci(haystack: &str, needle: &str) -> bool {
+    haystack.to_lowercase().contains(&needle.to_lowercase())
+}
+
+async fn extension_bundle_reply(
+    state: &Shared,
+    target: Option<String>,
+    source: String,
+    extension_id: String,
+    mut query: TimelineQuery,
+    json: bool,
+) -> Reply {
+    query.extension = Some(extension_id.clone());
+    let lens = {
+        let expr = wrap_lens(&source, std::slice::from_ref(&extension_id), &lens_context(state));
+        run_in_target(state, target, true, |conn, session| evaluate(conn, session, expr)).await
+    };
+
+    let doctor = match lens {
+        Reply { ok: true, output } => {
+            serde_json::from_str::<Value>(&output).unwrap_or_else(|_| json!({ "raw": output }))
+        }
+        Reply { output, .. } => {
+            return Reply::fail(output);
+        }
+    };
+
+    let timeline = collect_timeline(state, &query);
+    let bundle = json!({
+        "extensionId": extension_id,
+        "doctor": doctor,
+        "timeline": timeline,
+        "timelineQuery": query,
+    });
+    Reply::ok(format::value(&bundle, json))
 }
 
 fn ignore_reply(state: &Shared, op: IgnoreOp, json: bool) -> Reply {
@@ -883,11 +996,52 @@ async fn evaluate(conn: CdpConnection, session: String, expr: String) -> Result<
     Ok(result.pointer("/result/value").cloned().unwrap_or(Value::Null))
 }
 
-/// A lens runs as `(function(args){ <source> })(<args>)` — the script gets `args` and `return`s a
-/// JSON-serializable value.
-fn wrap_lens(source: &str, args: &[String]) -> String {
+/// A lens runs as `(function(args, kit){ <source> })(<args>, <context>)` — the script gets `args`,
+/// live Target metadata, and `return`s a JSON-serializable value.
+fn wrap_lens(source: &str, args: &[String], context: &Value) -> String {
     let args_json = serde_json::to_string(args).unwrap_or_else(|_| "[]".to_owned());
-    format!("(function(args){{ {source} }})({args_json})")
+    let context_json = serde_json::to_string(context).unwrap_or_else(|_| "{}".to_owned());
+    format!("(function(args, kit){{ {source} }})({args_json}, {context_json})")
+}
+
+fn lens_context(state: &Shared) -> Value {
+    let state = state.lock().unwrap();
+    let counts = state.timeline.counts_by_target();
+    let targets: Vec<Value> = state
+        .sessions
+        .values()
+        .map(|target| {
+            let label = target.label();
+            let events = counts.get(&label).copied().unwrap_or(0);
+            json!({
+                "label": label,
+                "kind": target.kind.as_str(),
+                "title": target.title.clone(),
+                "url": target.url.clone(),
+                "events": events,
+                "extensionId": query_param(&target.url, "extensionId"),
+                "purpose": query_param(&target.url, "purpose"),
+            })
+        })
+        .collect();
+    json!({
+        "instance": state.name,
+        "app": state.app,
+        "port": state.port,
+        "uptimeMs": state.now_ms(),
+        "targets": targets,
+    })
+}
+
+fn query_param(url: &str, key: &str) -> Option<String> {
+    let query = url.split_once('?')?.1;
+    for pair in query.split('&') {
+        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if name == key && !value.is_empty() {
+            return Some(value.to_owned());
+        }
+    }
+    None
 }
 
 fn push_marker(state: &Shared, source: Source, text: &str) {

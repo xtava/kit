@@ -19,13 +19,13 @@ use std::path::PathBuf;
 use anyhow::{bail, Context as _, Result};
 use async_trait::async_trait;
 use clap::{
-    ArgMatches, Command as ClapCommand, CommandFactory, FromArgMatches, Parser, Subcommand,
+    ArgMatches, Args, Command as ClapCommand, CommandFactory, FromArgMatches, Parser, Subcommand,
 };
 
 use crate::cdp::{Source, TrackKind};
 use crate::framework::{Context, Tool, ToolMeta};
 
-use protocol::{Command, IgnoreOp};
+use protocol::{Command, IgnoreOp, TimelineQuery};
 
 pub fn tool() -> CdpTool {
     CdpTool
@@ -44,6 +44,7 @@ RECIPES
     PRE-WARM first, then reproduce:
       kit cdp attach --app dev               warm BEFORE the error fires
       # …save the file / reload the window…
+      kit cdp errors --since 30s --app dev   deduped: what broke, and how often
       kit cdp console --since 30s --app dev
       kit cdp tail --track exception --since 30s --app dev
 
@@ -54,6 +55,11 @@ RECIPES
   Inspect & drive a target (refs come from snap):
     kit cdp snap -i --app dev
     kit cdp click @e5 --app dev
+
+  Extension runtime diagnosis:
+    kit cdp lens extensions --app dev -- modular.local-sdk-view-showcase
+    kit cdp ext doctor modular.local-sdk-view-showcase --app dev
+    kit cdp ext bundle modular.local-sdk-view-showcase --since 60s --app dev
 
   Health & cleanup:
     kit cdp ls                               kit cdp detach --all
@@ -105,35 +111,37 @@ enum CdpCommand {
     Targets,
     /// Slice the Timeline — all tracks on one clock (the "what just happened" view).
     Tail {
-        #[arg(long)]
-        since: Option<String>,
         /// Restrict to tracks, comma-separated.
         #[arg(long)]
         track: Option<String>,
-        /// Restrict to one process side: `main` (Electron main) or `renderer` (web).
-        #[arg(long)]
-        source: Option<String>,
+        #[command(flatten)]
+        filter: TimelineFilterArgs,
     },
     /// Timeline, console tracks only (console · exceptions · log).
     Console {
+        #[command(flatten)]
+        filter: TimelineFilterArgs,
+    },
+    /// What's broken — error-shaped events (exceptions · console.error · log/error · failed
+    /// requests), with duplicates collapsed to `error (N×)` so it stays cheap to read. Never hides
+    /// silently: a `⚠` banner fires if the view is lossy (merged differing errors, ring eviction,
+    /// undecoded events). Use `--explain` to expand exactly what each group absorbed.
+    Errors {
+        /// Expand each collapsed group into the distinct lines it absorbed — the audit view.
         #[arg(long)]
-        since: Option<String>,
-        #[arg(long)]
-        source: Option<String>,
+        explain: bool,
+        #[command(flatten)]
+        filter: TimelineFilterArgs,
     },
     /// Timeline, network requests only.
     Net {
-        #[arg(long)]
-        since: Option<String>,
-        #[arg(long)]
-        source: Option<String>,
+        #[command(flatten)]
+        filter: TimelineFilterArgs,
     },
     /// Timeline, websocket frames only (your realtime/RPC wire).
     Ws {
-        #[arg(long)]
-        since: Option<String>,
-        #[arg(long)]
-        source: Option<String>,
+        #[command(flatten)]
+        filter: TimelineFilterArgs,
     },
     /// Evaluate JS in a Target and return its value.
     Eval {
@@ -185,11 +193,18 @@ enum CdpCommand {
     },
     /// Run a saved lens script inside a Target.
     Lens {
-        name: String,
+        name: Option<String>,
+        #[arg(long)]
+        list: bool,
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
         #[arg(long)]
         target: Option<String>,
+    },
+    /// Extension-runtime shortcuts built on the Modular extension lens.
+    Ext {
+        #[command(subcommand)]
+        command: ExtensionCommand,
     },
     /// Internal: the Attachment daemon. Not for direct use.
     #[command(name = "__serve", hide = true)]
@@ -204,6 +219,45 @@ enum CdpCommand {
         root_pid: u32,
         #[arg(long)]
         track: Option<String>,
+    },
+}
+
+#[derive(Args, Clone)]
+struct TimelineFilterArgs {
+    #[arg(long)]
+    since: Option<String>,
+    /// Restrict to one process side: `main` (Electron main) or `renderer` (web).
+    #[arg(long)]
+    source: Option<String>,
+    /// Restrict to Timeline events whose Target label matches this selector.
+    #[arg(long)]
+    target: Option<String>,
+    /// Restrict to rendered Timeline rows containing this text.
+    #[arg(long)]
+    grep: Option<String>,
+    /// Restrict to rows associated with an extension id.
+    #[arg(long)]
+    extension: Option<String>,
+    /// Return only the most recent N matching rows.
+    #[arg(long)]
+    limit: Option<usize>,
+}
+
+#[derive(Subcommand)]
+enum ExtensionCommand {
+    /// Diagnose one extension from the live runtime graph.
+    Doctor {
+        extension_id: String,
+        #[arg(long)]
+        target: Option<String>,
+    },
+    /// Capture extension diagnosis plus a bounded Timeline slice.
+    Bundle {
+        extension_id: String,
+        #[command(flatten)]
+        filter: TimelineFilterArgs,
+        #[arg(long)]
+        target: Option<String>,
     },
 }
 
@@ -240,6 +294,10 @@ impl Tool for CdpTool {
             Some(CdpCommand::Detach { all }) => client::detach(app, all).await,
             Some(CdpCommand::Ls) => client::ls(json),
             Some(CdpCommand::Gc) => client::gc(json),
+            Some(CdpCommand::Lens { list: true, .. }) => {
+                println!("{}", render_lens_list(json));
+                Ok(())
+            }
 
             Some(session) => finish(client::query(app, json, session_command(session)?).await?),
         }
@@ -252,26 +310,22 @@ impl Tool for CdpTool {
 fn session_command(command: CdpCommand) -> Result<Command> {
     Ok(match command {
         CdpCommand::Targets => Command::Targets,
-        CdpCommand::Tail { since, track, source } => Command::Tail {
-            since_ms: parse_since(since.as_deref()),
-            tracks: track.map(parse_tracks),
-            source: parse_source(source.as_deref())?,
-        },
-        CdpCommand::Console { since, source } => Command::Tail {
-            since_ms: parse_since(since.as_deref()),
-            tracks: Some(vec![TrackKind::Console, TrackKind::Exception, TrackKind::Log]),
-            source: parse_source(source.as_deref())?,
-        },
-        CdpCommand::Net { since, source } => Command::Tail {
-            since_ms: parse_since(since.as_deref()),
-            tracks: Some(vec![TrackKind::Network]),
-            source: parse_source(source.as_deref())?,
-        },
-        CdpCommand::Ws { since, source } => Command::Tail {
-            since_ms: parse_since(since.as_deref()),
-            tracks: Some(vec![TrackKind::Ws]),
-            source: parse_source(source.as_deref())?,
-        },
+        CdpCommand::Tail { track, filter } => {
+            Command::Tail(timeline_query(filter, track.map(parse_tracks))?)
+        }
+        CdpCommand::Console { filter } => Command::Tail(timeline_query(
+            filter,
+            Some(vec![TrackKind::Console, TrackKind::Exception, TrackKind::Log]),
+        )?),
+        CdpCommand::Errors { explain, filter } => {
+            Command::Errors { query: timeline_query(filter, None)?, explain }
+        }
+        CdpCommand::Net { filter } => {
+            Command::Tail(timeline_query(filter, Some(vec![TrackKind::Network]))?)
+        }
+        CdpCommand::Ws { filter } => {
+            Command::Tail(timeline_query(filter, Some(vec![TrackKind::Ws]))?)
+        }
         CdpCommand::Eval { expr, file, target } => {
             Command::Eval { target, expr: read_expr(expr, file)? }
         }
@@ -285,9 +339,27 @@ fn session_command(command: CdpCommand) -> Result<Command> {
         CdpCommand::Ignore { pattern, list, clear } => {
             Command::Ignore(ignore_op(pattern, list, clear))
         }
-        CdpCommand::Lens { name, args, target } => {
+        CdpCommand::Lens { name, list: false, args, target } => {
+            let Some(name) = name else {
+                bail!("no lens name — pass a name or use `kit cdp lens --list`");
+            };
             Command::Lens { target, source: load_lens(&name)?, args }
         }
+        CdpCommand::Lens { list: true, .. } => bail!("lens --list is not a session command"),
+        CdpCommand::Ext { command } => match command {
+            ExtensionCommand::Doctor { extension_id, target } => {
+                Command::Lens { target, source: load_lens("extensions")?, args: vec![extension_id] }
+            }
+            ExtensionCommand::Bundle { extension_id, filter, target } => {
+                let query = timeline_query(filter, None)?.with_extension(extension_id.clone());
+                Command::ExtensionBundle {
+                    target,
+                    source: load_lens("extensions")?,
+                    extension_id,
+                    query,
+                }
+            }
+        },
         CdpCommand::Attach { .. }
         | CdpCommand::Detach { .. }
         | CdpCommand::Ls
@@ -306,6 +378,39 @@ fn ignore_op(pattern: Vec<String>, list: bool, clear: bool) -> IgnoreOp {
     } else {
         IgnoreOp::Add(pattern.join(" "))
     }
+}
+
+fn timeline_query(
+    filter: TimelineFilterArgs,
+    tracks: Option<Vec<TrackKind>>,
+) -> Result<TimelineQuery> {
+    Ok(TimelineQuery {
+        since_ms: parse_since(filter.since.as_deref()),
+        tracks,
+        source: parse_source(filter.source.as_deref())?,
+        target: non_empty(filter.target),
+        grep: non_empty(filter.grep),
+        extension: non_empty(filter.extension),
+        limit: filter.limit,
+    })
+}
+
+trait TimelineQueryExt {
+    fn with_extension(self, extension_id: String) -> Self;
+}
+
+impl TimelineQueryExt for TimelineQuery {
+    fn with_extension(mut self, extension_id: String) -> Self {
+        self.extension = Some(extension_id);
+        self
+    }
+}
+
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    })
 }
 
 /// Map a command's success flag to a process exit code without re-printing (output is already out).
@@ -329,7 +434,10 @@ fn read_expr(expr: Vec<String>, file: Option<PathBuf>) -> Result<String> {
 /// Lenses that ship in the binary. A user file of the same name in `lens_dir()` shadows the builtin,
 /// so these are starting points, not walls — `kit cdp lens workbench` works with zero setup, and a
 /// `workbench.js` dropped in the config dir overrides it.
-const BUILTIN_LENSES: &[(&str, &str)] = &[("workbench", include_str!("lenses/workbench.js"))];
+const BUILTIN_LENSES: &[(&str, &str)] = &[
+    ("extensions", include_str!("lenses/extensions.js")),
+    ("workbench", include_str!("lenses/workbench.js")),
+];
 
 /// Load a lens by name: a user file first (the override), then a builtin, else an error that lists
 /// what *is* available.
@@ -346,6 +454,26 @@ fn load_lens(name: &str) -> Result<String> {
 
 /// The lens names a user can run — builtins plus every `*.js` in the config dir, deduped and sorted.
 fn available_lenses() -> String {
+    let names = lens_names();
+    if names.is_empty() {
+        String::new()
+    } else {
+        format!("\navailable: {}", names.join(", "))
+    }
+}
+
+fn render_lens_list(json: bool) -> String {
+    let names = lens_names();
+    if json {
+        serde_json::to_string_pretty(&names).unwrap_or_else(|_| "[]".to_owned())
+    } else if names.is_empty() {
+        "no lenses available".to_owned()
+    } else {
+        names.join("\n")
+    }
+}
+
+fn lens_names() -> Vec<String> {
     let mut names: Vec<String> =
         BUILTIN_LENSES.iter().map(|(name, _)| (*name).to_owned()).collect();
     if let Ok(entries) = std::fs::read_dir(lens_dir()) {
@@ -360,11 +488,7 @@ fn available_lenses() -> String {
     }
     names.sort();
     names.dedup();
-    if names.is_empty() {
-        String::new()
-    } else {
-        format!("\navailable: {}", names.join(", "))
-    }
+    names
 }
 
 fn lens_dir() -> PathBuf {

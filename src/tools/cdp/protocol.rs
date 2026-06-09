@@ -22,10 +22,14 @@ pub enum Command {
     Ping,
     Status,
     Targets,
-    Tail {
-        since_ms: u64,
-        tracks: Option<Vec<TrackKind>>,
-        source: Option<Source>,
+    Tail(TimelineQuery),
+    /// Error-shaped Timeline events, deduplicated into counted groups — the low-context "what's
+    /// broken" view. Same filters as [`Command::Tail`]; the daemon collapses duplicates and reports
+    /// the integrity facts (variants absorbed, ring eviction, undecoded events) alongside them.
+    Errors {
+        query: TimelineQuery,
+        /// Expand each group's absorbed variants instead of one representative line — the audit view.
+        explain: bool,
     },
     Eval {
         target: Option<String>,
@@ -57,6 +61,12 @@ pub enum Command {
         source: String,
         args: Vec<String>,
     },
+    ExtensionBundle {
+        target: Option<String>,
+        source: String,
+        extension_id: String,
+        query: TimelineQuery,
+    },
     Ignore(IgnoreOp),
     /// The target picker's data source: every Target joined with its Timeline event volume, ranked
     /// active-first. Returns a JSON `Vec<TargetActivity>` in the [`Reply`] output.
@@ -69,6 +79,17 @@ pub enum Command {
     Detach,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimelineQuery {
+    pub since_ms: u64,
+    pub tracks: Option<Vec<TrackKind>>,
+    pub source: Option<Source>,
+    pub target: Option<String>,
+    pub grep: Option<String>,
+    pub extension: Option<String>,
+    pub limit: Option<usize>,
+}
+
 /// A Target annotated with how much it is actually streaming — what the picker ranks and filters by.
 /// `events` counts the target's events currently held in the daemon's Timeline ring.
 #[derive(Debug, Serialize, Deserialize)]
@@ -78,6 +99,10 @@ pub struct TargetActivity {
     pub title: String,
     pub url: String,
     pub events: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -138,10 +163,26 @@ mod tests {
             Command::Targets,
             Command::TargetList,
             Command::Detach,
-            Command::Tail {
+            Command::Tail(TimelineQuery {
                 since_ms: 5000,
                 tracks: Some(vec![TrackKind::Network]),
                 source: Some(Source::Main),
+                target: Some("workspace".to_owned()),
+                grep: Some("extension".to_owned()),
+                extension: Some("modular.local-sdk-view-showcase".to_owned()),
+                limit: Some(25),
+            }),
+            Command::Errors {
+                query: TimelineQuery {
+                    since_ms: 60_000,
+                    tracks: None,
+                    source: None,
+                    target: None,
+                    grep: None,
+                    extension: None,
+                    limit: None,
+                },
+                explain: true,
             },
             Command::Eval { target: target.clone(), expr: "1+1".to_owned() },
             Command::Ready { target: target.clone() },
@@ -153,7 +194,25 @@ mod tests {
                 reference: "e1".to_owned(),
                 text: "x".to_owned(),
             },
-            Command::Lens { target, source: "return 1".to_owned(), args: vec!["a".to_owned()] },
+            Command::Lens {
+                target: target.clone(),
+                source: "return 1".to_owned(),
+                args: vec!["a".to_owned()],
+            },
+            Command::ExtensionBundle {
+                target,
+                source: "return 1".to_owned(),
+                extension_id: "modular.example".to_owned(),
+                query: TimelineQuery {
+                    since_ms: 30_000,
+                    tracks: None,
+                    source: None,
+                    target: None,
+                    grep: None,
+                    extension: Some("modular.example".to_owned()),
+                    limit: Some(200),
+                },
+            },
             Command::Ignore(IgnoreOp::Add("noise".to_owned())),
             Command::Subscribe { since_ms: 30_000 },
         ];
@@ -171,6 +230,8 @@ mod tests {
             title: "Workspace".to_owned(),
             url: "app://x".to_owned(),
             events: 42,
+            extension_id: None,
+            purpose: None,
         });
         // A Log event is the collision-prone one; wrapping it in both Frame shapes guards the
         // envelope without re-testing every track (that's `timeline`'s job).

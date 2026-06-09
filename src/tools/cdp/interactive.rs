@@ -551,7 +551,9 @@ fn apply_target(command: &mut Command, target: &Option<String>) {
         | Command::Snap { target, .. }
         | Command::Click { target, .. }
         | Command::Fill { target, .. }
-        | Command::Lens { target, .. } => target,
+        | Command::Lens { target, .. }
+        | Command::ExtensionBundle { target, .. } => target,
+        Command::Tail(query) | Command::Errors { query, .. } => &mut query.target,
         _ => return,
     };
     if slot.is_none() {
@@ -574,6 +576,8 @@ struct TargetEntry {
     kind: TargetKind,
     url: String,
     events: usize,
+    extension_id: Option<String>,
+    purpose: Option<String>,
 }
 
 impl TargetEntry {
@@ -583,6 +587,8 @@ impl TargetEntry {
             kind: activity.kind,
             url: activity.url,
             events: activity.events,
+            extension_id: activity.extension_id,
+            purpose: activity.purpose,
         }
     }
 
@@ -591,10 +597,17 @@ impl TargetEntry {
     }
 
     fn score(&self, needle: &str) -> Option<u16> {
-        [self.label.as_str(), self.url.as_str(), self.kind.as_str()]
-            .into_iter()
-            .filter_map(|field| fuzzy::score_ci(field, needle))
-            .min()
+        [
+            Some(self.label.as_str()),
+            Some(self.url.as_str()),
+            Some(self.kind.as_str()),
+            self.extension_id.as_deref(),
+            self.purpose.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|field| fuzzy::score_ci(field, needle))
+        .min()
     }
 }
 
@@ -924,12 +937,19 @@ fn picker_row(
 
     let focused = current.as_ref().is_some_and(|focus| label_matches(&entry.label, focus));
     let dot = if focused { "● " } else { "  " };
+    let meta = entry
+        .extension_id
+        .as_deref()
+        .or(entry.purpose.as_deref())
+        .map(|value| format!("  {}", truncate(value, 28)))
+        .unwrap_or_default();
     Line::from(vec![
         Span::styled(marker, Style::default().fg(Color::Cyan)),
         Span::styled(dot, Style::default().fg(Color::Green)),
         Span::styled(format!("{:<9}", entry.kind.as_str()), Style::default().fg(Color::DarkGray)),
         Span::styled(format!("{:<40}", truncate(&entry.label, 40)), base),
         Span::styled(format!("{:>8}", compact(entry.events)), Style::default().fg(Color::Cyan)),
+        Span::styled(meta, Style::default().fg(Color::DarkGray)),
     ])
 }
 
@@ -937,10 +957,14 @@ fn render_help(frame: &mut TuiFrame, area: Rect) {
     let body = vec![
         section("OBSERVE"),
         entry("tail [--since 5s] [--track ..] [--source ..]", "slice the live feed"),
-        entry("console · net · ws", "track-filtered slices"),
+        entry("console · net · ws [--grep ..] [--extension ..]", "filtered slices"),
+        entry("errors [--explain]", "what's broken — deduped, never silently lossy"),
         section("PROBE"),
         entry("eval <expr> · heap · targets · snap [-i]", "one-shot queries"),
         entry("ready", "is the workbench up? selected target + why"),
+        section("EXTENSIONS"),
+        entry("lens extensions -- <id>", "runtime graph + webview target diagnosis"),
+        entry("ext doctor <id> · ext bundle <id>", "diagnosis plus bounded timeline"),
         section("INTERACT"),
         entry("click @ref · fill @ref <text>", "drive the target (refs from snap)"),
         section("FOCUS & FILTER"),

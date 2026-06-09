@@ -20,6 +20,6 @@ pub use discovery::{
 pub use ports::listening_ports;
 pub use target::{select, select_active, ScoreReason, Target, TargetKind, TargetScore};
 pub use timeline::{
-    ConsoleLine, ExceptionInfo, LogEntry, NetEvent, NetPhase, Source, Timeline, TimelineEvent,
-    Track, TrackKind, WsDir, WsFrame,
+    group_errors, ConsoleLine, ErrorGroup, ErrorReport, ExceptionInfo, LogEntry, NetEvent,
+    NetPhase, Source, Timeline, TimelineEvent, Track, TrackKind, WsDir, WsFrame,
 };
