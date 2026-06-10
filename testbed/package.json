@@ -1,0 +1,17 @@
+{
+  "name": "kit-testbed",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Electron playground that emits errors, network traffic, and state changes on demand so kit cdp can be verified against a live app.",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "overrides": {
+    "semver": "7.7.1",
+    "@types/node": "22.10.5"
+  },
+  "devDependencies": {
+    "electron": "^42.4.0"
+  }
+}

@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>kit testbed</title>
+    <style>
+      body { font: 14px/1.5 -apple-system, sans-serif; margin: 1.5rem; max-width: 64rem; }
+      section { border: 1px solid #ccc; border-radius: 8px; padding: 0.75rem 1rem; margin-bottom: 1rem; }
+      h2 { font-size: 1rem; margin: 0 0 0.5rem; }
+      button { margin: 0.15rem 0.3rem 0.15rem 0; }
+      label { display: inline-block; margin-right: 1rem; }
+      #toasts div { background: #2a6; color: white; padding: 0.4rem 0.8rem; border-radius: 6px; margin-top: 0.4rem; width: fit-content; }
+      #toasts div.error { background: #c33; }
+      .cart-item { margin: 0.1rem 0; }
+    </style>
+  </head>
+  <body>
+    <h1>kit testbed</h1>
+    <p id="api-info">api: connecting…</p>
+
+    <section aria-label="console">
+      <h2>Console</h2>
+      <button id="log-info">log info</button>
+      <button id="log-warn">log warn</button>
+      <button id="log-error">log error</button>
+      <button id="throw-exception">throw exception</button>
+      <button id="unhandled-rejection">unhandled rejection</button>
+      <button id="burst-logs">burst logs</button>
+    </section>
+
+    <section aria-label="network">
+      <h2>Network</h2>
+      <button id="fetch-ok">fetch ok</button>
+      <button id="fetch-500">fetch 500</button>
+      <button id="fetch-404">fetch 404</button>
+      <button id="fetch-slow">fetch slow</button>
+      <button id="fetch-flaky">fetch flaky</button>
+    </section>
+
+    <section aria-label="websocket">
+      <h2>WebSocket</h2>
+      <button id="ws-send">ws send ping</button>
+      <span id="ws-status" role="status" aria-label="websocket status">disconnected</span>
+    </section>
+
+    <section aria-label="saving">
+      <h2>Async save</h2>
+      <button id="save-settings">Save settings</button>
+      <button id="save-failing">Save (will fail)</button>
+      <span id="save-status" role="status" aria-label="save status">idle</span>
+      <div id="toasts"></div>
+    </section>
+
+    <section aria-label="state">
+      <h2>State</h2>
+      <button id="increment">increment counter</button>
+      <button id="ticker-toggle">start ticker</button>
+      counter: <output id="counter-value" aria-label="counter value">0</output>
+      <div>
+        <button id="add-item">add item</button>
+        <button id="remove-item">remove item</button>
+        <ul id="cart"></ul>
+      </div>
+    </section>
+
+    <section aria-label="form">
+      <h2>Form</h2>
+      <form id="signup">
+        <label>Name <input id="name" name="name" type="text" /></label>
+        <label>Flavor
+          <select id="flavor" name="flavor">
+            <option>vanilla</option>
+            <option>chocolate</option>
+            <option>strawberry</option>
+          </select>
+        </label>
+        <label>Subscribe <input id="subscribe" name="subscribe" type="checkbox" /></label>
+        <button type="submit">Submit form</button>
+      </form>
+      <div id="form-result"></div>
+    </section>
+
+    <section aria-label="navigation">
+      <h2>Navigation</h2>
+      <a id="goto-page2" href="page2.html">go to page two</a>
+    </section>
+
+    <script src="renderer.js"></script>
+  </body>
+</html>

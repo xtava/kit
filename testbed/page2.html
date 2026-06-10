@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>kit testbed — page two</title>
+    <style>
+      body { font: 14px/1.5 -apple-system, sans-serif; margin: 1.5rem; }
+    </style>
+  </head>
+  <body>
+    <h1>Page Two</h1>
+    <button id="page2-button">page two button</button>
+    <a id="back" href="index.html">back to playground</a>
+    <script>
+      const apiPort = new URLSearchParams(location.search).get('api');
+      console.log('[testbed] page two loaded');
+      document.getElementById('back').href = `index.html?api=${apiPort}`;
+      document.getElementById('page2-button').addEventListener('click', () => {
+        console.log('[testbed] page two button clicked');
+      });
+    </script>
+  </body>
+</html>
