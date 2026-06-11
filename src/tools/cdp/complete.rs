@@ -324,10 +324,13 @@ fn value_flag<'a>(node: &'a clap::Command, long: &str) -> Option<&'a clap::Arg> 
     })
 }
 
-/// Rank a candidate pool against the typed word. A match on the insert text always outranks a
-/// match that only hit the hint — hints exist so an element can be found by its name, not to
-/// shadow the words being typed.
+/// Rank a candidate pool against the typed word. Fuzzy scores are lower-is-better; a match on
+/// the insert text always outranks a match that only hit the hint — hints exist so an element
+/// can be found by its name, not to shadow the words being typed. A leading `@` is the element
+/// operator, not part of the name: it is stripped before hint matching, and a bare `@` therefore
+/// narrows to the `@ref` inserts alone.
 fn rank(pool: Vec<Candidate>, needle: &str) -> Vec<Candidate> {
+    let by_name = needle.trim_start_matches('@');
     let mut ranked: Vec<(u32, Candidate)> = pool
         .into_iter()
         .filter_map(|candidate| {
@@ -335,14 +338,15 @@ fn rank(pool: Vec<Candidate>, needle: &str) -> Vec<Candidate> {
                 return Some((0, candidate));
             }
             match fuzzy::score_ci(&candidate.insert, needle) {
-                Some(score) => Some((u32::from(score) + 10_000, candidate)),
-                None => fuzzy::score_ci(&candidate.hint, needle)
-                    .map(|score| (u32::from(score), candidate)),
+                Some(score) => Some((u32::from(score), candidate)),
+                None if by_name.is_empty() => None,
+                None => fuzzy::score_ci(&candidate.hint, by_name)
+                    .map(|score| (10_000 + u32::from(score), candidate)),
             }
         })
         .collect();
     if !needle.is_empty() {
-        ranked.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+        ranked.sort_by_key(|(score, _)| *score);
     }
     ranked.into_iter().map(|(_, candidate)| candidate).collect()
 }
@@ -568,6 +572,17 @@ mod tests {
         assert!(ghost("click sv", &ctx()).is_none());
         // A fully typed word has no remainder to show.
         assert!(ghost("verify", &Context::default()).is_none());
+    }
+
+    /// `@` is the ref trigger by construction: it matches only `@eN` inserts, so the menu
+    /// narrows to elements; `@` plus letters keeps narrowing by element *name* via the hint.
+    #[test]
+    fn at_sign_narrows_to_refs_then_by_name() {
+        let at = complete("click @", &ctx()).unwrap();
+        assert_eq!(names(&at), vec!["@e23"], "bare @ shows refs only");
+        let by_name = complete("click @sav", &ctx()).unwrap();
+        assert_eq!(names(&by_name), vec!["@e23"], "name narrows through the hint");
+        assert!(complete("click @zzz", &ctx()).is_none(), "no element matches");
     }
 
     /// Multi-value trailing positionals keep their meaning for every following word.

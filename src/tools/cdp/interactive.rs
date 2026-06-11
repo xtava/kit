@@ -140,14 +140,19 @@ struct Repl {
     pending_copy: Option<String>,
     /// Live data the completion engine draws on beyond the static grammar.
     complete_ctx: complete::Context,
-    /// The open completion popup, if any: candidates for the word at `start`.
-    completion: Option<CompletionState>,
+    /// The always-on suggestion menu, when the current word has candidates and isn't muted.
+    suggestions: Option<Suggestions>,
+    /// Word start Esc silenced — the menu stays hidden until the cursor enters a new word.
+    muted_at: Option<usize>,
 }
 
-struct CompletionState {
+/// The always-on suggestion menu: candidates for the word under the cursor, recomputed after
+/// every edit. `selected: None` is the passive display — Enter still submits and typing still
+/// types; Tab/↓ engage a selection, which Enter/→ then accept.
+struct Suggestions {
     candidates: Vec<complete::Candidate>,
-    selected: usize,
     start: usize,
+    selected: Option<usize>,
 }
 
 impl Repl {
@@ -179,7 +184,8 @@ impl Repl {
                 targets: Vec::new(),
                 refs: Vec::new(),
             },
-            completion: None,
+            suggestions: None,
+            muted_at: None,
         }
     }
 
@@ -241,11 +247,11 @@ impl Repl {
             return Flow::Continue;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.completion = None;
             return match key.code {
                 KeyCode::Char('c') if self.input.value().is_empty() => Flow::Quit,
                 KeyCode::Char('c') | KeyCode::Char('u') => {
                     self.input.clear();
+                    self.refresh_suggestions();
                     Flow::Continue
                 }
                 KeyCode::Char('d') => Flow::Quit,
@@ -258,27 +264,16 @@ impl Repl {
                 // with scrolling the feed.
                 KeyCode::Char('p') => {
                     self.history_prev();
+                    self.refresh_suggestions();
                     Flow::Continue
                 }
                 KeyCode::Char('n') => {
                     self.history_next();
+                    self.refresh_suggestions();
                     Flow::Continue
                 }
                 _ => Flow::Continue,
             };
-        }
-        if self.completion.is_some() {
-            match key.code {
-                KeyCode::Tab | KeyCode::Down => self.cycle_completion(1),
-                KeyCode::BackTab | KeyCode::Up => self.cycle_completion(-1),
-                KeyCode::Enter | KeyCode::Right => self.accept_completion(),
-                KeyCode::Esc => self.completion = None,
-                _ => {
-                    self.input.apply_key(key);
-                    self.refresh_completion();
-                }
-            }
-            return Flow::Continue;
         }
         // While scrolled (reviewing history), `c`/`y` yank the view — they can't shadow typing here
         // because the prompt isn't in compose mode. Pinned to live, they're ordinary characters.
@@ -286,16 +281,31 @@ impl Repl {
             self.copy_view();
             return Flow::Continue;
         }
+
+        // The suggestion menu is non-modal: visible whenever the word has candidates, passive
+        // until ⇥/↓ engage a selection. Enter only ever accepts an *engaged* selection — a plain
+        // Enter always submits the line.
+        let engaged = self.engaged();
+        let menu = self.suggestions.is_some();
         match key.code {
+            KeyCode::Enter if engaged => self.accept_selected(),
             KeyCode::Enter => return self.submit(async_tx),
-            // Tab: target picker on an empty prompt, completion popup while typing.
             KeyCode::Tab if self.input.value().is_empty() => self.open_picker(async_tx),
-            KeyCode::Tab => self.open_completion(),
-            // The arrows drive the feed — ↑/↓ scroll (the first press from live enters the scrolled
-            // state), ←/→ pan wide lines once scrolled. Command history is on Ctrl+P/N (below), the
-            // readline pairing, so it never contends with scrolling.
+            KeyCode::Tab if menu => self.cycle_selection(1),
+            // Tab on a muted/empty menu re-summons it for this word.
+            KeyCode::Tab => {
+                self.muted_at = None;
+                self.refresh_suggestions();
+                self.cycle_selection(1);
+            }
+            KeyCode::BackTab if menu => self.cycle_selection(-1),
+            // With a menu up the vertical arrows drive it; the feed keeps PgUp/PgDn (and the
+            // arrows whenever no menu is showing).
+            KeyCode::Down if menu => self.cycle_selection(1),
+            KeyCode::Up if menu => self.cycle_selection(-1),
             KeyCode::Up => self.scroll_by(-1),
             KeyCode::Down => self.scroll_by(1),
+            KeyCode::Right if engaged => self.accept_selected(),
             // → at the end of the line accepts the inline ghost, the fish-shell pairing.
             KeyCode::Right
                 if self.input.cursor() == self.input.value().len() && self.ghost_acceptable() =>
@@ -310,18 +320,16 @@ impl Repl {
             }
             KeyCode::PageUp => self.page_up(),
             KeyCode::PageDown => self.page_down(),
-            // Back to the home view: pinned to live, panned fully left.
+            // Esc peels back one layer: selection → menu (muted for this word) → the feed view.
+            KeyCode::Esc if engaged => self.disengage(),
+            KeyCode::Esc if menu => self.mute_suggestions(),
             KeyCode::End | KeyCode::Esc => {
                 self.view_top = None;
                 self.view_left = 0;
             }
             _ => {
                 self.input.apply_key(key);
-                // Entering a fresh slot (word boundary) surfaces its options unprompted; Esc
-                // closes, and nothing reopens until the next slot.
-                if matches!(key.code, KeyCode::Char(' ')) {
-                    self.open_completion();
-                }
+                self.refresh_suggestions();
             }
         }
         Flow::Continue
@@ -330,6 +338,8 @@ impl Repl {
     fn submit(&mut self, async_tx: &UnboundedSender<Async>) -> Flow {
         let line = self.input.value().trim().to_owned();
         self.input.clear();
+        self.suggestions = None;
+        self.muted_at = None;
         self.history_pos = None;
         if line.is_empty() {
             return Flow::Continue;
@@ -395,41 +405,91 @@ impl Repl {
         });
     }
 
-    // --- completion ---
+    // --- suggestions ---
 
-    fn open_completion(&mut self) {
-        let Some(found) = complete::complete(self.input.value(), &self.complete_ctx) else {
+    /// Re-project the menu from the current line. Runs after every edit: candidates for the
+    /// word under the cursor, hidden while the word is muted or already fully typed.
+    fn refresh_suggestions(&mut self) {
+        let line = self.input.value();
+        if line.is_empty() {
+            self.suggestions = None;
+            self.muted_at = None;
+            return;
+        }
+        let Some(found) = complete::complete(line, &self.complete_ctx) else {
+            self.suggestions = None;
             return;
         };
-        self.completion =
-            Some(CompletionState { candidates: found.candidates, selected: 0, start: found.start });
-        if self.completion.as_ref().is_some_and(|state| state.candidates.len() == 1) {
-            self.accept_completion();
+        // A mute lasts exactly as long as the word that earned it.
+        if self.muted_at.is_some_and(|at| at != found.start) {
+            self.muted_at = None;
+        }
+        if self.muted_at == Some(found.start) {
+            self.suggestions = None;
+            return;
+        }
+        // A word typed out in full is no longer a suggestion.
+        let word = line[found.start..].trim_start_matches(['\'', '"']);
+        if found.candidates.len() == 1 && found.candidates[0].insert == word {
+            self.suggestions = None;
+            return;
+        }
+        // Edits always return the menu to passive — selection is an explicit gesture.
+        self.suggestions =
+            Some(Suggestions { candidates: found.candidates, start: found.start, selected: None });
+    }
+
+    fn engaged(&self) -> bool {
+        self.suggestions.as_ref().is_some_and(|menu| menu.selected.is_some())
+    }
+
+    fn cycle_selection(&mut self, step: isize) {
+        let Some(menu) = &mut self.suggestions else {
+            return;
+        };
+        // A single candidate has nothing to choose between — engaging it accepts it.
+        if menu.selected.is_none() && menu.candidates.len() == 1 {
+            menu.selected = Some(0);
+            self.accept_selected();
+            return;
+        }
+        let len = menu.candidates.len() as isize;
+        menu.selected = Some(match menu.selected {
+            None if step > 0 => 0,
+            None => (len - 1) as usize,
+            Some(at) => ((at as isize + step).rem_euclid(len)) as usize,
+        });
+    }
+
+    fn disengage(&mut self) {
+        if let Some(menu) = &mut self.suggestions {
+            menu.selected = None;
         }
     }
 
-    fn refresh_completion(&mut self) {
-        match complete::complete(self.input.value(), &self.complete_ctx) {
-            Some(found) => {
-                self.completion = Some(CompletionState {
-                    candidates: found.candidates,
-                    selected: 0,
-                    start: found.start,
-                })
-            }
-            None => self.completion = None,
-        }
+    fn mute_suggestions(&mut self) {
+        self.muted_at = self.suggestions.as_ref().map(|menu| menu.start);
+        self.suggestions = None;
     }
 
-    fn cycle_completion(&mut self, step: isize) {
-        if let Some(state) = &mut self.completion {
-            let len = state.candidates.len() as isize;
-            state.selected = ((state.selected as isize + step).rem_euclid(len)) as usize;
-        }
+    fn accept_selected(&mut self) {
+        let Some(menu) = self.suggestions.take() else {
+            return;
+        };
+        let Some(candidate) = menu.selected.and_then(|at| menu.candidates.get(at)) else {
+            return;
+        };
+        let mut line = self.input.value()[..menu.start].to_owned();
+        line.push_str(&candidate.insert);
+        line.push(' ');
+        self.input.set(line);
+        self.refresh_suggestions();
     }
 
+    /// The inline ghost: hidden while a selection is engaged — the highlight already shows the
+    /// choice, and two competing previews would lie to one of themselves.
     fn ghost(&self) -> Option<complete::Ghost> {
-        if self.picker.is_some() || self.help_open {
+        if self.picker.is_some() || self.help_open || self.engaged() {
             return None;
         }
         complete::ghost(self.input.value(), &self.complete_ctx)
@@ -450,23 +510,7 @@ impl Repl {
         line.push_str(&ghost.text);
         line.push(' ');
         self.input.set(line);
-        self.completion = None;
-        // Landing in the next slot: surface what it offers, exactly as a typed space would.
-        self.open_completion();
-    }
-
-    fn accept_completion(&mut self) {
-        let Some(state) = self.completion.take() else {
-            return;
-        };
-        let Some(candidate) = state.candidates.get(state.selected) else {
-            return;
-        };
-        let mut line = self.input.value()[..state.start].to_owned();
-        line.push_str(&candidate.insert);
-        line.push(' ');
-        self.input.set(line);
-        self.open_completion();
+        self.refresh_suggestions();
     }
 
     // --- target picker ---
@@ -948,8 +992,8 @@ fn render(frame: &mut TuiFrame, repl: &mut Repl) {
     render_feed(frame, chunks[1], repl, lines);
     render_input(frame, chunks[2], repl);
 
-    if let Some(state) = &repl.completion {
-        render_completion(frame, area, state);
+    if let Some(menu) = &repl.suggestions {
+        render_suggestions(frame, area, menu);
     }
     if repl.help_open {
         render_help(frame, area);
@@ -959,12 +1003,13 @@ fn render(frame: &mut TuiFrame, repl: &mut Repl) {
     }
 }
 
-/// The completion popup: a short list floated just above the prompt, selection reversed. Shows a
-/// window around the selection when the list is longer than the popup.
-fn render_completion(frame: &mut TuiFrame, area: Rect, state: &CompletionState) {
+/// The suggestion menu: a short list floated just above the prompt. Passive rows are unlit —
+/// only an engaged selection (⇥/↓) is reversed. Shows a window around the selection when the
+/// list is longer than the menu.
+fn render_suggestions(frame: &mut TuiFrame, area: Rect, menu: &Suggestions) {
     const ROWS: usize = 8;
-    let shown = state.candidates.len().min(ROWS);
-    let offset = state.selected.saturating_sub(ROWS - 1);
+    let shown = menu.candidates.len().min(ROWS);
+    let offset = menu.selected.unwrap_or(0).saturating_sub(ROWS - 1);
     let width = area.width.min(72);
     let popup = Rect {
         x: area.x,
@@ -973,14 +1018,14 @@ fn render_completion(frame: &mut TuiFrame, area: Rect, state: &CompletionState) 
         height: shown as u16,
     };
 
-    let rows: Vec<Line<'static>> = state
+    let rows: Vec<Line<'static>> = menu
         .candidates
         .iter()
         .enumerate()
         .skip(offset)
         .take(shown)
         .map(|(index, candidate)| {
-            let style = if index == state.selected {
+            let style = if menu.selected == Some(index) {
                 Style::default().fg(Color::Black).bg(Color::Cyan)
             } else {
                 Style::default().bg(Color::DarkGray).fg(Color::White)
@@ -1166,7 +1211,8 @@ fn render_help(frame: &mut TuiFrame, area: Rect) {
         entry("track <list> | all", "filter the live pane by track"),
         entry("source main | renderer | all", "filter the live pane by side"),
         entry("ignore <substr> · clear · help · quit", "noise, this help, exit"),
-        entry("Tab (while typing)", "complete commands, flags, locators, flows — ⏎ accepts"),
+        entry("suggestions appear as you type", "ghost shows what's next; @ narrows to elements"),
+        entry("⇥/↓ select · ⏎/→ accept · esc hide", "plain ⏎ always submits the line"),
         section("MOVE & COPY"),
         entry("↑↓ · PgUp/PgDn", "scroll the timeline · End re-pins to live"),
         entry("←→", "pan to read lines wider than the pane"),
