@@ -546,6 +546,7 @@ fn apply_target(command: &mut Command, target: &Option<String>) {
     };
     let slot = match command {
         Command::Eval { target, .. }
+        | Command::Navigate { target, .. }
         | Command::Ready { target }
         | Command::Heap { target }
         | Command::Snap { target, .. }
@@ -553,7 +554,9 @@ fn apply_target(command: &mut Command, target: &Option<String>) {
         | Command::Fill { target, .. }
         | Command::Lens { target, .. }
         | Command::ExtensionBundle { target, .. } => target,
-        Command::Tail(query) | Command::Errors { query, .. } => &mut query.target,
+        Command::Tail(query) | Command::Brief { query, .. } | Command::Errors { query, .. } => {
+            &mut query.target
+        }
         _ => return,
     };
     if slot.is_none() {
@@ -785,7 +788,7 @@ fn parse_track_filter(rest: &[String]) -> Result<Option<Vec<TrackKind>>, String>
             Some(track) => tracks.push(track),
             None => {
                 return Err(format!(
-                    "unknown track '{name}' — console, exception, log, network, ws"
+                    "unknown track '{name}' — console, exception, log, network, ws, lifecycle"
                 ))
             }
         }
@@ -957,6 +960,7 @@ fn render_help(frame: &mut TuiFrame, area: Rect) {
     let body = vec![
         section("OBSERVE"),
         entry("tail [--since 5s] [--track ..] [--source ..]", "slice the live feed"),
+        entry("brief [--since 30s]", "agent-safe compact timeline"),
         entry("console · net · ws [--grep ..] [--extension ..]", "filtered slices"),
         entry("errors [--explain]", "what's broken — deduped, never silently lossy"),
         section("PROBE"),
@@ -1022,6 +1026,7 @@ fn track_color(kind: TrackKind) -> Color {
         TrackKind::Log => Color::Blue,
         TrackKind::Network => Color::Cyan,
         TrackKind::Ws => Color::Magenta,
+        TrackKind::Lifecycle => Color::Yellow,
     }
 }
 

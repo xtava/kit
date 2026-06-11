@@ -65,7 +65,7 @@ fn build_instance(
             }
         })
         .collect();
-    processes.sort_by(|a, b| b.pss_kib.cmp(&a.pss_kib));
+    processes.sort_by_key(|process| std::cmp::Reverse(process.pss_kib));
 
     Some(Instance {
         name: classify::wm_class(&main.args)

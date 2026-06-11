@@ -5,10 +5,11 @@
 //! `docs/adr/0003`).
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -21,7 +22,10 @@ use crate::cdp::{
     TrackKind,
 };
 
-use super::protocol::{Command, Frame, IgnoreOp, Query, Reply, TargetActivity, TimelineQuery};
+use super::protocol::{
+    Command, Frame, IgnoreOp, LaunchSettings, NetCommand, Query, Reply, TargetActivity,
+    TimelineQuery,
+};
 use super::readiness::{self, DocState, Readiness};
 use super::registry::{self, Record};
 use super::{format, snapshot};
@@ -53,11 +57,32 @@ struct State {
     /// saw but did not model — surfaced by the `errors` view so an un-decoded error type can't hide.
     undecoded_errors: usize,
     ignore: Vec<String>,
+    marks: HashMap<String, u64>,
+    settings: LaunchSettings,
+    net_rules: Vec<NetRule>,
     /// Live `Subscribe` clients. Each gets every emitted event; senders to dropped clients are
     /// pruned on the next `emit`.
     subscribers: Vec<mpsc::UnboundedSender<TimelineEvent>>,
     start: Instant,
     last_activity: Instant,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+enum NetRule {
+    Block { pattern: String },
+    Mock { method: String, pattern: String, status: u16, mime: Option<String>, body: String },
+}
+
+impl NetRule {
+    fn matches(&self, method: &str, url: &str) -> bool {
+        match self {
+            Self::Block { pattern } => contains_ci(url, pattern),
+            Self::Mock { method: rule_method, pattern, .. } => {
+                method.eq_ignore_ascii_case(rule_method) && contains_ci(url, pattern)
+            }
+        }
+    }
 }
 
 impl State {
@@ -144,6 +169,9 @@ pub async fn serve(
         tracks: tracks.clone(),
         undecoded_errors: 0,
         ignore: Vec::new(),
+        marks: HashMap::new(),
+        settings: LaunchSettings::default(),
+        net_rules: Vec::new(),
         subscribers: Vec::new(),
         start: Instant::now(),
         last_activity: Instant::now(),
@@ -242,9 +270,16 @@ async fn apply_event(state: &Shared, event: &CdpEvent, tracks: &[TrackKind]) {
                 target.kind,
                 cdp::TargetKind::Page | cdp::TargetKind::Webview | cdp::TargetKind::Iframe
             );
-            state.lock().unwrap().sessions.insert(session.to_owned(), target);
-            let conn = state.lock().unwrap().conn.clone();
+            let (conn, settings, has_rules) = {
+                let mut state = state.lock().unwrap();
+                state.sessions.insert(session.to_owned(), target);
+                (state.conn.clone(), state.settings.clone(), !state.net_rules.is_empty())
+            };
             enable_session(&conn, session, tracks, cascade).await;
+            apply_session_settings(&conn, session, &settings).await;
+            if has_rules {
+                enable_fetch(&conn, session).await;
+            }
         }
         "Target.detachedFromTarget" => {
             if let Some(session) = event.params.get("sessionId").and_then(Value::as_str) {
@@ -278,6 +313,7 @@ async fn apply_event(state: &Shared, event: &CdpEvent, tracks: &[TrackKind]) {
                 }
             }
         }
+        "Fetch.requestPaused" => handle_paused_request(state, event).await,
         _ => {
             let mut state = state.lock().unwrap();
             match Track::from_event(event) {
@@ -319,6 +355,11 @@ async fn enable_session(conn: &CdpConnection, session: &str, tracks: &[TrackKind
     for domain in domains {
         let _ = conn.call(Some(session), &format!("{domain}.enable"), json!({})).await;
     }
+    if tracks.contains(&TrackKind::Lifecycle) {
+        let _ = conn
+            .call(Some(session), "Page.setLifecycleEventsEnabled", json!({ "enabled": true }))
+            .await;
+    }
     if cascade {
         let _ = conn
             .call(
@@ -327,6 +368,116 @@ async fn enable_session(conn: &CdpConnection, session: &str, tracks: &[TrackKind
                 json!({ "autoAttach": true, "waitForDebuggerOnStart": false, "flatten": true }),
             )
             .await;
+    }
+}
+
+async fn apply_session_settings(conn: &CdpConnection, session: &str, settings: &LaunchSettings) {
+    if let Some(viewport) = settings.viewport.as_deref().and_then(parse_viewport) {
+        let (width, height) = viewport;
+        let _ = conn
+            .call(
+                Some(session),
+                "Emulation.setDeviceMetricsOverride",
+                json!({ "width": width, "height": height, "deviceScaleFactor": 1, "mobile": false }),
+            )
+            .await;
+    } else {
+        let _ = conn.call(Some(session), "Emulation.clearDeviceMetricsOverride", json!({})).await;
+    }
+    let _ = conn
+        .call(
+            Some(session),
+            "Emulation.setTimezoneOverride",
+            json!({ "timezoneId": settings.timezone.as_deref().unwrap_or("") }),
+        )
+        .await;
+    let _ = conn
+        .call(
+            Some(session),
+            "Emulation.setLocaleOverride",
+            json!({ "locale": settings.locale.as_deref().unwrap_or("") }),
+        )
+        .await;
+    let features = if settings.dark {
+        json!([{ "name": "prefers-color-scheme", "value": "dark" }])
+    } else {
+        json!([])
+    };
+    let _ = conn
+        .call(Some(session), "Emulation.setEmulatedMedia", json!({ "features": features }))
+        .await;
+    let (latency, download, upload) = match settings.throttle.as_deref() {
+        Some("slow-3g") => (400, 50_000, 50_000),
+        Some("fast-3g") => (150, 180_000, 84_375),
+        _ => (0, -1, -1),
+    };
+    let _ = conn
+        .call(
+            Some(session),
+            "Network.emulateNetworkConditions",
+            json!({
+                "offline": settings.offline,
+                "latency": latency,
+                "downloadThroughput": download,
+                "uploadThroughput": upload,
+            }),
+        )
+        .await;
+}
+
+async fn enable_fetch(conn: &CdpConnection, session: &str) {
+    let _ = conn
+        .call(
+            Some(session),
+            "Fetch.enable",
+            json!({ "patterns": [{ "urlPattern": "*", "requestStage": "Request" }] }),
+        )
+        .await;
+}
+
+async fn handle_paused_request(state: &Shared, event: &CdpEvent) {
+    let Some(request_id) = event.params.get("requestId").and_then(Value::as_str) else {
+        return;
+    };
+    let url = event.params.pointer("/request/url").and_then(Value::as_str).unwrap_or("");
+    let method = event.params.pointer("/request/method").and_then(Value::as_str).unwrap_or("GET");
+    let (conn, rule) = {
+        let state = state.lock().unwrap();
+        (state.conn.clone(), state.net_rules.iter().find(|rule| rule.matches(method, url)).cloned())
+    };
+    match rule {
+        Some(NetRule::Block { .. }) => {
+            let _ = conn
+                .call(
+                    event.session.as_deref(),
+                    "Fetch.failRequest",
+                    json!({ "requestId": request_id, "errorReason": "BlockedByClient" }),
+                )
+                .await;
+        }
+        Some(NetRule::Mock { status, mime, body, .. }) => {
+            let _ = conn
+                .call(
+                    event.session.as_deref(),
+                    "Fetch.fulfillRequest",
+                    json!({
+                        "requestId": request_id,
+                        "responseCode": status,
+                        "responseHeaders": [{ "name": "content-type", "value": mime.unwrap_or_else(|| "application/json".to_owned()) }],
+                        "body": base64_encode(body.as_bytes()),
+                    }),
+                )
+                .await;
+        }
+        None => {
+            let _ = conn
+                .call(
+                    event.session.as_deref(),
+                    "Fetch.continueRequest",
+                    json!({ "requestId": request_id }),
+                )
+                .await;
+        }
     }
 }
 
@@ -499,7 +650,20 @@ async fn dispatch(
         Command::Status => status_reply(state, json),
         Command::Targets => targets_reply(state, json),
         Command::Tail(query) => tail_reply(state, query, json),
+        Command::Brief { query, tail, groups } => brief_reply(state, query, tail, groups, json),
         Command::Errors { query, explain } => errors_reply(state, query, explain, json),
+        Command::Configure(settings) => configure_reply(state, settings).await,
+        Command::Navigate { target, url } => navigate_reply(state, target, url).await,
+        Command::LaunchLog => launch_log_reply(state, json),
+        Command::State { visual } => state_reply(state, visual, json).await,
+        Command::Mark { name } => mark_reply(state, name, json),
+        Command::After { mark, idle_ms, timeout_ms } => {
+            after_reply(state, mark, idle_ms, timeout_ms, json).await
+        }
+        Command::Bundle { since, include, include_secrets } => {
+            bundle_reply(state, since, include, include_secrets, json)
+        }
+        Command::Net(command) => net_reply(state, command, json).await,
         Command::Eval { target, expr } => {
             run_in_target(state, target, json, |conn, session| evaluate(conn, session, expr)).await
         }
@@ -518,6 +682,15 @@ async fn dispatch(
         Command::Click { target, reference } => click_reply(state, target, reference).await,
         Command::Fill { target, reference, text } => {
             fill_reply(state, target, reference, text).await
+        }
+        Command::CloseBrowser => {
+            let conn = state.lock().unwrap().conn.clone();
+            let reply = match conn.call(None, "Browser.close", json!({})).await {
+                Ok(_) => Reply::ok("browser closed"),
+                Err(error) => Reply::fail(error.to_string()),
+            };
+            let _ = shutdown.send(()).await;
+            reply
         }
         Command::Detach => {
             let _ = shutdown.send(()).await;
@@ -581,20 +754,43 @@ fn target_list_reply(state: &Shared) -> Reply {
 }
 
 fn tail_reply(state: &Shared, query: TimelineQuery, json: bool) -> Reply {
-    let events = collect_timeline(state, &query);
-    Reply::ok(format::events(&events, json))
+    match collect_timeline(state, &query) {
+        Ok(events) => Reply::ok(format::events(&events, json)),
+        Err(error) => Reply::fail(error),
+    }
+}
+
+fn brief_reply(
+    state: &Shared,
+    query: TimelineQuery,
+    tail: usize,
+    groups: usize,
+    json: bool,
+) -> Reply {
+    match collect_brief_timeline(state, &query) {
+        Ok((events, meta)) => Reply::ok(format::brief(&events, meta, tail, groups, json)),
+        Err(error) => Reply::fail(error),
+    }
 }
 
 fn errors_reply(state: &Shared, query: TimelineQuery, explain: bool, json: bool) -> Reply {
     let guard = state.lock().unwrap();
     let now = guard.now_ms();
-    let saturated = guard.timeline.is_saturated_for(now, query.since_ms);
+    let since_ms = match query_window_ms(&guard, now, &query) {
+        Ok(window) => window,
+        Err(error) => return Reply::fail(error),
+    };
+    let saturated = guard.timeline.is_saturated_for(now, since_ms);
     let evicted = guard.timeline.evicted();
     let undecoded = guard.undecoded_errors;
     drop(guard);
 
+    let events = match collect_timeline(state, &query) {
+        Ok(events) => events,
+        Err(error) => return Reply::fail(error),
+    };
     let report = cdp::ErrorReport {
-        groups: cdp::group_errors(&collect_timeline(state, &query)),
+        groups: cdp::group_errors(&events),
         evicted: Some(evicted),
         undecoded,
         saturated,
@@ -602,12 +798,13 @@ fn errors_reply(state: &Shared, query: TimelineQuery, explain: bool, json: bool)
     Reply::ok(format::errors(&report, explain, json))
 }
 
-fn collect_timeline(state: &Shared, query: &TimelineQuery) -> Vec<TimelineEvent> {
+fn collect_timeline(state: &Shared, query: &TimelineQuery) -> Result<Vec<TimelineEvent>, String> {
     let state = state.lock().unwrap();
     let now = state.now_ms();
+    let since_ms = query_window_ms(&state, now, query)?;
     let mut events: Vec<TimelineEvent> = state
         .timeline
-        .since(now, query.since_ms, query.tracks.as_deref(), query.source)
+        .since(now, since_ms, query.tracks.as_deref(), query.source)
         .into_iter()
         .filter(|event| !state.is_suppressed(event))
         .filter(|event| event_matches(event, query))
@@ -619,7 +816,400 @@ fn collect_timeline(state: &Shared, query: &TimelineQuery) -> Vec<TimelineEvent>
         }
     }
 
-    events
+    Ok(events)
+}
+
+fn collect_brief_timeline(
+    state: &Shared,
+    query: &TimelineQuery,
+) -> Result<(Vec<TimelineEvent>, format::BriefMeta), String> {
+    let state = state.lock().unwrap();
+    let now = state.now_ms();
+    let since_ms = query_window_ms(&state, now, query)?;
+    let saturated = state.timeline.is_saturated_for(now, since_ms);
+    let evicted = state.timeline.evicted();
+    let undecoded = state.undecoded_errors;
+    let mut matching_events = 0;
+    let mut suppressed_by_ignore = 0;
+    let mut events = Vec::new();
+
+    for event in state.timeline.since(now, since_ms, query.tracks.as_deref(), query.source) {
+        if !event_matches(&event, query) {
+            continue;
+        }
+        matching_events += 1;
+        if state.is_suppressed(&event) {
+            suppressed_by_ignore += 1;
+        } else {
+            events.push(event);
+        }
+    }
+
+    let mut clipped_by_limit = 0;
+    if let Some(limit) = query.limit {
+        if events.len() > limit {
+            clipped_by_limit = events.len() - limit;
+            events = events.split_off(clipped_by_limit);
+        }
+    }
+
+    Ok((
+        events,
+        format::BriefMeta {
+            window_ms: since_ms,
+            matching_events,
+            suppressed_by_ignore,
+            clipped_by_limit,
+            evicted: Some(evicted),
+            undecoded,
+            saturated,
+        },
+    ))
+}
+
+fn query_window_ms(state: &State, now: u64, query: &TimelineQuery) -> Result<u64, String> {
+    let Some(mark) = query.since_mark.as_ref() else {
+        return Ok(query.since_ms);
+    };
+    let Some(at_ms) = state.marks.get(mark) else {
+        return Err(format!("unknown mark '{mark}'"));
+    };
+    Ok(now.saturating_sub(*at_ms))
+}
+
+async fn configure_reply(state: &Shared, settings: LaunchSettings) -> Reply {
+    let (conn, sessions) = {
+        let mut state = state.lock().unwrap();
+        state.settings = settings.clone();
+        (state.conn.clone(), state.sessions.keys().cloned().collect::<Vec<_>>())
+    };
+    for session in sessions {
+        apply_session_settings(&conn, &session, &settings).await;
+    }
+    Reply::ok("configured")
+}
+
+async fn navigate_reply(state: &Shared, target: Option<String>, url: String) -> Reply {
+    let resolved = {
+        let state = state.lock().unwrap();
+        state.resolve(target.as_deref()).map(|(session, _)| (state.conn.clone(), session))
+    };
+    let Some((conn, session)) = resolved else {
+        return Reply::fail(no_target());
+    };
+    push_marker(state, Source::Renderer, &format!("navigate {url}"));
+    match conn.call(Some(&session), "Page.navigate", json!({ "url": url })).await {
+        Ok(_) => Reply::ok("navigated"),
+        Err(error) => Reply::fail(error.to_string()),
+    }
+}
+
+fn launch_log_reply(state: &Shared, json: bool) -> Reply {
+    let query = TimelineQuery {
+        since_ms: 10_000,
+        since_mark: Some("launch".to_owned()),
+        tracks: None,
+        source: None,
+        target: None,
+        grep: None,
+        extension: None,
+        limit: None,
+    };
+    let events = match collect_timeline(state, &query) {
+        Ok(events) => events,
+        Err(error) => return Reply::fail(error),
+    };
+    if json {
+        return Reply::ok(serde_json::to_string_pretty(&events).unwrap_or_default());
+    }
+    let mut lines: Vec<String> = events.iter().map(format::event_line).collect();
+    if lines.is_empty() {
+        lines.push("(no launch events captured)".to_owned());
+    }
+    lines.push("raw    kit cdp tail --since-mark launch".to_owned());
+    Reply::ok(lines.join("\n"))
+}
+
+async fn state_reply(state: &Shared, visual: bool, json: bool) -> Reply {
+    let (name, resolved, recent_errors, failed_network, settings, rules, launch) = {
+        let state = state.lock().unwrap();
+        let now = state.now_ms();
+        let resolved =
+            state.resolve(None).map(|(session, target)| (state.conn.clone(), session, target));
+        let recent_errors = state
+            .timeline
+            .since(now, 60_000, None, None)
+            .into_iter()
+            .filter(|event| event.track.is_error())
+            .rev()
+            .take(5)
+            .collect::<Vec<_>>();
+        let failed_network = state
+            .timeline
+            .since(now, 60_000, Some(&[TrackKind::Network]), None)
+            .into_iter()
+            .filter(|event| event.track.is_error())
+            .rev()
+            .take(5)
+            .collect::<Vec<_>>();
+        (
+            state.name.clone(),
+            resolved,
+            recent_errors,
+            failed_network,
+            state.settings.clone(),
+            state.net_rules.clone(),
+            registry::read_launch(&state.name),
+        )
+    };
+
+    let mut document = None;
+    let mut focus = None;
+    let mut screenshot = None;
+    let mut target_label = "none".to_owned();
+    if let Some((conn, session, target)) = resolved {
+        target_label = target.label();
+        document = probe_document(&conn, &session).await;
+        focus = evaluate(conn.clone(), session.clone(), FOCUS_PROBE.to_owned()).await.ok();
+        if visual {
+            screenshot = capture_screenshot(&conn, &session, &name).await.ok();
+        }
+    }
+
+    let value = json!({
+        "name": name,
+        "target": target_label,
+        "document": document,
+        "focus": focus,
+        "screenshot": screenshot,
+        "recentErrors": recent_errors,
+        "failedNetwork": failed_network,
+        "settings": settings,
+        "netRules": rules,
+        "launch": launch,
+        "rawCommands": {
+            "tail": format!("kit cdp tail --app {name}"),
+            "errors": format!("kit cdp errors --explain --app {name}")
+        }
+    });
+    if json {
+        return Reply::ok(serde_json::to_string_pretty(&value).unwrap_or_default());
+    }
+
+    let mut out = Vec::new();
+    out.push(format!("target    {target_label}"));
+    if let Some(doc) = value.get("document") {
+        let ready = doc.get("readyState").and_then(Value::as_str).unwrap_or("?");
+        let visible = doc.get("visibility").and_then(Value::as_str).unwrap_or("?");
+        out.push(format!("ready     {ready}, {visible}"));
+    }
+    if recent_errors.is_empty() {
+        out.push("errors    none".to_owned());
+    } else {
+        out.push(format!(
+            "errors    {} recent  raw: kit cdp errors --explain --app {name}",
+            recent_errors.len()
+        ));
+    }
+    if let Some(event) = failed_network.first() {
+        out.push(format!(
+            "network   {}  raw: kit cdp net show {} --app {name}",
+            format::event_line(event),
+            network_request_id(event).unwrap_or("?")
+        ));
+    }
+    if let Some(focus) = value.get("focus") {
+        out.push(format!("focus     {}", compact_value(focus)));
+    }
+    if let Some(path) = value.get("screenshot").and_then(Value::as_str) {
+        out.push(format!("screen    {path}"));
+    }
+    out.push(format!("rules     {}", rules.len()));
+    out.push(format!("raw       kit cdp tail --app {name}"));
+    Reply::ok(out.join("\n"))
+}
+
+fn mark_reply(state: &Shared, name: String, json: bool) -> Reply {
+    let mut state = state.lock().unwrap();
+    let at_ms = state.now_ms();
+    state.marks.insert(name.clone(), at_ms);
+    state.emit(TimelineEvent {
+        at_ms,
+        source: Source::Renderer,
+        target: "kit".to_owned(),
+        track: Track::Log(LogEntry {
+            level: "info".to_owned(),
+            source: "kit".to_owned(),
+            text: format!("mark {name}"),
+            url: None,
+            line: None,
+        }),
+    });
+    if json {
+        Reply::ok(json!({ "mark": name, "atMs": at_ms }).to_string())
+    } else {
+        Reply::ok(format!("marked {name} at +{at_ms}ms"))
+    }
+}
+
+async fn after_reply(
+    state: &Shared,
+    mark: String,
+    idle_ms: u64,
+    timeout_ms: u64,
+    json: bool,
+) -> Reply {
+    let started = Instant::now();
+    let mut last_len = state.lock().unwrap().timeline.len();
+    let mut idle_started = Instant::now();
+    loop {
+        sleep(Duration::from_millis(50)).await;
+        let len = state.lock().unwrap().timeline.len();
+        if len != last_len {
+            last_len = len;
+            idle_started = Instant::now();
+        }
+        if idle_started.elapsed() >= Duration::from_millis(idle_ms) {
+            break;
+        }
+        if started.elapsed() >= Duration::from_millis(timeout_ms) {
+            break;
+        }
+    }
+
+    let (events, ended) = {
+        let state = state.lock().unwrap();
+        let Some(&at_ms) = state.marks.get(&mark) else {
+            return Reply::fail(format!("unknown mark '{mark}'"));
+        };
+        let now = state.now_ms();
+        let events = state
+            .timeline
+            .since(now, now.saturating_sub(at_ms), None, None)
+            .into_iter()
+            .filter(|event| !state.is_suppressed(event))
+            .collect::<Vec<_>>();
+        let ended = if started.elapsed() >= Duration::from_millis(timeout_ms) {
+            format!("timeout after {timeout_ms}ms")
+        } else {
+            format!("idle after {idle_ms}ms")
+        };
+        (events, ended)
+    };
+    let errors = events.iter().filter(|event| event.track.is_error()).count();
+    let network = events.iter().filter(|event| matches!(event.track, Track::Network(_))).count();
+    let recent: Vec<String> = events.iter().rev().take(8).rev().map(format::event_line).collect();
+    let value = json!({
+        "mark": mark,
+        "ended": ended,
+        "events": events.len(),
+        "errors": errors,
+        "network": network,
+        "recent": recent,
+        "rawCommand": format!("kit cdp tail --since-mark {mark}")
+    });
+    if json {
+        return Reply::ok(serde_json::to_string_pretty(&value).unwrap_or_default());
+    }
+    let mut out = vec![
+        format!("after {mark}"),
+        format!("ended     {ended}"),
+        format!("events    {} total, {errors} errors, {network} network", events.len()),
+    ];
+    for line in recent {
+        out.push(format!("event     {line}"));
+    }
+    out.push(format!("raw       kit cdp tail --since-mark {mark}"));
+    Reply::ok(out.join("\n"))
+}
+
+fn bundle_reply(
+    state: &Shared,
+    since: Option<String>,
+    include: Vec<String>,
+    include_secrets: bool,
+    json: bool,
+) -> Reply {
+    let (name, events, settings, rules, launch) = {
+        let state = state.lock().unwrap();
+        let now = state.now_ms();
+        let window = match since.as_ref() {
+            Some(mark) => match state.marks.get(mark) {
+                Some(at_ms) => now.saturating_sub(*at_ms),
+                None => return Reply::fail(format!("unknown mark '{mark}'")),
+            },
+            None => 60_000,
+        };
+        (
+            state.name.clone(),
+            state.timeline.since(now, window, None, None),
+            state.settings.clone(),
+            state.net_rules.clone(),
+            registry::read_launch(&state.name),
+        )
+    };
+    let dir = registry::artifact_dir(&name).join(format!("bundle-{}", now_unix_ms()));
+    if let Err(error) =
+        write_bundle(&dir, &events, &settings, &rules, &launch, &include, include_secrets)
+    {
+        return Reply::fail(error.to_string());
+    }
+    if json {
+        Reply::ok(json!({ "bundle": dir, "events": events.len() }).to_string())
+    } else {
+        Reply::ok(format!("bundle {}\nevents {}", dir.display(), events.len()))
+    }
+}
+
+async fn net_reply(state: &Shared, command: NetCommand, json: bool) -> Reply {
+    match command {
+        NetCommand::Failed { query } => {
+            let events = match collect_timeline(state, &query) {
+                Ok(events) => events,
+                Err(error) => return Reply::fail(error),
+            }
+            .into_iter()
+            .filter(|event| event.track.is_error())
+            .collect::<Vec<_>>();
+            Reply::ok(format::events(&events, json))
+        }
+        NetCommand::Slow { query } => net_slow_reply(state, &query, json),
+        NetCommand::Show { request_id } => net_show_reply(state, &request_id, json),
+        NetCommand::Block { pattern } => {
+            let (conn, sessions) = {
+                let mut state = state.lock().unwrap();
+                state.net_rules.push(NetRule::Block { pattern });
+                (state.conn.clone(), state.sessions.keys().cloned().collect::<Vec<_>>())
+            };
+            for session in sessions {
+                enable_fetch(&conn, &session).await;
+            }
+            net_rules_reply(state, json)
+        }
+        NetCommand::Mock { method, pattern, body, status, mime } => {
+            let (conn, sessions) = {
+                let mut state = state.lock().unwrap();
+                state.net_rules.push(NetRule::Mock { method, pattern, body, status, mime });
+                (state.conn.clone(), state.sessions.keys().cloned().collect::<Vec<_>>())
+            };
+            for session in sessions {
+                enable_fetch(&conn, &session).await;
+            }
+            net_rules_reply(state, json)
+        }
+        NetCommand::Rules => net_rules_reply(state, json),
+        NetCommand::RulesClear => {
+            let (conn, sessions) = {
+                let mut state = state.lock().unwrap();
+                state.net_rules.clear();
+                (state.conn.clone(), state.sessions.keys().cloned().collect::<Vec<_>>())
+            };
+            for session in sessions {
+                let _ = conn.call(Some(&session), "Fetch.disable", json!({})).await;
+            }
+            net_rules_reply(state, json)
+        }
+    }
 }
 
 fn event_matches(event: &TimelineEvent, query: &TimelineQuery) -> bool {
@@ -670,7 +1260,10 @@ async fn extension_bundle_reply(
         }
     };
 
-    let timeline = collect_timeline(state, &query);
+    let timeline = match collect_timeline(state, &query) {
+        Ok(timeline) => timeline,
+        Err(error) => return Reply::fail(error),
+    };
     let bundle = json!({
         "extensionId": extension_id,
         "doctor": doctor,
@@ -720,6 +1313,10 @@ const READY_PROBE: &str = "(()=>{const b=document.body;return{\
     href:location.href,title:document.title,readyState:document.readyState,\
     visibility:document.visibilityState,focused:document.hasFocus(),\
     bodyTextLen:((b&&b.innerText)||'').trim().length};})()";
+
+const FOCUS_PROBE: &str = "(()=>{const el=document.activeElement;if(!el)return null;\
+const label=el.getAttribute('aria-label')||el.innerText||el.value||el.placeholder||'';\
+return{tag:el.tagName.toLowerCase(),role:el.getAttribute('role'),label:String(label).trim().slice(0,120)}})()";
 
 async fn ready_reply(state: &Shared, target: Option<String>, json: bool) -> Reply {
     let (name, candidates, resolved, recent_errors) = {
@@ -1031,6 +1628,373 @@ fn lens_context(state: &Shared) -> Value {
         "uptimeMs": state.now_ms(),
         "targets": targets,
     })
+}
+
+async fn capture_screenshot(conn: &CdpConnection, session: &str, name: &str) -> Result<String> {
+    let value = conn
+        .call(
+            Some(session),
+            "Page.captureScreenshot",
+            json!({ "format": "png", "captureBeyondViewport": false }),
+        )
+        .await?;
+    let data = value.get("data").and_then(Value::as_str).context("screenshot missing data")?;
+    let bytes = base64_decode(data).context("decode screenshot")?;
+    let path = registry::artifact_dir(name).join("latest.png");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, bytes)?;
+    Ok(path.display().to_string())
+}
+
+fn compact_value(value: &Value) -> String {
+    match value {
+        Value::Null => "none".to_owned(),
+        Value::String(text) => text.clone(),
+        other => serde_json::to_string(other).unwrap_or_else(|_| "unknown".to_owned()),
+    }
+}
+
+fn network_request_id(event: &TimelineEvent) -> Option<&str> {
+    match &event.track {
+        Track::Network(net) => Some(&net.request_id),
+        _ => None,
+    }
+}
+
+fn net_show_reply(state: &Shared, request_id: &str, json: bool) -> Reply {
+    let events: Vec<TimelineEvent> = {
+        let state = state.lock().unwrap();
+        let now = state.now_ms();
+        state
+            .timeline
+            .since(now, 10 * 60_000, Some(&[TrackKind::Network]), None)
+            .into_iter()
+            .filter(|event| network_request_id(event) == Some(request_id))
+            .collect()
+    };
+    Reply::ok(format::events(&events, json))
+}
+
+fn net_slow_reply(state: &Shared, query: &TimelineQuery, json: bool) -> Reply {
+    #[derive(Default)]
+    struct Row {
+        first_ms: u64,
+        last_ms: u64,
+        count: usize,
+        method: Option<String>,
+        url: Option<String>,
+        status: Option<u64>,
+        error: Option<String>,
+    }
+
+    let events = match collect_timeline(state, query) {
+        Ok(events) => events,
+        Err(error) => return Reply::fail(error),
+    };
+    let mut rows: HashMap<String, Row> = HashMap::new();
+    for event in events {
+        let Track::Network(net) = event.track else {
+            continue;
+        };
+        let row = rows.entry(net.request_id).or_insert_with(|| Row {
+            first_ms: event.at_ms,
+            last_ms: event.at_ms,
+            count: 0,
+            method: None,
+            url: None,
+            status: None,
+            error: None,
+        });
+        row.first_ms = row.first_ms.min(event.at_ms);
+        row.last_ms = row.last_ms.max(event.at_ms);
+        row.count += 1;
+        row.method = row.method.take().or(net.method);
+        row.url = row.url.take().or(net.url);
+        row.status = row.status.or(net.status);
+        row.error = row.error.take().or(net.error);
+    }
+
+    let mut rows: Vec<(String, Row)> = rows.into_iter().collect();
+    rows.sort_by_key(|(_, row)| std::cmp::Reverse(row.last_ms.saturating_sub(row.first_ms)));
+    rows.truncate(20);
+
+    if json {
+        let value: Vec<Value> = rows
+            .into_iter()
+            .map(|(request_id, row)| {
+                json!({
+                    "requestId": request_id,
+                    "durationMs": row.last_ms.saturating_sub(row.first_ms),
+                    "events": row.count,
+                    "method": row.method,
+                    "url": row.url,
+                    "status": row.status,
+                    "error": row.error,
+                    "rawCommand": format!("kit cdp net show {request_id}"),
+                })
+            })
+            .collect();
+        return Reply::ok(serde_json::to_string_pretty(&value).unwrap_or_default());
+    }
+
+    if rows.is_empty() {
+        return Reply::ok("no network requests".to_owned());
+    }
+    Reply::ok(
+        rows.into_iter()
+            .map(|(request_id, row)| {
+                let duration = row.last_ms.saturating_sub(row.first_ms);
+                let method = row.method.as_deref().unwrap_or("?");
+                let status = row
+                    .status
+                    .map(|status| status.to_string())
+                    .or(row.error)
+                    .unwrap_or_else(|| "-".to_owned());
+                let url = row.url.as_deref().unwrap_or("(unknown url)");
+                format!(
+                    "{duration:>5}ms {method:<6} {status:<18} {url}  req:{request_id} raw: kit cdp net show {request_id}"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+fn net_rules_reply(state: &Shared, json: bool) -> Reply {
+    let rules = state.lock().unwrap().net_rules.clone();
+    if json {
+        return Reply::ok(serde_json::to_string_pretty(&rules).unwrap_or_default());
+    }
+    if rules.is_empty() {
+        return Reply::ok("no network rules".to_owned());
+    }
+    Reply::ok(
+        rules
+            .iter()
+            .map(|rule| match rule {
+                NetRule::Block { pattern } => format!("block {pattern}"),
+                NetRule::Mock { method, pattern, status, mime, .. } => format!(
+                    "mock {method} {pattern} {status} {}",
+                    mime.as_deref().unwrap_or("application/json")
+                ),
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+fn write_bundle(
+    dir: &PathBuf,
+    events: &[TimelineEvent],
+    settings: &LaunchSettings,
+    rules: &[NetRule],
+    launch: &Option<registry::LaunchRecord>,
+    include: &[String],
+    include_secrets: bool,
+) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let redacted_note = if include_secrets { "none" } else { "cookies/auth/storage/bodies" };
+    std::fs::write(
+        dir.join("summary.md"),
+        format!(
+            "# CDP Bundle\n\nEvents: {}\nSecrets redacted: {redacted_note}\nIncludes: {}\n",
+            events.len(),
+            if include.is_empty() { "default".to_owned() } else { include.join(",") }
+        ),
+    )?;
+    let mut timeline = serde_json::to_value(events)?;
+    if !include_secrets {
+        redact_value(&mut timeline);
+    }
+    std::fs::write(dir.join("timeline.json"), serde_json::to_string_pretty(&timeline)?)?;
+    let mut errors = events
+        .iter()
+        .filter(|event| event.track.is_error())
+        .map(format::event_line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !include_secrets {
+        errors = redact_text(&errors);
+    }
+    std::fs::write(dir.join("errors.txt"), errors)?;
+    let network: Vec<&TimelineEvent> =
+        events.iter().filter(|event| matches!(event.track, Track::Network(_))).collect();
+    let mut network = serde_json::to_value(&network)?;
+    if !include_secrets {
+        redact_value(&mut network);
+    }
+    std::fs::write(
+        dir.join("network.har"),
+        serde_json::to_string_pretty(&json!({
+            "log": {
+                "version": "1.2",
+                "creator": { "name": "kit cdp", "version": env!("CARGO_PKG_VERSION") },
+                "entries": network,
+            }
+        }))?,
+    )?;
+    std::fs::create_dir_all(dir.join("screenshots"))?;
+    std::fs::create_dir_all(dir.join("snapshots"))?;
+    let mut environment = json!({
+        "settings": settings,
+        "netRules": rules,
+        "launch": launch,
+    });
+    if !include_secrets {
+        redact_value(&mut environment);
+    }
+    std::fs::write(dir.join("environment.json"), serde_json::to_string_pretty(&environment)?)?;
+    std::fs::write(
+        dir.join("redactions.json"),
+        serde_json::to_string_pretty(&json!({
+            "includeSecrets": include_secrets,
+            "redacted": redacted_note,
+        }))?,
+    )?;
+    Ok(())
+}
+
+fn redact_value(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, value) in map {
+                if sensitive_key(key) {
+                    *value = Value::String("[redacted]".to_owned());
+                } else {
+                    redact_value(value);
+                }
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                redact_value(value);
+            }
+        }
+        Value::String(text) => *text = redact_text(text),
+        _ => {}
+    }
+}
+
+fn redact_text(text: &str) -> String {
+    if !text.contains("://") && !text.contains('?') {
+        return text.to_owned();
+    }
+    text.split_whitespace().map(redact_url_token).collect::<Vec<_>>().join(" ")
+}
+
+fn redact_url_token(token: &str) -> String {
+    let Some((base, query_and_fragment)) = token.split_once('?') else {
+        return token.to_owned();
+    };
+    let (query, fragment) = query_and_fragment.split_once('#').unwrap_or((query_and_fragment, ""));
+    let query = query
+        .split('&')
+        .map(|pair| {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            if sensitive_key(key) {
+                format!("{key}=[redacted]")
+            } else if value.is_empty() {
+                key.to_owned()
+            } else {
+                format!("{key}={value}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    if fragment.is_empty() {
+        format!("{base}?{query}")
+    } else {
+        format!("{base}?{query}#{fragment}")
+    }
+}
+
+fn sensitive_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    if [
+        "body",
+        "postdata",
+        "post_data",
+        "requestbody",
+        "request_body",
+        "responsebody",
+        "response_body",
+    ]
+    .contains(&key.as_str())
+    {
+        return true;
+    }
+    [
+        "authorization",
+        "auth",
+        "cookie",
+        "credential",
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "apikey",
+        "api_key",
+        "accesskey",
+        "access_key",
+    ]
+    .iter()
+    .any(|needle| key.contains(needle))
+}
+
+fn parse_viewport(viewport: &str) -> Option<(u64, u64)> {
+    let (width, height) = viewport.split_once('x').or_else(|| viewport.split_once('X'))?;
+    Some((width.trim().parse().ok()?, height.trim().parse().ok()?))
+}
+
+const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn base64_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let triple = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+        for (shift, present) in [(18, true), (12, true), (6, chunk.len() > 1), (0, chunk.len() > 2)]
+        {
+            out.push(if present { BASE64[(triple >> shift & 0x3f) as usize] as char } else { '=' });
+        }
+    }
+    out
+}
+
+fn base64_decode(text: &str) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(text.len() / 4 * 3);
+    let mut buf = [0u8; 4];
+    let mut len = 0;
+    for byte in text.bytes().filter(|byte| !byte.is_ascii_whitespace()) {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => 64,
+            _ => bail!("invalid base64 byte"),
+        };
+        buf[len] = value;
+        len += 1;
+        if len == 4 {
+            let triple = ((buf[0] as u32) << 18)
+                | ((buf[1] as u32) << 12)
+                | (((buf[2] & 63) as u32) << 6)
+                | ((buf[3] & 63) as u32);
+            out.push((triple >> 16) as u8);
+            if buf[2] != 64 {
+                out.push((triple >> 8) as u8);
+            }
+            if buf[3] != 64 {
+                out.push(triple as u8);
+            }
+            len = 0;
+        }
+    }
+    Ok(out)
 }
 
 fn query_param(url: &str, key: &str) -> Option<String> {

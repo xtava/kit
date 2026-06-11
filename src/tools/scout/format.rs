@@ -26,7 +26,7 @@ pub fn role_breakdown(instance: &Instance) -> Vec<(String, usize, u64)> {
     }
     let mut rows: Vec<(String, usize, u64)> =
         aggregate.into_iter().map(|(label, (count, pss))| (label, count, pss)).collect();
-    rows.sort_by(|a, b| b.2.cmp(&a.2));
+    rows.sort_by_key(|row| std::cmp::Reverse(row.2));
     rows
 }
 

@@ -23,6 +23,13 @@ pub enum Command {
     Status,
     Targets,
     Tail(TimelineQuery),
+    /// Agent-safe Timeline compression: errors stay grouped with integrity facts, repeated non-error
+    /// rows collapse to counted groups, a short raw tail anchors recency, and omissions are counted.
+    Brief {
+        query: TimelineQuery,
+        tail: usize,
+        groups: usize,
+    },
     /// Error-shaped Timeline events, deduplicated into counted groups — the low-context "what's
     /// broken" view. Same filters as [`Command::Tail`]; the daemon collapses duplicates and reports
     /// the integrity facts (variants absorbed, ring eviction, undecoded events) alongside them.
@@ -31,6 +38,29 @@ pub enum Command {
         /// Expand each group's absorbed variants instead of one representative line — the audit view.
         explain: bool,
     },
+    Navigate {
+        target: Option<String>,
+        url: String,
+    },
+    Configure(LaunchSettings),
+    LaunchLog,
+    State {
+        visual: bool,
+    },
+    Mark {
+        name: String,
+    },
+    After {
+        mark: String,
+        idle_ms: u64,
+        timeout_ms: u64,
+    },
+    Bundle {
+        since: Option<String>,
+        include: Vec<String>,
+        include_secrets: bool,
+    },
+    Net(NetCommand),
     Eval {
         target: Option<String>,
         expr: String,
@@ -76,18 +106,31 @@ pub enum Command {
     Subscribe {
         since_ms: u64,
     },
+    CloseBrowser,
     Detach,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimelineQuery {
     pub since_ms: u64,
+    pub since_mark: Option<String>,
     pub tracks: Option<Vec<TrackKind>>,
     pub source: Option<Source>,
     pub target: Option<String>,
     pub grep: Option<String>,
     pub extension: Option<String>,
     pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchSettings {
+    pub viewport: Option<String>,
+    pub timezone: Option<String>,
+    pub locale: Option<String>,
+    pub dark: bool,
+    pub offline: bool,
+    pub throttle: Option<String>,
 }
 
 /// A Target annotated with how much it is actually streaming — what the picker ranks and filters by.
@@ -110,6 +153,17 @@ pub enum IgnoreOp {
     Add(String),
     List,
     Clear,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum NetCommand {
+    Failed { query: TimelineQuery },
+    Slow { query: TimelineQuery },
+    Show { request_id: String },
+    Block { pattern: String },
+    Mock { method: String, pattern: String, body: String, status: u16, mime: Option<String> },
+    Rules,
+    RulesClear,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -162,28 +216,88 @@ mod tests {
             Command::Status,
             Command::Targets,
             Command::TargetList,
+            Command::CloseBrowser,
             Command::Detach,
             Command::Tail(TimelineQuery {
                 since_ms: 5000,
                 tracks: Some(vec![TrackKind::Network]),
                 source: Some(Source::Main),
                 target: Some("workspace".to_owned()),
+                since_mark: None,
                 grep: Some("extension".to_owned()),
                 extension: Some("modular.local-sdk-view-showcase".to_owned()),
                 limit: Some(25),
             }),
+            Command::Brief {
+                query: TimelineQuery {
+                    since_ms: 5000,
+                    tracks: None,
+                    source: None,
+                    target: None,
+                    since_mark: None,
+                    grep: None,
+                    extension: None,
+                    limit: Some(100),
+                },
+                tail: 12,
+                groups: 8,
+            },
             Command::Errors {
                 query: TimelineQuery {
                     since_ms: 60_000,
                     tracks: None,
                     source: None,
                     target: None,
+                    since_mark: None,
                     grep: None,
                     extension: None,
                     limit: None,
                 },
                 explain: true,
             },
+            Command::Navigate { target: target.clone(), url: "http://localhost:3000".to_owned() },
+            Command::Configure(LaunchSettings {
+                viewport: Some("1440x1000".to_owned()),
+                timezone: Some("America/New_York".to_owned()),
+                locale: Some("fr-FR".to_owned()),
+                dark: true,
+                offline: false,
+                throttle: Some("slow-3g".to_owned()),
+            }),
+            Command::LaunchLog,
+            Command::State { visual: true },
+            Command::Mark { name: "before".to_owned() },
+            Command::After { mark: "before".to_owned(), idle_ms: 500, timeout_ms: 5000 },
+            Command::Bundle {
+                since: Some("before".to_owned()),
+                include: vec!["har".to_owned()],
+                include_secrets: false,
+            },
+            Command::Net(NetCommand::Failed {
+                query: TimelineQuery {
+                    since_ms: 10_000,
+                    tracks: Some(vec![TrackKind::Network]),
+                    source: None,
+                    target: None,
+                    since_mark: Some("before".to_owned()),
+                    grep: None,
+                    extension: None,
+                    limit: None,
+                },
+            }),
+            Command::Net(NetCommand::Slow {
+                query: TimelineQuery {
+                    since_ms: 10_000,
+                    tracks: Some(vec![TrackKind::Network]),
+                    source: None,
+                    target: None,
+                    since_mark: None,
+                    grep: Some("/api".to_owned()),
+                    extension: None,
+                    limit: Some(20),
+                },
+            }),
+            Command::Net(NetCommand::Show { request_id: "req_1".to_owned() }),
             Command::Eval { target: target.clone(), expr: "1+1".to_owned() },
             Command::Ready { target: target.clone() },
             Command::Heap { target: target.clone() },
@@ -208,6 +322,7 @@ mod tests {
                     tracks: None,
                     source: None,
                     target: None,
+                    since_mark: None,
                     grep: None,
                     extension: Some("modular.example".to_owned()),
                     limit: Some(200),

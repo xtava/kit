@@ -31,7 +31,7 @@ pub async fn enrich(instances: &mut [Instance]) {
 
         let mut targets = probe_all(probeable).await;
         correlate(instance, &mut targets);
-        targets.sort_by(|a, b| b.js_heap_kib.unwrap_or(0).cmp(&a.js_heap_kib.unwrap_or(0)));
+        targets.sort_by_key(|target| std::cmp::Reverse(target.js_heap_kib.unwrap_or(0)));
         instance.targets = targets;
     }
 }
@@ -103,7 +103,7 @@ fn correlate(instance: &mut Instance, targets: &mut [Target]) {
         .filter(|process| process.role == Role::Renderer)
         .map(|process| (process.pid, process.pss_kib))
         .collect();
-    renderers.sort_by(|a, b| b.1.cmp(&a.1));
+    renderers.sort_by_key(|renderer| std::cmp::Reverse(renderer.1));
 
     let mut windows: Vec<usize> = targets
         .iter()

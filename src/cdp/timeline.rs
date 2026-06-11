@@ -46,6 +46,7 @@ pub enum Track {
     Log(LogEntry),
     Network(NetEvent),
     Ws(WsFrame),
+    Lifecycle(LifecycleEvent),
 }
 
 /// A Track category, independent of any one event — for `--track` filtering and domain enabling.
@@ -57,11 +58,12 @@ pub enum TrackKind {
     Log,
     Network,
     Ws,
+    Lifecycle,
 }
 
 impl TrackKind {
-    pub const ALL: [TrackKind; 5] =
-        [Self::Console, Self::Exception, Self::Log, Self::Network, Self::Ws];
+    pub const ALL: [TrackKind; 6] =
+        [Self::Console, Self::Exception, Self::Log, Self::Network, Self::Ws, Self::Lifecycle];
 
     pub fn parse(name: &str) -> Option<Self> {
         match name.trim().to_lowercase().as_str() {
@@ -70,6 +72,7 @@ impl TrackKind {
             "log" => Some(Self::Log),
             "network" | "net" => Some(Self::Network),
             "ws" | "websocket" => Some(Self::Ws),
+            "lifecycle" | "life" => Some(Self::Lifecycle),
             _ => None,
         }
     }
@@ -81,6 +84,7 @@ impl TrackKind {
             Self::Log => "log",
             Self::Network => "network",
             Self::Ws => "ws",
+            Self::Lifecycle => "lifecycle",
         }
     }
 
@@ -90,10 +94,14 @@ impl TrackKind {
             Self::Console | Self::Exception => "Runtime",
             Self::Log => "Log",
             Self::Network | Self::Ws => "Network",
+            Self::Lifecycle => "Page",
         }
     }
 }
 
+/// One observed change of a watched expression: the previous rendered value (absent on the first
+/// observation) and the new one. Values are bounded previews, not raw payloads — a watch records
+/// *that* and *when* state changed; `eval` retrieves the full current value.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsoleLine {
     pub level: String,
@@ -173,6 +181,13 @@ pub struct WsFrame {
     pub url: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LifecycleEvent {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loader_id: Option<String>,
+}
+
 const WS_PREVIEW_LEN: usize = 200;
 
 impl Track {
@@ -183,6 +198,7 @@ impl Track {
             Self::Log(_) => TrackKind::Log,
             Self::Network(_) => TrackKind::Network,
             Self::Ws(_) => TrackKind::Ws,
+            Self::Lifecycle(_) => TrackKind::Lifecycle,
         }
     }
 
@@ -196,6 +212,7 @@ impl Track {
             Self::Log(entry) => entry.level.eq_ignore_ascii_case("error"),
             Self::Network(net) => matches!(net.phase, NetPhase::Failed),
             Self::Ws(_) => false,
+            Self::Lifecycle(_) => false,
         }
     }
 
@@ -222,6 +239,7 @@ impl Track {
                 format!("net:{what}")
             }
             Self::Ws(frame) => format!("ws:{:?}", frame.dir),
+            Self::Lifecycle(event) => format!("lifecycle:{}", event.name),
         }
     }
 
@@ -249,6 +267,7 @@ impl Track {
                 format!("{what}{status}")
             }
             Self::Ws(frame) => format!("ws {:?}", frame.dir),
+            Self::Lifecycle(event) => format!("lifecycle {}", event.name),
         }
     }
 
@@ -324,6 +343,10 @@ impl Track {
                 len: None,
                 preview: None,
                 url: string_at(params, "url"),
+            })),
+            "Page.lifecycleEvent" => Some(Track::Lifecycle(LifecycleEvent {
+                name: string_at(params, "name").unwrap_or_else(|| "lifecycle".to_owned()),
+                loader_id: string_at(params, "loaderId"),
             })),
             _ => None,
         }
