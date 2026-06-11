@@ -5,8 +5,10 @@
 //! engine itself is the shared `crate::cdp` module — this tool is the daemon, the thin client, and
 //! the command surface on top of it. See `CONTEXT.md` and `docs/adr/000{1,2,3}`.
 
+mod checks;
 mod client;
 mod daemon;
+mod flow;
 mod format;
 mod interactive;
 mod protocol;
@@ -14,6 +16,7 @@ mod readiness;
 mod registry;
 mod snapshot;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{bail, Context as _, Result};
@@ -37,6 +40,19 @@ RECIPES
     kit cdp launch http://localhost:3000 --name checkout --headless
     kit cdp launch-log --app checkout        startup Timeline from before navigation
     kit cdp state --visual --app checkout    readiness, focus, failures, screenshot path
+
+  Act, then self-verify — every interaction settles and sets the last-action mark:
+    kit cdp click 'button:Save settings' --app checkout      locator resolved live
+    kit cdp verify --app checkout                            PASS/FAIL since that click
+    kit cdp snap --diff --app checkout                       what changed on screen
+
+  A whole sequence in one round trip (steps are the normal grammar):
+    kit cdp do \"click 'button:Save'; expect text 'Saved'; verify\" --app checkout
+    kit cdp flow run checkout-smoke user=Ada --app checkout  saved in .kit/cdp/flows/
+
+  Subscribe to a value and see changes on the Timeline clock:
+    kit cdp watch add cart 'document.querySelectorAll(\".cart-item\").length' --app checkout
+    kit cdp tail --track watch --since 2m --app checkout
 
   Bound an action so logs stay useful:
     kit cdp mark before-save --app checkout
@@ -110,6 +126,97 @@ EXAMPLES
     -- pnpm --filter studio start:prebuilt
   kit cdp launch-electron --name app --electron-arg '--remote-debugging-port={cdp_port}' -- ./my-app
   kit cdp launch-electron --name studio --cdp-port 9223 --cdp-env STUDIO_CDP_PORT -- pnpm start
+";
+
+const INTERACT_AFTER_HELP: &str = "\
+LOCATORS
+  @e5                 ref from the last `kit cdp snap` (fast; document-scoped)
+  button:Save         role-scoped accessible-name match, resolved live (survives navigation)
+  'Save settings'     bare name across all interactive roles
+  Exact name matches beat substring matches; an ambiguous locator fails listing the candidates.
+
+SETTLE
+  After dispatching, the command waits for the Timeline to go quiet (--idle, capped by --timeout)
+  and reports what the action caused: event/error/network counts and the recent lines. Every
+  interaction (re)sets the `last-action` mark for `after`/`tail --since-mark`/`verify`.
+
+EXAMPLES
+  kit cdp click 'button:Save settings' --app checkout
+  kit cdp click @e5 --no-settle --app checkout
+  kit cdp fill textbox:Name 'Ada Lovelace' --app checkout
+";
+
+const WAIT_AFTER_HELP: &str = "\
+EXAMPLES
+  kit cdp wait '!document.querySelector(\".spinner\")' --app checkout
+  kit cdp wait 'window.testbed.counter >= 3' --timeout 10s --app checkout
+  kit cdp click 'button:Save' && kit cdp wait 'document.title.includes(\"saved\")'
+";
+
+const EXPECT_AFTER_HELP: &str = "\
+EXAMPLES
+  kit cdp expect text 'Saved' --app checkout
+  kit cdp expect eval 'cart.items.length' --equals 3 --app checkout
+  kit cdp expect net '/api/save' --status 2xx --since-mark last-action --app checkout
+  kit cdp expect no-errors --since-mark last-action --app checkout
+
+EXIT CODE
+  0 when the expectation holds, 1 when it does not — chain with && in scripts.
+";
+
+const VERIFY_AFTER_HELP: &str = "\
+THE LOOP
+  kit cdp click 'button:Save settings' --app checkout && kit cdp verify --app checkout
+
+  With no window flags, verify covers everything since the last click/fill (the `last-action`
+  mark), or the last 30s when nothing was clicked yet. PASS requires: document complete, zero
+  error-shaped events, zero failed requests.
+
+EXAMPLES
+  kit cdp verify --app checkout
+  kit cdp verify --since-mark before-save --app checkout
+  kit cdp verify --since 2m --app checkout
+";
+
+const WATCH_AFTER_HELP: &str = "\
+ON THE TIMELINE
+  A change lands as a `watch` event on the same clock as console/network rows, so causality
+  reads straight off `tail`:
+    +1410ms [app] net ← 200 POST /api/cart
+    +1422ms [app] watch cart 2 → 3
+  Watches survive reloads (the poller re-resolves its target each tick). Failed evaluations
+  are skipped, not recorded — a target mid-reload is not a change.
+
+EXAMPLES
+  kit cdp watch add cart 'document.querySelectorAll(\".cart-item\").length' --app checkout
+  kit cdp watch add route 'location.pathname' --app checkout
+  kit cdp tail --track watch --since 2m --app checkout
+  kit cdp watch ls · watch rm cart · watch clear
+";
+
+const DO_AFTER_HELP: &str = "\
+ONE ROUND TRIP
+  Steps run inside the daemon back-to-back — no per-step CLI cost. Each step is a line of the
+  normal session grammar; the first failing step stops the run and prints its full evidence.
+  The batch sets a `do-start` mark, so `kit cdp tail --since-mark do-start` replays the run.
+
+EXAMPLES
+  kit cdp do \"click 'button:Save settings'; expect text 'Saved'; verify\" --app checkout
+  kit cdp do --file checkout-steps.txt --app checkout
+";
+
+const FLOW_AFTER_HELP: &str = "\
+FILES
+  A flow is a file of session-grammar lines: one step per line, `#` comments, ${param}
+  placeholders filled from key=value arguments. Search order: `.kit/cdp/flows/<name>.flow`
+  walking up from the working directory (commit these — they are project knowledge), then the
+  user config dir. Project shadows user.
+
+EXAMPLES
+  kit cdp flow ls
+  kit cdp flow run checkout-smoke --app checkout
+  kit cdp flow run login -- user=ada@example.com --app checkout
+  kit cdp flow show checkout-smoke
 ";
 
 const STATE_AFTER_HELP: &str = "\
@@ -384,6 +491,69 @@ enum CdpCommand {
         #[arg(long)]
         target: Option<String>,
     },
+    /// Block until a JS expression is truthy in a Target — the precise form of "sleep and check".
+    #[command(after_help = WAIT_AFTER_HELP)]
+    Wait {
+        expr: Vec<String>,
+        #[arg(long)]
+        target: Option<String>,
+        /// Give up after this long.
+        #[arg(long, default_value = "5s")]
+        timeout: String,
+    },
+    /// Assert one condition: on-screen text, an eval result, a network response, or no errors.
+    #[command(after_help = EXPECT_AFTER_HELP)]
+    Expect {
+        #[command(subcommand)]
+        command: ExpectCommand,
+    },
+    /// One-line PASS/FAIL verdict: document ready, no errors, no failed requests in the window.
+    /// Defaults to "since the last click/fill", so `click … && verify` needs no arguments.
+    #[command(after_help = VERIFY_AFTER_HELP)]
+    Verify {
+        #[command(flatten)]
+        filter: TimelineFilterArgs,
+    },
+    /// Press a key into the focused element: Enter, Tab, Escape, arrows, or Ctrl/Meta/Alt/Shift+<key>.
+    Press {
+        /// Key chord, e.g. `Enter` or `Meta+s`.
+        key: String,
+        #[arg(long)]
+        target: Option<String>,
+        #[command(flatten)]
+        settle: SettleArgs,
+    },
+    /// Choose a select/combobox option by its visible label (or value).
+    Select {
+        /// `@e7`, `combobox:Flavor`, or a bare accessible name. Quote locators with spaces.
+        locator: String,
+        option: Vec<String>,
+        #[arg(long)]
+        target: Option<String>,
+        #[command(flatten)]
+        settle: SettleArgs,
+    },
+    /// Subscribe to a value: re-evaluate on an interval, record a `watch` event when it changes.
+    #[command(after_help = WATCH_AFTER_HELP)]
+    Watch {
+        #[command(subcommand)]
+        command: WatchCommand,
+    },
+    /// Run several session commands as one daemon-side batch, stopping at the first failure.
+    #[command(after_help = DO_AFTER_HELP)]
+    Do {
+        /// Steps in the session grammar, separated by ';' — e.g. "click 'button:Save'; verify".
+        steps: Vec<String>,
+        /// Read steps from a file instead: one per line, `#` comments, blank lines ignored.
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
+    /// Reusable named step sequences from `.kit/cdp/flows` (project) or the config dir (user).
+    #[command(after_help = FLOW_AFTER_HELP)]
+    Flow {
+        #[command(subcommand)]
+        command: FlowCommand,
+    },
     /// Current target state: readiness, recent failures, focus, rules, and optional screenshot.
     #[command(after_help = STATE_AFTER_HELP)]
     State {
@@ -443,21 +613,33 @@ enum CdpCommand {
         /// Compact view — only ref-bearing nodes and their structure.
         #[arg(short, long)]
         interactive: bool,
+        /// What changed since the last snap: +/- semantic lines instead of the whole tree.
+        /// Verification without assertions — act, then ask what the UI did.
+        #[arg(long)]
+        diff: bool,
         #[arg(long)]
         target: Option<String>,
     },
-    /// Click an element by its `@ref` from the last snap.
+    /// Click an element: `@ref` from the last snap, or a live `role:name` / bare-name locator.
+    #[command(after_help = INTERACT_AFTER_HELP)]
     Click {
-        reference: String,
+        /// `@e5`, `button:Save settings`, or `Save settings`. Quote locators with spaces.
+        locator: String,
         #[arg(long)]
         target: Option<String>,
+        #[command(flatten)]
+        settle: SettleArgs,
     },
-    /// Fill an input by its `@ref` with text.
+    /// Fill an input with text: `@ref` from the last snap, or a live `role:name` locator.
+    #[command(after_help = INTERACT_AFTER_HELP)]
     Fill {
-        reference: String,
+        /// `@e7`, `textbox:Name`, or a bare accessible name. Quote locators with spaces.
+        locator: String,
         text: Vec<String>,
         #[arg(long)]
         target: Option<String>,
+        #[command(flatten)]
+        settle: SettleArgs,
     },
     /// Suppress noise from the Timeline — add a substring, `--list`, or `--clear` (per attachment).
     Ignore {
@@ -543,6 +725,84 @@ enum NetRulesCommand {
 }
 
 #[derive(Subcommand)]
+enum WatchCommand {
+    /// Watch a JS expression in a Target.
+    Add {
+        /// Watch name — how rows read on the Timeline (`watch cart 2 → 3`).
+        name: String,
+        expr: Vec<String>,
+        #[arg(long)]
+        target: Option<String>,
+        /// Re-evaluation interval (minimum 50ms).
+        #[arg(long, default_value = "300ms")]
+        interval: String,
+    },
+    /// List active watches with their last values.
+    Ls,
+    /// Stop one watch.
+    Rm { name: String },
+    /// Stop all watches.
+    Clear,
+}
+
+#[derive(Subcommand)]
+enum FlowCommand {
+    /// List available flows and where each comes from.
+    Ls,
+    /// Run a named flow. Pass `key=value` parameters after the name.
+    Run {
+        name: String,
+        /// `key=value` substitutions for `${key}` placeholders in the flow.
+        params: Vec<String>,
+    },
+    /// Print a flow's steps and its source path.
+    Show { name: String },
+}
+
+#[derive(Subcommand)]
+enum ExpectCommand {
+    /// The rendered page text contains the needle (case-insensitive).
+    Text {
+        needle: Vec<String>,
+        #[arg(long)]
+        target: Option<String>,
+        /// Keep checking until satisfied or this much time passes.
+        #[arg(long, default_value = "2s")]
+        within: String,
+    },
+    /// An eval result equals/contains a value, or is truthy when neither flag is given.
+    Eval {
+        expr: Vec<String>,
+        /// Expected value — compared as JSON when it parses (`3`, `true`), as text otherwise.
+        #[arg(long)]
+        equals: Option<String>,
+        /// The rendered result contains this text.
+        #[arg(long, conflicts_with = "equals")]
+        contains: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long, default_value = "2s")]
+        within: String,
+    },
+    /// A network response matching a URL substring (and optional status) is on the Timeline.
+    Net {
+        pattern: String,
+        /// `2xx`, `404`, `ok` (< 400), or `fail` (>= 400 or a dead request).
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long, default_value = "5s")]
+        within: String,
+        #[command(flatten)]
+        filter: TimelineFilterArgs,
+    },
+    /// No error-shaped events in the Timeline window.
+    NoErrors {
+        #[command(flatten)]
+        filter: TimelineFilterArgs,
+    },
+}
+
+#[derive(Subcommand)]
 enum ProfileCommand {
     /// List named kit CDP profiles.
     Ls,
@@ -559,6 +819,33 @@ enum ProfileCommand {
         #[arg(long)]
         from: String,
     },
+}
+
+/// How an interaction waits for its consequences before replying. The default reports what the
+/// action caused; `--no-settle` returns the moment the input is dispatched.
+#[derive(Args, Clone)]
+struct SettleArgs {
+    /// Return immediately without waiting for the action's consequences.
+    #[arg(long)]
+    no_settle: bool,
+    /// Settle: stop once the Timeline has been quiet this long.
+    #[arg(long, default_value = "300ms")]
+    idle: String,
+    /// Settle: maximum wait before summarizing anyway.
+    #[arg(long, default_value = "2s")]
+    timeout: String,
+}
+
+impl SettleArgs {
+    fn into_settle(self) -> Result<Option<protocol::Settle>> {
+        if self.no_settle {
+            return Ok(None);
+        }
+        Ok(Some(protocol::Settle {
+            idle_ms: parse_duration(&self.idle)?,
+            timeout_ms: parse_duration(&self.timeout)?,
+        }))
+    }
 }
 
 #[derive(Args, Clone)]
@@ -717,6 +1004,15 @@ impl Tool for CdpTool {
                 println!("{}", render_lens_list(json));
                 Ok(())
             }
+            Some(CdpCommand::Flow { command: FlowCommand::Ls }) => {
+                println!("{}", render_flow_list(json));
+                Ok(())
+            }
+            Some(CdpCommand::Flow { command: FlowCommand::Show { name } }) => {
+                let (source, path) = flow::load(&name)?;
+                println!("# {}\n{source}", path.display());
+                Ok(())
+            }
             Some(CdpCommand::Profile { command }) => client::profile(profile_op(command), json),
             Some(CdpCommand::Bundle { name, since, include, include_secrets }) => finish(
                 client::query(
@@ -765,6 +1061,77 @@ fn session_command(command: CdpCommand) -> Result<Command> {
             Command::Eval { target, expr: read_expr(expr, file)? }
         }
         CdpCommand::Ready { target } => Command::Ready { target },
+        CdpCommand::Wait { expr, target, timeout } => {
+            if expr.is_empty() {
+                bail!("nothing to wait for — pass a JS expression");
+            }
+            Command::WaitFor { target, expr: expr.join(" "), timeout_ms: parse_duration(&timeout)? }
+        }
+        CdpCommand::Expect { command } => expect_command(command)?,
+        CdpCommand::Verify { filter } => {
+            let target = non_empty(filter.target.clone());
+            let window =
+                if filter_provided(&filter) { Some(timeline_query(filter, None)?) } else { None };
+            Command::Verify { target, window }
+        }
+        CdpCommand::Press { key, target, settle } => Command::Press {
+            target,
+            chord: protocol::KeyChord::parse(&key).map_err(anyhow::Error::msg)?,
+            settle: settle.into_settle()?,
+        },
+        CdpCommand::Select { locator, option, target, settle } => {
+            if option.is_empty() {
+                bail!("no option — pass the option label to select");
+            }
+            Command::Select {
+                target,
+                locator: protocol::Locator::parse(&locator),
+                option: option.join(" "),
+                settle: settle.into_settle()?,
+            }
+        }
+        CdpCommand::Watch { command } => Command::Watch(match command {
+            WatchCommand::Add { name, expr, target, interval } => {
+                if expr.is_empty() {
+                    bail!("nothing to watch — pass a JS expression");
+                }
+                protocol::WatchOp::Add {
+                    name,
+                    target,
+                    expr: expr.join(" "),
+                    interval_ms: parse_duration(&interval)?,
+                }
+            }
+            WatchCommand::Ls => protocol::WatchOp::Ls,
+            WatchCommand::Rm { name } => protocol::WatchOp::Rm { name },
+            WatchCommand::Clear => protocol::WatchOp::Clear,
+        }),
+        CdpCommand::Do { steps, file } => {
+            let script = match file {
+                Some(path) => std::fs::read_to_string(&path)
+                    .with_context(|| format!("read {}", path.display()))?,
+                None if steps.is_empty() => {
+                    bail!("no steps — pass \"step; step; …\" or --file <path>")
+                }
+                None => steps
+                    .join(" ")
+                    .split(';')
+                    .map(str::trim)
+                    .filter(|step| !step.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            };
+            Command::Do { steps: flow::parse_script(&script, &HashMap::new())? }
+        }
+        CdpCommand::Flow { command: FlowCommand::Run { name, params } } => {
+            let (source, path) = flow::load(&name)?;
+            let steps = flow::parse_script(&source, &flow::parse_params(&params)?)
+                .with_context(|| format!("flow '{name}' ({})", path.display()))?;
+            Command::Do { steps }
+        }
+        CdpCommand::Flow { .. } => {
+            bail!("flow ls/show are shell commands — run them outside a session")
+        }
         CdpCommand::State { visual } => Command::State { visual },
         CdpCommand::LaunchLog => Command::LaunchLog,
         CdpCommand::Mark { name } => Command::Mark { name },
@@ -774,11 +1141,20 @@ fn session_command(command: CdpCommand) -> Result<Command> {
             timeout_ms: parse_duration(&timeout)?,
         },
         CdpCommand::Heap { target } => Command::Heap { target },
-        CdpCommand::Snap { interactive, target } => Command::Snap { target, interactive },
-        CdpCommand::Click { reference, target } => Command::Click { target, reference },
-        CdpCommand::Fill { reference, text, target } => {
-            Command::Fill { target, reference, text: text.join(" ") }
+        CdpCommand::Snap { interactive, diff, target } => {
+            Command::Snap { target, interactive, diff }
         }
+        CdpCommand::Click { locator, target, settle } => Command::Click {
+            target,
+            locator: protocol::Locator::parse(&locator),
+            settle: settle.into_settle()?,
+        },
+        CdpCommand::Fill { locator, text, target, settle } => Command::Fill {
+            target,
+            locator: protocol::Locator::parse(&locator),
+            text: text.join(" "),
+            settle: settle.into_settle()?,
+        },
         CdpCommand::Ignore { pattern, list, clear } => {
             Command::Ignore(ignore_op(pattern, list, clear))
         }
@@ -817,6 +1193,53 @@ fn session_command(command: CdpCommand) -> Result<Command> {
             bail!("not a session command — manage attachments from the shell, not in interactive mode")
         }
     })
+}
+
+fn expect_command(command: ExpectCommand) -> Result<Command> {
+    Ok(match command {
+        ExpectCommand::Text { needle, target, within } => {
+            if needle.is_empty() {
+                bail!("nothing to expect — pass the text to look for");
+            }
+            Command::Expect {
+                expectation: protocol::Expectation::Text { target, needle: needle.join(" ") },
+                within_ms: parse_duration(&within)?,
+            }
+        }
+        ExpectCommand::Eval { expr, equals, contains, target, within } => Command::Expect {
+            expectation: protocol::Expectation::Eval {
+                target,
+                expr: read_expr(expr, None)?,
+                equals,
+                contains,
+            },
+            within_ms: parse_duration(&within)?,
+        },
+        ExpectCommand::Net { pattern, status, within, filter } => Command::Expect {
+            expectation: protocol::Expectation::Net {
+                pattern,
+                status,
+                query: timeline_query(filter, Some(vec![TrackKind::Network]))?,
+            },
+            within_ms: parse_duration(&within)?,
+        },
+        ExpectCommand::NoErrors { filter } => Command::Expect {
+            expectation: protocol::Expectation::NoErrors { query: timeline_query(filter, None)? },
+            within_ms: 0,
+        },
+    })
+}
+
+/// Whether the user narrowed the window themselves — `verify` only falls back to "since the last
+/// action" when every filter was left at its default.
+fn filter_provided(filter: &TimelineFilterArgs) -> bool {
+    filter.since.is_some()
+        || filter.since_mark.is_some()
+        || filter.source.is_some()
+        || filter.target.is_some()
+        || filter.grep.is_some()
+        || filter.extension.is_some()
+        || filter.limit.is_some()
 }
 
 fn net_command(command: CdpNetCommand, query: TimelineQuery) -> Result<NetCommand> {
@@ -937,6 +1360,27 @@ fn available_lenses() -> String {
     } else {
         format!("\navailable: {}", names.join(", "))
     }
+}
+
+fn render_flow_list(json: bool) -> String {
+    let flows = flow::list();
+    if json {
+        let value: Vec<serde_json::Value> = flows
+            .iter()
+            .map(|flow| {
+                serde_json::json!({ "name": flow.name, "scope": flow.scope, "path": flow.path })
+            })
+            .collect();
+        return serde_json::to_string_pretty(&value).unwrap_or_else(|_| "[]".to_owned());
+    }
+    if flows.is_empty() {
+        return "no flows yet — create .kit/cdp/flows/<name>.flow".to_owned();
+    }
+    flows
+        .iter()
+        .map(|flow| format!("{:<20} {:<8} {}", flow.name, flow.scope, flow.path.display()))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn render_lens_list(json: bool) -> String {

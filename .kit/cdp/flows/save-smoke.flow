@@ -1,0 +1,8 @@
+# Save-path smoke: drive the form, save, and prove the app stayed healthy.
+fill textbox:Name '${user}'
+click 'button:Submit form'
+expect text 'submitted: ${user}'
+click 'button:Save settings'
+expect text 'Saved'
+expect net '/api/save' --status 2xx --since-mark last-action
+verify --since-mark do-start

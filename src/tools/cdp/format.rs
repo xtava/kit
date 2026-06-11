@@ -543,6 +543,10 @@ fn event_body(event: &TimelineEvent) -> String {
             format!("ws {dir} {len}{what}")
         }
         Track::Lifecycle(event) => format!("life {}", event.name),
+        Track::Watch(delta) => match &delta.from {
+            Some(from) => format!("watch {} {from} → {}", delta.name, delta.to),
+            None => format!("watch {} → {}", delta.name, delta.to),
+        },
     }
 }
 

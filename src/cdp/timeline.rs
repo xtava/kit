@@ -47,6 +47,7 @@ pub enum Track {
     Network(NetEvent),
     Ws(WsFrame),
     Lifecycle(LifecycleEvent),
+    Watch(WatchDelta),
 }
 
 /// A Track category, independent of any one event — for `--track` filtering and domain enabling.
@@ -59,9 +60,12 @@ pub enum TrackKind {
     Network,
     Ws,
     Lifecycle,
+    Watch,
 }
 
 impl TrackKind {
+    /// The capturable tracks — what `attach --track` can enable. `Watch` is daemon-generated
+    /// (a `watch add` poller), not a CDP subscription, so it is filterable but never enabled.
     pub const ALL: [TrackKind; 6] =
         [Self::Console, Self::Exception, Self::Log, Self::Network, Self::Ws, Self::Lifecycle];
 
@@ -73,6 +77,7 @@ impl TrackKind {
             "network" | "net" => Some(Self::Network),
             "ws" | "websocket" => Some(Self::Ws),
             "lifecycle" | "life" => Some(Self::Lifecycle),
+            "watch" => Some(Self::Watch),
             _ => None,
         }
     }
@@ -85,16 +90,19 @@ impl TrackKind {
             Self::Network => "network",
             Self::Ws => "ws",
             Self::Lifecycle => "lifecycle",
+            Self::Watch => "watch",
         }
     }
 
-    /// The CDP domain that must be enabled to receive this Track's events.
-    pub fn domain(self) -> &'static str {
+    /// The CDP domain that must be enabled to receive this Track's events; `None` for tracks the
+    /// daemon generates itself.
+    pub fn domain(self) -> Option<&'static str> {
         match self {
-            Self::Console | Self::Exception => "Runtime",
-            Self::Log => "Log",
-            Self::Network | Self::Ws => "Network",
-            Self::Lifecycle => "Page",
+            Self::Console | Self::Exception => Some("Runtime"),
+            Self::Log => Some("Log"),
+            Self::Network | Self::Ws => Some("Network"),
+            Self::Lifecycle => Some("Page"),
+            Self::Watch => None,
         }
     }
 }
@@ -102,6 +110,14 @@ impl TrackKind {
 /// One observed change of a watched expression: the previous rendered value (absent on the first
 /// observation) and the new one. Values are bounded previews, not raw payloads — a watch records
 /// *that* and *when* state changed; `eval` retrieves the full current value.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatchDelta {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    pub to: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsoleLine {
     pub level: String,
@@ -199,6 +215,7 @@ impl Track {
             Self::Network(_) => TrackKind::Network,
             Self::Ws(_) => TrackKind::Ws,
             Self::Lifecycle(_) => TrackKind::Lifecycle,
+            Self::Watch(_) => TrackKind::Watch,
         }
     }
 
@@ -213,6 +230,7 @@ impl Track {
             Self::Network(net) => matches!(net.phase, NetPhase::Failed),
             Self::Ws(_) => false,
             Self::Lifecycle(_) => false,
+            Self::Watch(_) => false,
         }
     }
 
@@ -240,6 +258,7 @@ impl Track {
             }
             Self::Ws(frame) => format!("ws:{:?}", frame.dir),
             Self::Lifecycle(event) => format!("lifecycle:{}", event.name),
+            Self::Watch(delta) => format!("watch:{}", delta.name),
         }
     }
 
@@ -268,6 +287,10 @@ impl Track {
             }
             Self::Ws(frame) => format!("ws {:?}", frame.dir),
             Self::Lifecycle(event) => format!("lifecycle {}", event.name),
+            Self::Watch(delta) => match &delta.from {
+                Some(from) => format!("watch {} {from} → {}", delta.name, delta.to),
+                None => format!("watch {} → {}", delta.name, delta.to),
+            },
         }
     }
 
@@ -778,6 +801,11 @@ mod tests {
                 len: Some(8),
                 preview: Some("hi".into()),
                 url: None,
+            }),
+            Track::Watch(WatchDelta {
+                name: "cart".into(),
+                from: Some("2".into()),
+                to: "3".into(),
             }),
         ];
         for track in cases {

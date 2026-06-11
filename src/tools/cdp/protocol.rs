@@ -10,6 +10,117 @@ use serde::{Deserialize, Serialize};
 
 use crate::cdp::{Source, TargetKind, TimelineEvent, TrackKind};
 
+use super::snapshot;
+
+/// How an interaction names its element: a `@eN` ref from the last snap, or a `role:name` query
+/// resolved against a fresh accessibility snapshot at execution time. Refs are fast but
+/// document-scoped; queries survive navigation and re-renders.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Locator {
+    Ref(String),
+    Query { role: Option<String>, name: String },
+}
+
+impl Locator {
+    /// Parse the CLI grammar: `@e5` / `e5` / `5` → ref; `button:Save` → role-scoped query; bare
+    /// text → query across every ref-bearing role. A `:` prefix that isn't a known AX role stays
+    /// part of the name, so `click 'Save: all'` still means what it says.
+    pub fn parse(text: &str) -> Self {
+        let trimmed = text.trim();
+        if let Some(rest) = trimmed.strip_prefix('@') {
+            return Self::Ref(normalize_ref(rest));
+        }
+        if is_ref_shaped(trimmed) {
+            return Self::Ref(normalize_ref(trimmed));
+        }
+        if let Some((prefix, name)) = trimmed.split_once(':') {
+            if snapshot::is_known_role(prefix.trim()) {
+                return Self::Query {
+                    role: Some(prefix.trim().to_lowercase()),
+                    name: name.trim().to_owned(),
+                };
+            }
+        }
+        Self::Query { role: None, name: trimmed.to_owned() }
+    }
+}
+
+fn is_ref_shaped(text: &str) -> bool {
+    let digits = text.strip_prefix('e').unwrap_or(text);
+    !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn normalize_ref(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.starts_with('e') {
+        trimmed.to_owned()
+    } else {
+        format!("e{trimmed}")
+    }
+}
+
+/// How long an interaction waits for its consequences: Timeline quiet for `idle_ms` ends the
+/// window early; `timeout_ms` caps it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Settle {
+    pub idle_ms: u64,
+    pub timeout_ms: u64,
+}
+
+/// A parsed key chord (`Enter`, `Meta+s`) — parsed client-side so a typo fails before the wire.
+/// `modifiers` uses the CDP bitmask: Alt 1, Ctrl 2, Meta 4, Shift 8.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyChord {
+    pub modifiers: u8,
+    pub key: String,
+}
+
+impl KeyChord {
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let parts: Vec<&str> = text.split('+').map(str::trim).collect();
+        let (key, modifier_parts) = parts.split_last().ok_or("empty key")?;
+        let mut modifiers = 0u8;
+        for part in modifier_parts {
+            modifiers |= match part.to_lowercase().as_str() {
+                "alt" | "option" => 1,
+                "ctrl" | "control" => 2,
+                "meta" | "cmd" | "command" => 4,
+                "shift" => 8,
+                other => return Err(format!("unknown modifier '{other}'")),
+            };
+        }
+        let key = canonical_key(key)?;
+        Ok(Self { modifiers, key })
+    }
+}
+
+/// The named keys `press` understands, canonicalized; anything else must be a single character.
+fn canonical_key(key: &str) -> Result<String, String> {
+    const NAMED: &[&str] = &[
+        "Enter",
+        "Tab",
+        "Escape",
+        "Backspace",
+        "Delete",
+        "Space",
+        "ArrowUp",
+        "ArrowDown",
+        "ArrowLeft",
+        "ArrowRight",
+        "Home",
+        "End",
+        "PageUp",
+        "PageDown",
+    ];
+    if let Some(name) = NAMED.iter().find(|name| name.eq_ignore_ascii_case(key)) {
+        return Ok((*name).to_owned());
+    }
+    if key.chars().count() == 1 {
+        return Ok(key.to_owned());
+    }
+    Err(format!("unknown key '{key}' — named keys: {}", NAMED.join(", ")))
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Query {
     pub command: Command,
@@ -76,16 +187,59 @@ pub enum Command {
     Snap {
         target: Option<String>,
         interactive: bool,
+        /// Diff against the previous explicit snap instead of printing the tree; this snap
+        /// becomes the new baseline either way.
+        diff: bool,
     },
     Click {
         target: Option<String>,
-        reference: String,
+        locator: Locator,
+        settle: Option<Settle>,
     },
     Fill {
         target: Option<String>,
-        reference: String,
+        locator: Locator,
         text: String,
+        settle: Option<Settle>,
     },
+    /// Press a key chord into the focused element of a Target.
+    Press {
+        target: Option<String>,
+        chord: KeyChord,
+        settle: Option<Settle>,
+    },
+    /// Choose a select/combobox option by visible label or value.
+    Select {
+        target: Option<String>,
+        locator: Locator,
+        option: String,
+        settle: Option<Settle>,
+    },
+    /// Run steps sequentially in the daemon, stopping at the first failure. One round trip for a
+    /// whole interaction sequence; every step's evidence lands on the same Timeline.
+    Do {
+        steps: Vec<Step>,
+    },
+    /// Block until a JS expression evaluates truthy in a Target, polling until `timeout_ms`.
+    WaitFor {
+        target: Option<String>,
+        expr: String,
+        timeout_ms: u64,
+    },
+    /// Assert one condition against the live app, polling until satisfied or `within_ms` elapses.
+    Expect {
+        expectation: Expectation,
+        within_ms: u64,
+    },
+    /// Composite verdict: document ready, no error-shaped events, no failed requests in the
+    /// window. `window: None` means "since the last interaction, or the last 30s if none".
+    Verify {
+        target: Option<String>,
+        window: Option<TimelineQuery>,
+    },
+    /// Manage value subscriptions: daemon-side pollers that record a `watch` Timeline event
+    /// whenever an expression's value changes.
+    Watch(WatchOp),
     Lens {
         target: Option<String>,
         source: String,
@@ -153,6 +307,37 @@ pub enum IgnoreOp {
     Add(String),
     List,
     Clear,
+}
+
+/// One step of a [`Command::Do`] batch: the source line as the user wrote it (for reporting) plus
+/// its parsed command. Steps are parsed client-side so the daemon never sees raw text.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Step {
+    pub line: String,
+    pub command: Box<Command>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum WatchOp {
+    Add { name: String, target: Option<String>, expr: String, interval_ms: u64 },
+    Ls,
+    Rm { name: String },
+    Clear,
+}
+
+/// One assertable condition for [`Command::Expect`].
+#[derive(Debug, Serialize, Deserialize)]
+pub enum Expectation {
+    /// The rendered page text contains `needle` (case-insensitive).
+    Text { target: Option<String>, needle: String },
+    /// An eval result satisfies the check: `equals` (JSON compare), `contains` (rendered text),
+    /// or plain truthiness when neither is given.
+    Eval { target: Option<String>, expr: String, equals: Option<String>, contains: Option<String> },
+    /// The Timeline window holds a network response whose URL contains `pattern` and whose status
+    /// matches `status` (`2xx`, `404`, `ok`, `fail`; default any).
+    Net { pattern: String, status: Option<String>, query: TimelineQuery },
+    /// The Timeline window holds no error-shaped events.
+    NoErrors { query: TimelineQuery },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -301,12 +486,20 @@ mod tests {
             Command::Eval { target: target.clone(), expr: "1+1".to_owned() },
             Command::Ready { target: target.clone() },
             Command::Heap { target: target.clone() },
-            Command::Snap { target: target.clone(), interactive: true },
-            Command::Click { target: target.clone(), reference: "e1".to_owned() },
+            Command::Snap { target: target.clone(), interactive: true, diff: true },
+            Command::Click {
+                target: target.clone(),
+                locator: Locator::Ref("e1".to_owned()),
+                settle: Some(Settle { idle_ms: 300, timeout_ms: 2000 }),
+            },
             Command::Fill {
                 target: target.clone(),
-                reference: "e1".to_owned(),
+                locator: Locator::Query {
+                    role: Some("textbox".to_owned()),
+                    name: "Name".to_owned(),
+                },
                 text: "x".to_owned(),
+                settle: None,
             },
             Command::Lens {
                 target: target.clone(),
@@ -314,7 +507,7 @@ mod tests {
                 args: vec!["a".to_owned()],
             },
             Command::ExtensionBundle {
-                target,
+                target: target.clone(),
                 source: "return 1".to_owned(),
                 extension_id: "modular.example".to_owned(),
                 query: TimelineQuery {
@@ -329,11 +522,106 @@ mod tests {
                 },
             },
             Command::Ignore(IgnoreOp::Add("noise".to_owned())),
+            Command::WaitFor {
+                target: target.clone(),
+                expr: "!document.querySelector('.spinner')".to_owned(),
+                timeout_ms: 5_000,
+            },
+            Command::Expect {
+                expectation: Expectation::Text {
+                    target: target.clone(),
+                    needle: "Saved".to_owned(),
+                },
+                within_ms: 2_000,
+            },
+            Command::Expect {
+                expectation: Expectation::Net {
+                    pattern: "/api/save".to_owned(),
+                    status: Some("2xx".to_owned()),
+                    query: TimelineQuery {
+                        since_ms: 10_000,
+                        since_mark: Some("last-action".to_owned()),
+                        tracks: None,
+                        source: None,
+                        target: None,
+                        grep: None,
+                        extension: None,
+                        limit: None,
+                    },
+                },
+                within_ms: 5_000,
+            },
+            Command::Verify { target: target.clone(), window: None },
+            Command::Press {
+                target: target.clone(),
+                chord: KeyChord { modifiers: 4, key: "s".to_owned() },
+                settle: None,
+            },
+            Command::Select {
+                target,
+                locator: Locator::Query {
+                    role: Some("combobox".to_owned()),
+                    name: "Flavor".to_owned(),
+                },
+                option: "chocolate".to_owned(),
+                settle: Some(Settle { idle_ms: 300, timeout_ms: 2000 }),
+            },
+            Command::Watch(WatchOp::Add {
+                name: "cart".to_owned(),
+                target: None,
+                expr: "document.querySelectorAll('.cart-item').length".to_owned(),
+                interval_ms: 300,
+            }),
+            Command::Do {
+                steps: vec![Step {
+                    line: "click 'button:Save'".to_owned(),
+                    command: Box::new(Command::Click {
+                        target: None,
+                        locator: Locator::Query {
+                            role: Some("button".to_owned()),
+                            name: "Save".to_owned(),
+                        },
+                        settle: Some(Settle { idle_ms: 300, timeout_ms: 2000 }),
+                    }),
+                }],
+            },
             Command::Subscribe { since_ms: 30_000 },
         ];
         for command in commands {
             survives(&Query { command, json: false });
         }
+    }
+
+    #[test]
+    fn key_chords_parse_modifiers_and_reject_typos() {
+        let enter = KeyChord::parse("Enter").unwrap();
+        assert_eq!((enter.modifiers, enter.key.as_str()), (0, "Enter"));
+        let save = KeyChord::parse("Meta+s").unwrap();
+        assert_eq!((save.modifiers, save.key.as_str()), (4, "s"));
+        let all = KeyChord::parse("ctrl+shift+escape").unwrap();
+        assert_eq!((all.modifiers, all.key.as_str()), (10, "Escape"));
+        assert!(KeyChord::parse("Enterr").is_err());
+        assert!(KeyChord::parse("Hyper+x").is_err());
+    }
+
+    #[test]
+    fn locator_grammar_separates_refs_roles_and_bare_names() {
+        assert!(matches!(Locator::parse("@e5"), Locator::Ref(reference) if reference == "e5"));
+        assert!(matches!(Locator::parse("e12"), Locator::Ref(reference) if reference == "e12"));
+        assert!(matches!(Locator::parse("@7"), Locator::Ref(reference) if reference == "e7"));
+        assert!(matches!(
+            Locator::parse("button:Save settings"),
+            Locator::Query { role: Some(role), name } if role == "button" && name == "Save settings"
+        ));
+        assert!(matches!(
+            Locator::parse("Save settings"),
+            Locator::Query { role: None, name } if name == "Save settings"
+        ));
+        // A colon after a non-role prefix is part of the name, not a role separator.
+        assert!(matches!(
+            Locator::parse("Save: all documents"),
+            Locator::Query { role: None, name } if name == "Save: all documents"
+        ));
     }
 
     #[test]

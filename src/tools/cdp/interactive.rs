@@ -14,7 +14,6 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::Parser;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -728,15 +727,6 @@ enum Meta {
     Quit,
 }
 
-/// The clap parser for a single typed session line — `no_binary_name` so the first token is the
-/// subcommand, not a program name.
-#[derive(Parser)]
-#[command(no_binary_name = true)]
-struct ReplLine {
-    #[command(subcommand)]
-    command: super::CdpCommand,
-}
-
 fn parse_input(line: &str) -> Input {
     let tokens = match shell_words::split(line.trim()) {
         Ok(tokens) if !tokens.is_empty() => tokens,
@@ -758,11 +748,8 @@ fn parse_input(line: &str) -> Input {
             Ok(source) => Input::Meta(Meta::Source(source)),
             Err(error) => Input::Error(error),
         },
-        _ => match ReplLine::try_parse_from(&tokens) {
-            Ok(parsed) => match super::session_command(parsed.command) {
-                Ok(command) => Input::Session(command),
-                Err(error) => Input::Error(error.to_string()),
-            },
+        _ => match super::flow::parse_session_tokens(&tokens) {
+            Ok(command) => Input::Session(command),
             Err(error) => Input::Error(error.to_string()),
         },
     }
@@ -970,7 +957,20 @@ fn render_help(frame: &mut TuiFrame, area: Rect) {
         entry("lens extensions -- <id>", "runtime graph + webview target diagnosis"),
         entry("ext doctor <id> · ext bundle <id>", "diagnosis plus bounded timeline"),
         section("INTERACT"),
-        entry("click @ref · fill @ref <text>", "drive the target (refs from snap)"),
+        entry("click <loc> · fill <loc> <text>", "locators: @ref · button:Save · 'bare name'"),
+        entry(
+            "press <chord> · select <loc> <option>",
+            "keys to the focused element · pick an option",
+        ),
+        section("VERIFY"),
+        entry(
+            "wait '<expr>' · expect text/eval/net/no-errors",
+            "poll a condition · assert one fact",
+        ),
+        entry("verify · snap --diff", "PASS/FAIL since last action · what changed on screen"),
+        section("BATCH & SUBSCRIBE"),
+        entry("do \"<step>; <step>\" · flow run <name> [k=v]", "whole sequences, one round trip"),
+        entry("watch add <name> '<expr>' · ls · rm · clear", "value changes land on the feed live"),
         section("FOCUS & FILTER"),
         entry("Tab  ·  target [<text>|main]", "pick / set / clear the focused target"),
         entry("track <list> | all", "filter the live pane by track"),
@@ -1027,6 +1027,7 @@ fn track_color(kind: TrackKind) -> Color {
         TrackKind::Network => Color::Cyan,
         TrackKind::Ws => Color::Magenta,
         TrackKind::Lifecycle => Color::Yellow,
+        TrackKind::Watch => Color::Green,
     }
 }
 
@@ -1119,6 +1120,8 @@ fn load_history(path: &PathBuf) -> Vec<String> {
 mod tests {
     use super::*;
 
+    use crate::tools::cdp::protocol;
+
     fn session(line: &str) -> Command {
         match parse_input(line) {
             Input::Session(command) => command,
@@ -1132,6 +1135,35 @@ mod tests {
             Input::Meta(_) => "meta",
             Input::Session(_) => "session",
             Input::Error(_) => "error",
+        }
+    }
+
+    /// The interactive prompt speaks the whole verification grammar — a typed `do`, `watch`,
+    /// `verify`, or `expect` is the same wire command the CLI sends.
+    #[test]
+    fn verification_grammar_parses_at_the_prompt() {
+        assert!(matches!(
+            session("click 'button:Save settings'"),
+            Command::Click { locator: protocol::Locator::Query { .. }, settle: Some(_), .. }
+        ));
+        assert!(matches!(session("verify"), Command::Verify { window: None, .. }));
+        assert!(matches!(
+            session("expect text 'Saved'"),
+            Command::Expect { expectation: protocol::Expectation::Text { .. }, .. }
+        ));
+        assert!(matches!(
+            session("wait 'window.ready' --timeout 10s"),
+            Command::WaitFor { timeout_ms: 10_000, .. }
+        ));
+        assert!(matches!(
+            session("watch add cart 'cart.length'"),
+            Command::Watch(protocol::WatchOp::Add { .. })
+        ));
+        assert!(matches!(session("press Meta+s"), Command::Press { .. }));
+        assert!(matches!(session("snap --diff"), Command::Snap { diff: true, .. }));
+        match session("do \"click 'button:Save'; verify\"") {
+            Command::Do { steps } => assert_eq!(steps.len(), 2),
+            other => panic!("wrong command: {other:?}"),
         }
     }
 
