@@ -39,6 +39,11 @@ settle, `wait`/`expect`/`verify`, `do` batches, flows, watches, and `snap --diff
 The live playground every feature is verified against lives in
 [`testbed/`](./testbed/README.md).
 
+Coding agents get all of this as a canonical [Agent Skill](https://agentskills.io)
+in [`skills/kit-cdp/`](./skills/kit-cdp/SKILL.md) — auto-discovered by Claude Code
+and Codex inside this repo, installable anywhere else (the repo doubles as a
+Claude Code plugin). See [`skills/README.md`](./skills/README.md).
+
 ## Layout
 
 One crate; the layers are modules, and the module dependency direction *is* the
