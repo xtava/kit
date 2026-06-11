@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use crate::cdp::{
     group_errors, ErrorGroup, ErrorReport, NetPhase, Target, TargetKind, TargetMetrics,
-    TimelineEvent, Track, WsDir,
+    TimelineEvent, TraceOutcome, TraceRecord, Track, WsDir,
 };
 
 fn pretty<T: Serialize + ?Sized>(value: &T) -> String {
@@ -512,7 +512,17 @@ fn event_body(event: &TimelineEvent) -> String {
             format!("console.{} {}{}", line.level, line.text, location(&line.url, line.line))
         }
         Track::Exception(info) => {
-            format!("exception {}{}", info.text, location(&info.url, info.line))
+            // The resolved site goes on the headline — V8's description embeds the whole stack,
+            // and a marker after five frames of bundle noise is a marker nobody sees.
+            let mut text = info.text.clone();
+            if let Some(site) = &info.resolved {
+                let marker = format!(" → {site}");
+                match text.find('\n') {
+                    Some(at) => text.insert_str(at, &marker),
+                    None => text.push_str(&marker),
+                }
+            }
+            format!("exception {text}{}", location(&info.url, info.line))
         }
         Track::Log(entry) => {
             format!("log/{} {}{}", entry.source, entry.text, location(&entry.url, entry.line))
@@ -547,7 +557,30 @@ fn event_body(event: &TimelineEvent) -> String {
             Some(from) => format!("watch {} {from} → {}", delta.name, delta.to),
             None => format!("watch {} → {}", delta.name, delta.to),
         },
+        Track::Trace(record) => trace_line(record),
     }
+}
+
+/// `trace save (2 args) → {ok: true} 38ms` · `trace save (1 arg) ✗ TypeError…` · the rate-cap
+/// summary reads as a warning so suppression is never mistaken for silence.
+fn trace_line(record: &TraceRecord) -> String {
+    if let Some(count) = record.suppressed {
+        return format!("trace {} ⚠ {count} hit(s) suppressed (rate cap)", record.name);
+    }
+    let mut line = format!("trace {}", record.name);
+    if let Some(value) = &record.value {
+        line.push(' ');
+        line.push_str(value);
+    }
+    match &record.outcome {
+        Some(TraceOutcome::Returned(preview)) => line.push_str(&format!(" → {preview}")),
+        Some(TraceOutcome::Threw(preview)) => line.push_str(&format!(" ✗ {preview}")),
+        None => {}
+    }
+    if let Some(ms) = record.duration_ms {
+        line.push_str(&format!(" {:.0}ms", ms));
+    }
+    line
 }
 
 fn location(url: &Option<String>, line: Option<u64>) -> String {
@@ -600,6 +633,8 @@ mod tests {
                     text: text.to_owned(),
                     url: None,
                     line: None,
+                    frames: Vec::new(),
+                    resolved: None,
                 }),
             },
             count,
@@ -644,7 +679,13 @@ mod tests {
             at_ms,
             source: Source::Renderer,
             target: "main".to_owned(),
-            track: Track::Exception(ExceptionInfo { text: text.to_owned(), url: None, line: None }),
+            track: Track::Exception(ExceptionInfo {
+                text: text.to_owned(),
+                url: None,
+                line: None,
+                frames: Vec::new(),
+                resolved: None,
+            }),
         }
     }
 

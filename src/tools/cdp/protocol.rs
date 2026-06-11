@@ -151,6 +151,9 @@ pub enum Command {
         query: TimelineQuery,
         /// Expand each group's absorbed variants instead of one representative line — the audit view.
         explain: bool,
+        /// Force-load source maps for the error frames first (enabling Debugger where needed),
+        /// so stacks resolve to original files even on a cold registry.
+        resolve: bool,
     },
     Navigate {
         target: Option<String>,
@@ -243,6 +246,9 @@ pub enum Command {
     /// Manage value subscriptions: daemon-side pollers that record a `watch` Timeline event
     /// whenever an expression's value changes.
     Watch(WatchOp),
+    /// Manage instrumentation points: live function wrappers that record a `trace` Timeline
+    /// event on every call — args, outcome, duration — without pausing or rebuilding.
+    Trace(TraceOp),
     Lens {
         target: Option<String>,
         source: String,
@@ -330,6 +336,32 @@ pub enum WatchOp {
     Add { name: String, target: Option<String>, expr: String, interval_ms: u64 },
     Ls,
     Rm { name: String },
+    Clear,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum TraceOp {
+    /// Wrap the live function at a dotted `path` (`app.api.save`) in the resolved Target.
+    Fn {
+        name: Option<String>,
+        target: Option<String>,
+        path: String,
+        rate: u64,
+    },
+    /// Logpoint: a never-pausing breakpoint at `location` (`file.js:line[:col]`) that records
+    /// `expr` (gated by `when`) on every pass.
+    Point {
+        name: Option<String>,
+        target: Option<String>,
+        location: String,
+        expr: Option<String>,
+        when: Option<String>,
+        rate: u64,
+    },
+    Ls,
+    Rm {
+        name: String,
+    },
     Clear,
 }
 
@@ -447,6 +479,7 @@ mod tests {
                     limit: None,
                 },
                 explain: true,
+                resolve: true,
             },
             Command::Navigate { target: target.clone(), url: "http://localhost:3000".to_owned() },
             Command::Configure(LaunchSettings {
@@ -580,6 +613,20 @@ mod tests {
                 target: None,
                 expr: "document.querySelectorAll('.cart-item').length".to_owned(),
                 interval_ms: 300,
+            }),
+            Command::Trace(TraceOp::Fn {
+                name: Some("save".to_owned()),
+                target: None,
+                path: "app.api.save".to_owned(),
+                rate: 20,
+            }),
+            Command::Trace(TraceOp::Point {
+                name: None,
+                target: None,
+                location: "renderer.js:93".to_owned(),
+                expr: Some("({ counter })".to_owned()),
+                when: Some("counter > 2".to_owned()),
+                rate: 20,
             }),
             Command::Do {
                 steps: vec![Step {

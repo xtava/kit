@@ -55,6 +55,7 @@ Failed assertions exit non-zero, so `&&` chains behave.
 | Assert | `wait '<expr>'` · `expect text/eval/net/no-errors` · `verify` | self-verification: poll a condition, assert one fact, or get a composite PASS/FAIL — all exit non-zero on failure |
 | Batch | `do "<step>; <step>"` · `flow ls/run/show` | run whole sequences daemon-side in one round trip; flows are saved, parameterized step files |
 | Subscribe | `watch add/ls/rm/clear` | record a `watch` Timeline event whenever an expression's value changes |
+| Instrument | `trace fn '<path>'` · `trace add <file:line> ['<expr>'] [--when …]` · `trace ls/rm/clear` | record execution: fn calls (args · outcome · duration) and never-pausing logpoints, source-map aware |
 | Action window | `mark <name>` · `after <name>` · `bundle <name>` | summarize and export what changed after an action |
 | Lens | `lens <name> [-- args]` | run a scriptable lens in a Target |
 | Extensions | `ext doctor <id>` · `ext bundle <id>` | diagnose a Modular extension runtime view |
@@ -142,6 +143,58 @@ kit cdp watch ls · rm <name> · clear
 
 Watches survive reloads (the poller re-resolves its target every tick); failed
 evaluations are skipped, not recorded. Filter any Timeline slice with `--track watch`.
+
+## Traces — execution on the Timeline
+
+Where a watch records *values*, a trace records *behavior*: every run of a function
+or a code location lands as a `trace` row interleaved with the console and network
+rows it causes, with no code edits, no rebuilds, and **no pauses**:
+
+```
++1203ms [app] trace store.js-84 {n: 2, t: "ADD"}
++1241ms [app] trace save (2 args) → {ok: true} 38ms
++1290ms [app] net ← 200 POST /api/save
+```
+
+```bash
+kit cdp trace fn 'app.api.save'                       # wrap a live function: args · outcome · duration
+kit cdp trace add src/cart.js:84 'items.length'       # logpoint, resolved through source maps
+kit cdp trace add renderer.js:108 '({ counter })' --when 'counter > 2'
+kit cdp tail --track trace --since 2m
+kit cdp trace ls · rm <name> · clear
+```
+
+**Fn traces** wrap the function at a dotted path. The wrapper preserves
+`this`/args/return/throw (constructors go through `Reflect.construct`), records a
+bounded preview of each call, and a keeper re-installs it after reloads. A traced
+*caught* throw renders as `✗` but is never error-shaped — observation must not flip
+a `verify`. Honest limits, disclosed in the reply: calls through references saved
+before wrapping are invisible, and thenables return as a *derived* promise (same
+settlement, different identity).
+
+**Logpoints** are breakpoints whose condition records and returns false — V8 never
+pauses. Expressions are compile-checked at arm time: a syntax error fails the `add`
+instead of arming a breakpoint that V8 would silently never fire. Locations resolve
+three ways: a script-URL suffix (`renderer.js:144`), an absolute URL, or a **repo
+path through the source-map registry** (`src/cart.js:5 → bundle.js:8`), which the
+daemon builds from `Debugger.scriptParsed` and feeds by fetching maps through the
+page (so `modular://` and asar apps resolve too). `--when` gates recording; one
+breakpoint per location (the error names the trace holding it).
+
+Both kinds rate-cap **in the page** (default 20 hits/s, `--rate`): past the cap the
+page counts drops and the Timeline shows `trace hot ⚠ 495 hit(s) suppressed` rows —
+exact counts, never silent loss. The cap protects the wire and the Timeline, not the
+app's CPU: V8 still evaluates the condition per hit, and the containing function
+runs deoptimized while a logpoint is armed.
+
+Arming a logpoint enables the Debugger domain (lazily, per session). That makes
+`debugger;` statements real pauses — kit auto-resumes them (and records that it did)
+unless a DevTools window is attached, in which case pauses belong to the human.
+
+**Source-mapped errors** ride the same registry: exception stacks gain their
+original location on the headline — `TypeError: … → src/cart.js:14` — automatically
+when a map is already loaded, and `kit cdp errors --resolve` force-loads maps for
+the frames in view (enabling Debugger where needed, same disclosure).
 
 ## Snap diff
 

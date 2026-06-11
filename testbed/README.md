@@ -24,6 +24,16 @@ startup-capture scenario.
 | Network buttons | network track, `net failed`, `net slow`, block/mock rules |
 | WebSocket | ws track |
 | Async save | settle windows, spinner→toast (`role=alert`) for `wait`/`expect text` |
-| State | `watch` deltas: counter, ticker (1s auto-increment), cart items |
+| Trace | `trace fn` on `testbed.fns.*`: sync (`compute`), async (`saveQuote`), caught throw (`failing`), hot loop (rate-cap suppression) |
+| State | `watch` deltas: counter, ticker (1s auto-increment), cart items; `renderer.js:<line>` logpoint targets |
 | Form | `fill`, `select`, checkbox, validation error path |
 | Navigation | ref invalidation, role:name re-resolution across pages |
+
+## The source-map fixture
+
+`bundle.js` + `bundle.js.map` are a hand-maintained "build" of `src/cart.js`: the
+bundle prepends a 3-line banner and the map encodes exactly that line shift, so
+`kit cdp trace add src/cart.js:5` must arm at `bundle.js:8`, and
+`window.testbed.cart.brokenTotal()` throws an exception whose stack resolves back
+to `src/cart.js:14` via `errors --resolve`. If you edit `src/cart.js`, re-paste it
+under the banner and keep the map's `AACA` run equal to the source's line count.

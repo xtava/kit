@@ -48,6 +48,7 @@ pub enum Track {
     Ws(WsFrame),
     Lifecycle(LifecycleEvent),
     Watch(WatchDelta),
+    Trace(TraceRecord),
 }
 
 /// A Track category, independent of any one event — for `--track` filtering and domain enabling.
@@ -61,11 +62,13 @@ pub enum TrackKind {
     Ws,
     Lifecycle,
     Watch,
+    Trace,
 }
 
 impl TrackKind {
-    /// The capturable tracks — what `attach --track` can enable. `Watch` is daemon-generated
-    /// (a `watch add` poller), not a CDP subscription, so it is filterable but never enabled.
+    /// The capturable tracks — what `attach --track` can enable. `Watch` and `Trace` are
+    /// daemon-generated (pollers and instrumentation points), not CDP subscriptions, so they are
+    /// filterable but never enabled.
     pub const ALL: [TrackKind; 6] =
         [Self::Console, Self::Exception, Self::Log, Self::Network, Self::Ws, Self::Lifecycle];
 
@@ -78,6 +81,7 @@ impl TrackKind {
             "ws" | "websocket" => Some(Self::Ws),
             "lifecycle" | "life" => Some(Self::Lifecycle),
             "watch" => Some(Self::Watch),
+            "trace" => Some(Self::Trace),
             _ => None,
         }
     }
@@ -91,6 +95,7 @@ impl TrackKind {
             Self::Ws => "ws",
             Self::Lifecycle => "lifecycle",
             Self::Watch => "watch",
+            Self::Trace => "trace",
         }
     }
 
@@ -102,7 +107,7 @@ impl TrackKind {
             Self::Log => Some("Log"),
             Self::Network | Self::Ws => Some("Network"),
             Self::Lifecycle => Some("Page"),
-            Self::Watch => None,
+            Self::Watch | Self::Trace => None,
         }
     }
 }
@@ -116,6 +121,35 @@ pub struct WatchDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
     pub to: String,
+}
+
+/// One firing of an instrumentation point — a fn-trace call (and, later, a logpoint hit) — or,
+/// when `suppressed` is set, the rate-cap summary standing in for that many dropped hits. Values
+/// are bounded previews serialized in-page; `eval` retrieves full state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceRecord {
+    pub name: String,
+    /// Where the trace is armed: a function path (`app.api.save`) or a `file:line` site.
+    pub site: String,
+    /// The logged expression (logpoint) or the call arguments (fn trace).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    /// Fn traces: how the call ended.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<TraceOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<f64>,
+    /// When set, this row summarizes that many hits the rate cap dropped since the last record.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suppressed: Option<u64>,
+}
+
+/// How a traced call ended, with a bounded preview of the result or the error.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "preview", rename_all = "snake_case")]
+pub enum TraceOutcome {
+    Returned(String),
+    Threw(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,6 +169,24 @@ pub struct ExceptionInfo {
     pub url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub line: Option<u64>,
+    /// Top stack frames with the ids source-map resolution needs. Bounded at decode; absent on
+    /// events captured before this field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frames: Vec<StackFrame>,
+    /// The top frame's original location (`src/cart.js:14`), filled at query time when the
+    /// source-map registry holds the frame's map — never stored in the ring.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved: Option<String>,
+}
+
+/// One captured stack frame: generated-code coordinates (0-based, as V8 reports them) plus the
+/// script identity resolution keys on.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StackFrame {
+    pub script_id: String,
+    pub url: String,
+    pub line: u64,
+    pub column: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -216,6 +268,7 @@ impl Track {
             Self::Ws(_) => TrackKind::Ws,
             Self::Lifecycle(_) => TrackKind::Lifecycle,
             Self::Watch(_) => TrackKind::Watch,
+            Self::Trace(_) => TrackKind::Trace,
         }
     }
 
@@ -231,6 +284,10 @@ impl Track {
             Self::Ws(_) => false,
             Self::Lifecycle(_) => false,
             Self::Watch(_) => false,
+            // A traced `Threw` is an observation, not an app failure — the app may catch and
+            // handle it, and arming a trace must never flip a `verify` verdict. Uncaught throws
+            // already land on the exception track.
+            Self::Trace(_) => false,
         }
     }
 
@@ -259,6 +316,7 @@ impl Track {
             Self::Ws(frame) => format!("ws:{:?}", frame.dir),
             Self::Lifecycle(event) => format!("lifecycle:{}", event.name),
             Self::Watch(delta) => format!("watch:{}", delta.name),
+            Self::Trace(record) => format!("trace:{}@{}", record.name, record.site),
         }
     }
 
@@ -291,6 +349,10 @@ impl Track {
                 Some(from) => format!("watch {} {from} → {}", delta.name, delta.to),
                 None => format!("watch {} → {}", delta.name, delta.to),
             },
+            Self::Trace(record) => {
+                let value = record.value.as_deref().unwrap_or("");
+                format!("trace {} {value}", record.name)
+            }
         }
     }
 
@@ -310,6 +372,8 @@ impl Track {
                     text: exception_text(details),
                     url: string_at(details, "url"),
                     line: u64_at(details, "lineNumber"),
+                    frames: exception_frames(details),
+                    resolved: None,
                 }))
             }
             "Log.entryAdded" => {
@@ -603,6 +667,36 @@ fn exception_text(details: &Value) -> String {
         .unwrap_or_else(|| "uncaught exception".to_owned())
 }
 
+/// The top stack frames, with the throw site itself standing in when no stack was attached.
+fn exception_frames(details: &Value) -> Vec<StackFrame> {
+    const TOP_FRAMES: usize = 5;
+    let from_stack: Vec<StackFrame> = details
+        .pointer("/stackTrace/callFrames")
+        .and_then(Value::as_array)
+        .map(|frames| {
+            frames
+                .iter()
+                .take(TOP_FRAMES)
+                .filter_map(|frame| {
+                    Some(StackFrame {
+                        script_id: string_at(frame, "scriptId")?,
+                        url: string_at(frame, "url")?,
+                        line: u64_at(frame, "lineNumber")?,
+                        column: u64_at(frame, "columnNumber")?,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if !from_stack.is_empty() {
+        return from_stack;
+    }
+    Option::zip(string_at(details, "scriptId"), string_at(details, "url"))
+        .zip(Option::zip(u64_at(details, "lineNumber"), u64_at(details, "columnNumber")))
+        .map(|((script_id, url), (line, column))| vec![StackFrame { script_id, url, line, column }])
+        .unwrap_or_default()
+}
+
 fn frame_url(params: &Value) -> Option<String> {
     params.pointer("/stackTrace/callFrames/0/url").and_then(as_string)
 }
@@ -685,6 +779,8 @@ mod tests {
             text: "Error: boom".into(),
             url: Some("a.js".into()),
             line: Some(1),
+            frames: Vec::new(),
+            resolved: None,
         });
         let groups = group_errors(&[at(1, one.clone()), at(2, one)]);
         assert_eq!(groups.len(), 1);
@@ -734,6 +830,8 @@ mod tests {
                 text: "TypeError: x".into(),
                 url: Some(url.into()),
                 line: Some(line),
+                frames: Vec::new(),
+                resolved: None,
             })
         };
         let events = [at(1, boom("a.js", 10)), at(2, boom("a.js", 10)), at(3, boom("b.js", 20))];
@@ -778,7 +876,18 @@ mod tests {
                 url: None,
                 line: None,
             }),
-            Track::Exception(ExceptionInfo { text: "boom".into(), url: None, line: None }),
+            Track::Exception(ExceptionInfo {
+                text: "boom".into(),
+                url: None,
+                line: None,
+                frames: vec![StackFrame {
+                    script_id: "12".into(),
+                    url: "bundle.js".into(),
+                    line: 17,
+                    column: 9,
+                }],
+                resolved: Some("src/cart.js:14".into()),
+            }),
             Track::Log(LogEntry {
                 level: "info".into(),
                 source: "network".into(),
@@ -806,6 +915,14 @@ mod tests {
                 name: "cart".into(),
                 from: Some("2".into()),
                 to: "3".into(),
+            }),
+            Track::Trace(TraceRecord {
+                name: "save".into(),
+                site: "app.api.save".into(),
+                value: Some("(2 args)".into()),
+                outcome: Some(TraceOutcome::Returned("{ok: true}".into())),
+                duration_ms: Some(38.0),
+                suppressed: None,
             }),
         ];
         for track in cases {

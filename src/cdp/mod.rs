@@ -9,6 +9,7 @@ mod client;
 mod discovery;
 mod http;
 mod ports;
+mod sourcemap;
 mod target;
 mod timeline;
 
@@ -18,8 +19,10 @@ pub use discovery::{
     NodeEndpoint,
 };
 pub use ports::listening_ports;
+pub use sourcemap::{inline_map, resolve_map_url, SourceMap, SourceMatch};
 pub use target::{select, select_active, ScoreReason, Target, TargetKind, TargetScore};
 pub use timeline::{
     group_errors, ConsoleLine, ErrorGroup, ErrorReport, ExceptionInfo, LogEntry, NetEvent,
-    NetPhase, Source, Timeline, TimelineEvent, Track, TrackKind, WatchDelta, WsDir, WsFrame,
+    NetPhase, Source, Timeline, TimelineEvent, TraceOutcome, TraceRecord, Track, TrackKind,
+    WatchDelta, WsDir, WsFrame,
 };

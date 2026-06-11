@@ -960,7 +960,7 @@ fn parse_track_filter(rest: &[String]) -> Result<Option<Vec<TrackKind>>, String>
             Some(track) => tracks.push(track),
             None => {
                 return Err(format!(
-                    "unknown track '{name}' — console, exception, log, network, ws, lifecycle"
+                    "unknown track '{name}' — console, exception, log, network, ws, lifecycle, watch, trace"
                 ))
             }
         }
@@ -1228,6 +1228,10 @@ fn render_help(frame: &mut TuiFrame, area: Rect) {
         section("BATCH & SUBSCRIBE"),
         entry("do \"<step>; <step>\" · flow run <name> [k=v]", "whole sequences, one round trip"),
         entry("watch add <name> '<expr>' · ls · rm · clear", "value changes land on the feed live"),
+        entry(
+            "trace fn '<path>' · trace add <file:line> ['<expr>']",
+            "execution lands on the feed — no pause, no rebuild",
+        ),
         section("FOCUS & FILTER"),
         entry("Tab  ·  target [<text>|main]", "pick / set / clear the focused target"),
         entry("track <list> | all", "filter the live pane by track"),
@@ -1287,6 +1291,7 @@ fn track_color(kind: TrackKind) -> Color {
         TrackKind::Ws => Color::Magenta,
         TrackKind::Lifecycle => Color::Yellow,
         TrackKind::Watch => Color::Green,
+        TrackKind::Trace => Color::LightMagenta,
     }
 }
 

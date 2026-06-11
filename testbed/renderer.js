@@ -72,6 +72,42 @@ on('ws-send', () => {
   ws.send(`ping #${(pings += 1)}`);
 });
 
+// --- trace targets -----------------------------------------------------------
+// Plain functions on a dotted path, for `kit cdp trace fn 'testbed.fns.<name>'`:
+// sync return, async settle, sync throw (caught here — must NOT flip verify), and
+// a hot loop that proves the rate cap suppresses with exact counts.
+window.testbed.fns = {
+  compute(a, b) {
+    return { sum: a + b, at: Date.now() };
+  },
+  async saveQuote(text) {
+    const response = await fetch(api('/api/ok'), { method: 'POST', body: text });
+    return { ok: response.ok, status: response.status };
+  },
+  failing(input) {
+    throw new TypeError(`bad input: ${input}`);
+  },
+  hot(n) {
+    return n * 2;
+  },
+};
+on('call-compute', () => console.log('[testbed] compute →', window.testbed.fns.compute(2, 3)));
+on('call-save-quote', () => {
+  window.testbed.fns.saveQuote('hello').then((result) => console.log('[testbed] saveQuote →', result));
+});
+on('call-failing', () => {
+  try {
+    window.testbed.fns.failing('oops');
+  } catch (error) {
+    console.log('[testbed] failing threw (caught):', error.message);
+  }
+});
+on('call-hot', () => {
+  let total = 0;
+  for (let index = 0; index < 500; index += 1) total += window.testbed.fns.hot(index);
+  console.log('[testbed] hot loop done', { total });
+});
+
 // --- async save ---------------------------------------------------------------
 const saveStatus = document.getElementById('save-status');
 const toast = (text, isError) => {

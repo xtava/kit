@@ -16,6 +16,7 @@ mod protocol;
 mod readiness;
 mod registry;
 mod snapshot;
+mod trace;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -54,6 +55,12 @@ RECIPES
   Subscribe to a value and see changes on the Timeline clock:
     kit cdp watch add cart 'document.querySelectorAll(\".cart-item\").length' --app checkout
     kit cdp tail --track watch --since 2m --app checkout
+
+  Trace execution — console.log without editing code (no pause, no rebuild):
+    kit cdp trace fn 'app.api.save' --app checkout           args → outcome, duration, per call
+    kit cdp trace add src/cart.js:84 'items.length' --app checkout    logpoint via source maps
+    kit cdp tail --track trace --since 2m --app checkout
+    kit cdp errors --resolve --app checkout                  stacks back to original files
 
   Bound an action so logs stay useful:
     kit cdp mark before-save --app checkout
@@ -193,6 +200,33 @@ EXAMPLES
   kit cdp watch add route 'location.pathname' --app checkout
   kit cdp tail --track watch --since 2m --app checkout
   kit cdp watch ls · watch rm cart · watch clear
+";
+
+const TRACE_AFTER_HELP: &str = "\
+EXECUTION ON THE TIMELINE
+  Each hit lands as a `trace` row interleaved with the console/network rows it causes, so
+  \"did my code run, with what, and what did it trigger\" is one `tail`:
+    +1203ms [app] trace store.js-84 {n: 2, t: \"ADD\"}
+    +1241ms [app] trace save (2 args) → {ok: true} 38ms
+    +1290ms [app] net ← 200 POST /api/save
+
+  `trace fn` wraps a live function (this/args/return/throw preserved; survives reloads via a
+  keeper). `trace add` sets a logpoint: a breakpoint whose condition records and returns false —
+  the app NEVER pauses. Expressions are compile-checked at arm time, so a syntax error fails the
+  add instead of arming a trace that is silently dead.
+
+  Honest limits: fn calls through references saved before wrapping are not seen; thenables
+  return as derived promises (same settlement, different identity); past --rate the page counts
+  drops and the Timeline shows `suppressed N` rows — never silent loss. Arming a logpoint
+  enables the Debugger domain: `debugger;` statements then pause and are auto-resumed unless
+  DevTools is open, and V8 runs the containing function deoptimized while armed.
+
+EXAMPLES
+  kit cdp trace fn 'app.api.save' --app checkout
+  kit cdp trace add renderer.js:108 '({ counter: window.testbed.counter })' --app testbed
+  kit cdp trace add store.js:84 'items.length' --when 'items.length > 3' --name big-cart
+  kit cdp tail --track trace --since 2m --app checkout
+  kit cdp trace ls · trace rm save · trace clear
 ";
 
 const DO_AFTER_HELP: &str = "\
@@ -462,6 +496,10 @@ enum CdpCommand {
         /// Expand each collapsed group into the distinct lines it absorbed — the audit view.
         #[arg(long)]
         explain: bool,
+        /// Resolve stacks through source maps to original files (loads maps; enables the
+        /// Debugger domain where needed — `debugger;` statements then pause and auto-resume).
+        #[arg(long)]
+        resolve: bool,
         #[command(flatten)]
         filter: TimelineFilterArgs,
     },
@@ -539,6 +577,12 @@ enum CdpCommand {
     Watch {
         #[command(subcommand)]
         command: WatchCommand,
+    },
+    /// Instrument a live function: record every call — args, outcome, duration — on the Timeline.
+    #[command(after_help = TRACE_AFTER_HELP)]
+    Trace {
+        #[command(subcommand)]
+        command: TraceCommand,
     },
     /// Run several session commands as one daemon-side batch, stopping at the first failure.
     #[command(after_help = DO_AFTER_HELP)]
@@ -743,6 +787,47 @@ enum WatchCommand {
     /// Stop one watch.
     Rm { name: String },
     /// Stop all watches.
+    Clear,
+}
+
+#[derive(Subcommand)]
+enum TraceCommand {
+    /// Wrap a live function: every call records args, outcome, and duration.
+    Fn {
+        /// Dotted path to the function in the page (`app.api.save`).
+        path: String,
+        /// Trace name — how rows read on the Timeline. Defaults to the path's last segment.
+        #[arg(long)]
+        name: Option<String>,
+        /// Emission cap, hits per second; past it the page counts instead of sends.
+        #[arg(long, default_value_t = 20)]
+        rate: u64,
+        #[arg(long)]
+        target: Option<String>,
+    },
+    /// Logpoint: record a value every time a code location runs — no pause, no rebuild.
+    Add {
+        /// Script location: `renderer.js:93` (URL suffix) or a full URL, optional `:column`.
+        location: String,
+        /// JS expression evaluated in the frame's scope there; `({a, b})` logs several values.
+        expr: Option<String>,
+        /// Record only when this frame-scope condition is truthy.
+        #[arg(long)]
+        when: Option<String>,
+        /// Trace name — how rows read on the Timeline. Defaults to `file-line`.
+        #[arg(long)]
+        name: Option<String>,
+        /// Emission cap, hits per second; past it the page counts instead of sends.
+        #[arg(long, default_value_t = 20)]
+        rate: u64,
+        #[arg(long)]
+        target: Option<String>,
+    },
+    /// List armed traces with hit and suppression counts.
+    Ls,
+    /// Remove one trace and restore the original function.
+    Rm { name: String },
+    /// Remove all traces.
     Clear,
 }
 
@@ -1036,17 +1121,17 @@ fn session_command(command: CdpCommand) -> Result<Command> {
     Ok(match command {
         CdpCommand::Targets => Command::Targets,
         CdpCommand::Tail { track, filter } => {
-            Command::Tail(timeline_query(filter, track.map(parse_tracks))?)
+            Command::Tail(timeline_query(filter, parse_tracks(track)?)?)
         }
         CdpCommand::Brief { track, tail, groups, filter } => {
-            Command::Brief { query: timeline_query(filter, track.map(parse_tracks))?, tail, groups }
+            Command::Brief { query: timeline_query(filter, parse_tracks(track)?)?, tail, groups }
         }
         CdpCommand::Console { filter } => Command::Tail(timeline_query(
             filter,
             Some(vec![TrackKind::Console, TrackKind::Exception, TrackKind::Log]),
         )?),
-        CdpCommand::Errors { explain, filter } => {
-            Command::Errors { query: timeline_query(filter, None)?, explain }
+        CdpCommand::Errors { explain, resolve, filter } => {
+            Command::Errors { query: timeline_query(filter, None)?, explain, resolve }
         }
         CdpCommand::Net { command: None, filter } => {
             Command::Tail(timeline_query(filter, Some(vec![TrackKind::Network]))?)
@@ -1106,6 +1191,17 @@ fn session_command(command: CdpCommand) -> Result<Command> {
             WatchCommand::Ls => protocol::WatchOp::Ls,
             WatchCommand::Rm { name } => protocol::WatchOp::Rm { name },
             WatchCommand::Clear => protocol::WatchOp::Clear,
+        }),
+        CdpCommand::Trace { command } => Command::Trace(match command {
+            TraceCommand::Fn { path, name, rate, target } => {
+                protocol::TraceOp::Fn { name, target, path, rate }
+            }
+            TraceCommand::Add { location, expr, when, name, rate, target } => {
+                protocol::TraceOp::Point { name, target, location, expr, when, rate }
+            }
+            TraceCommand::Ls => protocol::TraceOp::Ls,
+            TraceCommand::Rm { name } => protocol::TraceOp::Rm { name },
+            TraceCommand::Clear => protocol::TraceOp::Clear,
         }),
         CdpCommand::Do { steps, file } => {
             let script = match file {
@@ -1419,9 +1515,25 @@ fn lens_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("cdp/lenses"))
 }
 
-/// Parse a comma-separated track list, skipping unknown names.
-fn parse_tracks(csv: String) -> Vec<TrackKind> {
-    csv.split(',').filter_map(TrackKind::parse).collect()
+/// `--track net,ws` → a filter; `all`/`*` (or no flag) → no filter; a typo → an error, because a
+/// silently-empty filter matches nothing and reads as "nothing happened".
+fn parse_tracks(csv: Option<String>) -> Result<Option<Vec<TrackKind>>> {
+    let Some(csv) = csv else {
+        return Ok(None);
+    };
+    let mut kinds = Vec::new();
+    for name in csv.split(',').map(str::trim).filter(|name| !name.is_empty()) {
+        if matches!(name, "all" | "*") {
+            return Ok(None);
+        }
+        match TrackKind::parse(name) {
+            Some(kind) => kinds.push(kind),
+            None => bail!(
+                "unknown track '{name}' — console, exception, log, network, ws, lifecycle, watch, trace"
+            ),
+        }
+    }
+    Ok((!kinds.is_empty()).then_some(kinds))
 }
 
 /// `main` / `renderer`, or an error on a typo — silently returning everything would be a quiet lie.
