@@ -176,6 +176,7 @@ impl Repl {
             complete_ctx: complete::Context {
                 flows: super::flow::list().into_iter().map(|flow| flow.name).collect(),
                 lenses: super::lens_names(),
+                targets: Vec::new(),
                 refs: Vec::new(),
             },
             completion: None,
@@ -270,7 +271,7 @@ impl Repl {
             match key.code {
                 KeyCode::Tab | KeyCode::Down => self.cycle_completion(1),
                 KeyCode::BackTab | KeyCode::Up => self.cycle_completion(-1),
-                KeyCode::Enter => self.accept_completion(),
+                KeyCode::Enter | KeyCode::Right => self.accept_completion(),
                 KeyCode::Esc => self.completion = None,
                 _ => {
                     self.input.apply_key(key);
@@ -295,6 +296,12 @@ impl Repl {
             // readline pairing, so it never contends with scrolling.
             KeyCode::Up => self.scroll_by(-1),
             KeyCode::Down => self.scroll_by(1),
+            // → at the end of the line accepts the inline ghost, the fish-shell pairing.
+            KeyCode::Right
+                if self.input.cursor() == self.input.value().len() && self.ghost_acceptable() =>
+            {
+                self.accept_ghost()
+            }
             KeyCode::Left if self.view_top.is_some() => {
                 self.view_left = self.view_left.saturating_sub(PAN_STEP)
             }
@@ -308,7 +315,14 @@ impl Repl {
                 self.view_top = None;
                 self.view_left = 0;
             }
-            _ => self.input.apply_key(key),
+            _ => {
+                self.input.apply_key(key);
+                // Entering a fresh slot (word boundary) surfaces its options unprompted; Esc
+                // closes, and nothing reopens until the next slot.
+                if matches!(key.code, KeyCode::Char(' ')) {
+                    self.open_completion();
+                }
+            }
         }
         Flow::Continue
     }
@@ -414,6 +428,33 @@ impl Repl {
         }
     }
 
+    fn ghost(&self) -> Option<complete::Ghost> {
+        if self.picker.is_some() || self.help_open {
+            return None;
+        }
+        complete::ghost(self.input.value(), &self.complete_ctx)
+    }
+
+    fn ghost_acceptable(&self) -> bool {
+        self.ghost().is_some_and(|ghost| ghost.acceptable)
+    }
+
+    fn accept_ghost(&mut self) {
+        let Some(ghost) = self.ghost() else {
+            return;
+        };
+        if !ghost.acceptable {
+            return;
+        }
+        let mut line = self.input.value().to_owned();
+        line.push_str(&ghost.text);
+        line.push(' ');
+        self.input.set(line);
+        self.completion = None;
+        // Landing in the next slot: surface what it offers, exactly as a typed space would.
+        self.open_completion();
+    }
+
     fn accept_completion(&mut self) {
         let Some(state) = self.completion.take() else {
             return;
@@ -425,6 +466,7 @@ impl Repl {
         line.push_str(&candidate.insert);
         line.push(' ');
         self.input.set(line);
+        self.open_completion();
     }
 
     // --- target picker ---
@@ -439,6 +481,9 @@ impl Repl {
     }
 
     fn populate_picker(&mut self, result: Result<Vec<TargetEntry>>) {
+        if let Ok(entries) = &result {
+            self.complete_ctx.targets = entries.iter().map(|entry| entry.label.clone()).collect();
+        }
         let current = self.target.clone();
         let Some(picker) = &mut self.picker else {
             return;
@@ -1000,11 +1045,15 @@ fn render_feed(frame: &mut TuiFrame, area: Rect, repl: &Repl, lines: Vec<Line<'s
 }
 
 fn render_input(frame: &mut TuiFrame, area: Rect, repl: &Repl) {
-    let line = Line::from(vec![
+    let mut spans = vec![
         Span::styled("cdp› ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         Span::raw(repl.input.value().to_owned()),
-    ]);
-    frame.render_widget(Paragraph::new(line), area);
+    ];
+    // The inline ghost: dim completion remainder (→ accepts) or the slot's placeholder.
+    if let Some(ghost) = repl.ghost() {
+        spans.push(Span::styled(ghost.text, Style::default().fg(Color::DarkGray)));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 
     if repl.picker.is_none() && !repl.help_open {
         let cursor_x =
