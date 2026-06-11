@@ -702,6 +702,7 @@ async fn dispatch(
         }
         Command::Ignore(op) => ignore_reply(state, op, json),
         Command::TargetList => target_list_reply(state),
+        Command::Refs { target } => refs_reply(state, target),
         Command::Heap { target } => heap_reply(state, target, json).await,
         Command::Snap { target, interactive, diff } => {
             snap_reply(state, target, interactive, diff, json).await
@@ -779,6 +780,20 @@ fn target_list_reply(state: &Shared) -> Reply {
     match serde_json::to_string(&list) {
         Ok(json) => Reply::ok(json),
         Err(error) => Reply::fail(format!("encode targets: {error}")),
+    }
+}
+
+/// The stored refs for a target's session, as JSON — completion data, not for humans.
+fn refs_reply(state: &Shared, target: Option<String>) -> Reply {
+    let state = state.lock().unwrap();
+    let refs = state
+        .resolve(target.as_deref())
+        .and_then(|(session, _)| state.refs.get(&session))
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    match serde_json::to_string(refs) {
+        Ok(json) => Reply::ok(json),
+        Err(error) => Reply::fail(format!("encode refs: {error}")),
     }
 }
 

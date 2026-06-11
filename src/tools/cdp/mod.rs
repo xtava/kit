@@ -7,6 +7,7 @@
 
 mod checks;
 mod client;
+mod complete;
 mod daemon;
 mod flow;
 mod format;

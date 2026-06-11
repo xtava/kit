@@ -26,9 +26,9 @@ use tokio::time;
 use crate::cdp::{Source, TargetKind, TimelineEvent, TrackKind};
 use crate::tui::{fuzzy, EventReader, LineEditor, Session};
 
-use super::client;
 use super::protocol::{Command, Frame, Reply, TargetActivity};
 use super::registry::Record;
+use super::{client, complete};
 
 /// How much recent Timeline to request when the session opens.
 const BACKFILL_MS: u64 = 30_000;
@@ -49,6 +49,13 @@ pub async fn run(app: Option<&str>) -> Result<()> {
     let mut session = Session::open()?;
     let mut events = EventReader::start();
     let mut repl = Repl::new(record);
+    {
+        let record = repl.record.clone();
+        let async_tx = async_tx.clone();
+        tokio::spawn(async move {
+            let _ = async_tx.send(Async::Refs(fetch_refs(&record, None).await));
+        });
+    }
     let mut redraw = time::interval(REDRAW);
 
     loop {
@@ -90,6 +97,7 @@ enum Flow {
 enum Async {
     Command(CommandResult),
     Targets(Result<Vec<TargetEntry>>),
+    Refs(Result<Vec<complete::ElementRef>>),
 }
 
 struct CommandResult {
@@ -130,6 +138,16 @@ struct Repl {
     history_path: Option<PathBuf>,
     /// A clipboard yank awaiting the event loop, which owns the terminal the OSC 52 write goes to.
     pending_copy: Option<String>,
+    /// Live data the completion engine draws on beyond the static grammar.
+    complete_ctx: complete::Context,
+    /// The open completion popup, if any: candidates for the word at `start`.
+    completion: Option<CompletionState>,
+}
+
+struct CompletionState {
+    candidates: Vec<complete::Candidate>,
+    selected: usize,
+    start: usize,
 }
 
 impl Repl {
@@ -155,6 +173,12 @@ impl Repl {
             connected: true,
             history_path,
             pending_copy: None,
+            complete_ctx: complete::Context {
+                flows: super::flow::list().into_iter().map(|flow| flow.name).collect(),
+                lenses: super::lens_names(),
+                refs: Vec::new(),
+            },
+            completion: None,
         }
     }
 
@@ -173,6 +197,9 @@ impl Repl {
         match message {
             Async::Command(result) => self.push_result(result),
             Async::Targets(result) => self.populate_picker(result),
+            // Stale refs are worse than none; errors (daemon mid-restart) keep the old set.
+            Async::Refs(Ok(refs)) => self.complete_ctx.refs = refs,
+            Async::Refs(Err(_)) => {}
         }
     }
 
@@ -213,6 +240,7 @@ impl Repl {
             return Flow::Continue;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.completion = None;
             return match key.code {
                 KeyCode::Char('c') if self.input.value().is_empty() => Flow::Quit,
                 KeyCode::Char('c') | KeyCode::Char('u') => {
@@ -238,6 +266,19 @@ impl Repl {
                 _ => Flow::Continue,
             };
         }
+        if self.completion.is_some() {
+            match key.code {
+                KeyCode::Tab | KeyCode::Down => self.cycle_completion(1),
+                KeyCode::BackTab | KeyCode::Up => self.cycle_completion(-1),
+                KeyCode::Enter => self.accept_completion(),
+                KeyCode::Esc => self.completion = None,
+                _ => {
+                    self.input.apply_key(key);
+                    self.refresh_completion();
+                }
+            }
+            return Flow::Continue;
+        }
         // While scrolled (reviewing history), `c`/`y` yank the view — they can't shadow typing here
         // because the prompt isn't in compose mode. Pinned to live, they're ordinary characters.
         if self.view_top.is_some() && matches!(key.code, KeyCode::Char('c' | 'y')) {
@@ -246,8 +287,9 @@ impl Repl {
         }
         match key.code {
             KeyCode::Enter => return self.submit(async_tx),
-            // Tab on an empty prompt opens the target picker; (completion-while-typing is deferred).
+            // Tab: target picker on an empty prompt, completion popup while typing.
             KeyCode::Tab if self.input.value().is_empty() => self.open_picker(async_tx),
+            KeyCode::Tab => self.open_completion(),
             // The arrows drive the feed — ↑/↓ scroll (the first press from live enters the scrolled
             // state), ←/→ pan wide lines once scrolled. Command history is on Ctrl+P/N (below), the
             // readline pairing, so it never contends with scrolling.
@@ -329,11 +371,60 @@ impl Repl {
         apply_target(&mut command, &self.target);
         let record = self.record.clone();
         let label = label.to_owned();
+        let target = self.target.clone();
         let async_tx = async_tx.clone();
         tokio::spawn(async move {
             let outcome = client::run_one(&record, command, false).await;
             let _ = async_tx.send(Async::Command(CommandResult { label, outcome }));
+            // The command may have re-snapped (snap, or a locator click) — refresh ref completion.
+            let _ = async_tx.send(Async::Refs(fetch_refs(&record, target).await));
         });
+    }
+
+    // --- completion ---
+
+    fn open_completion(&mut self) {
+        let Some(found) = complete::complete(self.input.value(), &self.complete_ctx) else {
+            return;
+        };
+        self.completion =
+            Some(CompletionState { candidates: found.candidates, selected: 0, start: found.start });
+        if self.completion.as_ref().is_some_and(|state| state.candidates.len() == 1) {
+            self.accept_completion();
+        }
+    }
+
+    fn refresh_completion(&mut self) {
+        match complete::complete(self.input.value(), &self.complete_ctx) {
+            Some(found) => {
+                self.completion = Some(CompletionState {
+                    candidates: found.candidates,
+                    selected: 0,
+                    start: found.start,
+                })
+            }
+            None => self.completion = None,
+        }
+    }
+
+    fn cycle_completion(&mut self, step: isize) {
+        if let Some(state) = &mut self.completion {
+            let len = state.candidates.len() as isize;
+            state.selected = ((state.selected as isize + step).rem_euclid(len)) as usize;
+        }
+    }
+
+    fn accept_completion(&mut self) {
+        let Some(state) = self.completion.take() else {
+            return;
+        };
+        let Some(candidate) = state.candidates.get(state.selected) else {
+            return;
+        };
+        let mut line = self.input.value()[..state.start].to_owned();
+        line.push_str(&candidate.insert);
+        line.push(' ');
+        self.input.set(line);
     }
 
     // --- target picker ---
@@ -702,6 +793,11 @@ impl Picker {
     }
 }
 
+async fn fetch_refs(record: &Record, target: Option<String>) -> Result<Vec<complete::ElementRef>> {
+    let reply = client::run_one(record, Command::Refs { target }, true).await?;
+    Ok(serde_json::from_str(&reply.output)?)
+}
+
 async fn fetch_targets(record: &Record) -> Result<Vec<TargetEntry>> {
     let reply = client::run_one(record, Command::TargetList, false).await?;
     let activity: Vec<TargetActivity> = serde_json::from_str(&reply.output)?;
@@ -807,12 +903,57 @@ fn render(frame: &mut TuiFrame, repl: &mut Repl) {
     render_feed(frame, chunks[1], repl, lines);
     render_input(frame, chunks[2], repl);
 
+    if let Some(state) = &repl.completion {
+        render_completion(frame, area, state);
+    }
     if repl.help_open {
         render_help(frame, area);
     }
     if let Some(picker) = &repl.picker {
         render_picker(frame, area, picker);
     }
+}
+
+/// The completion popup: a short list floated just above the prompt, selection reversed. Shows a
+/// window around the selection when the list is longer than the popup.
+fn render_completion(frame: &mut TuiFrame, area: Rect, state: &CompletionState) {
+    const ROWS: usize = 8;
+    let shown = state.candidates.len().min(ROWS);
+    let offset = state.selected.saturating_sub(ROWS - 1);
+    let width = area.width.min(72);
+    let popup = Rect {
+        x: area.x,
+        y: area.height.saturating_sub(1 + shown as u16),
+        width,
+        height: shown as u16,
+    };
+
+    let rows: Vec<Line<'static>> = state
+        .candidates
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(shown)
+        .map(|(index, candidate)| {
+            let style = if index == state.selected {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            } else {
+                Style::default().bg(Color::DarkGray).fg(Color::White)
+            };
+            let hint = if candidate.hint.is_empty() {
+                String::new()
+            } else {
+                format!("  {}", truncate(&candidate.hint, 44))
+            };
+            Line::from(vec![
+                Span::styled(format!(" {:<24}", truncate(&candidate.insert, 24)), style),
+                Span::styled(hint, style.add_modifier(Modifier::DIM)),
+            ])
+        })
+        .collect();
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(Paragraph::new(rows), popup);
 }
 
 fn render_header(frame: &mut TuiFrame, area: Rect, repl: &Repl) {
@@ -976,6 +1117,7 @@ fn render_help(frame: &mut TuiFrame, area: Rect) {
         entry("track <list> | all", "filter the live pane by track"),
         entry("source main | renderer | all", "filter the live pane by side"),
         entry("ignore <substr> · clear · help · quit", "noise, this help, exit"),
+        entry("Tab (while typing)", "complete commands, flags, locators, flows — ⏎ accepts"),
         section("MOVE & COPY"),
         entry("↑↓ · PgUp/PgDn", "scroll the timeline · End re-pins to live"),
         entry("←→", "pan to read lines wider than the pane"),

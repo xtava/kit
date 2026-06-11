@@ -369,7 +369,8 @@ Two grammars meet at the prompt:
   - `source main` / `source renderer` / `source all` — filter by process side.
   - `clear` · `help` · `quit`.
 
-Keys: `⏎` run · `⇥` target picker (empty prompt) · `↑↓` history (persisted under the
+Keys: `⏎` run · `⇥` complete (commands · flags · live locators · flows; empty prompt:
+target picker) · `↑↓` history (persisted under the
 config dir) · `PgUp`/`PgDn` scroll the feed · `End`/`Esc` re-pin to live · `^L`
 clear · `^D` quit. The feed header shows `● live` when pinned and `▲ N below` when
 you've scrolled up. The live pane survives HMR reloads and app restarts on the same

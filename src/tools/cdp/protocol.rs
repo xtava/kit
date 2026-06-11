@@ -94,31 +94,34 @@ impl KeyChord {
     }
 }
 
-/// The named keys `press` understands, canonicalized; anything else must be a single character.
+/// The named keys `press` understands — shared with completion so the offered list is the
+/// accepted list.
+pub(crate) const NAMED_KEYS: &[&str] = &[
+    "Enter",
+    "Tab",
+    "Escape",
+    "Backspace",
+    "Delete",
+    "Space",
+    "ArrowUp",
+    "ArrowDown",
+    "ArrowLeft",
+    "ArrowRight",
+    "Home",
+    "End",
+    "PageUp",
+    "PageDown",
+];
+
+/// Canonicalize a key name; anything not in [`NAMED_KEYS`] must be a single character.
 fn canonical_key(key: &str) -> Result<String, String> {
-    const NAMED: &[&str] = &[
-        "Enter",
-        "Tab",
-        "Escape",
-        "Backspace",
-        "Delete",
-        "Space",
-        "ArrowUp",
-        "ArrowDown",
-        "ArrowLeft",
-        "ArrowRight",
-        "Home",
-        "End",
-        "PageUp",
-        "PageDown",
-    ];
-    if let Some(name) = NAMED.iter().find(|name| name.eq_ignore_ascii_case(key)) {
+    if let Some(name) = NAMED_KEYS.iter().find(|name| name.eq_ignore_ascii_case(key)) {
         return Ok((*name).to_owned());
     }
     if key.chars().count() == 1 {
         return Ok(key.to_owned());
     }
-    Err(format!("unknown key '{key}' — named keys: {}", NAMED.join(", ")))
+    Err(format!("unknown key '{key}' — named keys: {}", NAMED_KEYS.join(", ")))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -255,6 +258,11 @@ pub enum Command {
     /// The target picker's data source: every Target joined with its Timeline event volume, ranked
     /// active-first. Returns a JSON `Vec<TargetActivity>` in the [`Reply`] output.
     TargetList,
+    /// The stored element refs from the target's last accessibility snapshot, as JSON — the
+    /// completion data source for locator positions.
+    Refs {
+        target: Option<String>,
+    },
     /// Open a live subscription: the daemon replies with a [`Frame`] stream (not a [`Reply`]) and
     /// holds the socket open, pushing each new Timeline event until the client disconnects.
     Subscribe {
@@ -522,6 +530,7 @@ mod tests {
                 },
             },
             Command::Ignore(IgnoreOp::Add("noise".to_owned())),
+            Command::Refs { target: Some("main".to_owned()) },
             Command::WaitFor {
                 target: target.clone(),
                 expr: "!document.querySelector('.spinner')".to_owned(),
