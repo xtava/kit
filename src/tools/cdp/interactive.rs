@@ -981,20 +981,28 @@ fn parse_source_filter(rest: &[String]) -> Result<Option<Source>, String> {
 
 fn render(frame: &mut TuiFrame, repl: &mut Repl) {
     let area = frame.area();
-    let chunks =
-        Layout::vertical([Constraint::Length(3), Constraint::Min(1), Constraint::Length(1)])
-            .split(area);
+    let shown = repl.suggestions.as_ref().map_or(0, |menu| menu_rows(menu, area));
+    let menu_height = if shown == 0 { 0 } else { shown as u16 + 1 };
+    let chunks = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(1),
+        Constraint::Length(menu_height),
+        Constraint::Length(1),
+    ])
+    .split(area);
 
     render_header(frame, chunks[0], repl);
     let lines = repl.visible_lines();
     repl.feed_height = chunks[1].height.saturating_sub(2) as usize;
     repl.feed_total = lines.len();
     render_feed(frame, chunks[1], repl, lines);
-    render_input(frame, chunks[2], repl);
-
-    if let Some(menu) = &repl.suggestions {
-        render_suggestions(frame, area, menu);
+    if shown > 0 {
+        if let Some(menu) = &repl.suggestions {
+            render_suggestions(frame, chunks[2], menu, shown);
+        }
     }
+    render_input(frame, chunks[3], repl);
+
     if repl.help_open {
         render_help(frame, area);
     }
@@ -1003,47 +1011,61 @@ fn render(frame: &mut TuiFrame, repl: &mut Repl) {
     }
 }
 
-/// The suggestion menu: a short list floated just above the prompt. Passive rows are unlit —
-/// only an engaged selection (⇥/↓) is reversed. Shows a window around the selection when the
-/// list is longer than the menu.
-fn render_suggestions(frame: &mut TuiFrame, area: Rect, menu: &Suggestions) {
+/// Rows the suggestion section may claim: capped, and never enough to squeeze the feed
+/// below a few visible lines.
+fn menu_rows(menu: &Suggestions, area: Rect) -> usize {
     const ROWS: usize = 8;
-    let shown = menu.candidates.len().min(ROWS);
-    let offset = menu.selected.unwrap_or(0).saturating_sub(ROWS - 1);
-    let width = area.width.min(72);
-    let popup = Rect {
-        x: area.x,
-        y: area.height.saturating_sub(1 + shown as u16),
-        width,
-        height: shown as u16,
-    };
+    let room = (area.height as usize).saturating_sub(8);
+    menu.candidates.len().min(ROWS).min(room)
+}
 
-    let rows: Vec<Line<'static>> = menu
-        .candidates
-        .iter()
-        .enumerate()
-        .skip(offset)
-        .take(shown)
-        .map(|(index, candidate)| {
-            let style = if menu.selected == Some(index) {
-                Style::default().fg(Color::Black).bg(Color::Cyan)
-            } else {
-                Style::default().bg(Color::DarkGray).fg(Color::White)
-            };
-            let hint = if candidate.hint.is_empty() {
-                String::new()
-            } else {
-                format!("  {}", truncate(&candidate.hint, 44))
-            };
-            Line::from(vec![
-                Span::styled(format!(" {:<24}", truncate(&candidate.insert, 24)), style),
-                Span::styled(hint, style.add_modifier(Modifier::DIM)),
-            ])
-        })
-        .collect();
+/// The suggestion section: a dedicated band between the feed and the prompt — part of the
+/// layout, never painted over content. Passive rows are unlit; ⇥/↓ engage a picker-style
+/// bar, and the rule line says what ⏎ will do. Windows around the selection when the list
+/// outgrows the band.
+fn render_suggestions(frame: &mut TuiFrame, area: Rect, menu: &Suggestions, shown: usize) {
+    let offset = menu.selected.unwrap_or(0).saturating_sub(shown - 1);
+    let hint_width = (area.width as usize).saturating_sub(32);
 
-    frame.render_widget(Clear, popup);
-    frame.render_widget(Paragraph::new(rows), popup);
+    let mut lines = vec![menu_rule(menu, offset, shown, area.width as usize)];
+    for (index, candidate) in menu.candidates.iter().enumerate().skip(offset).take(shown) {
+        let engaged = menu.selected == Some(index);
+        let marker = if engaged { "▌ " } else { "  " };
+        let insert_style = if engaged {
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        let hint = if candidate.hint.is_empty() {
+            String::new()
+        } else {
+            format!("  {}", truncate(&candidate.hint, hint_width))
+        };
+        lines.push(Line::from(vec![
+            Span::styled(marker, Style::default().fg(Color::Cyan)),
+            Span::styled(format!("{:<24}", truncate(&candidate.insert, 24)), insert_style),
+            Span::styled(hint, Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// The band's top rule: match count, hidden-row indicators, and the keys that matter right
+/// now — ⇥ to engage while passive, ⏎/esc once a row is engaged.
+fn menu_rule(menu: &Suggestions, offset: usize, shown: usize, width: usize) -> Line<'static> {
+    let mut label = format!("─ suggestions · {} ", menu.candidates.len());
+    if offset > 0 {
+        label.push_str(&format!("· ↑ {offset} "));
+    }
+    let below = menu.candidates.len() - offset - shown;
+    if below > 0 {
+        label.push_str(&format!("· ↓ {below} "));
+    }
+    let keys =
+        if menu.selected.is_some() { " ⏎ accept · esc back ─" } else { " ⇥ select ─" };
+    let fill = width.saturating_sub(label.chars().count() + keys.chars().count());
+    let rule = format!("{label}{}{keys}", "─".repeat(fill));
+    Line::from(Span::styled(rule, Style::default().fg(Color::DarkGray)))
 }
 
 fn render_header(frame: &mut TuiFrame, area: Rect, repl: &Repl) {
@@ -1373,6 +1395,45 @@ mod tests {
             Input::Session(_) => "session",
             Input::Error(_) => "error",
         }
+    }
+
+    fn menu(count: usize, selected: Option<usize>) -> Suggestions {
+        let candidates = (0..count)
+            .map(|n| complete::Candidate { insert: format!("c{n}"), hint: String::new() })
+            .collect();
+        Suggestions { candidates, start: 0, selected }
+    }
+
+    fn rule_text(menu: &Suggestions, offset: usize, shown: usize) -> String {
+        menu_rule(menu, offset, shown, 80).spans.iter().map(|span| span.content.clone()).collect()
+    }
+
+    /// The band's rule line carries the whole story: match count, hidden rows on either side
+    /// of the window, and the keys whose meaning depends on engagement.
+    #[test]
+    fn menu_rule_reports_window_and_keys() {
+        let passive = menu(12, None);
+        let rule = rule_text(&passive, 0, 8);
+        assert!(rule.contains("suggestions · 12"), "{rule}");
+        assert!(rule.contains("↓ 4"), "{rule}");
+        assert!(!rule.contains('↑'), "{rule}");
+        assert!(rule.contains("⇥ select"), "{rule}");
+
+        let engaged = menu(12, Some(9));
+        let rule = rule_text(&engaged, 2, 8);
+        assert!(rule.contains("↑ 2"), "{rule}");
+        assert!(rule.contains("↓ 2"), "{rule}");
+        assert!(rule.contains("⏎ accept"), "{rule}");
+    }
+
+    /// The band scales to its content but never starves the feed on a short terminal.
+    #[test]
+    fn menu_rows_cap_against_short_terminals() {
+        let area = |height| Rect { x: 0, y: 0, width: 80, height };
+        assert_eq!(menu_rows(&menu(3, None), area(40)), 3);
+        assert_eq!(menu_rows(&menu(20, None), area(40)), 8);
+        assert_eq!(menu_rows(&menu(20, None), area(12)), 4);
+        assert_eq!(menu_rows(&menu(20, None), area(8)), 0);
     }
 
     /// The interactive prompt speaks the whole verification grammar — a typed `do`, `watch`,
