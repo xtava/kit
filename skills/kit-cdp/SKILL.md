@@ -1,6 +1,6 @@
 ---
 name: kit-cdp
-description: Drive, verify, and instrument live Electron and Chrome apps with `kit cdp`, a warm Chrome DevTools Protocol debugger CLI. Use when you need to self-verify UI work in a running app (click/fill/press, then get a PASS/FAIL verdict), trace whether a function or code line actually ran and with what values (fn traces and never-pausing logpoints — no console.log edits, no rebuilds), resolve minified stack traces back to original source files, reproduce and diagnose console errors, exceptions, failed network requests, or websocket traffic, inspect a live page's accessibility tree, watch an app value change over time, or capture a redacted evidence bundle of what an interaction caused. One command attaches lazily and stays warm — no setup step, no driver scripts; every command takes --json.
+description: Drive, verify, and instrument live Electron and Chrome apps with `kit cdp`, a warm Chrome DevTools Protocol debugger CLI. Use when you need to self-verify UI work in a running app (click/fill/press, then get a PASS/FAIL verdict), trace whether a function or code line actually ran and with what values (fn traces and never-pausing logpoints — no console.log edits, no rebuilds; arms read back the exact bound site), search the running app's parsed scripts for code to instrument (live url:line coordinates, immune to bundle drift), resolve minified stack traces back to original source files, reproduce and diagnose console errors, exceptions, failed network requests, or websocket traffic, inspect a live page's accessibility tree, watch an app value change over time, or capture a redacted evidence bundle of what an interaction caused. One command attaches lazily and stays warm — no setup step, no driver scripts; every command takes --json.
 license: MIT
 metadata:
   source: https://github.com/xtava/kit
@@ -134,9 +134,10 @@ its side effects:
 
 ```bash
 kit cdp trace fn 'app.api.save' --app dev            # every call: args → outcome, duration
+kit cdp trace find 'groupId: opts.group.id'          # live url:line coordinates from parsed scripts
 kit cdp trace add src/cart.js:84 'items.length'      # logpoint at a repo path (source maps)
 kit cdp trace add renderer.js:108 '({ counter })' --when 'counter > 2'
-kit cdp tail --track trace --since 2m --app dev
+kit cdp tail --track trace --since-mark trace-counter-108 --app dev
 kit cdp trace ls / rm <name> / clear
 ```
 
@@ -145,11 +146,29 @@ kit cdp trace ls / rm <name> / clear
 +1290ms [app] net ← 200 POST /api/save
 ```
 
-"Did my code run, with what, and what did it cause" is now one `tail`. Traces
-survive reloads; expressions are compile-checked at arm time (a typo fails the add,
-never arms a silently-dead trace); past `--rate` (default 20/s) the page counts
+**`trace fn` only reaches paths on `globalThis`** — in bundled ESM apps most
+functions are module-scoped, so use a logpoint: `trace find '<fnName>('` gives the
+line, `trace add <url:line> '([...arguments])'` records the calls.
+
+**Verify the arm, don't assume it.** The `add` reply reads back where V8 actually
+bound the breakpoint (`src/cart.js:5 → bundle.js:8:3 (1 site)`) and the source
+line's text when the map embeds content — if it shows `return;`, your line guess
+was wrong; fix it now, not after six silent repros. Every arm sets a `trace-<name>`
+mark and prints the exact `tail` command to read results. `trace ls` separates
+`armed, awaiting first hit` / `N hit(s) · last 4s ago` / `0 sites — no parsed
+script matches` / `⚠ stalled: <reason>` — `0 hit(s)` is never ambiguous. Never grep
+a build output for line numbers; `trace find` searches what is *actually executing*.
+
+Traces survive reloads (the keeper re-arms on script re-parse and says `re-armed
+N×`; fn re-installs have a ≤1s gap). Expressions are compile-checked at arm time —
+a typo fails the add, never arms a silently-dead trace — and a runtime throw in the
+expression ships as the row's value (`(expr threw: …)`), so a wrong variable name is
+evidence, not silence. Past `--rate` (default 20/s, max 32 traces) the page counts
 drops and the Timeline shows exact `suppressed N` rows. A traced *caught* throw
 shows as `✗` but never flips `verify`. Log several values with `'({a, b})'`.
+
+One side effect, disclosed: arming a logpoint enables the Debugger domain, so
+`debugger;` statements pause — kit auto-resumes them unless DevTools is open.
 
 Exception stacks resolve through the same source maps: `kit cdp errors --resolve`
 turns `bundle.js:48211` into `src/cart.js:14` on the error's headline.

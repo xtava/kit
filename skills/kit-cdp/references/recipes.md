@@ -70,7 +70,7 @@ and what it triggers — without touching the code:
 ```bash
 kit cdp trace fn 'app.api.save' --app dev
 kit cdp click 'button:Save settings' --app dev
-kit cdp tail --since 5s --app dev
+kit cdp tail --track trace --since-mark trace-save --app dev
 ```
 
 ```
@@ -78,12 +78,24 @@ kit cdp tail --since 5s --app dev
 +1290ms [app] net ← 200 POST /api/save
 ```
 
-For a specific line (loop bodies, branches), use a logpoint with a repo path —
-the source-map registry resolves it into the bundle:
+`trace fn` needs a `globalThis`-reachable path. For module-scoped functions and
+specific lines (loop bodies, branches), use a logpoint — and **verify the arm
+against its readback** before reproducing:
 
 ```bash
 kit cdp trace add src/cart/store.ts:84 '({n: items.length, t: action.type})' --app dev
-kit cdp trace add src/sync.ts:212 'state' --when 'retries > 0' --name retry --app dev
+# logpoint 'store.ts-84' at src/cart/store.ts:84 → bundle.js:9214:18 (1 site), rate cap 20/s
+# line      const next = reduce(items, action);
+```
+
+The `line` echo is the original source at that line — if it reads `return;` or a
+comment, the coordinate is wrong; fix it now instead of staring at silence later.
+Don't grep build output for line numbers (they drift on every rebuild); search the
+code that is actually executing:
+
+```bash
+kit cdp trace find 'reduce(items, action)' --app dev   # → url:line + the line's text, always current
+kit cdp trace ls --app dev                             # armed/awaiting · hits + last-hit age · stalled reasons
 ```
 
 When you're done: `kit cdp trace clear`. Traces are observation only — a caught
