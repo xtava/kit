@@ -6,9 +6,20 @@ new tool is *only* its own logic.
 
 ```
 kit                        # list tools
+kit cdp launch http://localhost:3000 --name app
+                           # controlled Chrome launch with startup capture
 kit cdp ready              # warm CDP debugger — is the workbench up? selected target + why
 kit cdp tail --since 3s    # …correlated timeline of a running fleet
+kit cdp brief --since 30s  # …agent-safe compact timeline, with omission counts
 kit cdp eval 'location'    # …probe a live target (lazy-attaches, stays warm)
+kit cdp click 'button:Save'  # …drive it by accessible name; waits for the dust to settle
+kit cdp verify             # …PASS/FAIL since that click: ready · errors · failed net
+kit cdp snap --diff        # …what changed on screen since the last snap
+kit cdp do "click 'button:Save'; expect text 'Saved'; verify"
+                           # …a whole verification sequence in one round trip
+kit cdp flow run smoke     # …the same sequence, saved in .kit/cdp/flows/
+kit cdp watch add cart 'cart.items.length'
+                           # …subscribe to a value; changes land on the timeline
 kit cdp ext doctor <id>    # …diagnose a Modular extension view/webview runtime
 kit scout                  # live Electron memory recon   (TUI when interactive)
 kit scout --once           # …one survey, headless table
@@ -20,6 +31,13 @@ kit domain                 # …its TUI
 Every tool inherits the same spine for free: a global `--json`, headless-vs-TUI
 dispatch from a single `Context`, XDG config, and a panic-safe TUI harness. Adding
 a tool is a module under `src/tools/` plus one `register()` line.
+
+For the CDP debugger, see **[docs/cdp.md](./docs/cdp.md)**. It covers the warm
+attach flow, the controlled launcher flow (startup capture, state/marks, network
+rules, redacted bundles, profiles, cleanup), and the verification loop: locators,
+settle, `wait`/`expect`/`verify`, `do` batches, flows, watches, and `snap --diff`.
+The live playground every feature is verified against lives in
+[`testbed/`](./testbed/README.md).
 
 ## Layout
 
