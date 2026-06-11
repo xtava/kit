@@ -62,6 +62,46 @@ kit cdp tail --since 5s --app dev
 The tail interleaves the click, the network response, and the `watch cart 2 → 3`
 row on one clock — causality is readable directly.
 
+## "Did my code even run?" — trace instead of console.log
+
+You changed `app.api.save` and want proof the new path executes, with what data,
+and what it triggers — without touching the code:
+
+```bash
+kit cdp trace fn 'app.api.save' --app dev
+kit cdp click 'button:Save settings' --app dev
+kit cdp tail --since 5s --app dev
+```
+
+```
++1241ms [app] trace save ({name: "Grace"}) → {ok: true} 38ms
++1290ms [app] net ← 200 POST /api/save
+```
+
+For a specific line (loop bodies, branches), use a logpoint with a repo path —
+the source-map registry resolves it into the bundle:
+
+```bash
+kit cdp trace add src/cart/store.ts:84 '({n: items.length, t: action.type})' --app dev
+kit cdp trace add src/sync.ts:212 'state' --when 'retries > 0' --name retry --app dev
+```
+
+When you're done: `kit cdp trace clear`. Traces are observation only — a caught
+throw shows as `✗` but never fails `verify`.
+
+## Map a minified stack back to the repo
+
+```bash
+kit cdp errors --since 5m --resolve --app dev
+```
+
+```
+exception TypeError: Cannot read properties of undefined → src/cart.js:14
+```
+
+The original location lands on the headline; the raw bundle stack stays below it.
+Resolution is automatic (and free) on every view once a map is loaded.
+
 ## Author a flow worth committing
 
 When a verification sequence works, save it so every future session (human or

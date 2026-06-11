@@ -1,6 +1,6 @@
 ---
 name: kit-cdp
-description: Drive and verify live Electron and Chrome apps with `kit cdp`, a warm Chrome DevTools Protocol debugger CLI. Use when you need to self-verify UI work in a running app (click/fill/press, then get a PASS/FAIL verdict), reproduce and diagnose console errors, exceptions, failed network requests, or websocket traffic, inspect a live page's accessibility tree, watch an app value change over time, or capture a redacted evidence bundle of what an interaction caused. One command attaches lazily and stays warm — no setup step, no driver scripts; every command takes --json.
+description: Drive, verify, and instrument live Electron and Chrome apps with `kit cdp`, a warm Chrome DevTools Protocol debugger CLI. Use when you need to self-verify UI work in a running app (click/fill/press, then get a PASS/FAIL verdict), trace whether a function or code line actually ran and with what values (fn traces and never-pausing logpoints — no console.log edits, no rebuilds), resolve minified stack traces back to original source files, reproduce and diagnose console errors, exceptions, failed network requests, or websocket traffic, inspect a live page's accessibility tree, watch an app value change over time, or capture a redacted evidence bundle of what an interaction caused. One command attaches lazily and stays warm — no setup step, no driver scripts; every command takes --json.
 license: MIT
 metadata:
   source: https://github.com/xtava/kit
@@ -126,6 +126,34 @@ A daemon-side poller records a `watch` event whenever the value changes — on t
 same clock as console and network rows, so causality reads straight off `tail`.
 Watches survive reloads. `watch ls / rm <name> / clear` manage them.
 
+## Trace execution — instead of adding console.logs
+
+The replacement for the edit-log-rebuild-reproduce loop. Instrument the *running*
+app — no code edits, no rebuilds, no pauses — and read execution interleaved with
+its side effects:
+
+```bash
+kit cdp trace fn 'app.api.save' --app dev            # every call: args → outcome, duration
+kit cdp trace add src/cart.js:84 'items.length'      # logpoint at a repo path (source maps)
+kit cdp trace add renderer.js:108 '({ counter })' --when 'counter > 2'
+kit cdp tail --track trace --since 2m --app dev
+kit cdp trace ls / rm <name> / clear
+```
+
+```
++1241ms [app] trace save (2 args) → {ok: true} 38ms
++1290ms [app] net ← 200 POST /api/save
+```
+
+"Did my code run, with what, and what did it cause" is now one `tail`. Traces
+survive reloads; expressions are compile-checked at arm time (a typo fails the add,
+never arms a silently-dead trace); past `--rate` (default 20/s) the page counts
+drops and the Timeline shows exact `suppressed N` rows. A traced *caught* throw
+shows as `✗` but never flips `verify`. Log several values with `'({a, b})'`.
+
+Exception stacks resolve through the same source maps: `kit cdp errors --resolve`
+turns `bundle.js:48211` into `src/cart.js:14` on the error's headline.
+
 ## Read the Timeline cheaply
 
 ```bash
@@ -152,8 +180,10 @@ an issue or hand to another agent.
 ## Going deeper
 
 - [references/commands.md](references/commands.md) — the full command surface:
-  launcher flags, network rules (block/mock/throttle), profiles, heap, lenses,
-  extension diagnosis, marks.
+  launcher flags, trace/instrumentation semantics (rate caps, Debugger side
+  effects, disclosed limits), network rules (block/mock/throttle), profiles,
+  heap, lenses, extension diagnosis, marks.
 - [references/recipes.md](references/recipes.md) — worked end-to-end sequences:
-  verifying a feature, diagnosing a reload crash, form workflows, watch-driven
-  debugging, flow authoring.
+  verifying a feature, diagnosing a reload crash, tracing instead of
+  console.log, mapping minified stacks to the repo, form workflows,
+  watch-driven debugging, flow authoring.

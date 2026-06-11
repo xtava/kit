@@ -91,6 +91,21 @@ discloses it.
 | `watch add <name> '<expr>' [--interval 300ms]` | Daemon-side poller; records a `watch` Timeline event on value change. Survives reloads; failed evals are skipped, not recorded. |
 | `watch ls / rm <name> / clear` | Manage watches. |
 
+## Instrument (trace)
+
+| Command | What |
+|---|---|
+| `trace fn '<path>' [--name n] [--rate 20]` | Wrap the live function at a dotted path: every call records args, return/throw preview, and duration. Preserves `this`/args/return/throw and constructors; survives reloads via a keeper. Disclosed limits: calls through pre-wrap saved references are unseen; thenables return as derived promises. |
+| `trace add <file:line[:col]> ['<expr>'] [--when '<cond>'] [--name n] [--rate 20]` | Logpoint: a breakpoint whose condition records and returns false — the app never pauses. Location is a script-URL suffix, absolute URL, or repo path resolved through the source-map registry. Expressions compile-checked at arm time. One breakpoint per location. |
+| `trace ls / rm <name> / clear` | List (hits, suppressed, pending, transport losses) / restore the original function or remove the breakpoint. |
+| `errors --resolve` | Force-load source maps so exception stacks resolve to original files on the headline. |
+
+Rate caps count in-page and emit exact `suppressed N` Timeline rows — never silent
+loss. Arming a logpoint enables the Debugger domain: `debugger;` statements then
+pause and are auto-resumed (recorded on the Timeline) unless DevTools is open, and
+the containing function runs deoptimized while armed. Trace rows are never
+error-shaped: observing a caught throw cannot flip `verify`.
+
 ## Action windows & evidence
 
 | Command | What |
