@@ -5,12 +5,21 @@
 
 use serde::Deserialize;
 
-/// Decoded-map size guard — a pathological map should fail loudly, not own the daemon's memory.
+/// Decoded-map size guards — a pathological map should fail loudly, not own the daemon's memory.
+/// The line cap matters independently of the byte cap: a megabyte of bare `;` would otherwise
+/// decode into tens of millions of empty line vectors.
 const MAX_MAP_BYTES: usize = 64 * 1024 * 1024;
+const MAX_MAP_LINES: usize = 2_000_000;
+
+/// Retained `sourcesContent` is a convenience (line snippets), not a requirement — past this
+/// total it is dropped rather than letting one giant map own the daemon's memory.
+const MAX_CONTENT_BYTES: usize = 16 * 1024 * 1024;
 
 /// One parsed source map: original source paths and the generated↔original line/column mesh.
 pub struct SourceMap {
     sources: Vec<String>,
+    /// Original file contents per source, when the map embedded them (and they fit the cap).
+    contents: Vec<Option<String>>,
     /// Per generated line, segments sorted by generated column.
     lines: Vec<Vec<Segment>>,
 }
@@ -39,6 +48,8 @@ struct RawMap {
     sources: Vec<String>,
     #[serde(default, rename = "sourceRoot")]
     source_root: Option<String>,
+    #[serde(default, rename = "sourcesContent")]
+    sources_content: Vec<Option<String>>,
     #[serde(default)]
     mappings: String,
     #[serde(default)]
@@ -58,7 +69,7 @@ impl SourceMap {
             return Err(format!("unsupported source map version {}", raw.version));
         }
         let root = raw.source_root.unwrap_or_default();
-        let sources = raw
+        let sources: Vec<String> = raw
             .sources
             .into_iter()
             .map(|source| {
@@ -69,12 +80,20 @@ impl SourceMap {
                 }
             })
             .collect();
+        let mut contents = raw.sources_content;
+        contents.resize(sources.len(), None);
+        let total: usize = contents.iter().flatten().map(String::len).sum();
+        if total > MAX_CONTENT_BYTES {
+            contents = vec![None; sources.len()];
+        }
         let lines = decode_mappings(&raw.mappings)?;
-        Ok(Self { sources, lines })
+        Ok(Self { sources, contents, lines })
     }
 
-    pub fn sources(&self) -> &[String] {
-        &self.sources
+    /// One line of an original source, from embedded `sourcesContent` — the proof of what code
+    /// a mapped location points at. `line` is 0-based.
+    pub fn source_line(&self, source: usize, line: u32) -> Option<&str> {
+        self.contents.get(source)?.as_deref()?.lines().nth(line as usize)
     }
 
     /// Match a user path against the sources: exact (after normalization) beats path-suffix;
@@ -121,10 +140,13 @@ impl SourceMap {
     }
 
     /// The original location covering a generated position: the last segment at or before the
-    /// column on that line. Returns `(source_path, line, column)`, all 0-based.
+    /// column on that line. Returns `(source_path, line, column)`, all 0-based. Binary search —
+    /// a minified bundle is one generated line with 10⁵+ segments, and this runs per frame per
+    /// query under the daemon's lock.
     pub fn original_for(&self, line: u32, column: u32) -> Option<(&str, u32, u32)> {
         let segments = self.lines.get(line as usize)?;
-        let segment = segments.iter().rev().find(|segment| segment.gen_col <= column)?;
+        let at_or_before = segments.partition_point(|segment| segment.gen_col <= column);
+        let segment = segments.get(at_or_before.checked_sub(1)?)?;
         let source = self.sources.get(segment.src as usize)?;
         Some((source, segment.src_line, segment.src_col))
     }
@@ -173,6 +195,9 @@ fn decode_mappings(mappings: &str) -> Result<Vec<Vec<Segment>>, String> {
     let (mut src, mut src_line, mut src_col) = (0i64, 0i64, 0i64);
 
     for group in mappings.split(';') {
+        if lines.len() >= MAX_MAP_LINES {
+            return Err(format!("source map exceeds {MAX_MAP_LINES} generated lines"));
+        }
         let mut segments = Vec::new();
         let mut gen_col = 0i64;
         for raw in group.split(',').filter(|raw| !raw.is_empty()) {
@@ -199,6 +224,8 @@ fn decode_mappings(mappings: &str) -> Result<Vec<Vec<Segment>>, String> {
                 _ => return Err(format!("malformed mapping segment '{raw}'")),
             }
         }
+        // The spec permits negative column deltas — `original_for`'s binary search needs order.
+        segments.sort_unstable_by_key(|segment| segment.gen_col);
         lines.push(segments);
     }
     Ok(lines)
@@ -306,13 +333,36 @@ mod tests {
         assert!(SourceMap::parse(r#"{"version":3,"sources":["a"],"mappings":"AADA"}"#).is_err());
     }
 
+    /// The spec permits negative column deltas, so segments can arrive out of generated order —
+    /// `IAEA` = [+4,0,+2,0] (col 4 → a.js:2), then `JACA` = [-4,0,+1,0] (col 0 → a.js:3).
+    #[test]
+    fn out_of_order_segments_sort_so_lookup_stays_correct() {
+        let map =
+            SourceMap::parse(r#"{"version":3,"sources":["a.js"],"mappings":"IAEA,JACA"}"#).unwrap();
+        assert_eq!(map.original_for(0, 0), Some(("a.js", 3, 0)));
+        assert_eq!(map.original_for(0, 2), Some(("a.js", 3, 0)));
+        assert_eq!(map.original_for(0, 4), Some(("a.js", 2, 0)));
+    }
+
+    #[test]
+    fn source_line_reads_embedded_content() {
+        let map = SourceMap::parse(
+            r#"{"version":3,"sources":["src/cart.js"],"sourcesContent":["const a = 1;\nreturn;\nconst b = 2;"],"mappings":"AAAA"}"#,
+        )
+        .unwrap();
+        assert_eq!(map.source_line(0, 1), Some("return;"));
+        assert_eq!(map.source_line(0, 9), None);
+        assert_eq!(map.source_line(3, 0), None);
+        let bare = SourceMap::parse(r#"{"version":3,"sources":["a.js"],"mappings":""}"#).unwrap();
+        assert_eq!(bare.source_line(0, 0), None);
+    }
+
     #[test]
     fn source_root_and_url_resolution_compose() {
         let map = SourceMap::parse(
             r#"{"version":3,"sourceRoot":"webpack://app","sources":["src/a.js"],"mappings":""}"#,
         )
         .unwrap();
-        assert_eq!(map.sources(), ["webpack://app/src/a.js"]);
         assert!(matches!(map.match_source("src/a.js"), SourceMatch::One(0)));
 
         assert_eq!(

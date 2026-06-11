@@ -108,11 +108,13 @@ pub fn default_point_name(location: &PointLocation) -> String {
 
 /// How `Debugger.setBreakpointByUrl` should match the location's URL: an absolute URL matches
 /// exactly; a bare suffix becomes an anchored regex so `renderer.js` can't match `xrenderer.js`.
+/// The suffix tolerates a query string — dev servers serve `/src/cart.ts?t=169…` and rotate the
+/// stamp on every HMR edit.
 pub fn url_match(location: &PointLocation) -> UrlMatch {
     if location.url.contains("://") {
         UrlMatch::Exact(location.url.clone())
     } else {
-        UrlMatch::Regex(format!("(^|/){}$", regex_escape(&location.url)))
+        UrlMatch::Regex(format!("(^|/){}($|\\?)", regex_escape(&location.url)))
     }
 }
 
@@ -155,21 +157,31 @@ fn regex_escape(text: &str) -> String {
 /// The user's `expr`/`when` are spliced as code (they must be — they reference frame locals), so
 /// the daemon compile-checks them *before* arming: a syntax error here would otherwise make the
 /// whole condition uncompilable, which V8 treats as no-break — a trace that is silently dead
-/// forever. State lives on `globalThis` because conditions have no closure to persist in.
+/// forever. Compiling is still not running: an expression can *throw* at the site (TDZ, a name
+/// that isn't in this frame's scope), so both splices are individually caught and the failure is
+/// shipped as the row's value — a runtime error must be readable evidence, never a silent skip.
+/// State lives on `globalThis` because conditions have no closure to persist in.
 pub fn logpoint_condition(name: &str, expr: Option<&str>, when: Option<&str>, rate: u64) -> String {
     let key = encode(name);
     let rate = rate.clamp(RATE_FLOOR, RATE_CEIL);
     let gate = match when {
-        Some(when) => format!("if (!({when})) return false;\n    "),
+        Some(when) => format!(
+            r#"var gate; try {{ gate = !!({when}); }} catch (e) {{ err = "(when threw: " + String(e && e.message || e).slice(0, 120) + ")"; }}
+    if (gate === false) return false;
+    "#
+        ),
         None => String::new(),
     };
     let value = match expr {
-        Some(expr) => format!("({PREVIEW_JS})(({expr}), 0)"),
-        None => "undefined".to_owned(),
+        Some(expr) => format!(
+            r#"var v; try {{ v = ({PREVIEW_JS})(({expr}), 0); }} catch (e) {{ err = err || "(expr threw: " + String(e && e.message || e).slice(0, 120) + ")"; }}"#
+        ),
+        None => "var v;".to_owned(),
     };
     format!(
         r#"(function () {{
   try {{
+    var err = null;
     {gate}var rt = globalThis.__kit_trace_rt__ || (globalThis.__kit_trace_rt__ = {{ traces: Object.create(null) }});
     var st = rt.traces[{key}] || (rt.traces[{key}] = {{ hits: 0, emitted: 0, dropped: 0, emitFails: 0, windowStart: 0 }});
     st.hits++;
@@ -180,7 +192,9 @@ pub fn logpoint_condition(name: &str, expr: Option<&str>, when: Option<&str>, ra
     }}
     if (st.emitted >= {rate}) {{ st.dropped++; return false; }}
     st.emitted++;
-    try {{ __kit_trace__(JSON.stringify({{ t: {key}, v: {value} }})); }} catch (_) {{ st.emitFails++; }}
+    {value}
+    if (err) v = err;
+    try {{ __kit_trace__(JSON.stringify({{ t: {key}, v: v }})); }} catch (_) {{ st.emitFails++; }}
   }} catch (_) {{}}
   return false;
 }})()"#
@@ -265,19 +279,20 @@ pub fn install_fn_js(name: &str, path_segments: &[String], rate: u64) -> String 
   const key = {key};
   const parts = {parts};
   if (rt.traces[key]) return {{ ok: true, already: true }};
+  const ownerName = parts.length > 1 ? parts.slice(0, -1).join(".") : "globalThis";
   let owner = globalThis;
   for (let i = 0; i < parts.length - 1; i++) {{
     owner = owner == null ? owner : owner[parts[i]];
   }}
   if (owner == null || (typeof owner !== "object" && typeof owner !== "function")) {{
-    return {{ ok: false, error: "path not reachable: '" + parts.slice(0, -1).join(".") + "' is " + String(owner) }};
+    return {{ ok: false, error: "path not reachable: '" + ownerName + "' is " + String(owner) }};
   }}
   const prop = parts[parts.length - 1];
   let holder = owner, desc;
   while (holder && !(desc = Object.getOwnPropertyDescriptor(holder, prop))) {{
     holder = Object.getPrototypeOf(holder);
   }}
-  if (!desc) return {{ ok: false, error: "no property '" + prop + "' on " + parts.slice(0, -1).join(".") }};
+  if (!desc) return {{ ok: false, error: "no property '" + prop + "' on " + ownerName }};
   if (desc.get || desc.set) return {{ ok: false, error: "'" + prop + "' is an accessor property — not wrappable" }};
   const original = desc.value;
   if (typeof original !== "function") return {{ ok: false, error: "'" + prop + "' is " + typeof original + ", not a function" }};
@@ -376,6 +391,7 @@ pub fn restore_fn_js(name: &str, path_segments: &[String]) -> String {
     delete owner[prop];
   }} else {{
     owner[prop] = st.original;
+    if (owner[prop] !== st.original) return {{ status: "blocked" }};
   }}
   return {{ status: "restored" }};
 }})()"#
@@ -384,6 +400,8 @@ pub fn restore_fn_js(name: &str, path_segments: &[String]) -> String {
 
 /// Build the keeper probe: per-trace liveness plus the suppression counts a silent page would
 /// otherwise never flush (the in-page cap only reports drops when the *next* hit arrives).
+/// `rt.dateNow` exists only once a fn trace installed the full runtime — a logpoint-only page
+/// has the minimal `rt` its conditions create, so the probe must fall back to `Date.now`.
 pub fn probe_js(names: &[String]) -> String {
     let keys = serde_json::to_string(names).expect("string array");
     format!(
@@ -391,14 +409,15 @@ pub fn probe_js(names: &[String]) -> String {
   const rt = globalThis.__kit_trace_rt__;
   const out = {{}};
   for (const key of {keys}) {{
-    const st = rt && rt.traces[key];
+    const st = rt && rt.traces && rt.traces[key];
     if (!st) {{ out[key] = {{ installed: false }}; continue; }}
+    const now = (rt.dateNow || Date.now)();
     let flush = 0;
-    if (st.dropped > 0 && rt.dateNow() - st.windowStart >= 1000) {{
+    if (st.dropped > 0 && now - st.windowStart >= 1000) {{
       flush = st.dropped;
       st.dropped = 0;
       st.emitted = 0;
-      st.windowStart = rt.dateNow();
+      st.windowStart = now;
     }}
     out[key] = {{ installed: true, flush, emitFails: st.emitFails }};
   }}
@@ -532,9 +551,17 @@ mod tests {
     #[test]
     fn url_matching_anchors_suffixes_and_passes_absolutes() {
         let suffix = parse_location("renderer.js:9").unwrap();
-        assert_eq!(url_match(&suffix), UrlMatch::Regex(r"(^|/)renderer\.js$".to_owned()));
+        assert_eq!(url_match(&suffix), UrlMatch::Regex(r"(^|/)renderer\.js($|\?)".to_owned()));
         let absolute = parse_location("file:///app/x.js:9").unwrap();
         assert_eq!(url_match(&absolute), UrlMatch::Exact("file:///app/x.js".to_owned()));
+    }
+
+    #[test]
+    fn probe_survives_a_logpoint_only_runtime() {
+        // A logpoint-only page never installs `rt.dateNow` — the probe must not assume it.
+        let probe = probe_js(&["hot".to_owned()]);
+        assert!(probe.contains("(rt.dateNow || Date.now)()"));
+        assert!(!probe.contains("rt.dateNow()"));
     }
 
     #[test]
@@ -542,10 +569,15 @@ mod tests {
         let bare = logpoint_condition("hot", None, None, 20);
         assert!(bare.ends_with("})()"));
         assert!(bare.contains("return false;\n})()"));
-        assert!(!bare.contains("if (!("));
+        assert!(!bare.contains("var gate"));
         let gated = logpoint_condition("hot", Some("items.length"), Some("retries > 0"), 20);
-        assert!(gated.contains("if (!(retries > 0)) return false;"));
+        assert!(gated.contains("gate = !!(retries > 0)"));
+        assert!(gated.contains("if (gate === false) return false;"));
         assert!(gated.contains("(items.length)"));
+        // A splice that compiles can still throw at the site (TDZ, out-of-scope name) — the
+        // failure must ship as the row's value, never vanish into a counter.
+        assert!(gated.contains("expr threw"));
+        assert!(gated.contains("when threw"));
     }
 
     #[test]

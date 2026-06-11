@@ -33,7 +33,9 @@ startup-capture scenario.
 
 `bundle.js` + `bundle.js.map` are a hand-maintained "build" of `src/cart.js`: the
 bundle prepends a 3-line banner and the map encodes exactly that line shift, so
-`kit cdp trace add src/cart.js:5` must arm at `bundle.js:8`, and
+`kit cdp trace add src/cart.js:5` must arm at `bundle.js:8` *and read back
+`line  items.push(name);`* (the map embeds `sourcesContent`), and
 `window.testbed.cart.brokenTotal()` throws an exception whose stack resolves back
 to `src/cart.js:14` via `errors --resolve`. If you edit `src/cart.js`, re-paste it
-under the banner and keep the map's `AACA` run equal to the source's line count.
+under the banner, keep the map's `AACA` run equal to the source's line count, and
+refresh `sourcesContent` with the new file body.

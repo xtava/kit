@@ -58,6 +58,7 @@ RECIPES
 
   Trace execution — console.log without editing code (no pause, no rebuild):
     kit cdp trace fn 'app.api.save' --app checkout           args → outcome, duration, per call
+    kit cdp trace find 'reduce(items,' --app checkout        live url:line coordinates to arm at
     kit cdp trace add src/cart.js:84 'items.length' --app checkout    logpoint via source maps
     kit cdp tail --track trace --since 2m --app checkout
     kit cdp errors --resolve --app checkout                  stacks back to original files
@@ -211,9 +212,16 @@ EXECUTION ON THE TIMELINE
     +1290ms [app] net ← 200 POST /api/save
 
   `trace fn` wraps a live function (this/args/return/throw preserved; survives reloads via a
-  keeper). `trace add` sets a logpoint: a breakpoint whose condition records and returns false —
-  the app NEVER pauses. Expressions are compile-checked at arm time, so a syntax error fails the
-  add instead of arming a trace that is silently dead.
+  keeper). It reaches only what hangs off globalThis — for module-scoped functions in bundled
+  apps, use a logpoint. `trace add` sets a logpoint: a breakpoint whose condition records and
+  returns false — the app NEVER pauses. Expressions are compile-checked at arm time, so a syntax
+  error fails the add instead of arming a trace that is silently dead.
+
+  The arm replies with where V8 actually bound the breakpoint (`src/cart.js:5 → bundle.js:8`) and
+  the source line when the map carries content — verify the site, don't assume it. `trace ls`
+  shows bound site, hit counts with last-hit age, and `stalled:` reasons when the keeper can't
+  re-arm. Don't grep a build output for line numbers — `trace find '<literal>'` searches the
+  *parsed* scripts and returns coordinates that can't be stale.
 
   Honest limits: fn calls through references saved before wrapping are not seen; thenables
   return as derived promises (same settlement, different identity); past --rate the page counts
@@ -223,9 +231,10 @@ EXECUTION ON THE TIMELINE
 
 EXAMPLES
   kit cdp trace fn 'app.api.save' --app checkout
+  kit cdp trace find 'groupId: options.group.id' --app checkout
   kit cdp trace add renderer.js:108 '({ counter: window.testbed.counter })' --app testbed
   kit cdp trace add store.js:84 'items.length' --when 'items.length > 3' --name big-cart
-  kit cdp tail --track trace --since 2m --app checkout
+  kit cdp tail --track trace --since-mark trace-big-cart --app checkout
   kit cdp trace ls · trace rm save · trace clear
 ";
 
@@ -823,9 +832,17 @@ enum TraceCommand {
         #[arg(long)]
         target: Option<String>,
     },
-    /// List armed traces with hit and suppression counts.
+    /// Search the live app's parsed scripts for a literal string — fresh `url:line` coordinates
+    /// for `trace add`, immune to bundle drift.
+    Find {
+        /// Literal text to search for (case-sensitive), e.g. a distinctive statement or `name(`.
+        text: String,
+        #[arg(long)]
+        target: Option<String>,
+    },
+    /// List armed traces: bound site, hits, last-hit age, suppression, and stalls.
     Ls,
-    /// Remove one trace and restore the original function.
+    /// Remove one trace — fn: restore the original function; logpoint: remove the breakpoint.
     Rm { name: String },
     /// Remove all traces.
     Clear,
@@ -1197,8 +1214,9 @@ fn session_command(command: CdpCommand) -> Result<Command> {
                 protocol::TraceOp::Fn { name, target, path, rate }
             }
             TraceCommand::Add { location, expr, when, name, rate, target } => {
-                protocol::TraceOp::Point { name, target, location, expr, when, rate }
+                protocol::TraceOp::Logpoint { name, target, location, expr, when, rate }
             }
+            TraceCommand::Find { text, target } => protocol::TraceOp::Find { target, text },
             TraceCommand::Ls => protocol::TraceOp::Ls,
             TraceCommand::Rm { name } => protocol::TraceOp::Rm { name },
             TraceCommand::Clear => protocol::TraceOp::Clear,

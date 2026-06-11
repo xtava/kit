@@ -350,13 +350,19 @@ pub enum TraceOp {
     },
     /// Logpoint: a never-pausing breakpoint at `location` (`file.js:line[:col]`) that records
     /// `expr` (gated by `when`) on every pass.
-    Point {
+    Logpoint {
         name: Option<String>,
         target: Option<String>,
         location: String,
         expr: Option<String>,
         when: Option<String>,
         rate: u64,
+    },
+    /// Search the resolved Target's parsed scripts for a literal string — live `url:line`
+    /// coordinates for `Logpoint`.
+    Find {
+        target: Option<String>,
+        text: String,
     },
     Ls,
     Rm {
@@ -620,13 +626,17 @@ mod tests {
                 path: "app.api.save".to_owned(),
                 rate: 20,
             }),
-            Command::Trace(TraceOp::Point {
+            Command::Trace(TraceOp::Logpoint {
                 name: None,
                 target: None,
                 location: "renderer.js:93".to_owned(),
                 expr: Some("({ counter })".to_owned()),
                 when: Some("counter > 2".to_owned()),
                 rate: 20,
+            }),
+            Command::Trace(TraceOp::Find {
+                target: None,
+                text: "groupId: options.group.id".to_owned(),
             }),
             Command::Do {
                 steps: vec![Step {

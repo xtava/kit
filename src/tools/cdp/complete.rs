@@ -159,6 +159,7 @@ fn kind_for(owner: &str, id: &str) -> ValueKind {
         (_, "rate") => ValueKind::Free("hits/sec cap"),
         (_, "expr") => ValueKind::Free("js expr"),
         (_, "needle") => ValueKind::Free("text to find"),
+        ("find", "text") => ValueKind::Free("literal to search parsed scripts for"),
         (_, "text") => ValueKind::Free("text"),
         (_, "option") => ValueKind::Free("option label"),
         (_, "pattern") => ValueKind::Free("url substring"),

@@ -83,6 +83,15 @@ pub fn find<'a>(
     name: &str,
 ) -> Result<&'a RefEntry, String> {
     let wanted = name.trim().to_lowercase();
+    // An empty needle substring-matches everything; the real cause is almost always a selector
+    // pipeline (grep over a snap) that found nothing — blame that, not the empty string.
+    if wanted.is_empty() {
+        return Err(
+            "empty locator — if a script built this from a grep over `snap`, the grep matched \
+             nothing; re-run `kit cdp snap -i` and check the label"
+                .to_owned(),
+        );
+    }
     let pool: Vec<&RefEntry> = refs
         .iter()
         .filter(|entry| role.is_none_or(|role| entry.role.eq_ignore_ascii_case(role)))

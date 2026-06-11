@@ -18,17 +18,20 @@ use tokio::sync::mpsc;
 use tokio::time::{interval, sleep};
 
 use crate::cdp::{
-    self, CdpConnection, CdpEvent, LogEntry, Source, Target, Timeline, TimelineEvent, TraceRecord,
-    Track, TrackKind,
+    self, CdpConnection, CdpEvent, LogEntry, Source, Target, Timeline, TimelineEvent, Track,
+    TrackKind,
 };
 
 use super::protocol::{
     Command, Expectation, Frame, IgnoreOp, LaunchSettings, Locator, NetCommand, Query, Reply,
-    Settle, TargetActivity, TimelineQuery, TraceOp,
+    Settle, TargetActivity, TimelineQuery,
 };
 use super::readiness::{self, DocState, Readiness};
 use super::registry::{self, Record};
-use super::{checks, format, snapshot, trace};
+use super::{checks, format, snapshot};
+
+mod sourcemaps;
+mod trace;
 
 const TIMELINE_CAP: usize = 20_000;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -66,9 +69,8 @@ struct State {
     /// Active value subscriptions by name. Each owns a poller task that re-evaluates its
     /// expression and emits a `watch` Timeline event on change.
     watches: HashMap<String, WatchState>,
-    /// Armed instrumentation points by name. Each owns a keeper task that re-installs its
-    /// wrapper after reloads and flushes suppression counts.
-    traces: HashMap<String, TraceState>,
+    /// Armed instrumentation points by name, healed by the daemon-wide keeper task.
+    traces: HashMap<String, trace::TraceState>,
     /// Sessions where the `__kit_trace__` binding (and Runtime) is armed — independent of the
     /// attach-time track list, because binding notifications only flow on Runtime-enabled
     /// sessions. Cleared with the sessions it describes.
@@ -76,9 +78,10 @@ struct State {
     /// Sessions where the Debugger domain is enabled — lazily, by the first logpoint, never at
     /// attach. Cleared with the sessions it describes.
     debugger_enabled: HashSet<String>,
-    /// Map-bearing scripts by scriptId, from `Debugger.scriptParsed` — the source-map registry's
-    /// index. Pruned with its session (detach, navigation, reconnect) and capped.
-    scripts: HashMap<String, ScriptRecord>,
+    /// Parsed scripts by scriptId, from `Debugger.scriptParsed` — the search space of
+    /// `trace find` and the source-map registry's index. Pruned with its session (detach,
+    /// navigation, reconnect) and capped.
+    scripts: HashMap<String, sourcemaps::ScriptRecord>,
     /// Decoded source maps by scriptId. `None` caches a failed fetch/decode so it isn't retried
     /// on every resolution.
     source_maps: HashMap<String, Option<Arc<cdp::SourceMap>>>,
@@ -107,64 +110,18 @@ impl NetRule {
     }
 }
 
-/// One map-bearing script the registry knows: whose session it runs in, its URL, and where its
-/// source map lives (possibly relative, possibly inline).
-struct ScriptRecord {
-    session: String,
-    url: String,
-    map_url: String,
-}
-
-/// Registry size guard — scripts re-parse on every navigation; the prune hooks keep this from
-/// mattering, the cap keeps a pathological page from mattering more.
-const SCRIPT_CAP: usize = 512;
-
 impl State {
     fn now_ms(&self) -> u64 {
         self.start.elapsed().as_millis() as u64
     }
 
-    fn prune_scripts(&mut self, gone: impl Fn(&ScriptRecord) -> bool) {
-        let dead: Vec<String> = self
-            .scripts
-            .iter()
-            .filter(|(_, record)| gone(record))
-            .map(|(id, _)| id.clone())
-            .collect();
-        for id in dead {
-            self.scripts.remove(&id);
-            self.source_maps.remove(&id);
-        }
-    }
-
-    /// Fill `resolved` on exception events whose frame's map is already decoded — query-time
-    /// only, never stored in the ring. `errors --resolve` pre-loads maps; every other view gets
-    /// resolution free once a map is cached. The frame's URL must match the registry record:
-    /// script ids are per-isolate and can collide across renderer processes.
-    fn resolve_exception_sites(&self, events: &mut [TimelineEvent]) {
-        for event in events {
-            let Track::Exception(info) = &mut event.track else {
-                continue;
-            };
-            if info.resolved.is_some() {
-                continue;
-            }
-            info.resolved = info.frames.iter().find_map(|frame| {
-                let map = self.source_maps.get(&frame.script_id)?.as_ref()?;
-                let record = self.scripts.get(&frame.script_id)?;
-                if record.url != frame.url {
-                    return None;
-                }
-                let (source, line, _) = map.original_for(frame.line as u32, frame.column as u32)?;
-                Some(format!("{source}:{}", line + 1))
-            });
-        }
-    }
-
     /// The single path an event enters the Timeline. Every source — renderer, main process, and
     /// markers — funnels through here, so the live fan-out and `tail` can never disagree about
     /// what happened. Suppressed (ignored) events reach neither.
-    fn emit(&mut self, event: TimelineEvent) {
+    fn emit(&mut self, mut event: TimelineEvent) {
+        // Resolution is a cache hit when the map is already decoded — doing it here keeps live
+        // subscribers and the stored ring in agreement; query-time resolution covers the rest.
+        self.resolve_exception_event(&mut event);
         if !self.subscribers.is_empty() && !self.is_suppressed(&event) {
             self.subscribers.retain(|client| client.send(event.clone()).is_ok());
         }
@@ -259,6 +216,7 @@ pub async fn serve(
     registry::write(&state.lock().unwrap().record())?;
 
     tokio::spawn(main_process_pump(state.clone()));
+    tokio::spawn(trace::keeper(state.clone()));
 
     let socket = registry::socket_path(&name);
     let _ = std::fs::remove_file(&socket);
@@ -370,9 +328,9 @@ async fn apply_event(state: &Shared, event: &CdpEvent, tracks: &[TrackKind]) {
                 state.prune_scripts(|record| record.session == session);
             }
         }
-        "Runtime.bindingCalled" => ingest_trace_payload(state, event),
-        "Debugger.paused" => handle_debugger_pause(state, event).await,
-        "Debugger.scriptParsed" => record_script(state, event),
+        "Runtime.bindingCalled" => trace::ingest_trace_payload(state, event),
+        "Debugger.paused" => trace::handle_debugger_pause(state, event).await,
+        "Debugger.scriptParsed" => sourcemaps::record_script(state, event),
         "Target.targetInfoChanged" => {
             if let Some(info) = event.params.get("targetInfo") {
                 let updated = target_from_info(info);
@@ -769,7 +727,7 @@ async fn dispatch(
         }
         Command::Verify { target, window } => verify_reply(state, target, window, json).await,
         Command::Watch(op) => watch_reply(state, op, json),
-        Command::Trace(op) => trace_reply(state, op, json).await,
+        Command::Trace(op) => trace::trace_reply(state, op, json).await,
         Command::Press { target, chord, settle } => {
             press_reply(state, target, chord, settle, json).await
         }
@@ -912,7 +870,7 @@ async fn errors_reply(
     json: bool,
 ) -> Reply {
     if resolve {
-        prime_error_maps(state, &query).await;
+        sourcemaps::prime_error_maps(state, &query).await;
     }
     let guard = state.lock().unwrap();
     let now = guard.now_ms();
@@ -936,48 +894,6 @@ async fn errors_reply(
         saturated,
     };
     Reply::ok(format::errors(&report, explain, json))
-}
-
-/// Warm the source-map registry for `errors --resolve`: enable Debugger on every session (the
-/// registry only hears `scriptParsed` on Debugger-enabled sessions — this is the command's
-/// disclosed side effect), give a cold backlog a beat, then decode the maps the error frames
-/// actually reference.
-async fn prime_error_maps(state: &Shared, query: &TimelineQuery) {
-    let (conn, sessions) = {
-        let guard = state.lock().unwrap();
-        (guard.conn.clone(), guard.sessions.keys().cloned().collect::<Vec<_>>())
-    };
-    let mut any_cold = false;
-    for session in &sessions {
-        if let Ok(true) = ensure_debugger(state, &conn, session).await {
-            any_cold = true;
-        }
-    }
-    if any_cold {
-        sleep(Duration::from_millis(400)).await;
-    }
-    let Ok(events) = collect_timeline(state, query) else {
-        return;
-    };
-    let wanted: Vec<String> = {
-        let guard = state.lock().unwrap();
-        events
-            .iter()
-            .filter_map(|event| match &event.track {
-                Track::Exception(info) => Some(&info.frames),
-                _ => None,
-            })
-            .flatten()
-            .filter(|frame| {
-                guard.scripts.contains_key(&frame.script_id)
-                    && !guard.source_maps.contains_key(&frame.script_id)
-            })
-            .map(|frame| frame.script_id.clone())
-            .collect()
-    };
-    for script_id in wanted {
-        let _ = load_source_map(state, &script_id).await;
-    }
 }
 
 fn collect_timeline(state: &Shared, query: &TimelineQuery) -> Result<Vec<TimelineEvent>, String> {
@@ -1471,882 +1387,6 @@ async fn watch_loop(
         }
         sleep(Duration::from_millis(interval_ms)).await;
     }
-}
-
-/// How often a trace keeper probes its wrapper, and the most traces one attachment may arm.
-const KEEPER_TICK: Duration = Duration::from_secs(1);
-const MAX_TRACES: usize = 32;
-
-/// One armed instrumentation point: where it lives, how it's capped, what it has seen, and the
-/// keeper task that heals it across reloads. `task` is `None` only during the insert→spawn
-/// handoff.
-struct TraceState {
-    target: Option<String>,
-    site: String,
-    rate: u64,
-    hits: u64,
-    suppressed: u64,
-    /// Page-side binding-call failures — payloads that never reached the daemon. A nonzero
-    /// count means hits were lost in transport, and `trace ls` says so.
-    emit_fails: u64,
-    kind: TraceKind,
-    task: Option<tokio::task::JoinHandle<()>>,
-}
-
-enum TraceKind {
-    Fn {
-        path: Vec<String>,
-    },
-    /// `armed` is where the breakpoint currently lives: `(session, breakpointId)`. `None` until
-    /// the first successful arm — `trace ls` shows it as pending.
-    Point {
-        location: trace::PointLocation,
-        condition: String,
-        armed: Option<(String, String)>,
-    },
-}
-
-impl TraceKind {
-    fn word(&self) -> &'static str {
-        match self {
-            Self::Fn { .. } => "fn",
-            Self::Point { .. } => "at",
-        }
-    }
-}
-
-async fn trace_reply(state: &Shared, op: TraceOp, json: bool) -> Reply {
-    match op {
-        TraceOp::Fn { name, target, path, rate } => {
-            let segments = match trace::parse_fn_path(&path) {
-                Ok(segments) => segments,
-                Err(error) => return Reply::fail(error),
-            };
-            let name = name.unwrap_or_else(|| trace::default_fn_name(&path));
-            let rate = rate.clamp(trace::RATE_FLOOR, trace::RATE_CEIL);
-            let entry = TraceState {
-                target: target.clone(),
-                site: path.clone(),
-                rate,
-                hits: 0,
-                suppressed: 0,
-                emit_fails: 0,
-                kind: TraceKind::Fn { path: segments.clone() },
-                task: None,
-            };
-            if let Err(error) = reserve_trace(state, &name, entry) {
-                return Reply::fail(error);
-            }
-            // Install synchronously so an arming failure lands in this reply, not a keeper log.
-            if let Err(error) =
-                install_trace(state, &name, target.as_deref(), &segments, rate).await
-            {
-                state.lock().unwrap().traces.remove(&name);
-                return Reply::fail(format!("trace '{name}' not armed — {error}"));
-            }
-            spawn_keeper(state, &name);
-            Reply::ok(format!(
-                "tracing '{name}' — {path} wrapped, rate cap {rate}/s\n\
-                 note      calls through saved references are not seen; thenables return as derived promises"
-            ))
-        }
-        TraceOp::Point { name, target, location, expr, when, rate } => {
-            let location = match trace::parse_location(&location) {
-                Ok(location) => location,
-                Err(error) => return Reply::fail(error),
-            };
-            let name = name.unwrap_or_else(|| trace::default_point_name(&location));
-            let rate = rate.clamp(trace::RATE_FLOOR, trace::RATE_CEIL);
-            let condition =
-                trace::logpoint_condition(&name, expr.as_deref(), when.as_deref(), rate);
-            let entry = TraceState {
-                target: target.clone(),
-                site: location.display(),
-                rate,
-                hits: 0,
-                suppressed: 0,
-                emit_fails: 0,
-                kind: TraceKind::Point {
-                    location: location.clone(),
-                    condition: condition.clone(),
-                    armed: None,
-                },
-                task: None,
-            };
-            if let Err(error) = reserve_trace(state, &name, entry) {
-                return Reply::fail(error);
-            }
-            let armed = arm_point(
-                state,
-                target.as_deref(),
-                &location,
-                &condition,
-                expr.as_deref(),
-                when.as_deref(),
-            )
-            .await;
-            let (session, breakpoint, resolved, via) = match armed {
-                Ok(armed) => armed,
-                Err(error) => {
-                    state.lock().unwrap().traces.remove(&name);
-                    return Reply::fail(format!("trace '{name}' not armed — {error}"));
-                }
-            };
-            if let Some(entry) = state.lock().unwrap().traces.get_mut(&name) {
-                if let TraceKind::Point { armed, .. } = &mut entry.kind {
-                    *armed = Some((session, breakpoint));
-                }
-            }
-            spawn_keeper(state, &name);
-            let sites = match resolved {
-                0 => "pending — no parsed script matches yet; arms when one does".to_owned(),
-                1 => "1 site".to_owned(),
-                n => format!("{n} sites"),
-            };
-            let mapped = via.map(|via| format!(" → {via} (source-mapped)")).unwrap_or_default();
-            Reply::ok(format!(
-                "logpoint '{name}' at {}{mapped} ({sites}), rate cap {rate}/s\n\
-                 note      Debugger enabled — `debugger;` statements now pause and are auto-resumed unless DevTools is open",
-                location.display()
-            ))
-        }
-        TraceOp::Ls => {
-            let guard = state.lock().unwrap();
-            if json {
-                let rows: Vec<Value> = guard
-                    .traces
-                    .iter()
-                    .map(|(name, entry)| {
-                        json!({
-                            "name": name,
-                            "kind": match &entry.kind {
-                                TraceKind::Fn { .. } => "fn",
-                                TraceKind::Point { .. } => "point",
-                            },
-                            "site": entry.site,
-                            "target": entry.target,
-                            "rate": entry.rate,
-                            "hits": entry.hits,
-                            "suppressed": entry.suppressed,
-                            "emitFailures": entry.emit_fails,
-                            "pending": matches!(&entry.kind, TraceKind::Point { armed: None, .. }),
-                        })
-                    })
-                    .collect();
-                return Reply::ok(serde_json::to_string_pretty(&rows).unwrap_or_default());
-            }
-            if guard.traces.is_empty() {
-                return Reply::ok("no traces — arm one with `trace fn '<path>'`".to_owned());
-            }
-            let mut rows: Vec<String> = guard
-                .traces
-                .iter()
-                .map(|(name, entry)| {
-                    let suppressed = if entry.suppressed > 0 {
-                        format!(" · {} suppressed", entry.suppressed)
-                    } else {
-                        String::new()
-                    };
-                    let lost = if entry.emit_fails > 0 {
-                        format!(" · ⚠ {} lost in transport", entry.emit_fails)
-                    } else {
-                        String::new()
-                    };
-                    let pending = match &entry.kind {
-                        TraceKind::Point { armed: None, .. } => " · pending",
-                        _ => "",
-                    };
-                    format!(
-                        "{name:<16} {} {} · {} hit(s){suppressed}{lost}{pending} · cap {}/s",
-                        entry.kind.word(),
-                        entry.site,
-                        entry.hits,
-                        entry.rate
-                    )
-                })
-                .collect();
-            rows.sort();
-            Reply::ok(rows.join("\n"))
-        }
-        TraceOp::Rm { name } => {
-            // Bind before matching — a scrutinee temporary would hold the lock across the await.
-            let removed = state.lock().unwrap().traces.remove(&name);
-            match removed {
-                Some(entry) => {
-                    if let Some(task) = &entry.task {
-                        task.abort();
-                    }
-                    let status = disarm_trace(state, &name, &entry).await;
-                    Reply::ok(format!("trace '{name}' removed — {status}"))
-                }
-                None => Reply::fail(format!("no trace '{name}'")),
-            }
-        }
-        TraceOp::Clear => {
-            let removed: Vec<(String, TraceState)> = state.lock().unwrap().traces.drain().collect();
-            for (name, entry) in &removed {
-                if let Some(task) = &entry.task {
-                    task.abort();
-                }
-                let _ = disarm_trace(state, name, entry).await;
-            }
-            Reply::ok(format!("{} trace(s) removed", removed.len()))
-        }
-    }
-}
-
-/// Claim a trace name and the capacity slot, atomically — inserted before arming so a payload
-/// arriving mid-install finds its entry.
-fn reserve_trace(state: &Shared, name: &str, entry: TraceState) -> Result<(), String> {
-    trace::validate_name(name)?;
-    let mut guard = state.lock().unwrap();
-    if guard.traces.contains_key(name) {
-        return Err(format!("trace '{name}' already exists — `trace rm {name}` first"));
-    }
-    if guard.traces.len() >= MAX_TRACES {
-        return Err(format!("{MAX_TRACES} traces armed — rm one first"));
-    }
-    guard.traces.insert(name.to_owned(), entry);
-    Ok(())
-}
-
-fn spawn_keeper(state: &Shared, name: &str) {
-    let task = tokio::spawn(trace_keeper(state.clone(), name.to_owned()));
-    match state.lock().unwrap().traces.get_mut(name) {
-        Some(entry) => entry.task = Some(task),
-        // A racing rm/clear removed it between insert and spawn — honor the removal.
-        None => task.abort(),
-    }
-}
-
-/// Arm the binding transport and run the install script in the resolved Target. Trace transport
-/// is independent of the attach-time track list (binding notifications only flow on
-/// Runtime-enabled sessions), so arming enables Runtime explicitly — idempotent and cheap.
-async fn install_trace(
-    state: &Shared,
-    name: &str,
-    target: Option<&str>,
-    segments: &[String],
-    rate: u64,
-) -> Result<(), String> {
-    let Some((conn, session)) = session_for(state, target) else {
-        return Err(no_target());
-    };
-    ensure_trace_transport(state, &conn, &session).await?;
-    let script = trace::install_fn_js(name, segments, rate);
-    let status = evaluate(conn, session, script).await?;
-    match status.get("ok").and_then(Value::as_bool) {
-        Some(true) => Ok(()),
-        _ => Err(status
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("install returned no status")
-            .to_owned()),
-    }
-}
-
-/// Compile-check the user's expressions, then arm the never-pausing breakpoint — directly or
-/// through the source-map registry. Resolution may legitimately be zero sites (no matching
-/// script parsed yet): that is reported, not failed — by-URL breakpoints arm automatically when
-/// a matching script appears.
-async fn arm_point(
-    state: &Shared,
-    target: Option<&str>,
-    location: &trace::PointLocation,
-    condition: &str,
-    expr: Option<&str>,
-    when: Option<&str>,
-) -> Result<(String, String, usize, Option<String>), String> {
-    let Some((conn, session)) = session_for(state, target) else {
-        return Err(no_target());
-    };
-    ensure_trace_transport(state, &conn, &session).await?;
-    let debugger_was_cold = ensure_debugger(state, &conn, &session).await?;
-    if let Some(expr) = expr {
-        compile_check(&conn, &session, &format!("({expr})"), "expression").await?;
-    }
-    if let Some(when) = when {
-        compile_check(&conn, &session, &format!("({when})"), "--when condition").await?;
-    }
-    let (mut breakpoint, mut resolved, mut via) =
-        set_point_breakpoint(state, &conn, &session, location, condition).await?;
-    if resolved == 0 && debugger_was_cold {
-        // The first enable replays scriptParsed for already-parsed scripts; the registry may
-        // still be filling. One beat, one retry — then pending is the honest answer.
-        sleep(Duration::from_millis(400)).await;
-        let _ = conn
-            .call(
-                Some(&session),
-                "Debugger.removeBreakpoint",
-                json!({ "breakpointId": breakpoint }),
-            )
-            .await;
-        (breakpoint, resolved, via) =
-            set_point_breakpoint(state, &conn, &session, location, condition).await?;
-    }
-    Ok((session, breakpoint, resolved, via))
-}
-
-/// A user expression must be syntactically valid *before* it is spliced into the breakpoint
-/// condition: V8 treats an uncompilable condition as no-break, which would leave the trace
-/// silently dead forever — the worst failure for a tool whose job is "did my code run".
-async fn compile_check(
-    conn: &CdpConnection,
-    session: &str,
-    source: &str,
-    what: &str,
-) -> Result<(), String> {
-    let result = conn
-        .call(
-            Some(session),
-            "Runtime.compileScript",
-            json!({ "expression": source, "sourceURL": "kit://trace", "persistScript": false }),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-    if let Some(details) = result.get("exceptionDetails") {
-        let message = details
-            .pointer("/exception/description")
-            .and_then(Value::as_str)
-            .or_else(|| details.get("text").and_then(Value::as_str))
-            .unwrap_or("syntax error");
-        return Err(format!("{what} does not compile: {message}"));
-    }
-    Ok(())
-}
-
-async fn ensure_trace_transport(
-    state: &Shared,
-    conn: &CdpConnection,
-    session: &str,
-) -> Result<(), String> {
-    if state.lock().unwrap().trace_transport.contains(session) {
-        return Ok(());
-    }
-    conn.call(Some(session), "Runtime.enable", json!({}))
-        .await
-        .map_err(|error| error.to_string())?;
-    conn.call(Some(session), "Runtime.addBinding", json!({ "name": "__kit_trace__" }))
-        .await
-        .map_err(|error| error.to_string())?;
-    state.lock().unwrap().trace_transport.insert(session.to_owned());
-    Ok(())
-}
-
-/// Enable the Debugger domain for one session, lazily — it costs nothing until the first
-/// logpoint, and enabling it is what makes `debugger;` statements pause (see
-/// [`handle_debugger_pause`] for how that is kept harmless). Returns whether this call enabled
-/// it: enabling replays `scriptParsed` for already-parsed scripts, and that backlog arrives
-/// asynchronously — a caller about to consult the registry should give it a beat.
-async fn ensure_debugger(
-    state: &Shared,
-    conn: &CdpConnection,
-    session: &str,
-) -> Result<bool, String> {
-    if state.lock().unwrap().debugger_enabled.contains(session) {
-        return Ok(false);
-    }
-    conn.call(Some(session), "Debugger.enable", json!({}))
-        .await
-        .map_err(|error| error.to_string())?;
-    state.lock().unwrap().debugger_enabled.insert(session.to_owned());
-    Ok(true)
-}
-
-/// Record a parsed script that carries a source map — the registry's only ingestion point.
-fn record_script(state: &Shared, event: &CdpEvent) {
-    let Some(session) = event.session.as_deref() else {
-        return;
-    };
-    let params = &event.params;
-    let (Some(script_id), Some(url)) =
-        (params.get("scriptId").and_then(Value::as_str), params.get("url").and_then(Value::as_str))
-    else {
-        return;
-    };
-    let map_url = params.get("sourceMapURL").and_then(Value::as_str).unwrap_or("");
-    if url.is_empty() || map_url.is_empty() {
-        return;
-    }
-    let mut guard = state.lock().unwrap();
-    if guard.scripts.len() >= SCRIPT_CAP && !guard.scripts.contains_key(script_id) {
-        return;
-    }
-    guard.scripts.insert(
-        script_id.to_owned(),
-        ScriptRecord {
-            session: session.to_owned(),
-            url: url.to_owned(),
-            map_url: map_url.to_owned(),
-        },
-    );
-}
-
-/// Load (and cache) one script's source map. Transport order: inline `data:` decodes here;
-/// `file:` reads from disk (the daemon shares the machine); anything else fetches *through the
-/// page* — the page can resolve its own scheme (`modular://`, asar) where the daemon cannot.
-async fn load_source_map(state: &Shared, script_id: &str) -> Option<Arc<cdp::SourceMap>> {
-    let (record_url, map_url, session, cached) = {
-        let guard = state.lock().unwrap();
-        if let Some(cached) = guard.source_maps.get(script_id) {
-            return cached.clone();
-        }
-        let record = guard.scripts.get(script_id)?;
-        (record.url.clone(), record.map_url.clone(), record.session.clone(), false)
-    };
-    debug_assert!(!cached);
-    let resolved = cdp::resolve_map_url(&record_url, &map_url);
-    let text = if let Some(inline) = cdp::inline_map(&resolved) {
-        inline.ok()
-    } else if let Some(path) = resolved.strip_prefix("file://") {
-        std::fs::read_to_string(path).ok()
-    } else {
-        let conn = state.lock().unwrap().conn.clone();
-        let url = serde_json::to_string(&resolved).expect("string encodes");
-        let script = format!(
-            "fetch({url}).then(r => {{ if (!r.ok) throw new Error('HTTP ' + r.status); return r.text(); }})"
-        );
-        evaluate(conn, session, script).await.ok().and_then(|value| match value {
-            Value::String(text) => Some(text),
-            _ => None,
-        })
-    };
-    let map = text.and_then(|text| cdp::SourceMap::parse(&text).ok()).map(Arc::new);
-    state.lock().unwrap().source_maps.insert(script_id.to_owned(), map.clone());
-    map
-}
-
-/// Where a source-mapped location landed: which script, and the generated site to arm.
-struct MappedSite {
-    script_url: String,
-    line: u32,
-    column: u32,
-}
-
-/// Resolve a repo path through the registry's maps, scoped to one session. Exact-beats-suffix
-/// inside each map; across scripts, one match arms and several is ambiguity to report — never a
-/// guess.
-async fn resolve_via_maps(
-    state: &Shared,
-    session: &str,
-    location: &trace::PointLocation,
-) -> Result<Option<MappedSite>, String> {
-    let candidates: Vec<String> = {
-        let guard = state.lock().unwrap();
-        guard
-            .scripts
-            .iter()
-            .filter(|(_, record)| record.session == session)
-            .map(|(id, _)| id.clone())
-            .collect()
-    };
-    let mut sites: Vec<MappedSite> = Vec::new();
-    let mut ambiguous: Vec<String> = Vec::new();
-    for script_id in candidates {
-        let Some(map) = load_source_map(state, &script_id).await else {
-            continue;
-        };
-        match map.match_source(&location.url) {
-            cdp::SourceMatch::None => {}
-            cdp::SourceMatch::Many(paths) => ambiguous.extend(paths),
-            cdp::SourceMatch::One(source) => {
-                let Some(script_url) =
-                    state.lock().unwrap().scripts.get(&script_id).map(|r| r.url.clone())
-                else {
-                    continue;
-                };
-                match map.generated_for(source, location.line - 1) {
-                    Some((line, column)) => sites.push(MappedSite { script_url, line, column }),
-                    None => {
-                        return Err(format!(
-                            "{} maps '{}' but line {} has no executable mapping — pick a line with code",
-                            short(&script_url),
-                            location.url,
-                            location.line
-                        ))
-                    }
-                }
-            }
-        }
-    }
-    if !ambiguous.is_empty() {
-        return Err(format!(
-            "ambiguous source '{}' — candidates: {}",
-            location.url,
-            ambiguous.join(", ")
-        ));
-    }
-    match sites.len() {
-        0 => Ok(None),
-        1 => Ok(sites.pop()),
-        n => Err(format!(
-            "'{}' is built into {n} scripts ({}) — trace the script url:line directly",
-            location.url,
-            sites.iter().map(|site| short(&site.script_url)).collect::<Vec<_>>().join(", ")
-        )),
-    }
-}
-
-fn short(url: &str) -> &str {
-    url.rsplit('/').next().filter(|tail| !tail.is_empty()).unwrap_or(url)
-}
-
-/// Set the never-pausing breakpoint for a point trace: directly when a parsed script matches the
-/// URL, through the source-map registry when none does. Returns the breakpoint id, how many
-/// sites resolved, and the generated site when the arm went through a map.
-async fn set_point_breakpoint(
-    state: &Shared,
-    conn: &CdpConnection,
-    session: &str,
-    location: &trace::PointLocation,
-    condition: &str,
-) -> Result<(String, usize, Option<String>), String> {
-    let direct = set_breakpoint_raw(
-        state,
-        conn,
-        session,
-        location,
-        match trace::url_match(location) {
-            trace::UrlMatch::Exact(url) => ("url", url),
-            trace::UrlMatch::Regex(regex) => ("urlRegex", regex),
-        },
-        location.line - 1,
-        location.column.map(|column| column.saturating_sub(1)),
-        condition,
-    )
-    .await?;
-    if direct.1 > 0 {
-        return Ok((direct.0, direct.1, None));
-    }
-    // Nothing parsed matches the URL — try the registry. The pending direct breakpoint is
-    // retired first so a later script named exactly `src/cart.js` can't double-fire.
-    let Some(site) = resolve_via_maps(state, session, location).await? else {
-        return Ok((direct.0, 0, None));
-    };
-    let _ = conn
-        .call(Some(session), "Debugger.removeBreakpoint", json!({ "breakpointId": direct.0 }))
-        .await;
-    let via = format!("{}:{}", short(&site.script_url), site.line + 1);
-    let (id, resolved) = set_breakpoint_raw(
-        state,
-        conn,
-        session,
-        location,
-        ("url", site.script_url.clone()),
-        site.line,
-        Some(site.column),
-        condition,
-    )
-    .await?;
-    Ok((id, resolved, Some(via)))
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn set_breakpoint_raw(
-    state: &Shared,
-    conn: &CdpConnection,
-    session: &str,
-    location: &trace::PointLocation,
-    (url_key, url_value): (&str, String),
-    line: u32,
-    column: Option<u32>,
-    condition: &str,
-) -> Result<(String, usize), String> {
-    let mut params = json!({ "lineNumber": line, "condition": condition });
-    params[url_key] = url_value.into();
-    if let Some(column) = column {
-        params["columnNumber"] = column.into();
-    }
-    let result =
-        conn.call(Some(session), "Debugger.setBreakpointByUrl", params).await.map_err(|error| {
-            // V8 allows one breakpoint per location — name the trace that holds it.
-            if error.to_string().contains("already exists") {
-                let holder = state.lock().unwrap().traces.iter().find_map(|(name, entry)| {
-                    match &entry.kind {
-                        TraceKind::Point { location: armed, .. }
-                            if armed.url == location.url && armed.line == location.line =>
-                        {
-                            Some(name.clone())
-                        }
-                        _ => None,
-                    }
-                });
-                return match holder {
-                    Some(name) => {
-                        format!("location already traced by '{name}' — `trace rm {name}` first")
-                    }
-                    None => "another debugger holds a breakpoint at this location".to_owned(),
-                };
-            }
-            error.to_string()
-        })?;
-    let Some(breakpoint) = result.get("breakpointId").and_then(Value::as_str) else {
-        return Err("breakpoint did not arm — no id returned".to_owned());
-    };
-    let resolved = result.get("locations").and_then(Value::as_array).map_or(0, Vec::len);
-    Ok((breakpoint.to_owned(), resolved))
-}
-
-/// The keeper behind one trace: every second, heal whatever a reload, target recreation, or
-/// reconnect destroyed, and flush suppression counts a silent page would never report.
-/// Pull-style like [`watch_loop`] — it re-resolves its target every tick, so no push-side
-/// bookkeeping can go stale.
-async fn trace_keeper(state: Shared, name: String) {
-    loop {
-        sleep(KEEPER_TICK).await;
-        enum Plan {
-            Fn {
-                segments: Vec<String>,
-                rate: u64,
-            },
-            Point {
-                location: trace::PointLocation,
-                condition: String,
-                armed: Option<(String, String)>,
-            },
-        }
-        let Some((target, plan)) = ({
-            let guard = state.lock().unwrap();
-            guard.traces.get(&name).map(|entry| {
-                let plan = match &entry.kind {
-                    TraceKind::Fn { path } => Plan::Fn { segments: path.clone(), rate: entry.rate },
-                    TraceKind::Point { location, condition, armed } => Plan::Point {
-                        location: location.clone(),
-                        condition: condition.clone(),
-                        armed: armed.clone(),
-                    },
-                };
-                (entry.target.clone(), plan)
-            })
-        }) else {
-            return;
-        };
-        let Some((conn, session)) = session_for(&state, target.as_deref()) else {
-            continue;
-        };
-        if ensure_trace_transport(&state, &conn, &session).await.is_err() {
-            continue;
-        }
-        // Both kinds keep their rate state in the page; the probe flushes burst-then-silence
-        // suppression counts and surfaces transport failures.
-        let probe = trace::probe_js(std::slice::from_ref(&name));
-        let status: Option<trace::ProbeStatus> =
-            match evaluate(conn.clone(), session.clone(), probe).await {
-                Ok(report) => {
-                    report.get(&name).cloned().and_then(|value| serde_json::from_value(value).ok())
-                }
-                Err(_) => None,
-            };
-        if let Some(probe) = &status {
-            if probe.flush > 0 {
-                emit_suppressed(&state, &name, &session, probe.flush);
-            }
-            if probe.emit_fails > 0 {
-                if let Some(entry) = state.lock().unwrap().traces.get_mut(&name) {
-                    // Page counters reset with the context — keep the high-water mark.
-                    entry.emit_fails = entry.emit_fails.max(probe.emit_fails);
-                }
-            }
-        }
-        match plan {
-            // A missing wrapper means the context was replaced — re-install. The 1s tick is the
-            // bounded retry; calls landing before the next successful install are not observed.
-            Plan::Fn { segments, rate } => {
-                if !status.is_some_and(|probe| probe.installed) {
-                    let script = trace::install_fn_js(&name, &segments, rate);
-                    let _ = evaluate(conn, session, script).await;
-                }
-            }
-            // By-URL breakpoints survive reloads within a session; what they don't survive is
-            // the *session* changing (target recreated, daemon reconnected, selector resolving
-            // elsewhere). Re-arm there — through the registry when needed — and retire the old
-            // breakpoint.
-            Plan::Point { location, condition, armed } => {
-                let stale =
-                    armed.as_ref().is_none_or(|(armed_session, _)| *armed_session != session);
-                if !stale {
-                    continue;
-                }
-                if ensure_debugger(&state, &conn, &session).await.is_err() {
-                    continue;
-                }
-                if let Some((old_session, old_id)) = &armed {
-                    let _ = conn
-                        .call(
-                            Some(old_session),
-                            "Debugger.removeBreakpoint",
-                            json!({ "breakpointId": old_id }),
-                        )
-                        .await;
-                }
-                let Ok((id, _, _)) =
-                    set_point_breakpoint(&state, &conn, &session, &location, &condition).await
-                else {
-                    continue;
-                };
-                if let Some(entry) = state.lock().unwrap().traces.get_mut(&name) {
-                    if let TraceKind::Point { armed, .. } = &mut entry.kind {
-                        *armed = Some((session.clone(), id));
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn emit_suppressed(state: &Shared, name: &str, session: &str, count: u64) {
-    let mut guard = state.lock().unwrap();
-    let Some(entry) = guard.traces.get_mut(name) else {
-        return;
-    };
-    entry.suppressed += count;
-    let site = entry.site.clone();
-    let at_ms = guard.now_ms();
-    let label = guard.label(&Some(session.to_owned()));
-    guard.emit(TimelineEvent {
-        at_ms,
-        source: Source::Renderer,
-        target: label,
-        track: Track::Trace(TraceRecord {
-            name: name.to_owned(),
-            site,
-            value: None,
-            outcome: None,
-            duration_ms: None,
-            suppressed: Some(count),
-        }),
-    });
-}
-
-/// Undo a trace's instrumentation, reporting exactly what happened. Fn traces: put the original
-/// back — unless the app replaced the function since, in which case clobbering its newer code
-/// would be worse than leaving the wrapper. Points: remove the breakpoint and the in-page state.
-async fn disarm_trace(state: &Shared, name: &str, entry: &TraceState) -> String {
-    match &entry.kind {
-        TraceKind::Fn { path } => {
-            let Some((conn, session)) = session_for(state, entry.target.as_deref()) else {
-                return "restore skipped (no live target)".to_owned();
-            };
-            let script = trace::restore_fn_js(name, path);
-            match evaluate(conn, session, script).await {
-                Ok(status) => match status.get("status").and_then(Value::as_str) {
-                    Some("restored") => "original restored".to_owned(),
-                    Some("replaced") => {
-                        "function was replaced after wrapping; left in place".to_owned()
-                    }
-                    Some("missing") => "wrapper not present (context reloaded)".to_owned(),
-                    _ => "restore returned no status".to_owned(),
-                },
-                Err(error) => format!("restore failed: {error}"),
-            }
-        }
-        TraceKind::Point { armed, .. } => {
-            let Some((session, id)) = armed else {
-                return "breakpoint was never armed".to_owned();
-            };
-            let conn = state.lock().unwrap().conn.clone();
-            let removed = conn
-                .call(Some(session), "Debugger.removeBreakpoint", json!({ "breakpointId": id }))
-                .await;
-            let _ = evaluate(conn, session.clone(), trace::clear_state_js(name)).await;
-            match removed {
-                Ok(_) => "breakpoint removed".to_owned(),
-                Err(_) => "breakpoint already gone (session ended)".to_owned(),
-            }
-        }
-    }
-}
-
-/// kit's breakpoint conditions always return false, so a pause that names a kit breakpoint is an
-/// anomaly to recover from instantly. Other pauses — `debugger;` statements, a human's manual
-/// pause — are theirs *if* a DevTools frontend is attached; with kit as the only debugger, an
-/// unresumed pause hangs the very app kit promised never to touch, so it is resumed and said.
-async fn handle_debugger_pause(state: &Shared, event: &CdpEvent) {
-    let Some(session) = event.session.as_deref() else {
-        return;
-    };
-    let hit: Vec<&str> = event
-        .params
-        .get("hitBreakpoints")
-        .and_then(Value::as_array)
-        .map(|ids| ids.iter().filter_map(Value::as_str).collect())
-        .unwrap_or_default();
-    let (conn, kit_ids) = {
-        let guard = state.lock().unwrap();
-        let ids: HashSet<String> = guard
-            .traces
-            .values()
-            .filter_map(|entry| match &entry.kind {
-                TraceKind::Point { armed: Some((_, id)), .. } => Some(id.clone()),
-                _ => None,
-            })
-            .collect();
-        (guard.conn.clone(), ids)
-    };
-    let ours = !hit.is_empty() && hit.iter().all(|id| kit_ids.contains(*id));
-    if !ours && devtools_frontend_present(&conn).await {
-        return;
-    }
-    let _ = conn.call(Some(session), "Debugger.resume", json!({})).await;
-    let what = if ours {
-        "kit breakpoint paused (bug) — resumed"
-    } else {
-        "debugger pause auto-resumed — open DevTools to actually pause"
-    };
-    push_marker(state, Source::Renderer, what);
-}
-
-async fn devtools_frontend_present(conn: &CdpConnection) -> bool {
-    let Ok(result) = conn.call(None, "Target.getTargets", json!({})).await else {
-        return false;
-    };
-    result.pointer("/targetInfos").and_then(Value::as_array).is_some_and(|targets| {
-        targets.iter().any(|target| {
-            target
-                .get("url")
-                .and_then(Value::as_str)
-                .is_some_and(|url| url.starts_with("devtools://"))
-        })
-    })
-}
-
-/// Decode one `__kit_trace__` binding payload into a Timeline row. The binding is callable by
-/// page code, so undecodable or unknown-trace payloads are dropped — forged rows must not enter
-/// the evidence stream.
-fn ingest_trace_payload(state: &Shared, event: &CdpEvent) {
-    if event.params.get("name").and_then(Value::as_str) != Some("__kit_trace__") {
-        return;
-    }
-    let Some(raw) = event.params.get("payload").and_then(Value::as_str) else {
-        return;
-    };
-    let Some(payload) = trace::decode_payload(raw) else {
-        return;
-    };
-    let mut guard = state.lock().unwrap();
-    let Some(entry) = guard.traces.get_mut(&payload.name) else {
-        return;
-    };
-    match payload.suppressed {
-        Some(count) => entry.suppressed += count,
-        None => entry.hits += 1,
-    }
-    let site = entry.site.clone();
-    let at_ms = guard.now_ms();
-    let label = guard.label(&event.session);
-    guard.emit(TimelineEvent {
-        at_ms,
-        source: Source::Renderer,
-        target: label,
-        track: Track::Trace(TraceRecord {
-            name: payload.name,
-            site,
-            value: payload.value,
-            outcome: payload.outcome,
-            duration_ms: payload.duration_ms,
-            suppressed: payload.suppressed,
-        }),
-    });
 }
 
 /// A bounded rendering of a watched value — deltas record *that* state changed; `eval` fetches
@@ -3650,14 +2690,39 @@ async fn evaluate(conn: CdpConnection, session: String, expr: String) -> Result<
         .map_err(|error| error.to_string())?;
 
     if let Some(details) = result.get("exceptionDetails") {
-        let message = details
-            .pointer("/exception/description")
-            .and_then(Value::as_str)
-            .or_else(|| details.get("text").and_then(Value::as_str))
-            .unwrap_or("evaluation failed");
-        return Err(message.to_owned());
+        return Err(exception_message(details));
     }
     Ok(result.pointer("/result/value").cloned().unwrap_or(Value::Null))
+}
+
+/// Render `exceptionDetails` as a sentence. `exception.description` usually carries
+/// "TypeError: …\n    at …" and stands alone — but a thrown non-Error leaves only a class name
+/// ("Object") or a bare stack, so compose the engine's `text` with whatever identity the
+/// exception carries; the message must always say *what* was thrown, not just where.
+fn exception_message(details: &Value) -> String {
+    let description = details.pointer("/exception/description").and_then(Value::as_str);
+    if let Some(description) = description {
+        let first = description.lines().next().unwrap_or_default().trim_start();
+        if first.contains(": ") && !first.starts_with("at ") {
+            return description.to_owned();
+        }
+    }
+    let text = details.get("text").and_then(Value::as_str).unwrap_or("evaluation failed");
+    let what = details
+        .pointer("/exception/className")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| details.pointer("/exception/value").map(compact_value))
+        .unwrap_or_default();
+    let stack = description
+        .filter(|description| description.contains('\n') || description.starts_with("at "))
+        .map(|stack| format!("\n{stack}"))
+        .unwrap_or_default();
+    if what.is_empty() || text.ends_with(&what) {
+        format!("{text}{stack}")
+    } else {
+        format!("{text} {what}{stack}")
+    }
 }
 
 /// A lens runs as `(async function(args, kit){ <source> })(<args>, <context>)` — the script gets

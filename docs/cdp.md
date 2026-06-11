@@ -55,7 +55,7 @@ Failed assertions exit non-zero, so `&&` chains behave.
 | Assert | `wait '<expr>'` · `expect text/eval/net/no-errors` · `verify` | self-verification: poll a condition, assert one fact, or get a composite PASS/FAIL — all exit non-zero on failure |
 | Batch | `do "<step>; <step>"` · `flow ls/run/show` | run whole sequences daemon-side in one round trip; flows are saved, parameterized step files |
 | Subscribe | `watch add/ls/rm/clear` | record a `watch` Timeline event whenever an expression's value changes |
-| Instrument | `trace fn '<path>'` · `trace add <file:line> ['<expr>'] [--when …]` · `trace ls/rm/clear` | record execution: fn calls (args · outcome · duration) and never-pausing logpoints, source-map aware |
+| Instrument | `trace fn '<path>'` · `trace add <file:line> ['<expr>'] [--when …]` · `trace find '<text>'` · `trace ls/rm/clear` | record execution: fn calls (args · outcome · duration) and never-pausing logpoints, source-map aware, bound site read back at arm |
 | Action window | `mark <name>` · `after <name>` · `bundle <name>` | summarize and export what changed after an action |
 | Lens | `lens <name> [-- args]` | run a scriptable lens in a Target |
 | Extensions | `ext doctor <id>` · `ext bundle <id>` | diagnose a Modular extension runtime view |
@@ -158,28 +158,48 @@ rows it causes, with no code edits, no rebuilds, and **no pauses**:
 
 ```bash
 kit cdp trace fn 'app.api.save'                       # wrap a live function: args · outcome · duration
+kit cdp trace find 'groupId: options.group.id'        # live url:line coordinates — never grep a stale build
 kit cdp trace add src/cart.js:84 'items.length'       # logpoint, resolved through source maps
 kit cdp trace add renderer.js:108 '({ counter })' --when 'counter > 2'
-kit cdp tail --track trace --since 2m
+kit cdp tail --track trace --since-mark trace-counter-108
 kit cdp trace ls · rm <name> · clear
 ```
 
-**Fn traces** wrap the function at a dotted path. The wrapper preserves
-`this`/args/return/throw (constructors go through `Reflect.construct`), records a
-bounded preview of each call, and a keeper re-installs it after reloads. A traced
-*caught* throw renders as `✗` but is never error-shaped — observation must not flip
-a `verify`. Honest limits, disclosed in the reply: calls through references saved
-before wrapping are invisible, and thenables return as a *derived* promise (same
-settlement, different identity).
+**Arming is a readback, not an echo.** The reply shows where V8 actually bound the
+breakpoint (`src/cart.js:5 → bundle.js:8:3 (1 site)`), the original line's text when
+the map embeds `sourcesContent` (`line  items.push(name);` — proof you're on the
+code you meant), and the exact command to read results (a `trace-<name>` mark is set
+at arm). `trace ls` then distinguishes the states that matter: `armed, awaiting
+first hit` vs `N hit(s) · last 4s ago` vs `0 sites — no parsed script matches` vs
+`⚠ stalled: <why>` when the keeper can't re-arm.
+
+**Fn traces** wrap the function at a dotted path — which must be reachable from
+`globalThis`, so in bundled ESM apps most functions need a logpoint instead (the
+error says so). The wrapper preserves `this`/args/return/throw (constructors go
+through `Reflect.construct`), records a bounded preview of each call, and the keeper
+re-installs it after reloads. A traced *caught* throw renders as `✗` but is never
+error-shaped — observation must not flip a `verify`. Honest limits, disclosed in the
+reply: calls through references saved before wrapping are invisible, and thenables
+return as a *derived* promise (same settlement, different identity).
 
 **Logpoints** are breakpoints whose condition records and returns false — V8 never
-pauses. Expressions are compile-checked at arm time: a syntax error fails the `add`
-instead of arming a breakpoint that V8 would silently never fire. Locations resolve
-three ways: a script-URL suffix (`renderer.js:144`), an absolute URL, or a **repo
-path through the source-map registry** (`src/cart.js:5 → bundle.js:8`), which the
-daemon builds from `Debugger.scriptParsed` and feeds by fetching maps through the
-page (so `modular://` and asar apps resolve too). `--when` gates recording; one
-breakpoint per location (the error names the trace holding it).
+pauses. Expressions are compile-checked at arm time — pieces *and* the assembled
+condition, so a syntax error fails the `add` instead of arming a breakpoint that V8
+would silently never fire — and an expression that *throws at runtime* (TDZ, a name
+not in that frame's scope) ships the error as the row's value, never a silent skip.
+Locations resolve three ways: a script-URL suffix (`renderer.js:144`, query-string
+tolerant for dev servers), an absolute URL, or a **repo path through the source-map
+registry** (`src/cart.js:5 → bundle.js:8`), which the daemon builds from
+`Debugger.scriptParsed` and feeds by fetching maps through the page (so `modular://`
+and asar apps resolve too). `--when` gates recording; one breakpoint per location
+(the error names the trace holding it). When the script under a logpoint re-parses
+(HMR rebuild, rotating `?t=` stamps), the keeper re-arms it and `ls` shows
+`re-armed N×` — coordinates heal instead of dying silently.
+
+**`trace find`** searches the *parsed* scripts of the live session for a literal
+string and returns `url:line` plus the line's text — coordinates from the code that
+is actually executing, immune to the build-output drift that makes grepping a bundle
+on disk a trap.
 
 Both kinds rate-cap **in the page** (default 20 hits/s, `--rate`): past the cap the
 page counts drops and the Timeline shows `trace hot ⚠ 495 hit(s) suppressed` rows —
