@@ -5,6 +5,8 @@
 
 use serde::Deserialize;
 
+use super::base64;
+
 /// Decoded-map size guards — a pathological map should fail loudly, not own the daemon's memory.
 /// The line cap matters independently of the byte cap: a megabyte of bare `;` would otherwise
 /// decode into tens of millions of empty line vectors.
@@ -180,7 +182,7 @@ pub fn inline_map(map_url: &str) -> Option<Result<String, String>> {
     let (header, payload) = rest.split_once(',')?;
     if header.contains("base64") {
         Some(
-            base64_decode(payload)
+            base64::decode(payload)
                 .and_then(|bytes| String::from_utf8(bytes).map_err(|_| "not utf-8".to_owned())),
         )
     } else {
@@ -237,7 +239,7 @@ fn vlq_decode(segment: &str) -> Result<Vec<i64>, String> {
     let mut value: i64 = 0;
     let mut shift = 0u32;
     for ch in segment.chars() {
-        let digit = base64_value(ch).ok_or_else(|| format!("bad VLQ char '{ch}'"))?;
+        let digit = base64::value(ch).ok_or_else(|| format!("bad VLQ char '{ch}'"))?;
         value |= i64::from(digit & 0x1f) << shift;
         if digit & 0x20 != 0 {
             shift += 5;
@@ -255,33 +257,6 @@ fn vlq_decode(segment: &str) -> Result<Vec<i64>, String> {
         return Err("truncated VLQ segment".to_owned());
     }
     Ok(fields)
-}
-
-fn base64_value(ch: char) -> Option<u8> {
-    match ch {
-        'A'..='Z' => Some(ch as u8 - b'A'),
-        'a'..='z' => Some(ch as u8 - b'a' + 26),
-        '0'..='9' => Some(ch as u8 - b'0' + 52),
-        '+' => Some(62),
-        '/' => Some(63),
-        _ => None,
-    }
-}
-
-fn base64_decode(text: &str) -> Result<Vec<u8>, String> {
-    let mut out = Vec::with_capacity(text.len() * 3 / 4);
-    let mut buffer = 0u32;
-    let mut bits = 0u32;
-    for ch in text.chars().filter(|ch| *ch != '=') {
-        let value = base64_value(ch).ok_or_else(|| format!("bad base64 char '{ch}'"))?;
-        buffer = (buffer << 6) | u32::from(value);
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((buffer >> bits) as u8);
-        }
-    }
-    Ok(out)
 }
 
 #[cfg(test)]

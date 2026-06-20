@@ -5,6 +5,7 @@
 //! The engine is deliberately app-agnostic — it knows Chromium/Electron and the protocol, nothing
 //! about any app running on top of it. App meaning lives in a `scout` recon step or a `cdp` lens.
 
+pub(crate) mod base64;
 mod client;
 mod discovery;
 mod http;
