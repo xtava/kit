@@ -26,6 +26,12 @@ kit scout --once           # …one survey, headless table
 kit scout dive             # capture a window's heap snapshot → memlab
 kit domain example.com io  # authoritative domain checker
 kit domain                 # …its TUI
+kit record -i              # Modular recorder REPL
+kit record status          # current recording artifact/run state
+kit record cancel          # cancel active recording and close its window
+kit record replay          # replay the current Modular recording
+kit record rename drag-smoke
+                           # save current recording under a stable name
 ```
 
 Every tool inherits the same spine for free: a global `--json`, headless-vs-TUI
@@ -36,6 +42,7 @@ For the CDP debugger, see **[docs/cdp.md](./docs/cdp.md)**. It covers the warm
 attach flow, the controlled launcher flow (startup capture, state/marks, network
 rules, redacted bundles, profiles, cleanup), and the verification loop: locators,
 settle, `wait`/`expect`/`verify`, `do` batches, flows, watches, and `snap --diff`.
+For the Modular Playwright recorder lane, see **[docs/record.md](./docs/record.md)**.
 The live playground every feature is verified against lives in
 [`testbed/`](./testbed/README.md).
 
@@ -58,7 +65,8 @@ src/
 └─ tools/
    ├─ cdp/            warm CDP debugger — daemon · client · snapshot · readiness · lenses
    ├─ scout/          proc · cdp (via kit::cdp) · survey · correlate · report · tui · dive
-   └─ domain/         engine{dns,rdap,whois} · config · report · tui
+   ├─ domain/         engine{dns,rdap,whois} · config · report · tui
+   └─ record/         Modular Playwright recorder operator shell
 ```
 
 A tool implements one trait — `Tool { meta, command, run }` — and decides

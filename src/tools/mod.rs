@@ -3,4 +3,5 @@
 
 pub mod cdp;
 pub mod domain;
+pub mod record;
 pub mod scout;
