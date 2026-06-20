@@ -6,7 +6,8 @@
 //! Skips itself (passes) when no Chrome binary is present, so the suite stays green on a box without
 //! one; on CI/dev with Chrome installed it is a true end-to-end check.
 
-use std::process::{Child, Command, Stdio};
+mod common;
+
 use std::time::Duration;
 
 use kit::cdp::{
@@ -14,87 +15,7 @@ use kit::cdp::{
 };
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
-use tokio::time::{sleep, timeout};
-
-/// A headless Chrome that cleans itself up on drop — a leaked browser would wedge the next run.
-struct Chrome {
-    child: Child,
-    port: u16,
-    profile: String,
-}
-
-impl Drop for Chrome {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        // Chrome's headless zygote releases the profile lock a beat after the launcher dies; retry so
-        // the data dir doesn't leak into /tmp across runs.
-        for _ in 0..20 {
-            if std::fs::remove_dir_all(&self.profile).is_ok()
-                || !std::path::Path::new(&self.profile).exists()
-            {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-}
-
-fn chrome_binary() -> Option<&'static str> {
-    ["google-chrome-stable", "google-chrome", "chromium", "chromium-browser"]
-        .into_iter()
-        .find(|binary| which(binary))
-}
-
-fn which(binary: &str) -> bool {
-    Command::new("sh")
-        .arg("-c")
-        .arg(format!("command -v {binary}"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
-
-/// Launch headless Chrome on a fixed debug port with a data-url page, and wait for its DevTools
-/// endpoint to answer. Returns `None` only if no Chrome binary exists.
-async fn launch_chrome(salt: u16) -> Option<Chrome> {
-    let binary = chrome_binary()?;
-    // A unique port + profile per run keeps concurrent invocations (and stale locks) from colliding;
-    // `salt` separates the tests that share this binary's pid so they don't fight over one port.
-    let port = 9300 + ((std::process::id() as u16).wrapping_add(salt) % 200);
-    let profile = format!(
-        "{}/kit-cdp-errors-{}-{}",
-        std::env::temp_dir().display(),
-        std::process::id(),
-        port
-    );
-    let _ = std::fs::remove_dir_all(&profile);
-    let child = Command::new(binary)
-        .args([
-            "--headless=new",
-            &format!("--remote-debugging-port={port}"),
-            "--no-sandbox",
-            "--disable-gpu",
-            "--no-first-run",
-            &format!("--user-data-dir={profile}"),
-            "data:text/html,<title>kit-test</title><body>error fixture</body>",
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn chrome");
-
-    let chrome = Chrome { child, port, profile };
-    for _ in 0..50 {
-        if browser_endpoint(port).await.is_some() {
-            return Some(chrome);
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
-    panic!("chrome did not expose a DevTools endpoint on :{port}");
-}
+use tokio::time::timeout;
 
 /// Attach to the browser exactly as the daemon does — discover + flatten auto-attach, **one** session
 /// per target — enable `Runtime` on the page, inject `script` to drive real errors, then fold the
@@ -164,7 +85,7 @@ async fn capture_timeline(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn errors_view_collapses_real_duplicate_errors() {
-    let Some(chrome) = launch_chrome(0).await else {
+    let Some(chrome) = common::launch_chrome("kit-cdp-errors", 0).await else {
         eprintln!("no chrome binary — skipping live CDP integration test");
         return;
     };
@@ -219,7 +140,7 @@ async fn errors_view_collapses_real_duplicate_errors() {
 /// single variant — that would be a silent merge of two different errors.
 #[tokio::test(flavor = "multi_thread")]
 async fn distinct_objects_never_collapse_silently() {
-    let Some(chrome) = launch_chrome(1).await else {
+    let Some(chrome) = common::launch_chrome("kit-cdp-errors", 1).await else {
         eprintln!("no chrome binary — skipping live CDP integration test");
         return;
     };
