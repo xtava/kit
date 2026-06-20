@@ -6,9 +6,11 @@
 //! - **Subscription** — a [`Command::Subscribe`] in, then a [`Frame`] *stream* out that stays open.
 //!   Frames carry structured [`TimelineEvent`]s; the interactive client renders them itself.
 
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
-use crate::cdp::{Source, TargetKind, TimelineEvent, TrackKind};
+use crate::cdp::{ImageFormat, Source, TargetKind, TimelineEvent, TrackKind};
 
 use super::snapshot;
 
@@ -197,6 +199,12 @@ pub enum Command {
         /// becomes the new baseline either way.
         diff: bool,
     },
+    /// Capture a window (page Target) to an image file. The daemon writes the file and replies
+    /// with its path.
+    Screenshot {
+        target: Option<String>,
+        request: ScreenshotRequest,
+    },
     Click {
         target: Option<String>,
         locator: Locator,
@@ -276,6 +284,27 @@ pub enum Command {
     },
     CloseBrowser,
     Detach,
+}
+
+/// The default capture budget: long enough to ride out a first paint after a reload, short enough
+/// that a non-painting target fails a tight loop fast instead of blocking on the generic call
+/// timeout. The happy path is unaffected — capture returns the moment a frame exists.
+pub const DEFAULT_CAPTURE_TIMEOUT_MS: u64 = 3_000;
+
+/// One screenshot ask: encoding, lossy quality, full-page vs viewport, raise-first, the no-frame
+/// budget, and where the image lands (`out: None` → a timestamped file in the attachment's artifact
+/// dir). The client absolutizes `out` before sending — the daemon's working directory is not the
+/// caller's.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ScreenshotRequest {
+    pub out: Option<PathBuf>,
+    pub format: ImageFormat,
+    /// 0–100, lossy formats only — the client rejects it for png before the wire.
+    pub quality: Option<u8>,
+    pub full: bool,
+    pub raise: bool,
+    /// How long to wait for a frame before failing with a no-frame error.
+    pub timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -534,6 +563,17 @@ mod tests {
             Command::Ready { target: target.clone() },
             Command::Heap { target: target.clone() },
             Command::Snap { target: target.clone(), interactive: true, diff: true },
+            Command::Screenshot {
+                target: target.clone(),
+                request: ScreenshotRequest {
+                    out: Some(PathBuf::from("/tmp/cart.jpeg")),
+                    format: ImageFormat::Jpeg,
+                    quality: Some(80),
+                    full: true,
+                    raise: true,
+                    timeout_ms: 3_000,
+                },
+            },
             Command::Click {
                 target: target.clone(),
                 locator: Locator::Ref("e1".to_owned()),

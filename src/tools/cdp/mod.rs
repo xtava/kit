@@ -19,7 +19,7 @@ mod snapshot;
 mod trace;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context as _, Result};
 use async_trait::async_trait;
@@ -27,10 +27,10 @@ use clap::{
     ArgMatches, Args, Command as ClapCommand, CommandFactory, FromArgMatches, Parser, Subcommand,
 };
 
-use crate::cdp::{Source, TrackKind};
+use crate::cdp::{ImageFormat, Source, TrackKind};
 use crate::framework::{Context, Tool, ToolMeta};
 
-use protocol::{Command, IgnoreOp, NetCommand, TimelineQuery};
+use protocol::{Command, IgnoreOp, NetCommand, ScreenshotRequest, TimelineQuery};
 
 pub fn tool() -> CdpTool {
     CdpTool
@@ -47,6 +47,7 @@ RECIPES
     kit cdp click 'button:Save settings' --app checkout      locator resolved live
     kit cdp verify --app checkout                            PASS/FAIL since that click
     kit cdp snap --diff --app checkout                       what changed on screen
+    kit cdp screenshot --app checkout                        what the window looks like now
 
   A whole sequence in one round trip (steps are the normal grammar):
     kit cdp do \"click 'button:Save'; expect text 'Saved'; verify\" --app checkout
@@ -261,6 +262,19 @@ EXAMPLES
   kit cdp flow run checkout-smoke --app checkout
   kit cdp flow run login -- user=ada@example.com --app checkout
   kit cdp flow show checkout-smoke
+";
+
+const SCREENSHOT_AFTER_HELP: &str = "\
+EXAMPLES
+  kit cdp screenshot --app checkout                       active window → artifact dir
+  kit cdp screenshot --target settings --app checkout     pick a window from `kit cdp targets`
+  kit cdp screenshot -o /tmp/cart.jpeg --quality 80       format inferred from the extension
+  kit cdp screenshot --full --raise --app checkout        whole scrollable page, raised first
+
+NOTES
+  Captures the renderer surface over CDP — the page's pixels, not the OS window chrome. An
+  occluded window can have no frames to capture; --raise brings it to front first (a visible
+  side effect, so never the default).
 ";
 
 const STATE_AFTER_HELP: &str = "\
@@ -671,6 +685,33 @@ enum CdpCommand {
         /// Verification without assertions — act, then ask what the UI did.
         #[arg(long)]
         diff: bool,
+        #[arg(long)]
+        target: Option<String>,
+    },
+    /// Screenshot a window (page Target) to an image file and print the path.
+    #[command(visible_alias = "shot", after_help = SCREENSHOT_AFTER_HELP)]
+    Screenshot {
+        /// Destination file. Defaults to a timestamped file in the attachment's artifact dir;
+        /// a relative path resolves against the current directory.
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+        /// png, jpeg, or webp. Defaults to the --out extension, else png.
+        #[arg(long)]
+        format: Option<String>,
+        /// Lossy quality 0–100, jpeg/webp only.
+        #[arg(long)]
+        quality: Option<u8>,
+        /// Capture the full scrollable page instead of the viewport.
+        #[arg(long)]
+        full: bool,
+        /// Bring the window to front first — an occluded window can have no frames to capture.
+        #[arg(long)]
+        raise: bool,
+        /// How long to wait for a frame before failing fast (500ms, 3s, 1m). A target that paints
+        /// nothing — backgrounded, minimized, or mid-reload — fails at this budget instead of
+        /// blocking; the happy path returns the instant a frame exists.
+        #[arg(long, default_value = "3s")]
+        timeout: String,
         #[arg(long)]
         target: Option<String>,
     },
@@ -1259,6 +1300,27 @@ fn session_command(command: CdpCommand) -> Result<Command> {
         CdpCommand::Snap { interactive, diff, target } => {
             Command::Snap { target, interactive, diff }
         }
+        CdpCommand::Screenshot { out, format, quality, full, raise, timeout, target } => {
+            let out = out.map(absolute_from_cwd).transpose()?;
+            let format = screenshot_format(format.as_deref(), out.as_deref())?;
+            if quality.is_some() && format == ImageFormat::Png {
+                bail!("--quality applies to jpeg/webp — png is lossless");
+            }
+            if quality.is_some_and(|quality| quality > 100) {
+                bail!("--quality is 0–100");
+            }
+            Command::Screenshot {
+                target,
+                request: ScreenshotRequest {
+                    out,
+                    format,
+                    quality,
+                    full,
+                    raise,
+                    timeout_ms: parse_duration(&timeout)?,
+                },
+            }
+        }
         CdpCommand::Click { locator, target, settle } => Command::Click {
             target,
             locator: protocol::Locator::parse(&locator),
@@ -1418,6 +1480,34 @@ impl TimelineQueryExt for TimelineQuery {
     fn with_extension(mut self, extension_id: String) -> Self {
         self.extension = Some(extension_id);
         self
+    }
+}
+
+/// The daemon runs in its own working directory, so a relative `--out` must be anchored to the
+/// caller's before it crosses the socket.
+fn absolute_from_cwd(path: PathBuf) -> Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    Ok(std::env::current_dir().context("resolve working directory")?.join(path))
+}
+
+/// An explicit `--format` wins but must not contradict an explicit `--out` extension; with no
+/// flag the extension decides, and the default is png.
+fn screenshot_format(flag: Option<&str>, out: Option<&Path>) -> Result<ImageFormat> {
+    let from_out = out
+        .and_then(Path::extension)
+        .and_then(|extension| extension.to_str())
+        .and_then(|extension| ImageFormat::parse(extension).ok());
+    match flag {
+        None => Ok(from_out.unwrap_or(ImageFormat::Png)),
+        Some(name) => {
+            let format = ImageFormat::parse(name).map_err(anyhow::Error::msg)?;
+            if from_out.is_some_and(|inferred| inferred != format) {
+                bail!("--format {} contradicts the --out extension", format.as_str());
+            }
+            Ok(format)
+        }
     }
 }
 
@@ -1609,4 +1699,38 @@ fn parse_duration(value: &str) -> Result<u64> {
         .or_else(|| parse("m", 60_000))
         .or_else(|| value.parse::<u64>().ok().map(|n| n * 1_000))
         .with_context(|| format!("invalid duration '{value}' — use 500ms, 5s, or 1m"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The flag wins, the extension fills in, png is the floor — and a flag that contradicts an
+    /// explicit extension is a mistake to surface, not a tiebreak to guess.
+    #[test]
+    fn screenshot_format_resolves_flag_extension_and_default() {
+        let jpeg_out = PathBuf::from("/tmp/cart.jpg");
+        assert_eq!(screenshot_format(None, None).unwrap(), ImageFormat::Png);
+        assert_eq!(screenshot_format(None, Some(&jpeg_out)).unwrap(), ImageFormat::Jpeg);
+        assert_eq!(screenshot_format(Some("webp"), None).unwrap(), ImageFormat::Webp);
+        assert_eq!(screenshot_format(Some("jpeg"), Some(&jpeg_out)).unwrap(), ImageFormat::Jpeg);
+        assert_eq!(
+            screenshot_format(None, Some(Path::new("/tmp/shot.bin"))).unwrap(),
+            ImageFormat::Png,
+            "an extension that names no image format falls back to png"
+        );
+        assert!(screenshot_format(Some("png"), Some(&jpeg_out)).is_err(), "contradiction");
+        assert!(screenshot_format(Some("bmp"), None).is_err(), "unknown format");
+    }
+
+    #[test]
+    fn screenshot_out_paths_are_anchored_to_the_callers_directory() {
+        assert_eq!(
+            absolute_from_cwd(PathBuf::from("/tmp/x.png")).unwrap(),
+            Path::new("/tmp/x.png")
+        );
+        let relative = absolute_from_cwd(PathBuf::from("shots/x.png")).unwrap();
+        assert!(relative.is_absolute());
+        assert_eq!(relative, std::env::current_dir().unwrap().join("shots/x.png"));
+    }
 }

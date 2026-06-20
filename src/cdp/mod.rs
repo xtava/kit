@@ -14,7 +14,10 @@ mod sourcemap;
 mod target;
 mod timeline;
 
-pub use client::{probe_metrics, probe_target, CdpConnection, CdpEvent, TargetMetrics};
+pub use client::{
+    capture_screenshot, probe_metrics, probe_target, CdpConnection, CdpEvent, ImageFormat, NoFrame,
+    TargetMetrics,
+};
 pub use discovery::{
     browser_endpoint, discover, is_cdp, node_endpoint, targets, BrowserEndpoint, Instance,
     NodeEndpoint,

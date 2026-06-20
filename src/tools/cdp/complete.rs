@@ -77,6 +77,8 @@ enum ValueKind {
     Source,
     Status,
     Target,
+    /// A screenshot encoding: png, jpeg, or webp.
+    Format,
     /// Free-form input with no candidates — the ghost still names what belongs here.
     Free(&'static str),
 }
@@ -94,6 +96,7 @@ impl ValueKind {
             Self::Mark => plain(&["last-action", "do-start", "launch"]),
             Self::Source => plain(&["main", "renderer"]),
             Self::Status => plain(&["2xx", "3xx", "4xx", "5xx", "ok", "fail"]),
+            Self::Format => plain(&["png", "jpeg", "webp"]),
             Self::Track => TrackKind::ALL
                 .iter()
                 .map(|kind| kind.as_str())
@@ -130,6 +133,7 @@ impl ValueKind {
             Self::Track => "‹track · ⇥ list›".to_owned(),
             Self::Source => "‹main · renderer›".to_owned(),
             Self::Status => "‹2xx · 404 · ok · fail›".to_owned(),
+            Self::Format => "‹png · jpeg · webp›".to_owned(),
             Self::Free(name) => format!("‹{name}›"),
         }
     }
@@ -148,6 +152,9 @@ fn kind_for(owner: &str, id: &str) -> ValueKind {
         (_, "source") => ValueKind::Source,
         (_, "status") => ValueKind::Status,
         (_, "target") => ValueKind::Target,
+        (_, "format") => ValueKind::Format,
+        (_, "out") => ValueKind::Free("file path · /tmp/shot.png"),
+        (_, "quality") => ValueKind::Free("0-100"),
         ("run" | "show", "name") => ValueKind::Flow,
         ("lens", "name") => ValueKind::Lens,
         ("rm", "name") => ValueKind::Free("watch/trace name"),

@@ -5,11 +5,11 @@
 //! `docs/adr/0003`).
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -18,13 +18,13 @@ use tokio::sync::mpsc;
 use tokio::time::{interval, sleep};
 
 use crate::cdp::{
-    self, CdpConnection, CdpEvent, LogEntry, Source, Target, Timeline, TimelineEvent, Track,
-    TrackKind,
+    self, CdpConnection, CdpEvent, ImageFormat, LogEntry, Source, Target, Timeline, TimelineEvent,
+    Track, TrackKind,
 };
 
 use super::protocol::{
     Command, Expectation, Frame, IgnoreOp, LaunchSettings, Locator, NetCommand, Query, Reply,
-    Settle, TargetActivity, TimelineQuery,
+    ScreenshotRequest, Settle, TargetActivity, TimelineQuery, DEFAULT_CAPTURE_TIMEOUT_MS,
 };
 use super::readiness::{self, DocState, Readiness};
 use super::registry::{self, Record};
@@ -508,7 +508,7 @@ async fn handle_paused_request(state: &Shared, event: &CdpEvent) {
                         "requestId": request_id,
                         "responseCode": status,
                         "responseHeaders": [{ "name": "content-type", "value": mime.unwrap_or_else(|| "application/json".to_owned()) }],
-                        "body": base64_encode(body.as_bytes()),
+                        "body": cdp::base64::encode(body.as_bytes()),
                     }),
                 )
                 .await;
@@ -748,6 +748,9 @@ async fn dispatch(
         Command::Heap { target } => heap_reply(state, target, json).await,
         Command::Snap { target, interactive, diff } => {
             snap_reply(state, target, interactive, diff, json).await
+        }
+        Command::Screenshot { target, request } => {
+            screenshot_reply(state, target, request, json).await
         }
         Command::Click { target, locator, settle } => {
             click_reply(state, target, locator, settle, json).await
@@ -1075,7 +1078,14 @@ async fn state_reply(state: &Shared, visual: bool, json: bool) -> Reply {
         document = probe_document(&conn, &session).await;
         focus = evaluate(conn.clone(), session.clone(), FOCUS_PROBE.to_owned()).await.ok();
         if visual {
-            screenshot = capture_screenshot(&conn, &session, &name).await.ok();
+            let path = registry::artifact_dir(&name).join("latest.png");
+            let budget = Duration::from_millis(DEFAULT_CAPTURE_TIMEOUT_MS);
+            if write_screenshot(&conn, &session, &path, ImageFormat::Png, None, false, budget)
+                .await
+                .is_ok()
+            {
+                screenshot = Some(path.display().to_string());
+            }
         }
     }
 
@@ -2763,22 +2773,89 @@ fn lens_context(state: &Shared) -> Value {
     })
 }
 
-async fn capture_screenshot(conn: &CdpConnection, session: &str, name: &str) -> Result<String> {
-    let value = conn
-        .call(
-            Some(session),
-            "Page.captureScreenshot",
-            json!({ "format": "png", "captureBeyondViewport": false }),
-        )
-        .await?;
-    let data = value.get("data").and_then(Value::as_str).context("screenshot missing data")?;
-    let bytes = base64_decode(data).context("decode screenshot")?;
-    let path = registry::artifact_dir(name).join("latest.png");
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+async fn screenshot_reply(
+    state: &Shared,
+    target: Option<String>,
+    request: ScreenshotRequest,
+    json: bool,
+) -> Reply {
+    let (name, resolved) = {
+        let state = state.lock().unwrap();
+        let resolved = state
+            .resolve(target.as_deref())
+            .map(|(session, target)| (state.conn.clone(), session, target));
+        (state.name.clone(), resolved)
+    };
+    let Some((conn, session, target)) = resolved else {
+        return Reply::fail(no_target());
+    };
+
+    if request.raise {
+        if let Err(error) = conn.call(Some(&session), "Page.bringToFront", json!({})).await {
+            return Reply::fail(format!("bring '{}' to front: {error}", target.label()));
+        }
     }
-    std::fs::write(&path, bytes)?;
-    Ok(path.display().to_string())
+
+    let path = request.out.unwrap_or_else(|| {
+        registry::artifact_dir(&name).join(format!(
+            "shot-{}.{}",
+            now_unix_ms(),
+            request.format.as_str()
+        ))
+    });
+    let bytes = match write_screenshot(
+        &conn,
+        &session,
+        &path,
+        request.format,
+        request.quality,
+        request.full,
+        Duration::from_millis(request.timeout_ms),
+    )
+    .await
+    {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            // A no-frame failure is recoverable by the caller — name the remedy; other failures
+            // (a dead session, a write error) speak for themselves.
+            let hint = if error.downcast_ref::<cdp::NoFrame>().is_some() && !request.raise {
+                " — retry once it has painted, or pass --raise to foreground the window"
+            } else {
+                ""
+            };
+            return Reply::fail(format!("screenshot '{}': {error:#}{hint}", target.label()));
+        }
+    };
+
+    if json {
+        let value = json!({
+            "target": target.label(),
+            "path": path,
+            "format": request.format.as_str(),
+            "bytes": bytes,
+        });
+        return Reply::ok(serde_json::to_string_pretty(&value).unwrap_or_default());
+    }
+    Reply::ok(format!("target    {}\nscreen    {}", target.label(), path.display()))
+}
+
+/// Capture a Target and write the image to `path`, creating parent directories. Returns the byte
+/// count written. `budget` caps the wait for a frame — see [`cdp::capture_screenshot`].
+async fn write_screenshot(
+    conn: &CdpConnection,
+    session: &str,
+    path: &Path,
+    format: ImageFormat,
+    quality: Option<u8>,
+    full: bool,
+    budget: Duration,
+) -> Result<usize> {
+    let image = cdp::capture_screenshot(conn, Some(session), format, quality, full, budget).await?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    std::fs::write(path, &image).with_context(|| format!("write {}", path.display()))?;
+    Ok(image.len())
 }
 
 fn compact_value(value: &Value) -> String {
@@ -3079,55 +3156,6 @@ fn sensitive_key(key: &str) -> bool {
 fn parse_viewport(viewport: &str) -> Option<(u64, u64)> {
     let (width, height) = viewport.split_once('x').or_else(|| viewport.split_once('X'))?;
     Some((width.trim().parse().ok()?, height.trim().parse().ok()?))
-}
-
-const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-fn base64_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
-        let triple = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
-        for (shift, present) in [(18, true), (12, true), (6, chunk.len() > 1), (0, chunk.len() > 2)]
-        {
-            out.push(if present { BASE64[(triple >> shift & 0x3f) as usize] as char } else { '=' });
-        }
-    }
-    out
-}
-
-fn base64_decode(text: &str) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(text.len() / 4 * 3);
-    let mut buf = [0u8; 4];
-    let mut len = 0;
-    for byte in text.bytes().filter(|byte| !byte.is_ascii_whitespace()) {
-        let value = match byte {
-            b'A'..=b'Z' => byte - b'A',
-            b'a'..=b'z' => byte - b'a' + 26,
-            b'0'..=b'9' => byte - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            b'=' => 64,
-            _ => bail!("invalid base64 byte"),
-        };
-        buf[len] = value;
-        len += 1;
-        if len == 4 {
-            let triple = ((buf[0] as u32) << 18)
-                | ((buf[1] as u32) << 12)
-                | (((buf[2] & 63) as u32) << 6)
-                | ((buf[3] & 63) as u32);
-            out.push((triple >> 16) as u8);
-            if buf[2] != 64 {
-                out.push((triple >> 8) as u8);
-            }
-            if buf[3] != 64 {
-                out.push(triple as u8);
-            }
-            len = 0;
-        }
-    }
-    Ok(out)
 }
 
 fn query_param(url: &str, key: &str) -> Option<String> {

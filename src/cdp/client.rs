@@ -10,13 +10,15 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+
+use super::base64;
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(6);
@@ -61,6 +63,20 @@ impl CdpConnection {
 
     /// Send a command and await its result. `session` targets a flatten-attached target.
     pub async fn call(&self, session: Option<&str>, method: &str, params: Value) -> Result<Value> {
+        self.call_within(session, method, params, CALL_TIMEOUT).await
+    }
+
+    /// Send a command and await its result, bounded by `deadline` instead of the default. A call
+    /// that overruns yields a typed [`CallTimeout`] (not a generic error, so callers can tell a
+    /// no-response from a protocol failure) and stops tracking its id, so a reply that lands after
+    /// the deadline is discarded rather than leaking a pending slot.
+    pub async fn call_within(
+        &self,
+        session: Option<&str>,
+        method: &str,
+        params: Value,
+        deadline: Duration,
+    ) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let mut request = json!({ "id": id, "method": method, "params": params });
         if let Some(session) = session {
@@ -75,15 +91,34 @@ impl CdpConnection {
             bail!("cdp connection closed");
         }
 
-        match timeout(CALL_TIMEOUT, rx).await {
+        match timeout(deadline, rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => bail!("cdp connection closed before response"),
             Err(_) => {
                 self.pending.lock().unwrap().remove(&id);
-                bail!("cdp call '{method}' timed out")
+                Err(CallTimeout { method: method.to_owned(), after: deadline.as_secs_f32() }.into())
             }
         }
     }
+}
+
+/// A CDP call that did not return within its deadline — a distinct error from a protocol failure so
+/// a caller can recognise a non-responding target rather than string-matching a message.
+#[derive(Debug, thiserror::Error)]
+#[error("cdp call '{method}' timed out after {after:.1}s")]
+pub struct CallTimeout {
+    pub method: String,
+    pub after: f32,
+}
+
+/// `Page.captureScreenshot` returned no frame before its budget elapsed: the target is painting
+/// nothing — a background page, a minimized or occluded window, or a renderer mid-reload. A distinct
+/// error so a tight capture loop fails fast (and the shell can suggest a remedy) instead of blocking
+/// on the generic call timeout.
+#[derive(Debug, thiserror::Error)]
+#[error("no frame within {budget:.1}s — the target produced no frame (a background page, a minimized or occluded window, or a renderer mid-reload)")]
+pub struct NoFrame {
+    pub budget: f32,
 }
 
 async fn write_loop(
@@ -182,6 +217,65 @@ pub async fn probe_metrics(connection: &CdpConnection, session: Option<&str>) ->
             .and_then(|value| value.pointer("/jsEventListeners"))
             .and_then(Value::as_u64),
     }
+}
+
+/// Screenshot encoding — the CDP `format` parameter, and the file extension to save under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageFormat {
+    Png,
+    Jpeg,
+    Webp,
+}
+
+impl ImageFormat {
+    /// Parse a user-facing name; `jpg` is accepted for `jpeg`.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        match text.to_ascii_lowercase().as_str() {
+            "png" => Ok(Self::Png),
+            "jpeg" | "jpg" => Ok(Self::Jpeg),
+            "webp" => Ok(Self::Webp),
+            other => Err(format!("unknown image format '{other}' — png, jpeg, or webp")),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Png => "png",
+            Self::Jpeg => "jpeg",
+            Self::Webp => "webp",
+        }
+    }
+}
+
+/// Capture a screenshot of one target via `Page.captureScreenshot`, decoded to image bytes.
+/// `quality` applies to the lossy formats only; `full_page` captures beyond the viewport.
+///
+/// The call returns the instant the compositor produces a frame, so `budget` is the only thing
+/// between a tight capture loop and a target that never paints: on overrun it fails fast with a
+/// typed [`NoFrame`] rather than blocking on the generic call timeout.
+pub async fn capture_screenshot(
+    connection: &CdpConnection,
+    session: Option<&str>,
+    format: ImageFormat,
+    quality: Option<u8>,
+    full_page: bool,
+    budget: Duration,
+) -> Result<Vec<u8>> {
+    let mut params = json!({ "format": format.as_str(), "captureBeyondViewport": full_page });
+    if let Some(quality) = quality {
+        params["quality"] = Value::from(quality);
+    }
+    let reply = connection
+        .call_within(session, "Page.captureScreenshot", params, budget)
+        .await
+        .map_err(|error| match error.downcast::<CallTimeout>() {
+            Ok(_) => NoFrame { budget: budget.as_secs_f32() }.into(),
+            Err(error) => error,
+        })?;
+    let encoded =
+        reply.get("data").and_then(Value::as_str).context("screenshot reply carried no image")?;
+    base64::decode(encoded).map_err(anyhow::Error::msg).context("decode screenshot")
 }
 
 /// Probe a target by its own websocket — opens a connection, probes, drops it. A connection
