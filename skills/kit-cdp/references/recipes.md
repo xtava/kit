@@ -141,7 +141,7 @@ then paste the lines into the flow file. Commit the file.
 kit cdp mark before-save --app checkout
 kit cdp click @e5 --app checkout
 kit cdp after before-save --app checkout       # waits for idle, summarizes the window
-kit cdp bundle checkout --since before-save    # redacted folder: summary, timeline, errors, HAR
+kit cdp bundle checkout --since before-save --app checkout   # redacted folder: summary, timeline, errors, HAR
 ```
 
 The bundle directory is the handoff artifact — attach it to an issue or pass the
@@ -174,17 +174,18 @@ Timeline slice filtered to that extension — capture it on a pre-warmed attachm
 ## Quiet a noisy timeline without lying to yourself
 
 ```bash
-kit cdp ignore 'ResizeObserver loop'
-kit cdp brief --since 2m
+kit cdp ignore 'ResizeObserver loop' --app dev
+kit cdp brief --since 2m --app dev
 ```
 
 Ignored rows still count in the omission banners, so a suppressed-but-relevant
-error can't vanish silently. `ignore --list` / `--clear` to audit.
+error can't vanish silently. `ignore --list` / `--clear` to audit. Ignore filters are
+per-instance — `ignore --app a` never quiets `b`.
 
 ## Script hygiene
 
-- Assertions exit non-zero: `kit cdp click 'button:Save' && kit cdp verify` is a
-  complete gated check.
+- Assertions exit non-zero: `kit cdp click 'button:Save' --app dev && kit cdp verify --app dev`
+  is a complete gated check — pass the same `--app` on both halves.
 - Everything takes `--json` for parsing; prefer it over scraping text.
 - One instance per concern: name launches (`--name checkout`) and pass `--app`
   explicitly in anything saved or shared.

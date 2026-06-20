@@ -1,6 +1,6 @@
 ---
 name: kit-cdp
-description: Drive, verify, and instrument live Electron and Chrome apps with `kit cdp`, a warm Chrome DevTools Protocol debugger CLI. Use when you need to self-verify UI work in a running app (click/fill/press, then get a PASS/FAIL verdict), trace whether a function or code line actually ran and with what values (fn traces and never-pausing logpoints — no console.log edits, no rebuilds; arms read back the exact bound site), search the running app's parsed scripts for code to instrument (live url:line coordinates, immune to bundle drift), resolve minified stack traces back to original source files, reproduce and diagnose console errors, exceptions, failed network requests, or websocket traffic, inspect a live page's accessibility tree, watch an app value change over time, or capture a redacted evidence bundle of what an interaction caused. One command attaches lazily and stays warm — no setup step, no driver scripts; every command takes --json.
+description: Drive, verify, and instrument live Electron and Chrome apps with `kit cdp`, a warm Chrome DevTools Protocol debugger CLI. Use when you need to self-verify UI work in a running app (click/fill/press, then get a PASS/FAIL verdict), trace whether a function or code line actually ran and with what values (fn traces and never-pausing logpoints — no console.log edits, no rebuilds; arms read back the exact bound site), search the running app's parsed scripts for code to instrument (live url:line coordinates, immune to bundle drift), resolve minified stack traces back to original source files, reproduce and diagnose console errors, exceptions, failed network requests, or websocket traffic, inspect a live page's accessibility tree, watch an app value change over time, or capture a redacted evidence bundle of what an interaction caused. One command attaches lazily and stays warm — no setup step, no driver scripts. Handles multiple instances at once (worktrees, ports, launched sessions), each its own attachment and Timeline; pick one with --app <selector>. Every command takes --json.
 license: MIT
 metadata:
   source: https://github.com/xtava/kit
@@ -9,25 +9,51 @@ metadata:
 # kit cdp — verify your work against the live app
 
 `kit cdp` keeps a **warm attachment** to a running app: a background daemon holds
-the CDP connection and accumulates one correlated **Timeline** (console · exceptions
-· network · websocket · lifecycle) on a single clock. The first command attaches
-lazily — there is no setup step — and the attachment survives HMR reloads and app
-restarts. You act on the app, then ask what happened, in as few round trips as
-possible.
+one CDP connection **per instance** and accumulates a correlated **Timeline**
+(console · exceptions · network · websocket · lifecycle) on a single clock per
+instance. The first command attaches lazily — there is no setup step — and the
+attachment survives HMR reloads and app restarts. You act on the app, then ask what
+happened, in as few round trips as possible.
+
+**Expect several instances at once.** Multiple worktrees, dev ports, or launched
+sessions run side by side, each its own attachment and its own Timeline — they never
+merge. Almost every command therefore takes `--app <selector>` to pick which one. See
+*Pick the instance* below; in scripts always pass it.
 
 Requires the `kit` binary on PATH (`cargo install --path .` from the kit repo).
 
 ## Orient first
 
 ```bash
-kit cdp                     # instances available + live attachments
+kit cdp                     # instances available + live attachments — run this first
 kit cdp ready --app dev     # is the app up? which target won, and why
 kit cdp state --app dev     # readiness, recent failures, focus; --visual adds a screenshot
 kit cdp targets --app dev   # every target, with the selector that addresses it
 ```
 
-`--app <name>` selects the attachment (app name / worktree / instance id / port).
-With a single instance it can be omitted; in scripts, always pass it.
+### Pick the instance
+
+Bare `kit cdp` lists every instance it can see. Pick one with `--app <selector>`,
+matched against the app name, worktree, instance id, or port:
+
+```bash
+kit cdp --app my-feature-worktree eval 'location.href'   # by worktree
+kit cdp --app instance-8 ready                            # by instance id
+kit cdp --app 9333 ready                                  # by debug port
+```
+
+- **Omit `--app` only when exactly one instance is running.** With several up, a bare
+  command is ambiguous — it errors and lists the candidates rather than guessing. In
+  scripts, always pass `--app`.
+- **Avoid bare digits as a name** — `--app 8` is too loose (it can collide with a port
+  or an id fragment). Use the worktree name, `instance-8`, or the full port.
+- `--target <selector>` picks a target *within* the chosen instance (a specific window
+  / webview). You rarely need it — every command defaults to the main workbench
+  window, the same one `ready` resolves. Use `targets` to see the selectors.
+
+`--app` selects *which app*; `--target` selects *which window inside that app*. Keep
+them straight: a wrong `--app` reads a different Timeline entirely; a wrong `--target`
+drives the wrong window of the right app.
 
 ## Three ways in
 
@@ -72,16 +98,29 @@ Sharper assertions when the composite isn't enough — all exit non-zero on fail
 so `&&` chains and CI steps behave:
 
 ```bash
-kit cdp wait '!document.querySelector(".spinner")' --timeout 10s
-kit cdp expect text 'Saved'                                   # on-screen text, polled
-kit cdp expect eval 'app.cart.items.length' --equals 3
-kit cdp expect net '/api/save' --status 2xx --since-mark last-action
-kit cdp expect no-errors --since-mark last-action
-kit cdp snap --diff                 # what changed on screen since the last snap — no assertions needed
+kit cdp wait '!document.querySelector(".spinner")' --timeout 10s --app dev
+kit cdp expect text 'Saved' --app dev                         # on-screen text, polled
+kit cdp expect eval 'app.cart.items.length' --equals 3 --app dev
+kit cdp expect net '/api/save' --status 2xx --since-mark last-action --app dev
+kit cdp expect no-errors --since-mark last-action --app dev
+kit cdp snap --diff --app dev       # what changed on screen since the last snap — no assertions needed
+kit cdp screenshot --app dev        # what the window literally looks like — prints the image path
 ```
+
+Per-instance state — the `last-action` mark, the `snap --diff` baseline, named
+`mark`s, watches, and traces all live **on the instance you set them on**. Reuse the
+same `--app` across a loop or the continuity breaks: `snap --diff --app a` diffs
+against `a`'s last snap, never `b`'s.
 
 `expect net` failures print near-misses (same URL, different status) — the
 diagnosis, not just the verdict.
+
+`screenshot` (alias `shot`) writes the active window's pixels to a timestamped
+file in the artifact dir, or `-o <path>` (format from the extension: png/jpeg/webp,
+`--quality` for the lossy ones). `--target` picks a window from `kit cdp targets`;
+`--full` captures the whole scrollable page; `--raise` brings an occluded window
+to front first (visible side effect, so never the default). It captures the
+renderer surface over CDP — page pixels, not the OS window chrome.
 
 ## Locators
 
@@ -133,10 +172,10 @@ app — no code edits, no rebuilds, no pauses — and read execution interleaved
 its side effects:
 
 ```bash
-kit cdp trace fn 'app.api.save' --app dev            # every call: args → outcome, duration
-kit cdp trace find 'groupId: opts.group.id'          # live url:line coordinates from parsed scripts
-kit cdp trace add src/cart.js:84 'items.length'      # logpoint at a repo path (source maps)
-kit cdp trace add renderer.js:108 '({ counter })' --when 'counter > 2'
+kit cdp trace fn 'app.api.save' --app dev                       # every call: args → outcome, duration
+kit cdp trace find 'groupId: opts.group.id' --app dev           # live url:line coordinates from parsed scripts
+kit cdp trace add src/cart.js:84 'items.length' --app dev       # logpoint at a repo path (source maps)
+kit cdp trace add renderer.js:108 '({ counter })' --when 'counter > 2' --app dev
 kit cdp tail --track trace --since-mark trace-counter-108 --app dev
 kit cdp trace ls / rm <name> / clear
 ```
@@ -176,11 +215,14 @@ turns `bundle.js:48211` into `src/cart.js:14` on the error's headline.
 ## Read the Timeline cheaply
 
 ```bash
-kit cdp brief --since 30s          # agent-safe digest: errors grouped, noise counted, never silently lossy
-kit cdp errors --since 5m          # error-shaped events deduped to `error (N×)`; --explain expands groups
-kit cdp tail --since 3s            # raw rows, all tracks on one clock
-kit cdp console / net / ws         # single-track slices; --grep, --source main|renderer, --limit
+kit cdp brief --since 30s --app dev   # agent-safe digest: errors grouped, noise counted, never silently lossy
+kit cdp errors --since 5m --app dev   # error-shaped events deduped to `error (N×)`; --explain expands groups
+kit cdp tail --since 3s --app dev     # raw rows, all tracks on one clock
+kit cdp console / net / ws            # single-track slices; --grep, --source main|renderer, --limit
 ```
+
+Each instance has its own Timeline — `errors --app a` never shows `b`'s errors. When
+two instances misbehave, read them separately; there is no merged view.
 
 Scope every read: `--since 5s|2m`, `--since-mark <name>`, or bound an action
 yourself with `mark <name>` → act → `after <name>` (waits for idle, summarizes).
@@ -189,7 +231,7 @@ yourself with `mark <name>` → act → `after <name>` (waits for idle, summariz
 ## Hand off evidence
 
 ```bash
-kit cdp bundle checkout --since before-save
+kit cdp bundle checkout --since before-save --app dev
 ```
 
 Writes `summary.md`, `timeline.json`, `errors.txt`, `network.har`,

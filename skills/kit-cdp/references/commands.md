@@ -4,6 +4,16 @@ Every command accepts `--json` (structured output) and `--app <selector>` (which
 attachment: app name, worktree, instance id, or port). Failed assertions and failed
 steps exit non-zero. Text output pipes cleanly to `grep`/`head`.
 
+**Multiple instances.** The daemon holds one attachment and one Timeline **per
+instance** — worktrees, dev ports, and launched sessions all coexist and never merge.
+`--app` selects which one; omit it only with a single instance running (otherwise the
+command errors and lists candidates rather than guessing). Avoid a bare digit as the
+selector (`--app 8` is too loose) — use the worktree name, `instance-8`, or the full
+port. `--target <selector>` then picks a specific window *within* that instance
+(defaults to the main window). Per-instance state — marks, the `snap --diff` baseline,
+watches, traces, ignore filters — lives on the instance you set it on; reuse the same
+`--app` across a loop or continuity breaks.
+
 ## Launch & lifecycle
 
 | Command | What |
@@ -48,6 +58,7 @@ Tracks captured from attach: `console`, `exception`, `log`, `network`, `ws`,
 | `snap [-i] [--diff]` | Accessibility-tree snapshot with `@eN` refs. `--diff` prints added/removed semantic lines vs the previous snap (reorder ≠ change; every explicit snap resets the baseline). |
 | `ready` | Is the app up? Selected target, document state, recent errors, ranked candidates with why each won. |
 | `state [--visual]` | Readiness, recent failures, focus, active net rules; `--visual` writes a screenshot and prints its path. |
+| `screenshot [-o <path>] [--format png\|jpeg\|webp] [--quality <0-100>] [--full] [--raise]` | Screenshot a window (page target) to an image file; prints the path. Alias `shot`. Default destination: a timestamped file in the artifact dir; format inferred from `-o`'s extension. `--full` captures the whole scrollable page; `--raise` brings an occluded window to front first. Renderer pixels over CDP, not the OS window chrome. |
 | `targets` | Every target with its stable selector. |
 | `heap` | JS heap + DOM counters, on demand. |
 
