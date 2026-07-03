@@ -26,7 +26,7 @@ pub use ports::listening_ports;
 pub use sourcemap::{inline_map, resolve_map_url, SourceMap, SourceMatch};
 pub use target::{select, select_active, ScoreReason, Target, TargetKind, TargetScore};
 pub use timeline::{
-    group_errors, ConsoleLine, ErrorGroup, ErrorReport, ExceptionInfo, LogEntry, NetEvent,
-    NetPhase, Source, Timeline, TimelineEvent, TraceOutcome, TraceRecord, Track, TrackKind,
-    WatchDelta, WsDir, WsFrame,
+    group_errors, ConsoleArg, ConsoleLine, ErrorGroup, ErrorReport, ExceptionInfo, LogEntry,
+    NetEvent, NetPhase, Source, Timeline, TimelineEvent, TraceOutcome, TraceRecord, Track,
+    TrackKind, WatchDelta, WsDir, WsFrame,
 };

@@ -50,6 +50,12 @@ Tracks captured from attach: `console`, `exception`, `log`, `network`, `ws`,
 `lifecycle`. The `watch` track is daemon-generated. Heap is not a track —
 `kit cdp heap` probes on demand.
 
+Console object payloads are available in structured output: `tail --json`,
+`console --json`, and bundle `timeline.json` include an `args` array on
+`track: "console"` rows. Primitive args carry `value`; object/function args keep
+CDP's bounded `preview` and, when the live handle can be read immediately, a
+JSON-safe `snapshot`. Human `tail` stays one line per event.
+
 ## Probe
 
 | Command | What |

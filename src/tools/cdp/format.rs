@@ -668,6 +668,7 @@ mod tests {
             track: Track::Console(ConsoleLine {
                 level: "log".to_owned(),
                 text: text.to_owned(),
+                args: Vec::new(),
                 url: None,
                 line: None,
             }),

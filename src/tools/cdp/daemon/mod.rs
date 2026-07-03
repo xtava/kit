@@ -30,6 +30,8 @@ use super::readiness::{self, DocState, Readiness};
 use super::registry::{self, Record};
 use super::{checks, format, snapshot};
 
+mod console_capture;
+mod redaction;
 mod sourcemaps;
 mod trace;
 
@@ -359,11 +361,14 @@ async fn apply_event(state: &Shared, event: &CdpEvent, tracks: &[TrackKind]) {
         }
         "Fetch.requestPaused" => handle_paused_request(state, event).await,
         _ => {
-            let mut state = state.lock().unwrap();
             match Track::from_event(event) {
-                Some(track) => {
-                    let at_ms = state.now_ms();
-                    let label = state.label(&event.session);
+                Some(mut track) => {
+                    let (conn, at_ms, label) = {
+                        let state = state.lock().unwrap();
+                        (state.conn.clone(), state.now_ms(), state.label(&event.session))
+                    };
+                    console_capture::enrich(&conn, event.session.as_deref(), &mut track).await;
+                    let mut state = state.lock().unwrap();
                     state.emit(TimelineEvent {
                         at_ms,
                         source: Source::Renderer,
@@ -373,7 +378,7 @@ async fn apply_event(state: &Shared, event: &CdpEvent, tracks: &[TrackKind]) {
                 }
                 // An error-domain event we couldn't decode is invisible to every view — count it so
                 // `errors` can disclose the blind spot rather than imply the field is empty.
-                None if is_error_domain_event(event) => state.undecoded_errors += 1,
+                None if is_error_domain_event(event) => state.lock().unwrap().undecoded_errors += 1,
                 None => {}
             }
         }
@@ -535,12 +540,13 @@ async fn main_process_pump(state: Shared) {
     loop {
         let root_pid = state.lock().unwrap().root_pid;
         match connect_main(root_pid).await {
-            Some(mut events) => {
+            Some((conn, mut events)) => {
                 push_marker(&state, Source::Main, "main process console attached");
                 while let Some(event) = events.recv().await {
-                    if let Some(track) = Track::from_event(&event) {
+                    if let Some(mut track) = Track::from_event(&event) {
+                        let at_ms = state.lock().unwrap().now_ms();
+                        console_capture::enrich(&conn, None, &mut track).await;
                         let mut state = state.lock().unwrap();
-                        let at_ms = state.now_ms();
                         state.emit(TimelineEvent {
                             at_ms,
                             source: Source::Main,
@@ -563,12 +569,12 @@ async fn main_process_pump(state: Shared) {
     }
 }
 
-async fn connect_main(root_pid: u32) -> Option<mpsc::UnboundedReceiver<CdpEvent>> {
+async fn connect_main(root_pid: u32) -> Option<(CdpConnection, mpsc::UnboundedReceiver<CdpEvent>)> {
     let endpoint = cdp::node_endpoint(root_pid).await?;
     let (conn, events) = CdpConnection::connect(&endpoint.ws_url).await.ok()?;
     // Node's V8 inspector implements Runtime (console + exceptions) but not the browser-only Log domain.
     conn.call(None, "Runtime.enable", json!({})).await.ok()?;
-    Some(events)
+    Some((conn, events))
 }
 
 async fn reconnect(state: &Shared) -> Option<mpsc::UnboundedReceiver<CdpEvent>> {
@@ -3016,7 +3022,7 @@ fn write_bundle(
     )?;
     let mut timeline = serde_json::to_value(events)?;
     if !include_secrets {
-        redact_value(&mut timeline);
+        redaction::redact_value(&mut timeline);
     }
     std::fs::write(dir.join("timeline.json"), serde_json::to_string_pretty(&timeline)?)?;
     let mut errors = events
@@ -3026,14 +3032,14 @@ fn write_bundle(
         .collect::<Vec<_>>()
         .join("\n");
     if !include_secrets {
-        errors = redact_text(&errors);
+        errors = redaction::redact_text(&errors);
     }
     std::fs::write(dir.join("errors.txt"), errors)?;
     let network: Vec<&TimelineEvent> =
         events.iter().filter(|event| matches!(event.track, Track::Network(_))).collect();
     let mut network = serde_json::to_value(&network)?;
     if !include_secrets {
-        redact_value(&mut network);
+        redaction::redact_value(&mut network);
     }
     std::fs::write(
         dir.join("network.har"),
@@ -3053,7 +3059,7 @@ fn write_bundle(
         "launch": launch,
     });
     if !include_secrets {
-        redact_value(&mut environment);
+        redaction::redact_value(&mut environment);
     }
     std::fs::write(dir.join("environment.json"), serde_json::to_string_pretty(&environment)?)?;
     std::fs::write(
@@ -3064,93 +3070,6 @@ fn write_bundle(
         }))?,
     )?;
     Ok(())
-}
-
-fn redact_value(value: &mut Value) {
-    match value {
-        Value::Object(map) => {
-            for (key, value) in map {
-                if sensitive_key(key) {
-                    *value = Value::String("[redacted]".to_owned());
-                } else {
-                    redact_value(value);
-                }
-            }
-        }
-        Value::Array(values) => {
-            for value in values {
-                redact_value(value);
-            }
-        }
-        Value::String(text) => *text = redact_text(text),
-        _ => {}
-    }
-}
-
-fn redact_text(text: &str) -> String {
-    if !text.contains("://") && !text.contains('?') {
-        return text.to_owned();
-    }
-    text.split_whitespace().map(redact_url_token).collect::<Vec<_>>().join(" ")
-}
-
-fn redact_url_token(token: &str) -> String {
-    let Some((base, query_and_fragment)) = token.split_once('?') else {
-        return token.to_owned();
-    };
-    let (query, fragment) = query_and_fragment.split_once('#').unwrap_or((query_and_fragment, ""));
-    let query = query
-        .split('&')
-        .map(|pair| {
-            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-            if sensitive_key(key) {
-                format!("{key}=[redacted]")
-            } else if value.is_empty() {
-                key.to_owned()
-            } else {
-                format!("{key}={value}")
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("&");
-    if fragment.is_empty() {
-        format!("{base}?{query}")
-    } else {
-        format!("{base}?{query}#{fragment}")
-    }
-}
-
-fn sensitive_key(key: &str) -> bool {
-    let key = key.to_ascii_lowercase();
-    if [
-        "body",
-        "postdata",
-        "post_data",
-        "requestbody",
-        "request_body",
-        "responsebody",
-        "response_body",
-    ]
-    .contains(&key.as_str())
-    {
-        return true;
-    }
-    [
-        "authorization",
-        "auth",
-        "cookie",
-        "credential",
-        "password",
-        "passwd",
-        "secret",
-        "token",
-        "apikey",
-        "api_key",
-        "accesskey",
-        "access_key",
-    ]
-    .iter()
-    .any(|needle| key.contains(needle))
 }
 
 fn parse_viewport(viewport: &str) -> Option<(u64, u64)> {

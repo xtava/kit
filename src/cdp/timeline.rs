@@ -156,10 +156,35 @@ pub enum TraceOutcome {
 pub struct ConsoleLine {
     pub level: String,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<ConsoleArg>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub line: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsoleArg {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subtype: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<Value>,
+    #[serde(rename = "unserializableValue", skip_serializing_if = "Option::is_none")]
+    pub unserializable_value: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<Value>,
+    #[serde(rename = "snapshotError", skip_serializing_if = "Option::is_none")]
+    pub snapshot_error: Option<String>,
+    #[serde(skip)]
+    pub remote_object_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -360,12 +385,16 @@ impl Track {
     pub fn from_event(event: &CdpEvent) -> Option<Track> {
         let params = &event.params;
         match event.method.as_str() {
-            "Runtime.consoleAPICalled" => Some(Track::Console(ConsoleLine {
-                level: string_at(params, "type").unwrap_or_else(|| "log".to_owned()),
-                text: console_text(params),
-                url: frame_url(params),
-                line: frame_line(params),
-            })),
+            "Runtime.consoleAPICalled" => {
+                let args = console_args(params);
+                Some(Track::Console(ConsoleLine {
+                    level: string_at(params, "type").unwrap_or_else(|| "log".to_owned()),
+                    text: console_text(&args),
+                    args,
+                    url: frame_url(params),
+                    line: frame_line(params),
+                }))
+            }
             "Runtime.exceptionThrown" => {
                 let details = params.get("exceptionDetails")?;
                 Some(Track::Exception(ExceptionInfo {
@@ -609,11 +638,31 @@ fn ws_frame(dir: WsDir, params: &Value) -> WsFrame {
     }
 }
 
-fn console_text(params: &Value) -> String {
-    let Some(args) = params.get("args").and_then(Value::as_array) else {
-        return String::new();
-    };
-    args.iter().map(remote_object_text).collect::<Vec<_>>().join(" ")
+fn console_args(params: &Value) -> Vec<ConsoleArg> {
+    params
+        .get("args")
+        .and_then(Value::as_array)
+        .map(|args| args.iter().map(console_arg).collect())
+        .unwrap_or_default()
+}
+
+fn console_text(args: &[ConsoleArg]) -> String {
+    args.iter().map(|arg| arg.text.as_str()).collect::<Vec<_>>().join(" ")
+}
+
+fn console_arg(arg: &Value) -> ConsoleArg {
+    ConsoleArg {
+        kind: string_at(arg, "type").unwrap_or_else(|| "unknown".to_owned()),
+        text: remote_object_text(arg),
+        subtype: string_at(arg, "subtype"),
+        value: arg.get("value").cloned(),
+        unserializable_value: string_at(arg, "unserializableValue"),
+        description: string_at(arg, "description"),
+        preview: arg.get("preview").cloned(),
+        snapshot: None,
+        snapshot_error: None,
+        remote_object_id: string_at(arg, "objectId"),
+    }
 }
 
 /// Render a CDP `RemoteObject` console arg to text. A primitive is its value; an object that CDP gave
@@ -624,8 +673,12 @@ fn console_text(params: &Value) -> String {
 fn remote_object_text(arg: &Value) -> String {
     match arg.get("value") {
         Some(Value::String(text)) => return text.clone(),
+        Some(Value::Null) => return "null".to_owned(),
         Some(other) if !other.is_null() => return other.to_string(),
         _ => {}
+    }
+    if let Some(unserializable) = string_at(arg, "unserializableValue") {
+        return unserializable;
     }
     if let Some(preview) = object_preview(arg) {
         return preview;
@@ -747,9 +800,59 @@ mod tests {
         Track::Console(ConsoleLine {
             level: level.into(),
             text: text.into(),
+            args: Vec::new(),
             url: None,
             line: None,
         })
+    }
+
+    #[test]
+    fn console_events_keep_structured_args() {
+        let event = CdpEvent {
+            method: "Runtime.consoleAPICalled".to_owned(),
+            session: None,
+            params: serde_json::json!({
+                "type": "error",
+                "args": [
+                    { "type": "string", "value": "request failed" },
+                    {
+                        "type": "object",
+                        "className": "Object",
+                        "description": "Object",
+                        "objectId": "remote-1",
+                        "preview": {
+                            "type": "object",
+                            "overflow": true,
+                            "properties": [
+                                { "name": "code", "type": "number", "value": "500" },
+                                { "name": "op", "type": "string", "value": "getWorkspaceInfo" }
+                            ]
+                        }
+                    },
+                    { "type": "object", "subtype": "null", "value": null, "description": "null" },
+                    { "type": "number", "unserializableValue": "NaN", "description": "NaN" }
+                ]
+            }),
+        };
+
+        let Some(Track::Console(line)) = Track::from_event(&event) else {
+            panic!("console event did not decode");
+        };
+
+        assert_eq!(line.text, "request failed {code: 500, op: getWorkspaceInfo, …} null NaN");
+        assert_eq!(line.args.len(), 4);
+        assert_eq!(line.args[0].kind, "string");
+        assert_eq!(line.args[0].value, Some(Value::String("request failed".to_owned())));
+        assert_eq!(line.args[1].kind, "object");
+        assert_eq!(line.args[1].description.as_deref(), Some("Object"));
+        assert_eq!(line.args[1].remote_object_id.as_deref(), Some("remote-1"));
+        assert!(line.args[1].snapshot.is_none());
+        assert_eq!(line.args[2].text, "null");
+        assert_eq!(line.args[3].text, "NaN");
+
+        let serialized = serde_json::to_value(&line.args[1]).unwrap();
+        assert!(serialized.get("remote_object_id").is_none(), "object ids are live handles");
+        assert_eq!(serialized["preview"]["properties"][0]["name"], "code");
     }
 
     /// The integrity guarantee: when two genuinely different errors share a signature (here: same
@@ -847,6 +950,7 @@ mod tests {
         let info = Track::Console(ConsoleLine {
             level: "log".into(),
             text: "fyi".into(),
+            args: Vec::new(),
             url: None,
             line: None,
         });
@@ -854,6 +958,7 @@ mod tests {
             Track::Console(ConsoleLine {
                 level: "error".into(),
                 text: text.into(),
+                args: Vec::new(),
                 url: None,
                 line: None,
             })
@@ -873,6 +978,7 @@ mod tests {
             Track::Console(ConsoleLine {
                 level: "log".into(),
                 text: "x".into(),
+                args: Vec::new(),
                 url: None,
                 line: None,
             }),

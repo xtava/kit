@@ -85,6 +85,7 @@ RECIPES
       kit cdp errors --since 30s --app dev   deduped: what broke, and how often
       kit cdp console --since 30s --app dev
       kit cdp tail --track exception --since 30s --app dev
+      kit cdp console --json --app dev        includes structured console args/snapshots
 
   Split the Electron main process from the web renderer:
     kit cdp tail --source main --app dev      Node main only (needs --inspect)

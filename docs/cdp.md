@@ -241,6 +241,14 @@ window). Timeline slices accept `--source main|renderer`, `--target <selector>`,
 `--grep <text>`, `--extension <id>`, and `--limit <n>`. `--since` takes `500ms`
 / `2s` / `5m`.
 
+Console rows keep their compact one-line text for `tail`, but `tail --json`,
+`console --json`, and bundle `timeline.json` also include each console argument
+under `args`. Primitive args carry `value`; object/function args preserve CDP's
+bounded `preview` and, when the live handle can be read immediately, a JSON-safe
+`snapshot` capped by depth, property count, array length, and string length.
+Snapshot failures stay on the arg as `snapshotError` so the original console row
+is never dropped.
+
 `brief` is the low-context handoff for coding agents. It does not delete or
 semantically filter the Timeline: it groups errors with the same integrity banners
 as `errors`, collapses repeated non-error rows to counts, shows a short raw tail,
