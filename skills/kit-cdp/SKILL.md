@@ -1,6 +1,6 @@
 ---
 name: kit-cdp
-description: Drive, verify, and instrument live Electron and Chrome apps with `kit cdp`, a warm Chrome DevTools Protocol debugger CLI. Use when you need to self-verify UI work in a running app (click/fill/press, then get a PASS/FAIL verdict), trace whether a function or code line actually ran and with what values (fn traces and never-pausing logpoints — no console.log edits, no rebuilds; arms read back the exact bound site), search the running app's parsed scripts for code to instrument (live url:line coordinates, immune to bundle drift), resolve minified stack traces back to original source files, reproduce and diagnose console errors, exceptions, failed network requests, or websocket traffic, inspect a live page's accessibility tree, watch an app value change over time, or capture a redacted evidence bundle of what an interaction caused. One command attaches lazily and stays warm — no setup step, no driver scripts; every command takes --json.
+description: Drive, verify, and instrument live Electron and Chrome apps with `kit cdp`, a warm Chrome DevTools Protocol debugger CLI. Use when you need to self-verify UI work in a running app (click/fill/press, then get a PASS/FAIL verdict), record a video of the app actually being driven (screencast → mp4) or take timestamped screenshots as evidence, trace whether a function or code line actually ran and with what values (fn traces and never-pausing logpoints — no console.log edits, no rebuilds; arms read back the exact bound site), search the running app's parsed scripts for code to instrument (live url:line coordinates, immune to bundle drift), resolve minified stack traces back to original source files, reproduce and diagnose console errors, exceptions, failed network requests, or websocket traffic, inspect a live page's accessibility tree, watch an app value change over time, or capture a redacted evidence bundle of what an interaction caused. One command attaches lazily and stays warm — no setup step, no driver scripts; every command takes --json.
 license: MIT
 metadata:
   source: https://github.com/xtava/kit
@@ -45,6 +45,10 @@ kit cdp launch-electron --name app --cwd app-dir -- ./node_modules/.bin/electron
 Launched sessions are cleaned up with `kit cdp close <name>` (stops the browser);
 `detach` only stops capture and leaves the app running. Never `detach --all` on a
 shared machine — other attachments may belong to someone else's session.
+
+Extra Chrome flags: `--chrome-arg <flag>` (repeatable) and `KIT_CDP_CHROME_ARGS`
+(whitespace-split) append after the built-in flags — env first, then flags.
+Headless Linux containers typically need `--no-sandbox --disable-dev-shm-usage`.
 
 ## The one rule about capture
 
@@ -114,6 +118,25 @@ they are verification knowledge every future session inherits:
 kit cdp flow ls
 kit cdp flow run save-smoke user=Grace --app dev
 ```
+
+## Record video and take shots — evidence humans can watch
+
+```bash
+kit cdp record start --app dev          # screencast of the selected target → frames on disk
+# …drive the app: click / fill / flows…
+kit cdp record stop --app dev --json    # {"video": "<mp4>", "frames": N, "durationMs": N, "framesDir": "<dir>"}
+kit cdp flow run smoke --record --app dev   # whole run wrapped: start → steps → stop + assemble
+kit cdp shot --app dev --json           # {"screenshot": "…/shots/shot-<unix-ms>.png"} — never overwrites
+```
+
+Frames are throttled to `--fps` (default 4) and buffered to
+`recordings/rec-<unix-ms>/` with a `frames.json` manifest; `stop` assembles an mp4
+(h264/yuv420p/+faststart) using the real inter-frame durations when ffmpeg is on
+PATH — without ffmpeg the frames dir is kept and the reply says so (`video` is
+`null`, never an error). One recording per attachment; it lives in the warm daemon
+across CLI calls and re-arms itself across HMR reloads. A `--record` run that fails
+mid-way still stops and assembles — the video of the failure is the evidence.
+`record start` / `record stop` are also valid flow/do steps for scoping.
 
 ## Watch values change
 
@@ -193,8 +216,10 @@ kit cdp bundle checkout --since before-save
 ```
 
 Writes `summary.md`, `timeline.json`, `errors.txt`, `network.har`,
-`environment.json` — secrets redacted by default. This is the artifact to attach to
-an issue or hand to another agent.
+`environment.json`, plus `screenshots/` (shots taken this session) and
+`recordings/` (the most recent completed recording's mp4, or its frames dir if
+unassembled) — secrets redacted by default; the `--json` reply lists every
+artifact. This is the artifact to attach to an issue or hand to another agent.
 
 ## Going deeper
 

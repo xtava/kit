@@ -20,7 +20,10 @@ steps exit non-zero. Text output pipes cleanly to `grep`/`head`.
 Launch flags: `--headless`, `--viewport 1440x1000`, `--timezone`, `--locale`,
 `--dark`, `--offline`, `--throttle slow-3g|fast-3g`, `--profile <name>`, `--fresh`,
 `--reuse` (navigate existing session), `--replace` (close + relaunch),
-`--no-startup-capture`. Names: ASCII letters, digits, `-`, `_`.
+`--no-startup-capture`, `--chrome-arg <flag>` (repeatable, appended after the
+built-in flags; `KIT_CDP_CHROME_ARGS` whitespace-split composes in front of the
+flags — containers typically need `--no-sandbox --disable-dev-shm-usage`).
+Names: ASCII letters, digits, `-`, `_`.
 
 ## Observe (Timeline slices)
 
@@ -45,6 +48,7 @@ Tracks captured from attach: `console`, `exception`, `log`, `network`, `ws`,
 | Command | What |
 |---|---|
 | `eval '<expr>'` / `eval --file <js>` | Evaluate JS in a target, return the value. |
+| `shot [--out <path>]` | Timestamped screenshot that never overwrites: `shots/shot-<unix-ms>.png` by default. `--json` → `{"screenshot": "<path>"}`. (`state --visual` still overwrites `latest.png`.) |
 | `snap [-i] [--diff]` | Accessibility-tree snapshot with `@eN` refs. `--diff` prints added/removed semantic lines vs the previous snap (reorder ≠ change; every explicit snap resets the baseline). |
 | `ready` | Is the app up? Selected target, document state, recent errors, ranked candidates with why each won. |
 | `state [--visual]` | Readiness, recent failures, focus, active net rules; `--visual` writes a screenshot and prints its path. |
@@ -83,6 +87,17 @@ discloses it.
 |---|---|
 | `do "<step>; <step>; …"` | Run steps daemon-side in one round trip. Steps are the exact CLI grammar. Stops at first failure with full evidence; remaining steps reported skipped. Sets a `do-start` mark. |
 | `flow ls / show <name> / run <name> [k=v …]` | Saved step files: one step per line, `#` comments, `${param}` placeholders. Project flows in `.kit/cdp/flows/` (commit them); user flows in the kit config dir. Project shadows user. |
+| `do --record …` / `flow run <name> --record` | Wrap the run in a screencast recording: start before the first step, stop + assemble after the last. A failing step still yields the video. The `--json` reply gains `video`, `frames`, `durationMs`, `framesDir`. |
+
+## Record (evidence video)
+
+| Command | What |
+|---|---|
+| `record start [--fps 4] [--target <sel>]` | Screencast the selected Target: every frame acked, throttled to the fps cap, buffered to `recordings/rec-<unix-ms>/frame-<seq>.png` with a live `frames.json` manifest. Sets a `record` mark; start/stop/re-arms land on the Timeline. Fails if a recording is already active (naming it). One per attachment; survives CLI calls (warm daemon) and HMR reloads (re-arms on the rebound target). |
+| `record stop [--out <path>]` | Stop and assemble `recording.mp4` (h264 · yuv420p · +faststart) from the real inter-frame durations, when ffmpeg is on PATH. Without ffmpeg the frames dir is kept and the reply says so — the stop never fails for a missing encoder. `--json` → `{"video": "<path>"|null, "frames": N, "durationMs": N, "framesDir": "<dir>"}`. |
+
+`record start` / `record stop` are ordinary do/flow steps too, so a flow can scope
+a recording to a subsequence.
 
 ## Subscribe
 
@@ -113,7 +128,7 @@ error-shaped: observing a caught throw cannot flip `verify`.
 |---|---|
 | `mark <name>` | Named Timeline mark. Typos in `--since-mark` fail loudly — never a silent fallback window. |
 | `after <name>` | Wait for idle (or timeout), then summarize events since the mark. Always prints the raw `tail --since-mark` escape hatch. |
-| `bundle [name] [--since <mark>]` | Redacted evidence folder: `summary.md`, `timeline.json`, `errors.txt`, `network.har`, `environment.json`, `redactions.json`. Cookies, tokens, auth-ish keys, body-like fields, sensitive query params redacted unless `--include-secrets`. |
+| `bundle [name] [--since <mark>]` | Redacted evidence folder: `summary.md`, `timeline.json`, `errors.txt`, `network.har`, `environment.json`, `redactions.json`, plus `screenshots/` (shots taken this session) and `recordings/` (most recent completed recording — mp4, or frames dir if unassembled). The `--json` reply lists every artifact. Cookies, tokens, auth-ish keys, body-like fields, sensitive query params redacted unless `--include-secrets`. |
 
 ## Network rules (launched sessions)
 
