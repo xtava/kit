@@ -203,6 +203,29 @@ verify
         assert!(missing.root_cause().to_string().contains("user=<value>"), "{missing:#}");
     }
 
+    /// Recording and shots are steps like any other, so a flow can scope a recording to a
+    /// subsequence — the same grammar drives the CLI, the prompt, and flow files.
+    #[test]
+    fn record_and_shot_parse_as_flow_steps() {
+        let script = "\
+record start --fps 2
+click 'button:Save'
+shot
+record stop
+";
+        let steps = parse_script(script, &HashMap::new()).unwrap();
+        assert_eq!(steps.len(), 4);
+        assert!(matches!(
+            &*steps[0].command,
+            Command::Record(crate::tools::cdp::protocol::RecordOp::Start { fps_cap: 2, .. })
+        ));
+        assert!(matches!(&*steps[2].command, Command::Shot { out: None, .. }));
+        assert!(matches!(
+            &*steps[3].command,
+            Command::Record(crate::tools::cdp::protocol::RecordOp::Stop { out: None })
+        ));
+    }
+
     #[test]
     fn a_flow_cannot_nest_do() {
         let error = parse_script("do 'verify'", &HashMap::new()).unwrap_err();

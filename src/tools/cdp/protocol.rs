@@ -6,6 +6,8 @@
 //! - **Subscription** — a [`Command::Subscribe`] in, then a [`Frame`] *stream* out that stays open.
 //!   Frames carry structured [`TimelineEvent`]s; the interactive client renders them itself.
 
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 use crate::cdp::{Source, TargetKind, TimelineEvent, TrackKind};
@@ -222,9 +224,13 @@ pub enum Command {
         settle: Option<Settle>,
     },
     /// Run steps sequentially in the daemon, stopping at the first failure. One round trip for a
-    /// whole interaction sequence; every step's evidence lands on the same Timeline.
+    /// whole interaction sequence; every step's evidence lands on the same Timeline. With
+    /// `record`, the whole batch is wrapped in a screencast recording — started before the first
+    /// step, stopped and assembled after the last (or after the failing one), its summary merged
+    /// into the reply.
     Do {
         steps: Vec<Step>,
+        record: bool,
     },
     /// Block until a JS expression evaluates truthy in a Target, polling until `timeout_ms`.
     WaitFor {
@@ -249,6 +255,15 @@ pub enum Command {
     /// Manage instrumentation points: live function wrappers that record a `trace` Timeline
     /// event on every call — args, outcome, duration — without pausing or rebuilding.
     Trace(TraceOp),
+    /// Manage the screencast recording: frames buffered to disk as the page paints, assembled to
+    /// an mp4 on stop. At most one recording per Attachment; it survives across CLI invocations.
+    Record(RecordOp),
+    /// A timestamped screenshot that never overwrites — `shots/shot-<unix-ms>.png` unless `out`
+    /// names a path.
+    Shot {
+        target: Option<String>,
+        out: Option<PathBuf>,
+    },
     Lens {
         target: Option<String>,
         source: String,
@@ -337,6 +352,16 @@ pub enum WatchOp {
     Ls,
     Rm { name: String },
     Clear,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum RecordOp {
+    /// Begin recording the resolved Target: `Page.startScreencast`, frames throttled to
+    /// `fps_cap` and buffered to the recording dir. Fails when a recording is already active.
+    Start { target: Option<String>, fps_cap: u32 },
+    /// Stop the screencast and assemble the mp4 (when ffmpeg is on PATH). `out` overrides the
+    /// default `<rec-dir>/recording.mp4`.
+    Stop { out: Option<PathBuf> },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -606,7 +631,7 @@ mod tests {
                 settle: None,
             },
             Command::Select {
-                target,
+                target: target.clone(),
                 locator: Locator::Query {
                     role: Some("combobox".to_owned()),
                     name: "Flavor".to_owned(),
@@ -638,6 +663,9 @@ mod tests {
                 target: None,
                 text: "groupId: options.group.id".to_owned(),
             }),
+            Command::Record(RecordOp::Start { target: target.clone(), fps_cap: 4 }),
+            Command::Record(RecordOp::Stop { out: Some(PathBuf::from("/tmp/evidence.mp4")) }),
+            Command::Shot { target, out: None },
             Command::Do {
                 steps: vec![Step {
                     line: "click 'button:Save'".to_owned(),
@@ -650,6 +678,7 @@ mod tests {
                         settle: Some(Settle { idle_ms: 300, timeout_ms: 2000 }),
                     }),
                 }],
+                record: true,
             },
             Command::Subscribe { since_ms: 30_000 },
         ];

@@ -51,6 +51,7 @@ Failed assertions exit non-zero, so `&&` chains behave.
 | Observe | `tail [--since 5s] [--track …]` · `brief [--tail N] [--groups N]` · `console` · `net` · `ws` | slice or compact the Timeline |
 | Triage | `errors [--explain]` | what's broken — error-shaped events deduped to `error (N×)`, with a `⚠` banner when the view is lossy |
 | Probe | `state [--visual]` · `launch-log` · `snap [-i] [--diff]` · `eval <expr>/--file` · `heap` · `targets` | live one-shot query |
+| Evidence | `record start [--fps]` · `record stop [--out]` · `shot [--out]` | record the Target as video (frames → mp4 via ffmpeg); timestamped screenshots that never overwrite |
 | Interact | `click <locator>` · `fill <locator> <text>` · `press <chord>` · `select <locator> <option>` | drive a Target; every interaction settles and (re)sets the `last-action` mark |
 | Assert | `wait '<expr>'` · `expect text/eval/net/no-errors` · `verify` | self-verification: poll a condition, assert one fact, or get a composite PASS/FAIL — all exit non-zero on failure |
 | Batch | `do "<step>; <step>"` · `flow ls/run/show` | run whole sequences daemon-side in one round trip; flows are saved, parameterized step files |
@@ -122,7 +123,9 @@ kit cdp flow show save-smoke
 ```
 
 Each `do`/flow run sets a `do-start` mark — `tail --since-mark do-start` replays the
-whole run's evidence, and `bundle --since do-start` exports it.
+whole run's evidence, and `bundle --since do-start` exports it. `flow run <name>
+--record` (and `do --record`) wraps the run in a screencast recording — see
+[Recording](#recording--evidence-video).
 
 ## Watches
 
@@ -235,6 +238,56 @@ A value change reads as a remove/add pair; reordering alone is not a change (ref
 renumber and layout shifts — identity is the line, not the position). Every explicit
 `snap` resets the baseline.
 
+## Recording — evidence video
+
+`record start` begins a screencast of the selected Target (same selection model as
+every other command). Chrome pushes each painted frame; the daemon acks it, throttles
+to the fps cap (default 4 — evidence video, not gameplay; `--fps` adjusts), and
+buffers what it keeps to disk:
+
+```
+<artifacts>/<name>/recordings/rec-<unix-ms>/
+├── frame-000001.png …        one PNG per kept frame
+├── frames.json                manifest: file + unix-ms timestamp per frame, updated as frames land
+├── frames.concat              ffmpeg concat script with the real inter-frame durations (on stop)
+└── recording.mp4              assembled on stop (h264 · yuv420p · +faststart)
+```
+
+```bash
+kit cdp record start --app checkout            # fails if a recording is already active, naming it
+kit cdp click 'button:Save' --app checkout
+kit cdp record stop --app checkout             # → {"video": …, "frames": N, "durationMs": …, "framesDir": …}
+kit cdp record stop --out /tmp/evidence.mp4 --app checkout
+kit cdp shot --app checkout                    # shots/shot-<unix-ms>.png — never overwrites
+```
+
+Assembly uses the *real* inter-frame durations (frames arrive only when the page
+paints), so the mp4's clock is honest. When ffmpeg is not on PATH the stop still
+succeeds: the frames dir and manifest are kept and the reply says exactly how to
+assemble later — a missing encoder never loses the evidence.
+
+Recording state lives in the daemon, so it spans CLI invocations, and it survives
+HMR reloads the same way watches and traces do: when the Attachment re-binds the
+recreated Target, the screencast re-arms on the new session and the Timeline notes
+it. `record start` sets a `record` mark; start, stop, and re-arms all land on the
+Timeline as events. One recording per Attachment at a time.
+
+`record start` / `record stop` are ordinary steps in the `do`/flow grammar, so a
+flow can scope a recording to a subsequence. To record a whole run, wrap it:
+
+```bash
+kit cdp flow run checkout-smoke --record --app checkout
+kit cdp do --record "click 'button:Save'; expect text 'Saved'; verify" --app checkout
+```
+
+`--record` starts before the first step and stops + assembles after the last — a
+run that fails mid-way still yields the video (the failure is exactly the evidence
+that matters) — and the `--json` reply gains the same pinned keys as `record stop`:
+`video` (path or `null`), `frames`, `durationMs`, `framesDir`.
+
+`shot` reuses the screenshot capture path but writes a timestamped file per call;
+`state --visual` keeps overwriting `latest.png` as before.
+
 Selectors: `--app <instance>` picks the Attachment (app name / worktree / instance
 id / port); `--target <selector>` picks the Target (defaults to the main app
 window). Timeline slices accept `--source main|renderer`, `--target <selector>`,
@@ -294,9 +347,13 @@ kit cdp close checkout
 network, focus, active overrides/rules, and a screenshot path with `--visual`.
 `after` waits until idle or timeout and always prints a raw `tail --since-mark`
 escape hatch. `bundle` writes `summary.md`, `timeline.json`, `errors.txt`,
-`network.har`, `environment.json`, and `redactions.json`; cookies, auth-like keys,
-tokens, request/response body-like fields, and sensitive URL query params are
-redacted unless `--include-secrets` is passed. A typoed mark fails explicitly with
+`network.har`, `environment.json`, and `redactions.json`, plus the visual evidence:
+`screenshots/` (every `shot` taken this session) and `recordings/` (the most recent
+completed recording — its mp4, or the frames dir + manifest when it was never
+assembled). Directories appear only when they have content, the `--json` reply
+lists every artifact, and `summary.md` names them. Cookies, auth-like keys, tokens,
+request/response body-like fields, and sensitive URL query params are redacted
+unless `--include-secrets` is passed. A typoed mark fails explicitly with
 `unknown mark '<name>'`; it never falls back to an unrelated time window.
 
 Network helpers stay session-scoped:
@@ -337,9 +394,14 @@ Key launch flags:
 | `--viewport <WxH>` | Set window size and device metrics. |
 | `--timezone`, `--locale`, `--dark` | Apply session-scoped environment overrides. |
 | `--offline`, `--throttle slow-3g|fast-3g` | Apply session-scoped network emulation. |
+| `--chrome-arg <flag>` | Extra Chrome flag, appended after the built-in ones. Repeatable. |
 | `--reuse` | Reuse and navigate an existing launched session with matching identity. |
 | `--replace` | Close the existing launched session, then launch a new one. |
 | `--no-startup-capture` | Skip the about:blank attach-before-navigation flow. |
+
+`KIT_CDP_CHROME_ARGS` (whitespace-split) also appends extra Chrome flags; env and
+`--chrome-arg` compose — env first, then flags. Headless Linux containers typically
+need `--no-sandbox --disable-dev-shm-usage`.
 
 ## Tracks
 

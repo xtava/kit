@@ -14,6 +14,7 @@ mod format;
 mod interactive;
 mod protocol;
 mod readiness;
+mod record;
 mod registry;
 mod snapshot;
 mod trace;
@@ -51,6 +52,12 @@ RECIPES
   A whole sequence in one round trip (steps are the normal grammar):
     kit cdp do \"click 'button:Save'; expect text 'Saved'; verify\" --app checkout
     kit cdp flow run checkout-smoke user=Ada --app checkout  saved in .kit/cdp/flows/
+
+  Visual evidence — a video of the app actually being driven, plus timestamped shots:
+    kit cdp record start --app checkout                      screencast frames → disk
+    kit cdp record stop --app checkout                       assemble recording.mp4 (ffmpeg)
+    kit cdp flow run checkout-smoke --record --app checkout  whole run wrapped in a recording
+    kit cdp shot --app checkout                              shots/shot-<ms>.png, never overwrites
 
   Subscribe to a value and see changes on the Timeline clock:
     kit cdp watch add cart 'document.querySelectorAll(\".cart-item\").length' --app checkout
@@ -249,10 +256,34 @@ ONE ROUND TRIP
   Steps run inside the daemon back-to-back — no per-step CLI cost. Each step is a line of the
   normal session grammar; the first failing step stops the run and prints its full evidence.
   The batch sets a `do-start` mark, so `kit cdp tail --since-mark do-start` replays the run.
+  --record wraps the batch in a screencast recording (stopped and assembled even on failure).
 
 EXAMPLES
   kit cdp do \"click 'button:Save settings'; expect text 'Saved'; verify\" --app checkout
   kit cdp do --file checkout-steps.txt --app checkout
+  kit cdp do --record \"click 'button:Save'; verify\" --app checkout
+";
+
+const RECORD_AFTER_HELP: &str = "\
+EVIDENCE VIDEO
+  `record start` begins a screencast of the selected Target: every frame Chrome paints is acked
+  and throttled to the fps cap (default 4 — evidence, not gameplay), then buffered to
+  <artifacts>/<name>/recordings/rec-<unix-ms>/frame-<seq>.png with a frames.json manifest.
+  `record stop` assembles recording.mp4 (h264, yuv420p, +faststart) using the real inter-frame
+  durations — when ffmpeg is on PATH. Without ffmpeg the frames dir is kept and the reply says
+  so; the stop never fails for a missing encoder. Recording state lives in the warm daemon (it
+  spans CLI invocations) and survives HMR reloads — the screencast re-arms on the rebound target.
+  `record start` sets a `record` mark; start/stop/re-arm land on the Timeline.
+
+  `record start` / `record stop` are also valid do/flow steps, so a flow can scope recording to
+  a subsequence. To record a whole run, prefer `flow run <name> --record`.
+
+EXAMPLES
+  kit cdp record start --app checkout
+  kit cdp click 'button:Save' --app checkout && kit cdp verify --app checkout
+  kit cdp record stop --app checkout                     # → …/recordings/rec-…/recording.mp4
+  kit cdp record stop --out /tmp/evidence.mp4 --app checkout
+  kit cdp flow run checkout-smoke --record --app checkout
 ";
 
 const FLOW_AFTER_HELP: &str = "\
@@ -296,9 +327,11 @@ EXAMPLES
 
 const BUNDLE_AFTER_HELP: &str = "\
 CONTENTS
-  Bundles include summary.md, timeline.json, errors.txt, network.har, environment.json,
-  redactions.json, and placeholder directories for screenshots/snapshots. Secrets are redacted
-  unless --include-secrets is passed.
+  Bundles include summary.md, timeline.json, errors.txt, network.har, environment.json, and
+  redactions.json, plus the visual evidence: screenshots/ (shots taken this session) and
+  recordings/ (the most recent completed recording — its mp4, or the frames dir when it was
+  never assembled). Directories appear only when they have content. The --json reply lists
+  every artifact. Secrets are redacted unless --include-secrets is passed.
 
 EXAMPLES
   kit cdp bundle checkout --since before-save
@@ -597,6 +630,21 @@ enum CdpCommand {
         #[command(subcommand)]
         command: WatchCommand,
     },
+    /// Record the selected Target as video: screencast frames buffered to disk, assembled to an
+    /// mp4 on stop (when ffmpeg is on PATH). One recording per Attachment; survives reloads.
+    #[command(after_help = RECORD_AFTER_HELP)]
+    Record {
+        #[command(subcommand)]
+        command: RecordCommand,
+    },
+    /// Timestamped screenshot that never overwrites: `shots/shot-<unix-ms>.png` (or --out).
+    Shot {
+        /// Write the screenshot here instead of the artifact `shots/` directory.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[arg(long)]
+        target: Option<String>,
+    },
     /// Instrument a live function: record every call — args, outcome, duration — on the Timeline.
     #[command(after_help = TRACE_AFTER_HELP)]
     Trace {
@@ -611,6 +659,10 @@ enum CdpCommand {
         /// Read steps from a file instead: one per line, `#` comments, blank lines ignored.
         #[arg(long)]
         file: Option<PathBuf>,
+        /// Wrap the batch in a screencast recording; the reply gains `video`, `frames`,
+        /// `durationMs`, `framesDir`. A failing step still stops and assembles the video.
+        #[arg(long)]
+        record: bool,
     },
     /// Reusable named step sequences from `.kit/cdp/flows` (project) or the config dir (user).
     #[command(after_help = FLOW_AFTER_HELP)]
@@ -867,9 +919,33 @@ enum FlowCommand {
         name: String,
         /// `key=value` substitutions for `${key}` placeholders in the flow.
         params: Vec<String>,
+        /// Record the run: start before the first step, stop + assemble after the last — a
+        /// failing step still yields the video. The `--json` reply gains `video`, `frames`,
+        /// `durationMs`, `framesDir`.
+        #[arg(long)]
+        record: bool,
     },
     /// Print a flow's steps and its source path.
     Show { name: String },
+}
+
+#[derive(Subcommand)]
+enum RecordCommand {
+    /// Start recording the resolved Target. Fails when a recording is already active.
+    Start {
+        /// Frame-rate cap in frames per second — evidence video, not gameplay.
+        #[arg(long, default_value_t = record::DEFAULT_FPS_CAP)]
+        fps: u32,
+        #[arg(long)]
+        target: Option<String>,
+    },
+    /// Stop the screencast and assemble the mp4. Without ffmpeg the frames dir is kept and the
+    /// reply says so — the stop itself never fails for a missing encoder.
+    Stop {
+        /// Output mp4 path. Defaults to `<recording-dir>/recording.mp4`.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1205,6 +1281,13 @@ fn session_command(command: CdpCommand) -> Result<Command> {
                 settle: settle.into_settle()?,
             }
         }
+        CdpCommand::Record { command } => Command::Record(match command {
+            RecordCommand::Start { fps, target } => {
+                protocol::RecordOp::Start { target, fps_cap: fps }
+            }
+            RecordCommand::Stop { out } => protocol::RecordOp::Stop { out: out.map(absolutize) },
+        }),
+        CdpCommand::Shot { out, target } => Command::Shot { target, out: out.map(absolutize) },
         CdpCommand::Watch { command } => Command::Watch(match command {
             WatchCommand::Add { name, expr, target, interval } => {
                 if expr.is_empty() {
@@ -1233,7 +1316,7 @@ fn session_command(command: CdpCommand) -> Result<Command> {
             TraceCommand::Rm { name } => protocol::TraceOp::Rm { name },
             TraceCommand::Clear => protocol::TraceOp::Clear,
         }),
-        CdpCommand::Do { steps, file } => {
+        CdpCommand::Do { steps, file, record } => {
             let script = match file {
                 Some(path) => std::fs::read_to_string(&path)
                     .with_context(|| format!("read {}", path.display()))?,
@@ -1248,13 +1331,13 @@ fn session_command(command: CdpCommand) -> Result<Command> {
                     .collect::<Vec<_>>()
                     .join("\n"),
             };
-            Command::Do { steps: flow::parse_script(&script, &HashMap::new())? }
+            Command::Do { steps: flow::parse_script(&script, &HashMap::new())?, record }
         }
-        CdpCommand::Flow { command: FlowCommand::Run { name, params } } => {
+        CdpCommand::Flow { command: FlowCommand::Run { name, params, record } } => {
             let (source, path) = flow::load(&name)?;
             let steps = flow::parse_script(&source, &flow::parse_params(&params)?)
                 .with_context(|| format!("flow '{name}' ({})", path.display()))?;
-            Command::Do { steps }
+            Command::Do { steps, record }
         }
         CdpCommand::Flow { .. } => {
             bail!("flow ls/show are shell commands — run them outside a session")
@@ -1438,6 +1521,15 @@ fn non_empty(value: Option<String>) -> Option<String> {
         let trimmed = value.trim();
         (!trimmed.is_empty()).then(|| trimmed.to_owned())
     })
+}
+
+/// A user-supplied output path is relative to the *caller's* cwd; the daemon that writes it runs
+/// elsewhere — resolve before the path crosses the wire.
+fn absolutize(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        return path;
+    }
+    std::env::current_dir().map(|cwd| cwd.join(&path)).unwrap_or(path)
 }
 
 /// Map a command's success flag to a process exit code without re-printing (output is already out).

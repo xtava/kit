@@ -5,7 +5,7 @@
 //! `docs/adr/0003`).
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -30,6 +30,7 @@ use super::readiness::{self, DocState, Readiness};
 use super::registry::{self, Record};
 use super::{checks, format, snapshot};
 
+mod record;
 mod sourcemaps;
 mod trace;
 
@@ -71,6 +72,9 @@ struct State {
     watches: HashMap<String, WatchState>,
     /// Armed instrumentation points by name, healed by the daemon-wide keeper task.
     traces: HashMap<String, trace::TraceState>,
+    /// The active screencast recording, at most one per Attachment — it outlives CLI invocations
+    /// (the warm-daemon model) and re-arms across target rebinds.
+    recording: Option<record::RecordingState>,
     /// Sessions where the `__kit_trace__` binding (and Runtime) is armed — independent of the
     /// attach-time track list, because binding notifications only flow on Runtime-enabled
     /// sessions. Cleared with the sessions it describes.
@@ -202,6 +206,7 @@ pub async fn serve(
         net_rules: Vec::new(),
         watches: HashMap::new(),
         traces: HashMap::new(),
+        recording: None,
         trace_transport: HashSet::new(),
         debugger_enabled: HashSet::new(),
         scripts: HashMap::new(),
@@ -316,6 +321,9 @@ async fn apply_event(state: &Shared, event: &CdpEvent, tracks: &[TrackKind]) {
             if has_rules {
                 enable_fetch(&conn, session).await;
             }
+            // A reload replaces the recording's session; the replacement target attaching is the
+            // moment to re-arm the screencast so the recording survives (no-op otherwise).
+            record::rearm_after_rebind(state).await;
         }
         "Target.detachedFromTarget" => {
             if let Some(session) = event.params.get("sessionId").and_then(Value::as_str) {
@@ -331,6 +339,7 @@ async fn apply_event(state: &Shared, event: &CdpEvent, tracks: &[TrackKind]) {
         "Runtime.bindingCalled" => trace::ingest_trace_payload(state, event),
         "Debugger.paused" => trace::handle_debugger_pause(state, event).await,
         "Debugger.scriptParsed" => sourcemaps::record_script(state, event),
+        "Page.screencastFrame" => record::handle_screencast_frame(state, event).await,
         "Target.targetInfoChanged" => {
             if let Some(info) = event.params.get("targetInfo") {
                 let updated = target_from_info(info);
@@ -728,13 +737,15 @@ async fn dispatch(
         Command::Verify { target, window } => verify_reply(state, target, window, json).await,
         Command::Watch(op) => watch_reply(state, op, json),
         Command::Trace(op) => trace::trace_reply(state, op, json).await,
+        Command::Record(op) => record::record_reply(state, op, json).await,
+        Command::Shot { target, out } => shot_reply(state, target, out, json).await,
         Command::Press { target, chord, settle } => {
             press_reply(state, target, chord, settle, json).await
         }
         Command::Select { target, locator, option, settle } => {
             select_reply(state, target, locator, option, settle, json).await
         }
-        Command::Do { steps } => do_reply(state, steps, json, shutdown).await,
+        Command::Do { steps, record } => do_reply(state, steps, record, json, shutdown).await,
         Command::Lens { target, source, args } => {
             let expr = wrap_lens(&source, &args, &lens_context(state));
             run_in_target(state, target, json, |conn, session| evaluate(conn, session, expr)).await
@@ -1744,7 +1755,7 @@ fn bundle_reply(
     include_secrets: bool,
     json: bool,
 ) -> Reply {
-    let (name, events, settings, rules, launch) = {
+    let (name, events, settings, rules, launch, attached_unix_ms, active_recording) = {
         let state = state.lock().unwrap();
         let now = state.now_ms();
         let window = match since.as_ref() {
@@ -1760,19 +1771,104 @@ fn bundle_reply(
             state.settings.clone(),
             state.net_rules.clone(),
             registry::read_launch(&state.name),
+            now_unix_ms().saturating_sub(now),
+            state.recording.as_ref().map(|recording| recording.id().to_owned()),
         )
     };
+    let visuals = visual_artifacts(&name, attached_unix_ms, active_recording.as_deref());
     let dir = registry::artifact_dir(&name).join(format!("bundle-{}", now_unix_ms()));
-    if let Err(error) =
-        write_bundle(&dir, &events, &settings, &rules, &launch, &include, include_secrets)
-    {
-        return Reply::fail(error.to_string());
-    }
+    let contents = BundleContents {
+        events: &events,
+        settings: &settings,
+        rules: &rules,
+        launch: &launch,
+        include: &include,
+        include_secrets,
+        visuals: &visuals,
+    };
+    let artifacts = match write_bundle(&dir, &contents) {
+        Ok(artifacts) => artifacts,
+        Err(error) => return Reply::fail(error.to_string()),
+    };
     if json {
-        Reply::ok(json!({ "bundle": dir, "events": events.len() }).to_string())
-    } else {
-        Reply::ok(format!("bundle {}\nevents {}", dir.display(), events.len()))
+        return Reply::ok(
+            json!({ "bundle": dir, "events": events.len(), "artifacts": artifacts }).to_string(),
+        );
     }
+    let mut out = vec![format!("bundle {}", dir.display()), format!("events {}", events.len())];
+    if let Some(line) = visuals.describe() {
+        out.push(format!("visual {line}"));
+    }
+    Reply::ok(out.join("\n"))
+}
+
+/// The visual evidence a bundle carries: shots taken during this Attachment's lifetime and the
+/// most recent completed recording.
+struct VisualArtifacts {
+    shots: Vec<PathBuf>,
+    recording: Option<RecordingArtifact>,
+}
+
+enum RecordingArtifact {
+    Video { id: String, path: PathBuf },
+    Frames { id: String, dir: PathBuf },
+}
+
+impl VisualArtifacts {
+    fn describe(&self) -> Option<String> {
+        let recording = self.recording.as_ref().map(|artifact| match artifact {
+            RecordingArtifact::Video { id, .. } => format!("recording {id} (mp4)"),
+            RecordingArtifact::Frames { id, .. } => format!("recording {id} (frames, unassembled)"),
+        });
+        match (self.shots.len(), recording) {
+            (0, None) => None,
+            (0, Some(recording)) => Some(recording),
+            (count, None) => Some(format!("{count} screenshot(s)")),
+            (count, Some(recording)) => Some(format!("{count} screenshot(s) · {recording}")),
+        }
+    }
+}
+
+/// Everything under `shots/` stamped at-or-after `since_unix_ms` (older shots belong to earlier
+/// sessions of the same name), plus the newest completed recording — assembled or not — skipping
+/// the one currently in flight.
+fn visual_artifacts(name: &str, since_unix_ms: u64, active: Option<&str>) -> VisualArtifacts {
+    let root = registry::artifact_dir(name);
+    let mut shots: Vec<PathBuf> = std::fs::read_dir(root.join("shots"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| shot_stamp(path).is_some_and(|at_ms| at_ms >= since_unix_ms))
+        .collect();
+    shots.sort();
+
+    let recording = std::fs::read_dir(root.join("recordings"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| {
+            let id = entry.file_name().into_string().ok()?;
+            let at_ms: u64 = id.strip_prefix("rec-")?.parse().ok()?;
+            (active != Some(id.as_str())).then_some((at_ms, id, entry.path()))
+        })
+        .max_by_key(|(at_ms, _, _)| *at_ms)
+        .map(|(_, id, dir)| {
+            let video = dir.join("recording.mp4");
+            if video.is_file() {
+                RecordingArtifact::Video { id, path: video }
+            } else {
+                RecordingArtifact::Frames { id, dir }
+            }
+        });
+    VisualArtifacts { shots, recording }
+}
+
+/// The unix-ms stamp baked into a default shot name (`shot-<ms>.png`); `None` for foreign files.
+fn shot_stamp(path: &Path) -> Option<u64> {
+    let name = path.file_name()?.to_str()?;
+    name.strip_prefix("shot-")?.strip_suffix(".png")?.parse().ok()
 }
 
 async fn net_reply(state: &Shared, command: NetCommand, json: bool) -> Reply {
@@ -2149,13 +2245,21 @@ const DO_MARK: &str = "do-start";
 
 /// Run a step batch: each step dispatches through the same handler as its standalone command,
 /// output condenses to a line per passing step, and the first failure stops the run with its full
-/// evidence plus what was skipped.
+/// evidence plus what was skipped. With `record_run`, the batch is wrapped in a screencast
+/// recording whose summary merges into the reply — a failing step still stops and assembles it,
+/// because the video of the failure is exactly the evidence that matters.
 async fn do_reply(
     state: &Shared,
     steps: Vec<super::protocol::Step>,
+    record_run: bool,
     json: bool,
     shutdown: &mpsc::Sender<()>,
 ) -> Reply {
+    if record_run {
+        if let Err(error) = record::start(state, None, super::record::DEFAULT_FPS_CAP).await {
+            return Reply::fail(format!("--record: {error}"));
+        }
+    }
     add_mark(state, DO_MARK, &format!("do: {} steps", steps.len()));
     let total = steps.len();
     let mut rendered: Vec<String> = Vec::new();
@@ -2193,14 +2297,23 @@ async fn do_reply(
         remaining.push(step.line);
     }
 
+    // Stop even when a step failed (or one of the steps already stopped the recording — then the
+    // wrapper has nothing left to close and says so instead of failing the run).
+    let recording = if record_run { Some(record::stop(state, None).await) } else { None };
+
     if json {
-        let value = json!({
+        let mut value = json!({
             "steps": results,
             "total": total,
             "failedAt": failed_at,
             "skipped": remaining,
             "rawCommand": format!("kit cdp tail --since-mark {DO_MARK}"),
         });
+        match &recording {
+            Some(Ok(summary)) => merge_recording(&mut value, summary),
+            Some(Err(error)) => value["recordingError"] = json!(error),
+            None => {}
+        }
         let output = serde_json::to_string_pretty(&value).unwrap_or_default();
         return if failed_at.is_none() { Reply::ok(output) } else { Reply::fail(output) };
     }
@@ -2217,12 +2330,31 @@ async fn do_reply(
         ),
     };
     rendered.push(verdict);
+    match &recording {
+        Some(Ok(summary)) => {
+            rendered.extend(record::render_stop(summary).lines().map(str::to_owned))
+        }
+        Some(Err(error)) => rendered.push(format!("recording {error}")),
+        None => {}
+    }
     rendered.push(format!("raw       kit cdp tail --since-mark {DO_MARK}"));
     let output = rendered.join("\n");
     if failed_at.is_none() {
         Reply::ok(output)
     } else {
         Reply::fail(output)
+    }
+}
+
+/// Fold a recording summary's fields into a reply object — the flow/do `--json` reply carries the
+/// same pinned keys (`video`, `frames`, `durationMs`, `framesDir`) as `record stop` itself.
+fn merge_recording(value: &mut Value, summary: &record::StopSummary) {
+    let (Value::Object(reply), Ok(Value::Object(fields))) = (value, serde_json::to_value(summary))
+    else {
+        return;
+    };
+    for (key, field) in fields {
+        reply.insert(key, field);
     }
 }
 
@@ -2763,7 +2895,9 @@ fn lens_context(state: &Shared) -> Value {
     })
 }
 
-async fn capture_screenshot(conn: &CdpConnection, session: &str, name: &str) -> Result<String> {
+/// Capture the session's viewport as PNG bytes — shared by `state --visual` (overwrites
+/// `latest.png`) and `shot` (timestamped, never overwrites).
+async fn screenshot_bytes(conn: &CdpConnection, session: &str) -> Result<Vec<u8>> {
     let value = conn
         .call(
             Some(session),
@@ -2772,13 +2906,53 @@ async fn capture_screenshot(conn: &CdpConnection, session: &str, name: &str) -> 
         )
         .await?;
     let data = value.get("data").and_then(Value::as_str).context("screenshot missing data")?;
-    let bytes = base64_decode(data).context("decode screenshot")?;
+    base64_decode(data).context("decode screenshot")
+}
+
+async fn capture_screenshot(conn: &CdpConnection, session: &str, name: &str) -> Result<String> {
+    let bytes = screenshot_bytes(conn, session).await?;
     let path = registry::artifact_dir(name).join("latest.png");
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&path, bytes)?;
+    write_creating_dirs(&path, &bytes)?;
     Ok(path.display().to_string())
+}
+
+fn write_creating_dirs(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    std::fs::write(path, bytes).with_context(|| format!("write {}", path.display()))
+}
+
+async fn shot_reply(
+    state: &Shared,
+    target: Option<String>,
+    out: Option<PathBuf>,
+    json: bool,
+) -> Reply {
+    let resolved = {
+        let state = state.lock().unwrap();
+        state
+            .resolve(target.as_deref())
+            .map(|(session, _)| (state.conn.clone(), session, state.name.clone()))
+    };
+    let Some((conn, session, name)) = resolved else {
+        return Reply::fail(no_target());
+    };
+    let bytes = match screenshot_bytes(&conn, &session).await {
+        Ok(bytes) => bytes,
+        Err(error) => return Reply::fail(error.to_string()),
+    };
+    let path = out.unwrap_or_else(|| {
+        registry::artifact_dir(&name).join("shots").join(format!("shot-{}.png", now_unix_ms()))
+    });
+    if let Err(error) = write_creating_dirs(&path, &bytes) {
+        return Reply::fail(error.to_string());
+    }
+    if json {
+        Reply::ok(json!({ "screenshot": path }).to_string())
+    } else {
+        Reply::ok(format!("screenshot {}", path.display()))
+    }
 }
 
 fn compact_value(value: &Value) -> String {
@@ -2918,30 +3092,29 @@ fn net_rules_reply(state: &Shared, json: bool) -> Reply {
     )
 }
 
-fn write_bundle(
-    dir: &PathBuf,
-    events: &[TimelineEvent],
-    settings: &LaunchSettings,
-    rules: &[NetRule],
-    launch: &Option<registry::LaunchRecord>,
-    include: &[String],
+/// Everything a bundle is written from — gathered under the state lock, written without it.
+struct BundleContents<'a> {
+    events: &'a [TimelineEvent],
+    settings: &'a LaunchSettings,
+    rules: &'a [NetRule],
+    launch: &'a Option<registry::LaunchRecord>,
+    include: &'a [String],
     include_secrets: bool,
-) -> Result<()> {
+    visuals: &'a VisualArtifacts,
+}
+
+fn write_bundle(dir: &PathBuf, contents: &BundleContents) -> Result<Vec<String>> {
+    let &BundleContents { events, settings, rules, launch, include, include_secrets, visuals } =
+        contents;
     std::fs::create_dir_all(dir)?;
-    let redacted_note = if include_secrets { "none" } else { "cookies/auth/storage/bodies" };
-    std::fs::write(
-        dir.join("summary.md"),
-        format!(
-            "# CDP Bundle\n\nEvents: {}\nSecrets redacted: {redacted_note}\nIncludes: {}\n",
-            events.len(),
-            if include.is_empty() { "default".to_owned() } else { include.join(",") }
-        ),
-    )?;
+    let mut artifacts: Vec<String> = Vec::new();
+
     let mut timeline = serde_json::to_value(events)?;
     if !include_secrets {
         redact_value(&mut timeline);
     }
     std::fs::write(dir.join("timeline.json"), serde_json::to_string_pretty(&timeline)?)?;
+    artifacts.push("timeline.json".to_owned());
     let mut errors = events
         .iter()
         .filter(|event| event.track.is_error())
@@ -2952,6 +3125,7 @@ fn write_bundle(
         errors = redact_text(&errors);
     }
     std::fs::write(dir.join("errors.txt"), errors)?;
+    artifacts.push("errors.txt".to_owned());
     let network: Vec<&TimelineEvent> =
         events.iter().filter(|event| matches!(event.track, Track::Network(_))).collect();
     let mut network = serde_json::to_value(&network)?;
@@ -2968,8 +3142,38 @@ fn write_bundle(
             }
         }))?,
     )?;
-    std::fs::create_dir_all(dir.join("screenshots"))?;
-    std::fs::create_dir_all(dir.join("snapshots"))?;
+    artifacts.push("network.har".to_owned());
+
+    if !visuals.shots.is_empty() {
+        std::fs::create_dir_all(dir.join("screenshots"))?;
+    }
+    for shot in &visuals.shots {
+        let Some(file_name) = shot.file_name() else {
+            continue;
+        };
+        let relative = Path::new("screenshots").join(file_name);
+        if std::fs::copy(shot, dir.join(&relative)).is_ok() {
+            artifacts.push(relative.display().to_string());
+        }
+    }
+    match &visuals.recording {
+        Some(RecordingArtifact::Video { id, path }) => {
+            std::fs::create_dir_all(dir.join("recordings"))?;
+            let relative = Path::new("recordings").join(format!("{id}.mp4"));
+            if std::fs::copy(path, dir.join(&relative)).is_ok() {
+                artifacts.push(relative.display().to_string());
+            }
+        }
+        // Unassembled (no ffmpeg at stop time): carry the frames + manifest so the video can
+        // still be built from the bundle alone.
+        Some(RecordingArtifact::Frames { id, dir: frames }) => {
+            let relative = Path::new("recordings").join(id);
+            copy_tree(frames, &dir.join(&relative))?;
+            artifacts.push(format!("{}/", relative.display()));
+        }
+        None => {}
+    }
+
     let mut environment = json!({
         "settings": settings,
         "netRules": rules,
@@ -2979,6 +3183,8 @@ fn write_bundle(
         redact_value(&mut environment);
     }
     std::fs::write(dir.join("environment.json"), serde_json::to_string_pretty(&environment)?)?;
+    artifacts.push("environment.json".to_owned());
+    let redacted_note = if include_secrets { "none" } else { "cookies/auth/storage/bodies" };
     std::fs::write(
         dir.join("redactions.json"),
         serde_json::to_string_pretty(&json!({
@@ -2986,6 +3192,35 @@ fn write_bundle(
             "redacted": redacted_note,
         }))?,
     )?;
+    artifacts.push("redactions.json".to_owned());
+
+    let visual_note = visuals.describe().unwrap_or_else(|| "none".to_owned());
+    std::fs::write(
+        dir.join("summary.md"),
+        format!(
+            "# CDP Bundle\n\nEvents: {}\nSecrets redacted: {redacted_note}\nIncludes: {}\n\
+             Visual evidence: {visual_note}\nArtifacts:\n{}\n",
+            events.len(),
+            if include.is_empty() { "default".to_owned() } else { include.join(",") },
+            artifacts.iter().map(|name| format!("- {name}")).collect::<Vec<_>>().join("\n"),
+        ),
+    )?;
+    artifacts.insert(0, "summary.md".to_owned());
+    Ok(artifacts)
+}
+
+fn copy_tree(source: &Path, dest: &Path) -> Result<()> {
+    std::fs::create_dir_all(dest).with_context(|| format!("create {}", dest.display()))?;
+    for entry in std::fs::read_dir(source).with_context(|| format!("read {}", source.display()))? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dest.join(entry.file_name());
+        if from.is_dir() {
+            copy_tree(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to).with_context(|| format!("copy {}", from.display()))?;
+        }
+    }
     Ok(())
 }
 

@@ -17,7 +17,9 @@ kit cdp verify             # …PASS/FAIL since that click: ready · errors · f
 kit cdp snap --diff        # …what changed on screen since the last snap
 kit cdp do "click 'button:Save'; expect text 'Saved'; verify"
                            # …a whole verification sequence in one round trip
-kit cdp flow run smoke     # …the same sequence, saved in .kit/cdp/flows/
+kit cdp flow run smoke --record
+                           # …the same sequence, saved in .kit/cdp/flows/ — recorded to an mp4
+kit cdp shot               # …timestamped screenshot, never overwrites
 kit cdp watch add cart 'cart.items.length'
                            # …subscribe to a value; changes land on the timeline
 kit cdp ext doctor <id>    # …diagnose a Modular extension view/webview runtime

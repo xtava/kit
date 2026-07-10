@@ -91,7 +91,7 @@ impl ValueKind {
             Self::Lens => named(&ctx.lenses),
             Self::Target => named(&ctx.targets),
             Self::Key => plain(NAMED_KEYS),
-            Self::Mark => plain(&["last-action", "do-start", "launch"]),
+            Self::Mark => plain(&["last-action", "do-start", "launch", "record"]),
             Self::Source => plain(&["main", "renderer"]),
             Self::Status => plain(&["2xx", "3xx", "4xx", "5xx", "ok", "fail"]),
             Self::Track => TrackKind::ALL
@@ -157,6 +157,8 @@ fn kind_for(owner: &str, id: &str) -> ValueKind {
         (_, "path") => ValueKind::Free("object.path · app.api.save"),
         (_, "when") => ValueKind::Free("js condition"),
         (_, "rate") => ValueKind::Free("hits/sec cap"),
+        (_, "fps") => ValueKind::Free("frames/sec cap"),
+        (_, "out") => ValueKind::Free("output path"),
         (_, "expr") => ValueKind::Free("js expr"),
         (_, "needle") => ValueKind::Free("text to find"),
         ("find", "text") => ValueKind::Free("literal to search parsed scripts for"),

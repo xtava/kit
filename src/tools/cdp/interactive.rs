@@ -1465,7 +1465,7 @@ mod tests {
         assert!(matches!(session("press Meta+s"), Command::Press { .. }));
         assert!(matches!(session("snap --diff"), Command::Snap { diff: true, .. }));
         match session("do \"click 'button:Save'; verify\"") {
-            Command::Do { steps } => assert_eq!(steps.len(), 2),
+            Command::Do { steps, record: false } => assert_eq!(steps.len(), 2),
             other => panic!("wrong command: {other:?}"),
         }
     }
