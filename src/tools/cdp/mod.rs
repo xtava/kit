@@ -115,11 +115,17 @@ SAFETY
   then the requested URL is loaded. Names may contain only ASCII letters, digits, '-' and '_'.
   The normal Chrome profile is never used; pass --profile to reuse an explicit kit profile.
 
+CONTAINERS
+  Extra Chrome flags come from --chrome-arg (repeatable) and KIT_CDP_CHROME_ARGS
+  (whitespace-split; env first, then flags). Headless Linux containers typically need
+  --no-sandbox --disable-dev-shm-usage.
+
 EXAMPLES
   kit cdp launch http://localhost:3000 --name checkout --headless
   kit cdp launch http://localhost:3000 --name checkout --viewport 1440x1000 --timezone America/New_York
   kit cdp launch http://localhost:3000 --name checkout --profile authed-user --reuse
   kit cdp launch http://localhost:3000 --name checkout --replace
+  kit cdp launch http://app:3000 --name ci --headless --chrome-arg --no-sandbox --chrome-arg --disable-dev-shm-usage
 ";
 
 const LAUNCH_ELECTRON_AFTER_HELP: &str = "\
@@ -403,6 +409,10 @@ enum CdpCommand {
         /// Emulate network throttling. Supported presets: `slow-3g`, `fast-3g`.
         #[arg(long)]
         throttle: Option<String>,
+        /// Extra Chrome flag, appended after the built-in flags. Repeatable. `KIT_CDP_CHROME_ARGS`
+        /// (whitespace-split) composes with these: env first, then flags.
+        #[arg(long = "chrome-arg", allow_hyphen_values = true)]
+        chrome_arg: Vec<String>,
     },
     /// Launch an Electron app, wait for the renderer CDP endpoint it exposes, and attach to it.
     #[command(after_help = LAUNCH_ELECTRON_AFTER_HELP)]
@@ -1038,6 +1048,7 @@ impl Tool for CdpTool {
                 dark,
                 offline,
                 throttle,
+                chrome_arg,
             }) => {
                 client::launch(
                     client::LaunchOptions {
@@ -1057,6 +1068,7 @@ impl Tool for CdpTool {
                         dark,
                         offline,
                         throttle,
+                        chrome_args: chrome_arg,
                     },
                     json,
                 )

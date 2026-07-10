@@ -42,6 +42,9 @@ pub struct LaunchOptions {
     pub dark: bool,
     pub offline: bool,
     pub throttle: Option<String>,
+    /// Extra Chrome flags appended after the built-in ones (containers typically need
+    /// `--no-sandbox --disable-dev-shm-usage`). `KIT_CDP_CHROME_ARGS` composes in front of these.
+    pub chrome_args: Vec<String>,
 }
 
 /// How an Electron app is launched and where its renderer CDP port comes from. Unlike a browser
@@ -350,6 +353,8 @@ pub async fn launch(options: LaunchOptions, json: bool) -> Result<()> {
             command.arg(format!("--window-size={width},{height}"));
         }
     }
+    let env_args = std::env::var("KIT_CDP_CHROME_ARGS").ok();
+    command.args(compose_chrome_args(env_args.as_deref(), &options.chrome_args));
     if options.startup_capture {
         command.arg("about:blank");
     } else {
@@ -780,6 +785,16 @@ fn print_launch(launch: &LaunchRecord, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Extra Chrome flags for a launch: `KIT_CDP_CHROME_ARGS` (whitespace-split) first, then the
+/// repeated `--chrome-arg` flags — env sets the baseline, flags refine per invocation.
+fn compose_chrome_args(env: Option<&str>, flags: &[String]) -> Vec<String> {
+    env.unwrap_or_default()
+        .split_whitespace()
+        .map(str::to_owned)
+        .chain(flags.iter().cloned())
+        .collect()
+}
+
 fn find_browser(explicit: Option<&Path>) -> Result<PathBuf> {
     if let Some(path) = explicit {
         return Ok(path.to_owned());
@@ -797,11 +812,34 @@ fn find_browser(explicit: Option<&Path>) -> Result<PathBuf> {
         "chromium",
         "chromium-browser",
     ];
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
     candidates
         .iter()
-        .map(PathBuf::from)
-        .find(|path| path.exists() || path.components().count() == 1)
+        .find_map(|candidate| {
+            let path = Path::new(candidate);
+            if path.is_absolute() {
+                return path.exists().then(|| path.to_owned());
+            }
+            find_in_path(candidate, &path_var)
+        })
         .context("no Chrome/Chromium browser found — pass --browser or set KIT_CDP_BROWSER")
+}
+
+/// Resolve a bare command name the way the shell would: the first PATH directory holding an
+/// executable file of that name. A bare candidate that resolves nowhere is *not* installed — the
+/// failure belongs here, not at spawn time.
+fn find_in_path(name: &str, path_var: &std::ffi::OsStr) -> Option<PathBuf> {
+    std::env::split_paths(path_var)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| dir.join(name))
+        .find(|candidate| is_executable_file(candidate))
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
 }
 
 fn session_name(explicit: Option<&str>, url: &str) -> Result<String> {
@@ -1131,5 +1169,60 @@ mod tests {
         assert!(decode_frame("not json").is_none());
         assert!(decode_frame("").is_none());
         assert!(decode_frame("{\"Unknown\":1}").is_none());
+    }
+
+    #[test]
+    fn chrome_args_compose_env_first_then_flags() {
+        let flags = vec!["--window-size=800,600".to_owned()];
+        assert_eq!(
+            compose_chrome_args(Some("--no-sandbox   --disable-dev-shm-usage"), &flags),
+            ["--no-sandbox", "--disable-dev-shm-usage", "--window-size=800,600"]
+        );
+        assert_eq!(compose_chrome_args(None, &flags), ["--window-size=800,600"]);
+        assert!(compose_chrome_args(Some("  "), &[]).is_empty());
+    }
+
+    /// A throwaway PATH dir holding one executable and one plain file — what `find_in_path`
+    /// resolves against, with no real browsers involved.
+    struct FakePath {
+        dir: PathBuf,
+    }
+
+    impl FakePath {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!("kit-fake-path-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self { dir }
+        }
+
+        fn add(&self, name: &str, executable: bool) -> PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+            let path = self.dir.join(name);
+            std::fs::write(&path, "#!/bin/sh\n").unwrap();
+            let mode = if executable { 0o755 } else { 0o644 };
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            path
+        }
+    }
+
+    impl Drop for FakePath {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// The find_browser bug this guards against: a bare candidate name used to count as "found"
+    /// without any PATH check, so the failure only surfaced later, at spawn. Resolution must
+    /// require an executable file in a PATH dir.
+    #[test]
+    fn bare_names_resolve_only_to_executables_on_path() {
+        let fake = FakePath::new();
+        let chrome = fake.add("google-chrome-stable", true);
+        fake.add("chromium", false);
+        let path_var = std::env::join_paths([fake.dir.clone()]).unwrap();
+
+        assert_eq!(find_in_path("google-chrome-stable", &path_var), Some(chrome));
+        assert_eq!(find_in_path("chromium", &path_var), None, "non-executable never resolves");
+        assert_eq!(find_in_path("firefox", &path_var), None, "absent name never resolves");
     }
 }
