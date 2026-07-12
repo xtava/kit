@@ -233,11 +233,9 @@ pub fn build(tree: &Value, interactive: bool) -> Snapshot {
 
     let order = dfs_order(&roots, &nodes);
     let refs = assign_refs(&order, &mut nodes);
+    let ref_subtrees = mark_ref_subtrees(&order, &nodes);
 
-    let mut lines = Vec::new();
-    for &root in &roots {
-        render(root, &nodes, 0, interactive, &mut lines);
-    }
+    let lines = render(&roots, &nodes, interactive, &ref_subtrees);
     let semantic = order
         .iter()
         .filter(|&&position| !STRUCTURAL.contains(&nodes[position].role.as_str()))
@@ -292,24 +290,40 @@ fn is_candidate(node: &Node) -> bool {
             || (CONTENT.contains(&node.role.as_str()) && !node.name.is_empty()))
 }
 
-fn render(position: usize, nodes: &[Node], depth: usize, interactive: bool, out: &mut Vec<String>) {
-    let node = &nodes[position];
-    if STRUCTURAL.contains(&node.role.as_str()) || node.role == TEXT {
-        for &child in &node.children {
-            render(child, nodes, depth, interactive, out);
+/// Mark every node whose subtree contains a ref in one reverse DFS pass. The previous renderer
+/// recursively rescanned descendants for every ancestor, turning a deep AX tree into O(N²) work.
+fn mark_ref_subtrees(order: &[usize], nodes: &[Node]) -> Vec<bool> {
+    let mut marked: Vec<bool> = nodes.iter().map(|node| node.reference.is_some()).collect();
+    for &position in order.iter().rev() {
+        if !marked[position] && nodes[position].children.iter().any(|&child| marked[child]) {
+            marked[position] = true;
         }
-        return;
     }
+    marked
+}
 
-    let show = !interactive || node.reference.is_some() || has_ref_descendant(position, nodes);
-    if show {
-        out.push(format!("{}- {}", "  ".repeat(depth), line(node, true)));
-    }
+fn render(
+    roots: &[usize],
+    nodes: &[Node],
+    interactive: bool,
+    ref_subtrees: &[bool],
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack: Vec<(usize, usize)> = roots.iter().rev().map(|&root| (root, 0)).collect();
+    while let Some((position, depth)) = stack.pop() {
+        let node = &nodes[position];
+        let transparent = STRUCTURAL.contains(&node.role.as_str()) || node.role == TEXT;
+        let show = !transparent && (!interactive || ref_subtrees[position]);
+        if show {
+            out.push(format!("{}- {}", "  ".repeat(depth), line(node, true)));
+        }
 
-    let child_depth = if show { depth + 1 } else { depth };
-    for &child in &node.children {
-        render(child, nodes, child_depth, interactive, out);
+        let child_depth = if show { depth + 1 } else { depth };
+        for &child in node.children.iter().rev() {
+            stack.push((child, child_depth));
+        }
     }
+    out
 }
 
 /// One node as a line: role, name, value, and the meaningful props — with or without its ref.
@@ -338,13 +352,6 @@ fn line(node: &Node, with_ref: bool) -> String {
         }
     }
     parts.join(" ")
-}
-
-fn has_ref_descendant(position: usize, nodes: &[Node]) -> bool {
-    nodes[position]
-        .children
-        .iter()
-        .any(|&child| nodes[child].reference.is_some() || has_ref_descendant(child, nodes))
 }
 
 fn properties(node: &Value) -> Vec<(String, String)> {
@@ -417,6 +424,7 @@ fn truncate(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn entry(reference: &str, role: &str, name: &str) -> RefEntry {
         RefEntry { reference: reference.into(), backend: 1, role: role.into(), name: name.into() }
@@ -494,5 +502,64 @@ mod tests {
         assert_eq!(changes.removed.len(), 1);
         assert!(changes.added.is_empty());
         assert_eq!(changes.unchanged, 1);
+    }
+
+    #[test]
+    fn interactive_render_keeps_exact_ref_ancestor_shape() {
+        let tree = json!({
+            "nodes": [
+                {
+                    "nodeId": "1",
+                    "role": { "value": "RootWebArea" },
+                    "name": { "value": "" },
+                    "childIds": ["2"]
+                },
+                {
+                    "nodeId": "2",
+                    "parentId": "1",
+                    "role": { "value": "group" },
+                    "name": { "value": "Panel" },
+                    "childIds": ["3", "4"]
+                },
+                {
+                    "nodeId": "3",
+                    "parentId": "2",
+                    "backendDOMNodeId": 33,
+                    "role": { "value": "button" },
+                    "name": { "value": "Save" }
+                },
+                {
+                    "nodeId": "4",
+                    "parentId": "2",
+                    "role": { "value": "StaticText" },
+                    "name": { "value": "ignored in rendered tree" }
+                }
+            ]
+        });
+        let snapshot = build(&tree, true);
+        assert_eq!(snapshot.text, "- group \"Panel\"\n  - [@e1] button \"Save\"");
+        assert_eq!(snapshot.refs.len(), 1);
+        assert!(snapshot.semantic.contains(&"text \"ignored in rendered tree\"".to_owned()));
+    }
+
+    #[test]
+    fn ref_subtree_marking_handles_deep_perf_shaped_tree_in_one_bottom_up_pass() {
+        let count = 20_000;
+        let mut nodes: Vec<Node> = (0..count)
+            .map(|position| Node {
+                role: "group".to_owned(),
+                name: position.to_string(),
+                value: None,
+                props: Vec::new(),
+                backend: None,
+                children: (position + 1 < count).then_some(position + 1).into_iter().collect(),
+                reference: None,
+            })
+            .collect();
+        nodes[count - 1].reference = Some("e1".to_owned());
+        let order: Vec<usize> = (0..count).collect();
+        let marked = mark_ref_subtrees(&order, &nodes);
+        assert_eq!(marked.len(), count);
+        assert!(marked.into_iter().all(|value| value));
     }
 }
