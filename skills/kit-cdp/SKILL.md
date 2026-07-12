@@ -1,6 +1,13 @@
 ---
 name: kit-cdp
-description: Drive, verify, and instrument live Electron and Chrome apps with `kit cdp`, a warm Chrome DevTools Protocol debugger CLI. Use when you need to self-verify UI work in a running app (click/fill/press, then get a PASS/FAIL verdict), trace whether a function or code line actually ran and with what values (fn traces and never-pausing logpoints — no console.log edits, no rebuilds; arms read back the exact bound site), search the running app's parsed scripts for code to instrument (live url:line coordinates, immune to bundle drift), resolve minified stack traces back to original source files, reproduce and diagnose console errors, exceptions, failed network requests, or websocket traffic, inspect a live page's accessibility tree, watch an app value change over time, or capture a redacted evidence bundle of what an interaction caused. One command attaches lazily and stays warm — no setup step, no driver scripts. Handles multiple instances at once (worktrees, ports, launched sessions), each its own attachment and Timeline; pick one with --app <selector>. Every command takes --json.
+description: >-
+  Drive, verify, and instrument live Electron or Chrome apps with `kit cdp`, a
+  warm Chrome DevTools Protocol debugger CLI. Use for UI self-verification
+  against a running app, CDP clicks/fills/presses, screenshots, accessibility
+  snapshots, console or network error diagnosis, live logpoints, function traces,
+  source-map stack resolution, websocket inspection, value watches, or evidence
+  bundles. Handles multiple app instances with `--app <selector>` and every
+  command supports `--json`.
 license: MIT
 metadata:
   source: https://github.com/xtava/kit
