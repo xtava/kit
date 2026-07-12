@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -18,13 +19,14 @@ use tokio::sync::mpsc;
 use tokio::time::{interval, sleep};
 
 use crate::cdp::{
-    self, CdpConnection, CdpEvent, ImageFormat, LogEntry, Source, Target, Timeline, TimelineEvent,
-    Track, TrackKind,
+    self, CdpConnection, CdpEvent, CdpEventStream, EventIngressSnapshot, EventIngressStats,
+    ImageFormat, LogEntry, Source, Target, Timeline, TimelineEvent, Track, TrackKind,
 };
 
 use super::protocol::{
     Command, Expectation, Frame, IgnoreOp, LaunchSettings, Locator, NetCommand, Query, Reply,
-    ScreenshotRequest, Settle, TargetActivity, TimelineQuery, DEFAULT_CAPTURE_TIMEOUT_MS,
+    ScreenshotRequest, Settle, SubscriptionOverload, TargetActivity, TimelineQuery,
+    DEFAULT_CAPTURE_TIMEOUT_MS,
 };
 use super::readiness::{self, DocState, Readiness};
 use super::registry::{self, Record};
@@ -41,8 +43,108 @@ const RECONNECT_WINDOW: Duration = Duration::from_secs(180);
 const RECONNECT_MIN: Duration = Duration::from_millis(500);
 const RECONNECT_MAX: Duration = Duration::from_secs(8);
 const WATCHDOG_TICK: Duration = Duration::from_secs(15);
+const SUBSCRIBER_ERROR_CAPACITY: usize = 256;
+const SUBSCRIBER_NORMAL_CAPACITY: usize = 1_024;
 
 type Shared = Arc<Mutex<State>>;
+
+#[derive(Default)]
+struct SubscriberCounters {
+    dropped_errors: AtomicU64,
+    dropped_normal: AtomicU64,
+    peak_backlog: AtomicUsize,
+}
+
+struct SubscriberSender {
+    errors: mpsc::Sender<TimelineEvent>,
+    normal: mpsc::Sender<TimelineEvent>,
+    counters: Arc<SubscriberCounters>,
+}
+
+struct SubscriberReceiver {
+    errors: mpsc::Receiver<TimelineEvent>,
+    normal: mpsc::Receiver<TimelineEvent>,
+    counters: Arc<SubscriberCounters>,
+}
+
+impl SubscriberSender {
+    fn new() -> (Self, SubscriberReceiver) {
+        Self::with_capacities(SUBSCRIBER_ERROR_CAPACITY, SUBSCRIBER_NORMAL_CAPACITY)
+    }
+
+    fn with_capacities(
+        error_capacity: usize,
+        normal_capacity: usize,
+    ) -> (Self, SubscriberReceiver) {
+        let (error_tx, error_rx) = mpsc::channel(error_capacity);
+        let (normal_tx, normal_rx) = mpsc::channel(normal_capacity);
+        let counters = Arc::new(SubscriberCounters::default());
+        (
+            Self { errors: error_tx, normal: normal_tx, counters: counters.clone() },
+            SubscriberReceiver { errors: error_rx, normal: normal_rx, counters },
+        )
+    }
+
+    /// Non-blocking fanout. Error-shaped rows have a dedicated reserve, so normal-volume spikes do
+    /// not erase exception evidence from a live pane.
+    fn try_send(&self, event: TimelineEvent) -> bool {
+        let is_error = event.track.is_error();
+        let sender = if is_error { &self.errors } else { &self.normal };
+        let alive = match sender.try_send(event) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                if is_error {
+                    self.counters.dropped_errors.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.counters.dropped_normal.fetch_add(1, Ordering::Relaxed);
+                }
+                true
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        };
+        let backlog = self
+            .errors
+            .max_capacity()
+            .saturating_sub(self.errors.capacity())
+            .saturating_add(self.normal.max_capacity().saturating_sub(self.normal.capacity()));
+        self.counters.peak_backlog.fetch_max(backlog, Ordering::Relaxed);
+        alive
+    }
+}
+
+impl SubscriberReceiver {
+    fn take_overload(&self) -> Option<SubscriptionOverload> {
+        let overload = SubscriptionOverload {
+            dropped_errors: self.counters.dropped_errors.swap(0, Ordering::Relaxed),
+            dropped_normal: self.counters.dropped_normal.swap(0, Ordering::Relaxed),
+            peak_backlog: self.counters.peak_backlog.load(Ordering::Relaxed),
+        };
+        (overload.total() > 0).then_some(overload)
+    }
+
+    async fn recv(&mut self) -> Option<TimelineEvent> {
+        loop {
+            if let Ok(event) = self.errors.try_recv() {
+                return Some(event);
+            }
+            if let Ok(event) = self.normal.try_recv() {
+                return Some(event);
+            }
+            if self.errors.is_closed() && self.normal.is_closed() {
+                return None;
+            }
+            tokio::select! {
+                biased;
+                event = self.errors.recv(), if !self.errors.is_closed() => {
+                    if event.is_some() { return event; }
+                }
+                event = self.normal.recv(), if !self.normal.is_closed() => {
+                    if event.is_some() { return event; }
+                }
+            }
+        }
+    }
+}
 
 /// The Attachment's live state. The connection lives here so reconnect can swap it under the lock.
 struct State {
@@ -64,6 +166,11 @@ struct State {
     /// Error-domain CDP events (`Runtime.exceptionThrown`, error-level `Log.entryAdded`) the decoder
     /// saw but did not model — surfaced by the `errors` view so an un-decoded error type can't hide.
     undecoded_errors: usize,
+    renderer_ingress: EventIngressStats,
+    renderer_ingress_history: EventIngressSnapshot,
+    main_ingress: Option<EventIngressStats>,
+    main_ingress_history: EventIngressSnapshot,
+    console_budget: console_capture::EnrichmentBudget,
     ignore: Vec<String>,
     marks: HashMap<String, u64>,
     settings: LaunchSettings,
@@ -89,7 +196,7 @@ struct State {
     source_maps: HashMap<String, Option<Arc<cdp::SourceMap>>>,
     /// Live `Subscribe` clients. Each gets every emitted event; senders to dropped clients are
     /// pruned on the next `emit`.
-    subscribers: Vec<mpsc::UnboundedSender<TimelineEvent>>,
+    subscribers: Vec<SubscriberSender>,
     start: Instant,
     last_activity: Instant,
 }
@@ -125,7 +232,7 @@ impl State {
         // subscribers and the stored ring in agreement; query-time resolution covers the rest.
         self.resolve_exception_event(&mut event);
         if !self.subscribers.is_empty() && !self.is_suppressed(&event) {
-            self.subscribers.retain(|client| client.send(event.clone()).is_ok());
+            self.subscribers.retain(|client| client.try_send(event.clone()));
         }
         self.timeline.push(event);
     }
@@ -175,6 +282,15 @@ impl State {
             tracks: self.tracks.iter().map(|track| track.as_str().to_owned()).collect(),
         }
     }
+
+    fn ingress_snapshot(&self) -> EventIngressSnapshot {
+        let renderer =
+            self.renderer_ingress_history.saturating_add(self.renderer_ingress.snapshot());
+        let main = self.main_ingress.as_ref().map_or(self.main_ingress_history, |stats| {
+            self.main_ingress_history.saturating_add(stats.snapshot())
+        });
+        renderer.saturating_add(main)
+    }
 }
 
 pub async fn serve(
@@ -188,6 +304,7 @@ pub async fn serve(
     let endpoint = cdp::browser_endpoint(port).await.context("instance is not a CDP endpoint")?;
     let (conn, events) =
         CdpConnection::connect(&endpoint.ws_url).await.context("connect browser endpoint")?;
+    let renderer_ingress = events.stats();
 
     let state: Shared = Arc::new(Mutex::new(State {
         name: name.clone(),
@@ -201,6 +318,11 @@ pub async fn serve(
         timeline: Timeline::new(TIMELINE_CAP),
         tracks: tracks.clone(),
         undecoded_errors: 0,
+        renderer_ingress,
+        renderer_ingress_history: EventIngressSnapshot::default(),
+        main_ingress: None,
+        main_ingress_history: EventIngressSnapshot::default(),
+        console_budget: console_capture::EnrichmentBudget::default(),
         ignore: Vec::new(),
         marks: HashMap::new(),
         settings: LaunchSettings::default(),
@@ -278,7 +400,7 @@ async fn setup_capture(conn: &CdpConnection) -> Result<()> {
 
 async fn event_pump(
     state: Shared,
-    mut events: mpsc::UnboundedReceiver<CdpEvent>,
+    mut events: CdpEventStream,
     tracks: Vec<TrackKind>,
     shutdown: mpsc::Sender<()>,
 ) {
@@ -374,11 +496,21 @@ async fn apply_event(state: &Shared, event: &CdpEvent, tracks: &[TrackKind]) {
         _ => {
             match Track::from_event(event) {
                 Some(mut track) => {
-                    let (conn, at_ms, label) = {
-                        let state = state.lock().unwrap();
-                        (state.conn.clone(), state.now_ms(), state.label(&event.session))
+                    let (conn, at_ms, label, capture_plan) = {
+                        let mut state = state.lock().unwrap();
+                        let at_ms = state.now_ms();
+                        let label = state.label(&event.session);
+                        let page = event.session.as_deref().unwrap_or("browser");
+                        let capture_plan = state.console_budget.plan(page, at_ms, &track);
+                        (state.conn.clone(), at_ms, label, capture_plan)
                     };
-                    console_capture::enrich(&conn, event.session.as_deref(), &mut track).await;
+                    console_capture::enrich(
+                        &conn,
+                        event.session.as_deref(),
+                        &mut track,
+                        capture_plan,
+                    )
+                    .await;
                     let mut state = state.lock().unwrap();
                     state.emit(TimelineEvent {
                         at_ms,
@@ -552,11 +684,18 @@ async fn main_process_pump(state: Shared) {
         let root_pid = state.lock().unwrap().root_pid;
         match connect_main(root_pid).await {
             Some((conn, mut events)) => {
+                let ingress = events.stats();
+                state.lock().unwrap().main_ingress = Some(ingress.clone());
                 push_marker(&state, Source::Main, "main process console attached");
                 while let Some(event) = events.recv().await {
                     if let Some(mut track) = Track::from_event(&event) {
-                        let at_ms = state.lock().unwrap().now_ms();
-                        console_capture::enrich(&conn, None, &mut track).await;
+                        let (at_ms, capture_plan) = {
+                            let mut state = state.lock().unwrap();
+                            let at_ms = state.now_ms();
+                            let capture_plan = state.console_budget.plan(MAIN_LABEL, at_ms, &track);
+                            (at_ms, capture_plan)
+                        };
+                        console_capture::enrich(&conn, None, &mut track, capture_plan).await;
                         let mut state = state.lock().unwrap();
                         state.emit(TimelineEvent {
                             at_ms,
@@ -566,8 +705,17 @@ async fn main_process_pump(state: Shared) {
                         });
                     }
                 }
+                {
+                    let mut state = state.lock().unwrap();
+                    state.main_ingress_history =
+                        state.main_ingress_history.saturating_add(ingress.snapshot());
+                    state.main_ingress = None;
+                }
                 delay = RECONNECT_MIN;
                 deadline = Instant::now() + RECONNECT_WINDOW;
+                // A closed or overloaded inspector stream must not become an immediate reconnect
+                // loop. Renderer reconnect already sleeps before discovery; keep the same floor.
+                sleep(RECONNECT_MIN).await;
             }
             None => {
                 if Instant::now() >= deadline {
@@ -580,7 +728,7 @@ async fn main_process_pump(state: Shared) {
     }
 }
 
-async fn connect_main(root_pid: u32) -> Option<(CdpConnection, mpsc::UnboundedReceiver<CdpEvent>)> {
+async fn connect_main(root_pid: u32) -> Option<(CdpConnection, CdpEventStream)> {
     let endpoint = cdp::node_endpoint(root_pid).await?;
     let (conn, events) = CdpConnection::connect(&endpoint.ws_url).await.ok()?;
     // Node's V8 inspector implements Runtime (console + exceptions) but not the browser-only Log domain.
@@ -588,7 +736,7 @@ async fn connect_main(root_pid: u32) -> Option<(CdpConnection, mpsc::UnboundedRe
     Some((conn, events))
 }
 
-async fn reconnect(state: &Shared) -> Option<mpsc::UnboundedReceiver<CdpEvent>> {
+async fn reconnect(state: &Shared) -> Option<CdpEventStream> {
     let selector = state.lock().unwrap().selector.clone();
     let deadline = Instant::now() + RECONNECT_WINDOW;
     let mut delay = RECONNECT_MIN;
@@ -603,12 +751,16 @@ async fn reconnect(state: &Shared) -> Option<mpsc::UnboundedReceiver<CdpEvent>> 
         let Ok((conn, events)) = CdpConnection::connect(&instance.endpoint.ws_url).await else {
             continue;
         };
+        let ingress = events.stats();
         if setup_capture(&conn).await.is_err() {
             continue;
         }
 
         let record = {
             let mut state = state.lock().unwrap();
+            state.renderer_ingress_history =
+                state.renderer_ingress_history.saturating_add(state.renderer_ingress.snapshot());
+            state.renderer_ingress = ingress;
             state.conn = conn;
             state.port = instance.endpoint.port;
             state.root_pid = instance.pid;
@@ -673,7 +825,7 @@ async fn write_reply(reader: &mut BufReader<UnixStream>, reply: &Reply) {
 /// emitted event until the client disconnects (a failed write). The sender is pruned from `State`
 /// by the next `emit` once this returns and the receiver drops.
 async fn stream_subscription(mut reader: BufReader<UnixStream>, state: Shared, since_ms: u64) {
-    let (sender, mut receiver) = mpsc::unbounded_channel::<TimelineEvent>();
+    let (sender, mut receiver) = SubscriberSender::new();
     let backfill = {
         let mut state = state.lock().unwrap();
         let now = state.now_ms();
@@ -690,7 +842,15 @@ async fn stream_subscription(mut reader: BufReader<UnixStream>, state: Shared, s
     if write_frame(&mut reader, &Frame::Backfill(backfill)).await.is_err() {
         return;
     }
-    while let Some(event) = receiver.recv().await {
+    loop {
+        if let Some(overload) = receiver.take_overload() {
+            if write_frame(&mut reader, &Frame::Overload(overload)).await.is_err() {
+                break;
+            }
+        }
+        let Some(event) = receiver.recv().await else {
+            break;
+        };
         if write_frame(&mut reader, &Frame::Event(event)).await.is_err() {
             break;
         }
@@ -802,6 +962,7 @@ fn status_reply(state: &Shared, json: bool) -> Reply {
         state.now_ms(),
         state.sessions.len(),
         state.timeline.len(),
+        state.ingress_snapshot(),
         state.tracks.iter().map(|track| track.as_str()).collect(),
         json,
     ))
@@ -901,6 +1062,7 @@ async fn errors_reply(
     let saturated = guard.timeline.is_saturated_for(now, since_ms);
     let evicted = guard.timeline.evicted();
     let undecoded = guard.undecoded_errors;
+    let ingress = guard.ingress_snapshot();
     drop(guard);
 
     let events = match collect_timeline(state, &query) {
@@ -911,6 +1073,7 @@ async fn errors_reply(
         groups: cdp::group_errors(&events),
         evicted: Some(evicted),
         undecoded,
+        ingress,
         saturated,
     };
     Reply::ok(format::errors(&report, explain, json))
@@ -948,6 +1111,7 @@ fn collect_brief_timeline(
     let saturated = state.timeline.is_saturated_for(now, since_ms);
     let evicted = state.timeline.evicted();
     let undecoded = state.undecoded_errors;
+    let ingress = state.ingress_snapshot();
     let mut matching_events = 0;
     let mut suppressed_by_ignore = 0;
     let mut events = Vec::new();
@@ -982,6 +1146,7 @@ fn collect_brief_timeline(
             clipped_by_limit,
             evicted: Some(evicted),
             undecoded,
+            ingress,
             saturated,
         },
     ))
@@ -1051,7 +1216,17 @@ fn launch_log_reply(state: &Shared, json: bool) -> Reply {
 }
 
 async fn state_reply(state: &Shared, visual: bool, json: bool) -> Reply {
-    let (name, resolved, recent_errors, failed_network, settings, rules, launch, instrumented) = {
+    let (
+        name,
+        resolved,
+        recent_errors,
+        failed_network,
+        settings,
+        rules,
+        launch,
+        instrumented,
+        ingress,
+    ) = {
         let state = state.lock().unwrap();
         let now = state.now_ms();
         let trace_hits: u64 = state.traces.values().map(|entry| entry.hits).sum();
@@ -1083,6 +1258,7 @@ async fn state_reply(state: &Shared, visual: bool, json: bool) -> Reply {
             state.net_rules.clone(),
             registry::read_launch(&state.name),
             instrumented,
+            state.ingress_snapshot(),
         )
     };
 
@@ -1117,6 +1293,7 @@ async fn state_reply(state: &Shared, visual: bool, json: bool) -> Reply {
         "settings": settings,
         "netRules": rules,
         "launch": launch,
+        "captureIngress": ingress,
         "watches": instrumented.0,
         "traces": { "armed": instrumented.1, "hits": instrumented.2 },
         "rawCommands": {
@@ -1161,6 +1338,14 @@ async fn state_reply(state: &Shared, visual: bool, json: bool) -> Reply {
         out.push(format!("gpu       {}", launch.gpu_mode.as_str()));
     }
     out.push(format!("rules     {}", rules.len()));
+    out.push(format!(
+        "ingress   peak {} · dropped {} (error {}, control {}, normal {})",
+        ingress.peak_backlog,
+        ingress.dropped.total(),
+        ingress.dropped.errors,
+        ingress.dropped.control,
+        ingress.dropped.normal,
+    ));
     if instrumented.0 > 0 || instrumented.1 > 0 {
         out.push(format!(
             "instr     {} watch(es) · {} trace(s), {} hit(s)",
@@ -3143,4 +3328,45 @@ fn now_unix_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn log_event(level: &str, text: &str) -> TimelineEvent {
+        TimelineEvent {
+            at_ms: 1,
+            source: Source::Renderer,
+            target: "main".to_owned(),
+            track: Track::Log(LogEntry {
+                level: level.to_owned(),
+                source: "test".to_owned(),
+                text: text.to_owned(),
+                url: None,
+                line: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn subscriber_queue_reserves_errors_and_reports_every_drop_class() {
+        let (sender, mut receiver) = SubscriberSender::with_capacities(1, 1);
+        assert!(sender.try_send(log_event("info", "normal one")));
+        assert!(sender.try_send(log_event("info", "normal dropped")));
+        assert!(sender.try_send(log_event("error", "error one")));
+        assert!(sender.try_send(log_event("error", "error dropped")));
+
+        let overload = receiver.take_overload().unwrap();
+        assert_eq!(overload.dropped_errors, 1);
+        assert_eq!(overload.dropped_normal, 1);
+        assert_eq!(overload.peak_backlog, 2);
+        assert!(receiver.take_overload().is_none(), "drop deltas report only once");
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            assert!(receiver.recv().await.unwrap().track.is_error());
+            assert!(!receiver.recv().await.unwrap().track.is_error());
+        });
+    }
 }

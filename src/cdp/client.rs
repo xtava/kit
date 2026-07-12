@@ -3,7 +3,7 @@
 //! a per-target connection calls with `session = None`. Cheap to clone — clones share the socket.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -22,6 +22,9 @@ use super::base64;
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(6);
+const CONTROL_EVENT_CAPACITY: usize = 256;
+const ERROR_EVENT_CAPACITY: usize = 512;
+const NORMAL_EVENT_CAPACITY: usize = 2_048;
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>;
@@ -35,6 +38,222 @@ pub struct CdpEvent {
     pub params: Value,
 }
 
+/// Counts of events discarded at the websocket ingress boundary. Control traffic and error-shaped
+/// events have dedicated reserves, so a network/console flood cannot consume their capacity.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventDropCounts {
+    pub control: u64,
+    pub errors: u64,
+    pub normal: u64,
+}
+
+impl EventDropCounts {
+    pub fn total(self) -> u64 {
+        self.control.saturating_add(self.errors).saturating_add(self.normal)
+    }
+
+    pub fn saturating_add(self, other: Self) -> Self {
+        Self {
+            control: self.control.saturating_add(other.control),
+            errors: self.errors.saturating_add(other.errors),
+            normal: self.normal.saturating_add(other.normal),
+        }
+    }
+}
+
+/// Observable pressure facts for one CDP websocket connection. `peak_backlog` is the largest number
+/// of queued events seen across all three ingress reserves.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventIngressSnapshot {
+    pub dropped: EventDropCounts,
+    pub peak_backlog: usize,
+}
+
+impl EventIngressSnapshot {
+    pub fn saturating_add(self, other: Self) -> Self {
+        Self {
+            dropped: self.dropped.saturating_add(other.dropped),
+            peak_backlog: self.peak_backlog.max(other.peak_backlog),
+        }
+    }
+}
+
+#[derive(Default)]
+struct EventIngressCounters {
+    dropped_control: AtomicU64,
+    dropped_errors: AtomicU64,
+    dropped_normal: AtomicU64,
+    peak_backlog: AtomicUsize,
+}
+
+/// Cloneable view of websocket ingress counters, held by the daemon while it consumes the stream.
+#[derive(Clone, Default)]
+pub struct EventIngressStats(Arc<EventIngressCounters>);
+
+impl EventIngressStats {
+    pub fn snapshot(&self) -> EventIngressSnapshot {
+        EventIngressSnapshot {
+            dropped: EventDropCounts {
+                control: self.0.dropped_control.load(Ordering::Relaxed),
+                errors: self.0.dropped_errors.load(Ordering::Relaxed),
+                normal: self.0.dropped_normal.load(Ordering::Relaxed),
+            },
+            peak_backlog: self.0.peak_backlog.load(Ordering::Relaxed),
+        }
+    }
+
+    fn record_drop(&self, priority: EventPriority) {
+        let counter = match priority {
+            EventPriority::Control => &self.0.dropped_control,
+            EventPriority::Error => &self.0.dropped_errors,
+            EventPriority::Normal => &self.0.dropped_normal,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn observe_backlog(&self, backlog: usize) {
+        self.0.peak_backlog.fetch_max(backlog, Ordering::Relaxed);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventPriority {
+    Control,
+    Error,
+    Normal,
+}
+
+struct EventIngressSenders {
+    control: mpsc::Sender<CdpEvent>,
+    errors: mpsc::Sender<CdpEvent>,
+    normal: mpsc::Sender<CdpEvent>,
+    stats: EventIngressStats,
+}
+
+/// Bounded CDP event stream. The websocket reader only uses `try_send`, so a slow consumer cannot
+/// deadlock command responses or the protocol socket.
+pub struct CdpEventStream {
+    control: mpsc::Receiver<CdpEvent>,
+    errors: mpsc::Receiver<CdpEvent>,
+    normal: mpsc::Receiver<CdpEvent>,
+    stats: EventIngressStats,
+}
+
+impl CdpEventStream {
+    pub fn stats(&self) -> EventIngressStats {
+        self.stats.clone()
+    }
+
+    /// Receive the next event, prioritizing protocol-control traffic and error-shaped evidence over
+    /// normal diagnostics while still servicing all queues when higher-priority reserves are empty.
+    pub async fn recv(&mut self) -> Option<CdpEvent> {
+        loop {
+            if let Ok(event) = self.control.try_recv() {
+                return Some(event);
+            }
+            if let Ok(event) = self.errors.try_recv() {
+                return Some(event);
+            }
+            if let Ok(event) = self.normal.try_recv() {
+                return Some(event);
+            }
+            if self.control.is_closed() && self.errors.is_closed() && self.normal.is_closed() {
+                return None;
+            }
+            tokio::select! {
+                biased;
+                event = self.control.recv(), if !self.control.is_closed() => {
+                    if event.is_some() { return event; }
+                }
+                event = self.errors.recv(), if !self.errors.is_closed() => {
+                    if event.is_some() { return event; }
+                }
+                event = self.normal.recv(), if !self.normal.is_closed() => {
+                    if event.is_some() { return event; }
+                }
+            }
+        }
+    }
+}
+
+impl EventIngressSenders {
+    fn new() -> (Self, CdpEventStream) {
+        Self::with_capacities(CONTROL_EVENT_CAPACITY, ERROR_EVENT_CAPACITY, NORMAL_EVENT_CAPACITY)
+    }
+
+    fn with_capacities(
+        control_capacity: usize,
+        error_capacity: usize,
+        normal_capacity: usize,
+    ) -> (Self, CdpEventStream) {
+        let (control_tx, control_rx) = mpsc::channel(control_capacity);
+        let (error_tx, error_rx) = mpsc::channel(error_capacity);
+        let (normal_tx, normal_rx) = mpsc::channel(normal_capacity);
+        let stats = EventIngressStats::default();
+        (
+            Self { control: control_tx, errors: error_tx, normal: normal_tx, stats: stats.clone() },
+            CdpEventStream { control: control_rx, errors: error_rx, normal: normal_rx, stats },
+        )
+    }
+
+    fn try_send(&self, event: CdpEvent) -> bool {
+        let priority = event_priority(&event);
+        let sender = match priority {
+            EventPriority::Control => &self.control,
+            EventPriority::Error => &self.errors,
+            EventPriority::Normal => &self.normal,
+        };
+        let sent = match sender.try_send(event) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.stats.record_drop(priority);
+                // Losing protocol-control or error evidence and then continuing would produce a
+                // deceptively healthy stream (and a dropped Fetch pause can stall a request).
+                // End this reader so the daemon reconnects after recording the overload. Normal
+                // diagnostic floods remain connected and are accounted as drops.
+                priority == EventPriority::Normal
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        };
+        self.stats.observe_backlog(
+            self.control
+                .max_capacity()
+                .saturating_sub(self.control.capacity())
+                .saturating_add(self.errors.max_capacity().saturating_sub(self.errors.capacity()))
+                .saturating_add(self.normal.max_capacity().saturating_sub(self.normal.capacity())),
+        );
+        sent
+    }
+}
+
+fn event_priority(event: &CdpEvent) -> EventPriority {
+    match event.method.as_str() {
+        "Target.attachedToTarget"
+        | "Target.detachedFromTarget"
+        | "Target.targetInfoChanged"
+        | "Fetch.requestPaused"
+        | "Debugger.paused"
+        | "Runtime.bindingCalled" => EventPriority::Control,
+        "Runtime.exceptionThrown" | "Network.loadingFailed" => EventPriority::Error,
+        "Log.entryAdded"
+            if event.params.pointer("/entry/level").and_then(Value::as_str) == Some("error") =>
+        {
+            EventPriority::Error
+        }
+        "Runtime.consoleAPICalled"
+            if matches!(
+                event.params.get("type").and_then(Value::as_str),
+                Some("error" | "assert")
+            ) =>
+        {
+            EventPriority::Error
+        }
+        _ => EventPriority::Normal,
+    }
+}
+
 /// A live CDP websocket connection. Clones share the socket; the event stream ends when it closes.
 #[derive(Clone)]
 pub struct CdpConnection {
@@ -45,13 +264,13 @@ pub struct CdpConnection {
 
 impl CdpConnection {
     /// Connect to a DevTools websocket. Returns the connection and the event stream.
-    pub async fn connect(ws_url: &str) -> Result<(Self, mpsc::UnboundedReceiver<CdpEvent>)> {
+    pub async fn connect(ws_url: &str) -> Result<(Self, CdpEventStream)> {
         let (ws, _) = connect_async(ws_url).await.context("cdp websocket connect")?;
         let (sink, stream) = ws.split();
 
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let (outgoing_tx, outgoing_rx) = mpsc::unbounded_channel::<Message>();
-        let (event_tx, event_rx) = mpsc::unbounded_channel::<CdpEvent>();
+        let (event_tx, event_rx) = EventIngressSenders::new();
 
         tokio::spawn(write_loop(sink, outgoing_rx));
         tokio::spawn(read_loop(stream, Arc::clone(&pending), event_tx));
@@ -132,11 +351,7 @@ async fn write_loop(
     }
 }
 
-async fn read_loop(
-    mut stream: SplitStream<Ws>,
-    pending: Pending,
-    events: mpsc::UnboundedSender<CdpEvent>,
-) {
+async fn read_loop(mut stream: SplitStream<Ws>, pending: Pending, events: EventIngressSenders) {
     while let Some(Ok(message)) = stream.next().await {
         let Message::Text(text) = message else { continue };
         let Ok(value) = serde_json::from_str::<Value>(text.as_str()) else { continue };
@@ -151,7 +366,7 @@ async fn read_loop(
                 session: value.get("sessionId").and_then(Value::as_str).map(str::to_owned),
                 params: value.get("params").cloned().unwrap_or(Value::Null),
             };
-            if events.send(event).is_err() {
+            if !events.try_send(event) {
                 break;
             }
         }
@@ -159,6 +374,62 @@ async fn read_loop(
     // Socket closed: fail every in-flight call so awaiters don't hang.
     for (_, tx) in pending.lock().unwrap().drain() {
         let _ = tx.send(Err(anyhow!("cdp connection closed")));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(method: &str, params: Value) -> CdpEvent {
+        CdpEvent { method: method.to_owned(), session: None, params }
+    }
+
+    #[test]
+    fn ingress_reserves_error_and_control_capacity_during_normal_flood() {
+        let (senders, mut stream) = EventIngressSenders::with_capacities(1, 1, 1);
+        assert!(senders.try_send(event("Network.requestWillBeSent", Value::Null)));
+        assert!(senders.try_send(event("Network.responseReceived", Value::Null)));
+        assert!(senders.try_send(event("Runtime.exceptionThrown", Value::Null)));
+        assert!(senders.try_send(event("Target.attachedToTarget", Value::Null)));
+
+        let stats = stream.stats().snapshot();
+        assert_eq!(stats.dropped, EventDropCounts { control: 0, errors: 0, normal: 1 });
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            assert_eq!(stream.recv().await.unwrap().method, "Target.attachedToTarget");
+            assert_eq!(stream.recv().await.unwrap().method, "Runtime.exceptionThrown");
+            assert_eq!(stream.recv().await.unwrap().method, "Network.requestWillBeSent");
+        });
+    }
+
+    #[test]
+    fn ingress_reports_each_priority_overflow_and_peak_backlog() {
+        let (senders, stream) = EventIngressSenders::with_capacities(1, 1, 1);
+        for method in ["Target.attachedToTarget", "Target.detachedFromTarget"] {
+            let accepted = senders.try_send(event(method, Value::Null));
+            assert_eq!(accepted, method == "Target.attachedToTarget");
+        }
+        for method in ["Runtime.exceptionThrown", "Network.loadingFailed"] {
+            let accepted = senders.try_send(event(method, Value::Null));
+            assert_eq!(accepted, method == "Runtime.exceptionThrown");
+        }
+        for method in ["Page.lifecycleEvent", "Network.responseReceived"] {
+            assert!(senders.try_send(event(method, Value::Null)));
+        }
+
+        let snapshot = stream.stats().snapshot();
+        assert_eq!(snapshot.dropped, EventDropCounts { control: 1, errors: 1, normal: 1 });
+        assert_eq!(snapshot.peak_backlog, 3);
+    }
+
+    #[test]
+    fn console_errors_are_classified_as_error_evidence() {
+        let console_error = event("Runtime.consoleAPICalled", json!({ "type": "error" }));
+        let console_log = event("Runtime.consoleAPICalled", json!({ "type": "log" }));
+        assert_eq!(event_priority(&console_error), EventPriority::Error);
+        assert_eq!(event_priority(&console_log), EventPriority::Normal);
     }
 }
 

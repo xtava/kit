@@ -12,20 +12,16 @@ mod common;
 use std::time::Duration;
 
 use kit::cdp::{
-    browser_endpoint, capture_screenshot, CdpConnection, CdpEvent, ImageFormat, NoFrame,
+    browser_endpoint, capture_screenshot, CdpConnection, CdpEventStream, ImageFormat, NoFrame,
 };
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
 use tokio::time::{timeout, Instant};
 
 /// A budget generous enough that a live headless page always paints inside it.
 const BUDGET: Duration = Duration::from_secs(5);
 
 /// Flatten auto-attach and return the first page target's CDP session id.
-async fn page_session(
-    conn: &CdpConnection,
-    events: &mut mpsc::UnboundedReceiver<CdpEvent>,
-) -> String {
+async fn page_session(conn: &CdpConnection, events: &mut CdpEventStream) -> String {
     conn.call(
         None,
         "Target.setAutoAttach",

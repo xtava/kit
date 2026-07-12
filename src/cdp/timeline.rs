@@ -7,7 +7,7 @@ use std::collections::{HashMap, VecDeque};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::client::CdpEvent;
+use super::client::{CdpEvent, EventIngressSnapshot};
 
 /// One event on the Timeline: when (ms since attach), which process side, which Target, and what.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -504,6 +504,11 @@ pub struct ErrorReport {
     pub evicted: Option<usize>,
     /// Error-domain events the decoder saw but does not model — invisible to every view unless named.
     pub undecoded: usize,
+    /// Events dropped before protocol decoding because a bounded websocket ingress reserve filled.
+    /// Error/control/normal counts remain separate so a clean-looking error list cannot hide lost
+    /// exception evidence.
+    #[serde(default)]
+    pub ingress: EventIngressSnapshot,
     /// The oldest in-window event sat at the ring boundary: older errors of *other* kinds may have
     /// scrolled off entirely, so even the set of distinct groups is a floor.
     pub saturated: bool,
@@ -515,6 +520,7 @@ impl ErrorReport {
         self.saturated
             || self.evicted.is_some_and(|count| count > 0)
             || self.undecoded > 0
+            || self.ingress.dropped.total() > 0
             || self.groups.iter().any(ErrorGroup::has_variants)
     }
 }

@@ -445,12 +445,30 @@ impl Reply {
     }
 }
 
+/// Explicit loss accounting for one live subscriber. The daemon keeps per-subscriber queues
+/// bounded; a slow client receives this frame before later surviving events instead of silently
+/// accumulating memory or presenting a complete-looking stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscriptionOverload {
+    pub dropped_errors: u64,
+    pub dropped_normal: u64,
+    pub peak_backlog: usize,
+}
+
+impl SubscriptionOverload {
+    pub fn total(self) -> u64 {
+        self.dropped_errors.saturating_add(self.dropped_normal)
+    }
+}
+
 /// One frame on a [`Command::Subscribe`] stream. The opening frame is a [`Frame::Backfill`] of the
-/// recent window; every frame after is a single live [`Frame::Event`].
+/// recent window; live events and explicit per-subscriber overload reports follow.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Frame {
     Backfill(Vec<TimelineEvent>),
     Event(TimelineEvent),
+    Overload(SubscriptionOverload),
 }
 
 #[cfg(test)]
@@ -758,5 +776,10 @@ mod tests {
         };
         survives(&Frame::Backfill(vec![event.clone()]));
         survives(&Frame::Event(event));
+        survives(&Frame::Overload(SubscriptionOverload {
+            dropped_errors: 2,
+            dropped_normal: 17,
+            peak_backlog: 512,
+        }));
     }
 }

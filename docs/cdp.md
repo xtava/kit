@@ -249,7 +249,9 @@ under `args`. Primitive args carry `value`; object/function args preserve CDP's
 bounded `preview` and, when the live handle can be read immediately, a JSON-safe
 `snapshot` capped by depth, property count, array length, and string length.
 Snapshot failures stay on the arg as `snapshotError` so the original console row
-is never dropped.
+is never dropped. Page-side snapshots are budgeted at eight objects per event and
+sixteen per second per page; previews/text remain intact and rate-limited objects are
+annotated rather than silently skipped.
 
 `brief` is the low-context handoff for coding agents. It does not delete or
 semantically filter the Timeline: it groups errors with the same integrity banners

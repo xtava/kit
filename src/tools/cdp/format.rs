@@ -7,8 +7,8 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::cdp::{
-    group_errors, ErrorGroup, ErrorReport, NetPhase, Target, TargetKind, TargetMetrics,
-    TimelineEvent, TraceOutcome, TraceRecord, Track, WsDir,
+    group_errors, ErrorGroup, ErrorReport, EventIngressSnapshot, NetPhase, Target, TargetKind,
+    TargetMetrics, TimelineEvent, TraceOutcome, TraceRecord, Track, WsDir,
 };
 
 fn pretty<T: Serialize + ?Sized>(value: &T) -> String {
@@ -124,6 +124,7 @@ pub struct BriefMeta {
     pub clipped_by_limit: usize,
     pub evicted: Option<usize>,
     pub undecoded: usize,
+    pub ingress: EventIngressSnapshot,
     pub saturated: bool,
 }
 
@@ -284,6 +285,7 @@ fn build_brief_report(
             groups: group_errors(events),
             evicted: meta.evicted,
             undecoded: meta.undecoded,
+            ingress: meta.ingress,
             saturated: meta.saturated,
         },
         repeated,
@@ -415,6 +417,16 @@ fn integrity_banner(report: &ErrorReport) -> Option<String> {
             report.undecoded
         ));
     }
+    if report.ingress.dropped.total() > 0 {
+        reasons.push(format!(
+            "{} CDP events dropped at bounded ingress ({} error, {} control, {} normal); peak backlog {}",
+            report.ingress.dropped.total(),
+            report.ingress.dropped.errors,
+            report.ingress.dropped.control,
+            report.ingress.dropped.normal,
+            report.ingress.peak_backlog,
+        ));
+    }
     let collisions = report.groups.iter().filter(|group| group.has_variants()).count();
     if collisions > 0 {
         reasons.push(format!(
@@ -436,6 +448,7 @@ struct StatusView<'a> {
     uptime_ms: u64,
     targets: usize,
     timeline_events: usize,
+    ingress: EventIngressSnapshot,
     tracks: Vec<&'a str>,
 }
 
@@ -447,6 +460,7 @@ pub fn status(
     uptime_ms: u64,
     target_count: usize,
     timeline_events: usize,
+    ingress: EventIngressSnapshot,
     tracks: Vec<&str>,
     json: bool,
 ) -> String {
@@ -458,12 +472,18 @@ pub fn status(
             uptime_ms,
             targets: target_count,
             timeline_events,
+            ingress,
             tracks: tracks.clone(),
         });
     }
     format!(
-        "{name}  {app}  :{port}  up {}  targets {target_count}  timeline {timeline_events}  tracks {}",
+        "{name}  {app}  :{port}  up {}  targets {target_count}  timeline {timeline_events}  ingress peak {} dropped {} (err {} ctl {} normal {})  tracks {}",
         human_ms(uptime_ms),
+        ingress.peak_backlog,
+        ingress.dropped.total(),
+        ingress.dropped.errors,
+        ingress.dropped.control,
+        ingress.dropped.normal,
         tracks.join(",")
     )
 }
@@ -621,7 +641,7 @@ fn truncate(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cdp::{ConsoleLine, ExceptionInfo, Source};
+    use crate::cdp::{ConsoleLine, EventDropCounts, ExceptionInfo, Source};
 
     fn group(text: &str, count: usize, variants: &[&str]) -> ErrorGroup {
         ErrorGroup {
@@ -645,7 +665,13 @@ mod tests {
     }
 
     fn clean(groups: Vec<ErrorGroup>) -> ErrorReport {
-        ErrorReport { groups, evicted: Some(0), undecoded: 0, saturated: false }
+        ErrorReport {
+            groups,
+            evicted: Some(0),
+            undecoded: 0,
+            ingress: EventIngressSnapshot::default(),
+            saturated: false,
+        }
     }
 
     fn meta(matching_events: usize) -> BriefMeta {
@@ -656,6 +682,7 @@ mod tests {
             clipped_by_limit: 0,
             evicted: Some(0),
             undecoded: 0,
+            ingress: EventIngressSnapshot::default(),
             saturated: false,
         }
     }
@@ -721,6 +748,7 @@ mod tests {
             groups: vec![group("boom", 1, &["boom"])],
             evicted: Some(412),
             undecoded: 0,
+            ingress: EventIngressSnapshot::default(),
             saturated: false,
         };
         assert!(errors(&evicted, false, false).contains("412 events dropped"));
@@ -729,9 +757,23 @@ mod tests {
             groups: vec![group("boom", 1, &["boom"])],
             evicted: Some(0),
             undecoded: 3,
+            ingress: EventIngressSnapshot::default(),
             saturated: false,
         };
         assert!(errors(&undecoded, false, false).contains("3 error-domain events"));
+    }
+
+    #[test]
+    fn bounded_ingress_loss_is_part_of_error_integrity_not_a_side_channel() {
+        let mut report = clean(Vec::new());
+        report.ingress = EventIngressSnapshot {
+            dropped: EventDropCounts { control: 2, errors: 3, normal: 40 },
+            peak_backlog: 2_816,
+        };
+        let rendered = errors(&report, false, false);
+        assert!(rendered.contains("45 CDP events dropped at bounded ingress"), "{rendered}");
+        assert!(rendered.contains("3 error"), "{rendered}");
+        assert!(rendered.contains("peak backlog 2816"), "{rendered}");
     }
 
     #[test]

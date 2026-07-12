@@ -11,10 +11,9 @@ mod common;
 use std::time::Duration;
 
 use kit::cdp::{
-    browser_endpoint, group_errors, CdpConnection, CdpEvent, Source, TimelineEvent, Track,
+    browser_endpoint, group_errors, CdpConnection, CdpEventStream, Source, TimelineEvent, Track,
 };
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 /// Attach to the browser exactly as the daemon does — discover + flatten auto-attach, **one** session
@@ -26,7 +25,7 @@ use tokio::time::timeout;
 /// event arrives twice — which is exactly the double-counting this view must never do.
 async fn capture_timeline(
     conn: &CdpConnection,
-    mut events: mpsc::UnboundedReceiver<CdpEvent>,
+    mut events: CdpEventStream,
     script: &str,
     done_marker: &str,
 ) -> Vec<TimelineEvent> {

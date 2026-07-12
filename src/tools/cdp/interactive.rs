@@ -26,7 +26,7 @@ use tokio::time;
 use crate::cdp::{Source, TargetKind, TimelineEvent, TrackKind};
 use crate::tui::{fuzzy, EventReader, LineEditor, Session};
 
-use super::protocol::{Command, Frame, Reply, TargetActivity};
+use super::protocol::{Command, Frame, Reply, SubscriptionOverload, TargetActivity};
 use super::registry::Record;
 use super::{client, complete};
 
@@ -197,7 +197,18 @@ impl Repl {
                 events.into_iter().for_each(|event| self.push(FeedItem::Event(event)))
             }
             Frame::Event(event) => self.push(FeedItem::Event(event)),
+            Frame::Overload(overload) => self.subscription_overload(overload),
         }
+    }
+
+    fn subscription_overload(&mut self, overload: SubscriptionOverload) {
+        self.notice(format!(
+            "⚠ live subscription overloaded: {} event(s) dropped ({} error, {} normal), peak backlog {} — use `tail`/`errors` for the daemon's stored Timeline",
+            overload.total(),
+            overload.dropped_errors,
+            overload.dropped_normal,
+            overload.peak_backlog,
+        ));
     }
 
     fn on_async(&mut self, message: Async) {

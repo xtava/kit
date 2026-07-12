@@ -15,8 +15,8 @@ mod target;
 mod timeline;
 
 pub use client::{
-    capture_screenshot, probe_metrics, probe_target, CdpConnection, CdpEvent, ImageFormat, NoFrame,
-    TargetMetrics,
+    capture_screenshot, probe_metrics, probe_target, CdpConnection, CdpEvent, CdpEventStream,
+    EventDropCounts, EventIngressSnapshot, EventIngressStats, ImageFormat, NoFrame, TargetMetrics,
 };
 pub use discovery::{
     browser_endpoint, discover, is_cdp, node_endpoint, targets, BrowserEndpoint, Instance,
