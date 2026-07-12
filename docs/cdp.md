@@ -12,7 +12,9 @@ Instance's browser endpoint that holds the live connection and accumulates a
 **Timeline**. The first command lazily spawns it; the rest are warm. It survives
 HMR reloads (browser endpoint is stable) and app restarts (re-discovers by
 selector), addresses **Targets** by stable **selector** (never a volatile id), and
-disposes itself (idle timeout, bounded reconnect, signals) so it can never stray.
+disposes itself through idle timeout, bounded reconnect, signals, and registry
+reconciliation; controlled close verifies ownership and retains recovery state when
+shutdown cannot be proven.
 
 ## The agent contract
 
@@ -281,10 +283,26 @@ letters, digits, `-`, and `_`. `detach` stops capture only; `close` closes the
 browser, removes the launch record, and deletes temporary profiles unless
 `--keep-profile` was used. Artifacts remain under the CDP artifact directory.
 
-Launch records store the browser-level websocket URL, so stale records cannot
-accidentally close or reuse a different Chromium process that later appears on the
-same port. Cloned profiles skip Chrome singleton files and `DevToolsActivePort`;
-launch removes stale launch-state files before waiting for the new browser.
+Launch records store the browser-level websocket URL plus the controlled session's
+pid start times, process group/session, and CDP-port owner. `close` uses CDP only when
+both endpoint and process identity match, then verifies session shutdown. It can
+terminate a verified owned session when CDP is unreachable, but never signals an
+unverified or reused pid. A failed/ambiguous close is non-zero, does not print
+`closed`, and retains the launch record/profile for recovery. Cloned profiles skip
+Chrome singleton files and `DevToolsActivePort`; launch removes stale launch-state
+files before waiting for the new browser.
+
+The ownership record is persisted before the Attachment is spawned. Every later
+failure—daemon spawn/readiness, launch mark, configuration, navigation, renderer
+selection, or final output—uses the same post-ownership cleanup boundary. That
+boundary verifies both the controlled process session and the exact spawned daemon;
+on incomplete cleanup it keeps the launch record/profile. If the initial registry
+write itself fails, an artifact-side `launch-recovery.json` preserves the ownership
+proof only as recovery evidence; it is never an alternate runtime registry.
+
+Launch and `state` output report render mode and GPU evidence. `gpu browser-default
+(no Kit GPU flag)` means Kit passed no GPU policy; `--headless` records
+`headless=new`. Kit does not default to `--disable-gpu`.
 
 The agent loop is:
 
@@ -324,7 +342,7 @@ kit cdp net rules clear --app checkout
 |---|---|
 | `launch <url>` | Start an isolated Chrome session, attach CDP, configure capture, then navigate. |
 | `launched` | List active launched sessions after verifying endpoint identity. |
-| `close <name>` / `close --all` | Stop launched browser(s), remove records, and delete temp profiles. |
+| `close <name>` / `close --all` | Stop verified launched browser session(s); remove records/profiles only after verified shutdown. |
 | `state [--visual]` | Print current target, readiness, failures, focus, rules, and optional screenshot path. |
 | `launch-log` | Show the Timeline from the built-in `launch` mark. |
 | `mark <name>` | Add a named Timeline mark for later `--since-mark`, `after`, and `bundle --since`. |
@@ -464,6 +482,7 @@ subscription (`docs/adr/0004`).
   records the navigation on the Timeline (`docs/adr/0002`).
 - **Restarts** trigger bounded, capped-backoff re-discovery by selector, not an
   infinite `/proc` spin.
-- **Disposal** is guaranteed: idle timeout (~30 min), reconnect give-up, SIGTERM,
-  and registry reconciliation — `kit cdp ls` always shows what's live, `detach`
-  /`gc` kill it (`docs/adr/0003`).
+- **Disposal** is verified when ownership is known: idle timeout (~30 min), reconnect
+  give-up, signals, and registry reconciliation cover Attachments; controlled close
+  retains recovery state and fails explicitly when process ownership or shutdown is
+  ambiguous (`docs/adr/0003`).

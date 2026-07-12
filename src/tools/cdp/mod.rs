@@ -771,6 +771,9 @@ enum CdpCommand {
         port: u16,
         #[arg(long, default_value_t = 0)]
         root_pid: u32,
+        /// Internal: controlled plain-Chrome launches have no Electron main inspector to probe.
+        #[arg(long)]
+        skip_main_probe: bool,
         #[arg(long)]
         track: Option<String>,
     },
@@ -1059,8 +1062,16 @@ impl Tool for CdpTool {
             None if args.interactive => interactive::run(app).await,
             None => client::overview(json).await,
 
-            Some(CdpCommand::Serve { name, selector, port, root_pid, track }) => {
-                daemon::serve(name, selector, port, root_pid, tracks_or_all(track.as_deref())).await
+            Some(CdpCommand::Serve { name, selector, port, root_pid, skip_main_probe, track }) => {
+                daemon::serve(
+                    name,
+                    selector,
+                    port,
+                    root_pid,
+                    !skip_main_probe,
+                    tracks_or_all(track.as_deref()),
+                )
+                .await
             }
 
             Some(CdpCommand::Launch {

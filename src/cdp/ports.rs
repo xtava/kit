@@ -63,6 +63,13 @@ pub fn all_listening() -> Vec<(u16, u32)> {
     found
 }
 
+/// The process that owns a localhost listening port, if it can be resolved through `/proc`. This is
+/// the process-identity half of controlled-launch ownership; a DevTools websocket URL alone does
+/// not prove which process will receive a later close request.
+pub fn owner_pid(port: u16) -> Option<u32> {
+    all_listening().into_iter().find_map(|(candidate, pid)| (candidate == port).then_some(pid))
+}
+
 const TCP_STATE_LISTEN: &str = "0A";
 
 fn parse_listeners() -> HashMap<u64, u16> {

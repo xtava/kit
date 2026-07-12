@@ -22,7 +22,7 @@ pub use discovery::{
     browser_endpoint, discover, is_cdp, node_endpoint, targets, BrowserEndpoint, Instance,
     NodeEndpoint,
 };
-pub use ports::listening_ports;
+pub use ports::{listening_ports, owner_pid};
 pub use sourcemap::{inline_map, resolve_map_url, SourceMap, SourceMatch};
 pub use target::{select, select_active, ScoreReason, Target, TargetKind, TargetScore};
 pub use timeline::{

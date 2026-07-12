@@ -19,6 +19,10 @@ pub struct Record {
     pub port: u16,
     /// The daemon process pid (the Attachment itself).
     pub pid: u32,
+    /// Linux process start ticks for `pid`. Paired with the pid so reconciliation never treats a
+    /// reused pid as the original Attachment process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_start_ticks: Option<u64>,
     /// The Instance's browser pid at attach time.
     pub root_pid: u32,
     pub started_at_ms: u64,
@@ -32,9 +36,21 @@ pub struct Record {
 #[serde(rename_all = "camelCase")]
 pub struct LaunchRecord {
     pub name: String,
+    #[serde(default)]
+    pub phase: LaunchPhase,
     pub url: String,
     pub browser: String,
     pub browser_pid: u32,
+    /// Controlled-launch ownership proof. Legacy records without this proof are retained but never
+    /// signalled automatically: a pid alone is not a safe process identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ownership: Option<LaunchOwnership>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_kind: Option<LaunchKind>,
+    #[serde(default)]
+    pub render_mode: RenderMode,
+    #[serde(default)]
+    pub gpu_mode: GpuMode,
     pub port: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub devtools_ws_url: Option<String>,
@@ -52,6 +68,92 @@ pub struct LaunchRecord {
     pub dark: bool,
     pub offline: bool,
     pub throttle: Option<String>,
+}
+
+/// Which controlled launcher created a session. Ambient attachments have no launch record and
+/// therefore no kind; the daemon probes an Electron main inspector only when this is Electron or
+/// unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchKind {
+    Chrome,
+    Electron,
+}
+
+/// Durable controlled-launch lifecycle. `Starting` is written immediately after process/endpoint
+/// ownership is proven; only a fully configured, attached session is promoted to `Ready`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchPhase {
+    Starting,
+    Ready,
+    #[default]
+    Unknown,
+}
+
+/// Rendering evidence recorded from the exact launch command. This is intentionally declarative:
+/// Kit reports the chosen mode without guessing at a GPU-disable policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RenderMode {
+    HeadlessNew,
+    Windowed,
+    ApplicationManaged,
+    #[default]
+    Unknown,
+}
+
+impl RenderMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::HeadlessNew => "headless=new",
+            Self::Windowed => "windowed",
+            Self::ApplicationManaged => "application-managed",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// GPU evidence recorded from the launch boundary. `BrowserDefault` means Kit passed no GPU flag;
+/// it does not claim that Chromium necessarily selected hardware acceleration at runtime.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GpuMode {
+    BrowserDefault,
+    ApplicationManaged,
+    #[default]
+    Unknown,
+}
+
+impl GpuMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BrowserDefault => "browser-default (no Kit GPU flag)",
+            Self::ApplicationManaged => "application-managed",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Stable identity for one Linux process. Pids are reusable; `start_ticks` makes a match specific to
+/// one process lifetime, while process-group/session ids establish the owned termination boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessIdentity {
+    pub pid: u32,
+    pub start_ticks: u64,
+    pub process_group_id: u32,
+    pub session_id: u32,
+}
+
+/// Ownership recorded after the controlled process and its CDP endpoint are both live. The endpoint
+/// may be a descendant of a launcher wrapper (notably `pnpm` -> Electron), but it must live in the
+/// same newly-created session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchOwnership {
+    pub leader: ProcessIdentity,
+    pub endpoint: ProcessIdentity,
 }
 
 pub fn dir() -> PathBuf {
@@ -117,7 +219,15 @@ pub fn write_launch(record: &LaunchRecord) -> Result<()> {
     std::fs::create_dir_all(&record.artifact_dir)
         .with_context(|| format!("create {}", record.artifact_dir.display()))?;
     let json = serde_json::to_string_pretty(record)?;
-    std::fs::write(launch_path(&record.name), json).context("write launch record")
+    let path = launch_path(&record.name);
+    let pending = dir.join(format!(".{}.launch.json.{}.tmp", record.name, std::process::id()));
+    let result = std::fs::write(&pending, json)
+        .context("write pending launch record")
+        .and_then(|()| std::fs::rename(&pending, &path).context("publish launch record"));
+    if result.is_err() {
+        let _ = std::fs::remove_file(pending);
+    }
+    result
 }
 
 pub fn read_launch(name: &str) -> Option<LaunchRecord> {
@@ -160,7 +270,7 @@ pub fn reconcile() -> Vec<Record> {
     all()
         .into_iter()
         .filter(|record| {
-            if is_alive(record.pid) {
+            if record_process_is_current(record) {
                 true
             } else {
                 remove(&record.name);
@@ -168,6 +278,18 @@ pub fn reconcile() -> Vec<Record> {
             }
         })
         .collect()
+}
+
+/// Whether an Attachment record still names the exact process that wrote it. Old records without
+/// start ticks keep the previous liveness check so `gc` can still recover them, but newly written
+/// records cannot be kept alive by pid reuse.
+pub fn record_process_is_current(record: &Record) -> bool {
+    match record.process_start_ticks {
+        Some(start_ticks) => {
+            process_identity(record.pid).is_some_and(|identity| identity.start_ticks == start_ticks)
+        }
+        None => is_alive(record.pid),
+    }
 }
 
 pub fn remove(name: &str) {
@@ -204,4 +326,56 @@ pub fn is_alive(pid: u32) -> bool {
         return true;
     }
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Read one process's identity from `/proc/<pid>/stat`. The command name is parenthesized and may
+/// contain spaces or parentheses, so fields are parsed only after its final `)`.
+pub fn process_identity(pid: u32) -> Option<ProcessIdentity> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    parse_process_stat(pid, &stat)
+}
+
+/// Enumerate every live process currently in a Linux session. Callers must first verify a recorded
+/// process identity in that session before treating this as an owned termination boundary.
+pub fn processes_in_session(session_id: u32) -> Vec<ProcessIdentity> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_string_lossy().parse::<u32>().ok())
+        .filter_map(process_identity)
+        .filter(|identity| identity.session_id == session_id)
+        .collect()
+}
+
+fn parse_process_stat(pid: u32, stat: &str) -> Option<ProcessIdentity> {
+    let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+    Some(ProcessIdentity {
+        pid,
+        process_group_id: fields.get(2)?.parse().ok()?,
+        session_id: fields.get(3)?.parse().ok()?,
+        start_ticks: fields.get(19)?.parse().ok()?,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_stat_parser_handles_spaces_and_parentheses_in_command_name() {
+        let mut fields = vec!["0"; 20];
+        fields[0] = "S";
+        fields[1] = "1";
+        fields[2] = "42";
+        fields[3] = "42";
+        fields[19] = "987654";
+        let stat = format!("42 (chrome (renderer)) {}", fields.join(" "));
+        let identity = parse_process_stat(42, &stat).unwrap();
+        assert_eq!(
+            identity,
+            ProcessIdentity { pid: 42, process_group_id: 42, session_id: 42, start_ticks: 987654 }
+        );
+    }
 }

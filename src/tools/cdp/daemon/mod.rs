@@ -168,6 +168,8 @@ impl State {
             selector: self.selector.clone(),
             port: self.port,
             pid: std::process::id(),
+            process_start_ticks: registry::process_identity(std::process::id())
+                .map(|identity| identity.start_ticks),
             root_pid: self.root_pid,
             started_at_ms: now_unix_ms(),
             tracks: self.tracks.iter().map(|track| track.as_str().to_owned()).collect(),
@@ -180,6 +182,7 @@ pub async fn serve(
     selector: String,
     port: u16,
     root_pid: u32,
+    probe_main: bool,
     tracks: Vec<TrackKind>,
 ) -> Result<()> {
     let endpoint = cdp::browser_endpoint(port).await.context("instance is not a CDP endpoint")?;
@@ -217,7 +220,9 @@ pub async fn serve(
     setup_capture(&conn).await.context("enable target discovery")?;
     registry::write(&state.lock().unwrap().record())?;
 
-    tokio::spawn(main_process_pump(state.clone()));
+    if probe_main {
+        tokio::spawn(main_process_pump(state.clone()));
+    }
     tokio::spawn(trace::keeper(state.clone()));
 
     let socket = registry::socket_path(&name);
@@ -243,7 +248,13 @@ pub async fn serve(
             _ = sigint.recv() => break,
             _ = shutdown_rx.recv() => break,
             _ = watchdog.tick() => {
-                if state.lock().unwrap().last_activity.elapsed() > IDLE_TIMEOUT {
+                let idle = state.lock().unwrap().last_activity.elapsed() > IDLE_TIMEOUT;
+                let registry_owned = registry::read(&name)
+                    .is_some_and(|record| {
+                        record.pid == std::process::id()
+                            && registry::record_process_is_current(&record)
+                    });
+                if idle || !registry_owned {
                     break;
                 }
             }
@@ -1144,6 +1155,10 @@ async fn state_reply(state: &Shared, visual: bool, json: bool) -> Reply {
     }
     if let Some(path) = value.get("screenshot").and_then(Value::as_str) {
         out.push(format!("screen    {path}"));
+    }
+    if let Some(launch) = &launch {
+        out.push(format!("render    {}", launch.render_mode.as_str()));
+        out.push(format!("gpu       {}", launch.gpu_mode.as_str()));
     }
     out.push(format!("rules     {}", rules.len()));
     if instrumented.0 > 0 || instrumented.1 > 0 {

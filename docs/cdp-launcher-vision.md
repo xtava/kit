@@ -74,10 +74,20 @@ Rules:
 - `--reuse` keeps the existing browser and navigates/focuses it.
 - `--replace` closes the existing launched browser and starts a new one.
 - launch records store the browser websocket identity so stale records do not
-  close or reuse unrelated processes on the same port.
+  close or reuse unrelated processes on the same port, plus pid start times and the
+  controlled process group/session so an unreachable endpoint can still be cleaned
+  up without signalling a reused pid.
+- the ownership record is durable before Attachment spawn. All subsequent failures
+  use one cleanup boundary that verifies both the controlled session and exact daemon
+  identity; incomplete cleanup retains recovery state instead of returning through
+  an untracked window.
 - `detach` stops capture but does not close a launched browser.
-- `close` closes the launched browser and stops its attachment.
-- temporary profiles are deleted on `close` unless `--keep-profile` was used.
+- `close` closes the launched browser and stops its attachment only after verifying
+  endpoint/process ownership. It verifies session shutdown after graceful close,
+  SIGTERM, and SIGKILL.
+- temporary profiles are deleted after verified close unless `--keep-profile` was
+  used. Ambiguous ownership or surviving processes produce a non-zero failure and
+  retain the record/profile for recovery.
 - artifacts remain after `close` until explicitly removed.
 
 ## Startup Capture Contract
@@ -257,6 +267,10 @@ kit cdp launch http://localhost:3000 --throttle slow-3g
 ```
 
 Every override must be session-scoped and visible in `kit cdp state`.
+
+Render mode and GPU launch evidence are also visible in launch/state output. Kit
+records whether it passed `--headless=new` and whether GPU selection remains the
+browser/application default; it does not guess a GPU policy or add `--disable-gpu`.
 
 ### Network Debugging
 
