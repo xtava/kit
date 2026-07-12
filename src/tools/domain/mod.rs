@@ -17,7 +17,7 @@ use clap::{ArgMatches, Command, CommandFactory, FromArgMatches, Parser};
 
 use crate::framework::{Context, Tool, ToolMeta};
 use config::Config;
-use engine::{canonicalize_suffix, expand_domains, CheckClient, Verdict};
+use engine::{canonicalize_suffix, expand_domains, CheckClient, Listing, Verdict};
 
 pub const DEFAULT_TLDS: &[&str] = &["com", "ai", "io", "studio"];
 
@@ -36,7 +36,7 @@ pub struct DomainTool;
 #[command(
     name = "domain",
     about = "Authoritative domain registration checker",
-    long_about = "Checks whether domains are registered using DNS delegation, registry RDAP, then registry WHOIS. Available is only reported when a registry source confirms it."
+    long_about = "Checks whether domains are registered using DNS delegation, registry RDAP, then registry WHOIS. Available is only reported when a registry source confirms it. Registered names are also checked against the aftermarket, surfacing the buy-now or minimum-offer price when one is listed for sale."
 )]
 struct DomainArgs {
     /// Names or full domains to check. Bare names expand across the active TLD set.
@@ -50,6 +50,10 @@ struct DomainArgs {
     /// Only print domains confirmed available by registry sources.
     #[arg(short, long)]
     available: bool,
+
+    /// Only print domains currently listed for sale on the aftermarket.
+    #[arg(short = 's', long = "for-sale")]
+    for_sale: bool,
 }
 
 #[async_trait]
@@ -95,6 +99,10 @@ impl Tool for DomainTool {
 
         if args.available {
             results.retain(|result| result.verdict == Verdict::Available);
+        }
+
+        if args.for_sale {
+            results.retain(|result| matches!(result.listing, Some(Listing::ForSale(_))));
         }
 
         if cx.out.is_json() {

@@ -16,7 +16,7 @@ use tokio::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::config::{Config, FavoriteAdd};
-use super::engine::{expand_domains, CheckClient, CheckResult, Disposition, Verdict};
+use super::engine::{expand_domains, CheckClient, CheckResult, Disposition, Listing, Verdict};
 use crate::tui::{CommandSet, CommandSpec, EventReader, LineEditor, ParsedInput, Session};
 
 const HISTORY_LIMIT: usize = 200;
@@ -453,6 +453,10 @@ impl App {
                     "Available means a registry source confirmed the domain is not registered.",
                     Style::default().fg(Color::DarkGray),
                 ));
+                lines.push(Line::styled(
+                    "Registered names show an aftermarket sale price when one is listed.",
+                    Style::default().fg(Color::DarkGray),
+                ));
             }
             ResultsStatus::Help => {
                 lines.push(Line::styled(
@@ -752,6 +756,15 @@ fn result_line(result: &CheckResult, domain_width: usize, width: usize) -> Line<
 }
 
 fn disposition_badge(result: &CheckResult) -> Option<(String, Style)> {
+    if let Some(Listing::ForSale(sale)) = &result.listing {
+        if let Some(price) = sale.headline() {
+            return Some((
+                price.to_string(),
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            ));
+        }
+    }
+
     let disposition = result.disposition()?;
     match disposition {
         Disposition::Active => None,

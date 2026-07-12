@@ -24,7 +24,8 @@ kit cdp ext doctor <id>    # …diagnose a Modular extension view/webview runtim
 kit scout                  # live Electron memory recon   (TUI when interactive)
 kit scout --once           # …one survey, headless table
 kit scout dive             # capture a window's heap snapshot → memlab
-kit domain example.com io  # authoritative domain checker
+kit domain example.com io  # authoritative domain checker (+ aftermarket sale price)
+kit domain --for-sale ink  # …only names listed for sale, with buy-now/offer prices
 kit domain                 # …its TUI
 kit record -i              # Modular recorder REPL
 kit record status          # current recording artifact/run state
@@ -65,7 +66,7 @@ src/
 └─ tools/
    ├─ cdp/            warm CDP debugger — daemon · client · snapshot · readiness · lenses
    ├─ scout/          proc · cdp (via kit::cdp) · survey · correlate · report · tui · dive
-   ├─ domain/         engine{dns,rdap,whois} · config · report · tui
+   ├─ domain/         engine{dns,rdap,whois,market} · config · report · tui
    └─ record/         Modular Playwright recorder operator shell
 ```
 

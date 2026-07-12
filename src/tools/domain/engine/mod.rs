@@ -1,4 +1,5 @@
 mod dns;
+mod market;
 mod rdap;
 mod whois;
 
@@ -26,6 +27,14 @@ impl CheckClient {
     }
 
     pub async fn check_domain(&self, input: impl AsRef<str>) -> CheckResult {
+        let mut result = self.resolve(input).await;
+        if result.verdict == Verdict::Taken {
+            result.listing = market::probe(&self.http, &result.domain).await;
+        }
+        result
+    }
+
+    async fn resolve(&self, input: impl AsRef<str>) -> CheckResult {
         let start = Instant::now();
         let parsed = match CanonicalDomain::parse(input.as_ref()) {
             Ok(parsed) => parsed,
@@ -191,6 +200,8 @@ pub struct CheckResult {
     pub attempts: Vec<CheckAttempt>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub record: Option<DomainRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub listing: Option<Listing>,
 }
 
 impl CheckResult {
@@ -203,7 +214,16 @@ impl CheckResult {
         attempts: Vec<CheckAttempt>,
         record: Option<DomainRecord>,
     ) -> Self {
-        Self { domain, verdict, source, evidence: evidence.into(), ms, attempts, record }
+        Self {
+            domain,
+            verdict,
+            source,
+            evidence: evidence.into(),
+            ms,
+            attempts,
+            record,
+            listing: None,
+        }
     }
 
     pub fn disposition(&self) -> Option<Disposition> {
@@ -325,7 +345,7 @@ impl DomainRecord {
         if let Some(stage) = expiry_stage(&self.statuses) {
             return Disposition::Expiring(stage);
         }
-        if let Some(service) = parking_service(&self.nameservers) {
+        if let Some(service) = parking_marketplace(&self.nameservers) {
             return Disposition::Parked(service);
         }
         Disposition::Active
@@ -335,7 +355,7 @@ impl DomainRecord {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Disposition {
     Active,
-    Parked(ParkingService),
+    Parked(Marketplace),
     Expiring(ExpiryStage),
 }
 
@@ -349,8 +369,9 @@ impl std::fmt::Display for Disposition {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ParkingService {
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Marketplace {
     Sedo,
     Dan,
     Afternic,
@@ -361,7 +382,7 @@ pub enum ParkingService {
     BuyDomains,
 }
 
-impl std::fmt::Display for ParkingService {
+impl std::fmt::Display for Marketplace {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let value = match self {
             Self::Sedo => "Sedo",
@@ -375,6 +396,67 @@ impl std::fmt::Display for ParkingService {
         };
         f.write_str(value)
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "lowercase")]
+pub enum Listing {
+    ForSale(SaleListing),
+    NotListed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SaleListing {
+    pub marketplace: Marketplace,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub buy_now: Option<Price>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub minimum_offer: Option<Price>,
+    pub lease_to_own: bool,
+    pub url: String,
+}
+
+impl SaleListing {
+    pub fn headline(&self) -> Option<&Price> {
+        self.buy_now.as_ref().or(self.minimum_offer.as_ref())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Price {
+    pub amount: u64,
+    pub currency: String,
+}
+
+impl std::fmt::Display for Price {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match currency_symbol(&self.currency) {
+            Some(symbol) => write!(f, "{symbol}{}", group_thousands(self.amount)),
+            None => write!(f, "{} {}", group_thousands(self.amount), self.currency),
+        }
+    }
+}
+
+fn currency_symbol(currency: &str) -> Option<&'static str> {
+    match currency {
+        "USD" => Some("$"),
+        "EUR" => Some("€"),
+        "GBP" => Some("£"),
+        _ => None,
+    }
+}
+
+fn group_thousands(amount: u64) -> String {
+    let digits = amount.to_string();
+    let len = digits.len();
+    let mut grouped = String::with_capacity(len + len / 3);
+    for (index, digit) in digits.bytes().enumerate() {
+        if index > 0 && (len - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit as char);
+    }
+    grouped
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -408,21 +490,21 @@ fn expiry_stage(statuses: &[String]) -> Option<ExpiryStage> {
     }
 }
 
-fn parking_service(nameservers: &[String]) -> Option<ParkingService> {
-    const PARKERS: &[(&str, ParkingService)] = &[
-        ("sedoparking", ParkingService::Sedo),
-        ("sedo.com", ParkingService::Sedo),
-        ("dan.com", ParkingService::Dan),
-        ("undeveloped.com", ParkingService::Dan),
-        ("afternic", ParkingService::Afternic),
-        ("above.com", ParkingService::Afternic),
-        ("bodis.com", ParkingService::Bodis),
-        ("parkingcrew", ParkingService::ParkingCrew),
-        ("hugedomains", ParkingService::HugeDomains),
-        ("uniregistrymarket", ParkingService::Uniregistry),
-        ("uniregistry", ParkingService::Uniregistry),
-        ("buydomains", ParkingService::BuyDomains),
-        ("this-domain-for-sale", ParkingService::BuyDomains),
+fn parking_marketplace(nameservers: &[String]) -> Option<Marketplace> {
+    const PARKERS: &[(&str, Marketplace)] = &[
+        ("sedoparking", Marketplace::Sedo),
+        ("sedo.com", Marketplace::Sedo),
+        ("dan.com", Marketplace::Dan),
+        ("undeveloped.com", Marketplace::Dan),
+        ("afternic", Marketplace::Afternic),
+        ("above.com", Marketplace::Afternic),
+        ("bodis.com", Marketplace::Bodis),
+        ("parkingcrew", Marketplace::ParkingCrew),
+        ("hugedomains", Marketplace::HugeDomains),
+        ("uniregistrymarket", Marketplace::Uniregistry),
+        ("uniregistry", Marketplace::Uniregistry),
+        ("buydomains", Marketplace::BuyDomains),
+        ("this-domain-for-sale", Marketplace::BuyDomains),
     ];
 
     nameservers.iter().find_map(|nameserver| {
@@ -672,19 +754,19 @@ mod tests {
             "ns1.dan.com".to_owned(),
             "ns2.dan.com".to_owned(),
         ]);
-        assert_eq!(parked.disposition(), Disposition::Parked(ParkingService::Dan));
+        assert_eq!(parked.disposition(), Disposition::Parked(Marketplace::Dan));
 
         let afternic = DomainRecord::from_nameservers(vec![
             "ns1.afternic.com".to_owned(),
             "ns2.afternic.com".to_owned(),
         ]);
-        assert_eq!(afternic.disposition(), Disposition::Parked(ParkingService::Afternic));
+        assert_eq!(afternic.disposition(), Disposition::Parked(Marketplace::Afternic));
 
         let buydomains = DomainRecord::from_nameservers(vec![
             "ns.buydomains.com".to_owned(),
             "this-domain-for-sale.com".to_owned(),
         ]);
-        assert_eq!(buydomains.disposition(), Disposition::Parked(ParkingService::BuyDomains));
+        assert_eq!(buydomains.disposition(), Disposition::Parked(Marketplace::BuyDomains));
 
         let active = DomainRecord::from_nameservers(vec![
             "kip.ns.cloudflare.com".to_owned(),

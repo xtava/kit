@@ -1,4 +1,4 @@
-use super::engine::{CheckAttempt, CheckResult, Disposition};
+use super::engine::{CheckAttempt, CheckResult, Disposition, Listing};
 
 /// Headless text rendering — one aligned line per result, with a disposition tag and a trace line.
 pub fn print_results(results: &[CheckResult]) {
@@ -7,13 +7,14 @@ pub fn print_results(results: &[CheckResult]) {
 
     for result in results {
         println!(
-            "{:<12} {:<domain_width$}  {} ({}, {}ms){}",
+            "{:<12} {:<domain_width$}  {} ({}, {}ms){}{}",
             result.verdict,
             result.domain,
             result.evidence,
             result.source,
             result.ms,
-            disposition_tag(result)
+            disposition_tag(result),
+            listing_tag(result)
         );
         if !result.attempts.is_empty() {
             println!("  trace: {}", format_attempts(&result.attempts));
@@ -31,6 +32,16 @@ fn disposition_tag(result: &CheckResult) -> String {
             }
         }
         Some(disposition) => format!("  [{disposition}]"),
+    }
+}
+
+fn listing_tag(result: &CheckResult) -> String {
+    match &result.listing {
+        Some(Listing::ForSale(sale)) => match sale.headline() {
+            Some(price) => format!("  [{price}]"),
+            None => String::new(),
+        },
+        Some(Listing::NotListed) | None => String::new(),
     }
 }
 
