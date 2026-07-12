@@ -17,8 +17,19 @@ use tokio::process::Command as TokioCommand;
 
 use crate::framework::{Context, Tool, ToolMeta};
 
-const DEFAULT_MODULAR_REPO: &str = "/path/to/modular";
+const TOOL: &str = "record";
 const DEFAULT_SCENARIO: &str = "workspace-layout-dnd";
+
+/// Persistent config for `kit record`, stored at the framework config path (`record.toml`).
+/// The repo has no built-in default — it is machine-specific — and an unset scenario falls back to
+/// [`DEFAULT_SCENARIO`].
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct RecordConfig {
+    #[serde(default)]
+    repo: Option<PathBuf>,
+    #[serde(default)]
+    scenario: Option<String>,
+}
 
 pub fn tool() -> RecordTool {
     RecordTool
@@ -40,13 +51,14 @@ struct RecordArgs {
     #[arg(short, long)]
     interactive: bool,
 
-    /// Modular checkout that owns pnpm record and recorder artifacts.
-    #[arg(long, default_value = DEFAULT_MODULAR_REPO, global = true)]
-    repo: PathBuf,
+    /// Modular checkout that owns pnpm record and recorder artifacts. Defaults to the `repo` set in
+    /// `record.toml`.
+    #[arg(long, global = true)]
+    repo: Option<PathBuf>,
 
-    /// Recorder scenario id.
-    #[arg(long, default_value = DEFAULT_SCENARIO, global = true)]
-    scenario: String,
+    /// Recorder scenario id. Defaults to the `scenario` in `record.toml`, else the built-in fallback.
+    #[arg(long, global = true)]
+    scenario: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -102,16 +114,26 @@ impl Tool for RecordTool {
 
     async fn run(&self, cx: &Context, matches: &ArgMatches) -> Result<()> {
         let args = RecordArgs::from_arg_matches(matches)?;
-        let repo = normalize_repo(args.repo)?;
+        let config: RecordConfig = cx.config.load(TOOL)?;
+
+        let repo = args.repo.or(config.repo).ok_or_else(|| {
+            anyhow!(
+                "no Modular repo configured — set `repo` in {} or pass --repo <path>",
+                cx.config.path(TOOL).display()
+            )
+        })?;
+        let repo = normalize_repo(repo)?;
+        let scenario =
+            args.scenario.or(config.scenario).unwrap_or_else(|| DEFAULT_SCENARIO.to_owned());
 
         if args.interactive
             || (args.command.is_none() && cx.term.interactive() && !cx.out.is_json())
         {
-            return tui::run(repo, args.scenario).await;
+            return tui::run(repo, scenario).await;
         }
 
         let command = args.command.unwrap_or(RecordCommand::Status);
-        dispatch_command(cx, &repo, &args.scenario, command).await
+        dispatch_command(cx, &repo, &scenario, command).await
     }
 }
 

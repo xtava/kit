@@ -36,8 +36,9 @@ pnpm record-cancel -- --scenario <scenario>
 pnpm record -- --scenario <scenario> --replay [dir]
 ```
 
-The default repo is `/path/to/modular`. Use `--repo` or the
-interactive `repo PATH` command to point at a different Modular checkout.
+The repo has no built-in default — it is machine-specific. Set it once as `repo`
+in `record.toml` (the `kit` config dir), or pass `--repo` / use the interactive
+`repo PATH` command to point at your Modular checkout.
 
 ## Interactive Use
 
@@ -175,7 +176,7 @@ windows just because their command lines also contain `electron`.
 
 ## Install Or Update
 
-From `/path/to/kit`:
+From the kit repo root:
 
 ```bash
 cargo fmt
