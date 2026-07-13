@@ -22,6 +22,34 @@ The dependency direction is architectural: `tools/* -> framework | tui | cdp`; n
 - `cargo fmt`: format using the repository `rustfmt.toml`.
 - `cargo install --path .`: install the current binary as `kit`.
 
+## Resource-Conservative Cargo Workflow
+
+Treat CPU, memory, disk I/O, and build concurrency as shared machine resources. Verification should
+be proportional to the change and should never make Kit's own development work the hottest workload
+on the machine.
+
+- Run only one heavy Cargo operation at a time. Never overlap `cargo test`, `cargo clippy`, release
+  builds, benchmarks, or `cargo install`, and never launch them in parallel workers.
+- Do not chain heavy Cargo operations with `&&` in one shell command. Run one command, inspect and
+  report its result, then decide whether the next command is still necessary.
+- Before starting a heavy build, check for an existing Cargo or rustc build. Do not compete with a
+  build already running for the user or another agent.
+- Default to at most two build jobs for non-trivial work: use `cargo check -j 2`, targeted
+  `cargo test -j 2 <test-or-module>`, `cargo clippy -j 2`, and `cargo install -j 2 --path .`.
+- Start with the cheapest relevant proof: `cargo check -j 2` or a targeted test. Run the full
+  `cargo test -j 2` suite only once near handoff when the change surface warrants it.
+- Run clippy separately and only after targeted checks pass. Do not run full tests, clippy, and an
+  install back-to-back unless the user explicitly asks for exhaustive verification.
+- Install only once, after the implementation is settled and the necessary checks have passed.
+  Do not repeatedly run `cargo install --path .` after each visual or code iteration.
+- Release builds, ignored performance benchmarks, and 30-second sampling gates are opt-in heavy
+  checks. Run them only when performance or release behavior is actually in scope, and announce
+  them before starting.
+- If a heavy command is interrupted or aborted, verify that its Cargo/rustc process tree has exited
+  before starting another build.
+- For a user-requested build/install, prefer one targeted check followed by one bounded-job install;
+  do not silently expand the request into the full test, clippy, benchmark, and release matrix.
+
 ## Coding Style & Naming Conventions
 
 Use Rust 2021 and the house rustfmt style: 100 columns with `use_small_heuristics = "Max"`. Group imports as standard library, external crates, then crate modules, sorted within each group. Prefer descriptive names such as `fetch_targets` over vague names like `get_data`.
