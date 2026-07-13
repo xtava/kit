@@ -24,6 +24,8 @@ kit cdp ext doctor <id>    # …diagnose a Modular extension view/webview runtim
 kit scout                  # live Electron memory recon   (TUI when interactive)
 kit scout --once           # …one survey, headless table
 kit scout dive             # capture a window's heap snapshot → memlab
+kit stats                  # interactive CPU/core/process monitor
+kit stats --once           # warmed-up top-process snapshot
 kit domain example.com io  # authoritative domain checker (+ aftermarket sale price)
 kit domain --for-sale ink  # …only names listed for sale, with buy-now/offer prices
 kit domain                 # …its TUI
@@ -44,6 +46,7 @@ attach flow, the controlled launcher flow (startup capture, state/marks, network
 rules, redacted bundles, profiles, cleanup), and the verification loop: locators,
 settle, `wait`/`expect`/`verify`, `do` batches, flows, watches, and `snap --diff`.
 For the Modular Playwright recorder lane, see **[docs/record.md](./docs/record.md)**.
+For the CPU and process monitor, see **[docs/stats.md](./docs/stats.md)**.
 The live playground every feature is verified against lives in
 [`testbed/`](./testbed/README.md).
 
@@ -66,6 +69,7 @@ src/
 └─ tools/
    ├─ cdp/            warm CDP debugger — daemon · client · snapshot · readiness · lenses
    ├─ scout/          proc · cdp (via kit::cdp) · survey · correlate · report · tui · dive
+   ├─ stats/          sampler · Linux task identity/control · report · tui
    ├─ domain/         engine{dns,rdap,whois,market} · config · report · tui
    └─ record/         Modular Playwright recorder operator shell
 ```
