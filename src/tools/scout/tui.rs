@@ -19,13 +19,13 @@ use super::format::{human, role_breakdown, target_groups};
 use super::model::{Survey, TargetKind};
 use super::proc::total_pss;
 use super::survey;
-use crate::tui::{EventReader, Session};
+use crate::tui::{EventReader, Session, SessionOptions};
 
 const REFRESH: Duration = Duration::from_secs(4);
 const DELTA_FLOOR_KIB: i64 = 512;
 
 pub async fn run(marker: String) -> Result<()> {
-    let mut session = Session::open()?;
+    let mut session = Session::open(SessionOptions::default())?;
     let mut events = EventReader::start();
     let (tx, mut rx) = mpsc::unbounded_channel::<Survey>();
 

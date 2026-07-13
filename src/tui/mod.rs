@@ -15,4 +15,4 @@ mod session;
 pub use commandline::{CommandSet, CommandSpec, ParsedInput};
 pub use editor::LineEditor;
 pub use events::EventReader;
-pub use session::Session;
+pub use session::{Session, SessionOptions};

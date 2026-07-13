@@ -6,7 +6,9 @@ use std::{
 
 use anyhow::{Context, Result};
 use crossterm::{
-    cursor, execute,
+    cursor,
+    event::{DisableMouseCapture, EnableMouseCapture},
+    execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Frame, Terminal};
@@ -21,17 +23,37 @@ pub struct Session {
     previous_hook: Arc<Mutex<Option<PanicHook>>>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SessionOptions {
+    pub mouse_capture: bool,
+}
+
 impl Session {
-    pub fn open() -> Result<Self> {
+    pub fn open(options: SessionOptions) -> Result<Self> {
         let previous_hook = install_panic_restore_hook();
-        enable_raw_mode().context("enable raw terminal mode")?;
+        let terminal = (|| {
+            enable_raw_mode().context("enable raw terminal mode")?;
 
-        let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, cursor::Hide).context("enter alternate screen")?;
+            let mut stdout = io::stdout();
+            execute!(stdout, EnterAlternateScreen, cursor::Hide)
+                .context("enter alternate screen")?;
+            if options.mouse_capture {
+                execute!(stdout, EnableMouseCapture).context("enable mouse capture")?;
+            }
 
-        let backend = CrosstermBackend::new(stdout);
-        let mut terminal = Terminal::new(backend)?;
-        terminal.clear()?;
+            let backend = CrosstermBackend::new(stdout);
+            let mut terminal = Terminal::new(backend)?;
+            terminal.clear()?;
+            Ok::<_, anyhow::Error>(terminal)
+        })();
+        let terminal = match terminal {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                restore_terminal();
+                restore_previous_hook(&previous_hook);
+                return Err(error);
+            }
+        };
 
         Ok(Self { terminal, previous_hook })
     }
@@ -64,7 +86,7 @@ impl Drop for Session {
 fn restore_terminal() {
     let _ = disable_raw_mode();
     let mut stdout = io::stdout();
-    let _ = execute!(stdout, cursor::Show, LeaveAlternateScreen);
+    let _ = execute!(stdout, DisableMouseCapture, cursor::Show, LeaveAlternateScreen);
 }
 
 fn install_panic_restore_hook() -> Arc<Mutex<Option<PanicHook>>> {

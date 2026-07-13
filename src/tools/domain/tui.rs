@@ -17,7 +17,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::config::{Config, FavoriteAdd};
 use super::engine::{expand_domains, CheckClient, CheckResult, Disposition, Listing, Verdict};
-use crate::tui::{CommandSet, CommandSpec, EventReader, LineEditor, ParsedInput, Session};
+use crate::tui::{
+    CommandSet, CommandSpec, EventReader, LineEditor, ParsedInput, Session, SessionOptions,
+};
 
 const HISTORY_LIMIT: usize = 200;
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -51,7 +53,7 @@ const COMMANDS: CommandSet = CommandSet::new(&[
 ]);
 
 pub async fn run(config: Config) -> Result<()> {
-    let mut terminal = Session::open()?;
+    let mut terminal = Session::open(SessionOptions::default())?;
     let mut input = EventReader::start();
     let client = CheckClient::new()?;
     let (result_tx, mut result_rx) = mpsc::unbounded_channel();

@@ -24,7 +24,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::time;
 
 use crate::cdp::{Source, TargetKind, TimelineEvent, TrackKind};
-use crate::tui::{fuzzy, EventReader, LineEditor, Session};
+use crate::tui::{fuzzy, EventReader, LineEditor, Session, SessionOptions};
 
 use super::protocol::{Command, Frame, Reply, SubscriptionOverload, TargetActivity};
 use super::registry::Record;
@@ -46,7 +46,7 @@ pub async fn run(app: Option<&str>) -> Result<()> {
     let mut frames = client::subscribe(&record, BACKFILL_MS).await?;
     let (async_tx, mut async_rx) = mpsc::unbounded_channel::<Async>();
 
-    let mut session = Session::open()?;
+    let mut session = Session::open(SessionOptions::default())?;
     let mut events = EventReader::start();
     let mut repl = Repl::new(record);
     {

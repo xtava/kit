@@ -16,7 +16,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::time;
 use unicode_width::UnicodeWidthStr;
 
-use crate::tui::{fuzzy, EventReader, LineEditor, Session};
+use crate::tui::{fuzzy, EventReader, LineEditor, Session, SessionOptions};
 
 use super::{
     artifacts_report, cancel_args, current_recording_dir, events_summary, normalize_repo,
@@ -29,7 +29,7 @@ const FEED_CAP: usize = 5_000;
 const HISTORY_CAP: usize = 500;
 
 pub async fn run(repo: PathBuf, scenario: String) -> Result<()> {
-    let mut session = Session::open()?;
+    let mut session = Session::open(SessionOptions::default())?;
     let mut events = EventReader::start();
     let (tx, mut rx) = mpsc::unbounded_channel::<Async>();
     let mut app = App::new(repo, scenario);
