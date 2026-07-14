@@ -44,9 +44,10 @@ Uninterrupted single-child directory chains are compacted into one row while pre
 directory as the expansion identity; mixed and branching directories remain separate rows.
 
 Code rows use narrow colored bars and muted row backgrounds instead of literal patch `+` / `-`
-prefixes. Omitted context is labeled as “N unmodified lines” rather than displaying raw `@@` hunk
-headers. These are presentation choices only: every staged, unstaged, and untracked path reported by
-Git remains visible in the viewer.
+prefixes. Unified mode omits line numbers to maximize code width; split mode retains one number per
+pane for side alignment. Omitted context is labeled as “N unmodified lines” rather than displaying
+raw `@@` hunk headers. These are presentation choices only: every staged, unstaged, and untracked
+path reported by Git remains visible in the viewer.
 
 ## What is compared
 

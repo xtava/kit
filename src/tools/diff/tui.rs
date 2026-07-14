@@ -26,8 +26,7 @@ const WIDE_MIN_WIDTH: u16 = 84;
 const MIN_WIDTH: u16 = 30;
 const MIN_HEIGHT: u16 = 8;
 const TREE_WIDTH: u16 = 34;
-const PAIRED_GUTTER_WIDTH: usize = 14;
-const SINGLE_GUTTER_WIDTH: usize = 8;
+const CHANGE_INDICATOR_WIDTH: usize = 2;
 const SPLIT_GUTTER_WIDTH: usize = 8;
 const SPLIT_MIN_WIDTH: u16 = 50;
 const DARK_ADDED_BACKGROUND: Color = Color::Rgb(33, 58, 43);
@@ -248,23 +247,23 @@ impl DiffApp {
             }
             MouseEventKind::Up(MouseButton::Left) => self.dragging_divider = false,
             MouseEventKind::ScrollDown if self.regions.tree_area.intersects(point) => {
-                self.tree_scroll = self.tree_scroll.saturating_add(3)
+                self.tree_scroll = self.tree_scroll.saturating_add(1)
             }
             MouseEventKind::ScrollUp if self.regions.tree_area.intersects(point) => {
-                self.tree_scroll = self.tree_scroll.saturating_sub(3)
+                self.tree_scroll = self.tree_scroll.saturating_sub(1)
             }
             MouseEventKind::ScrollDown if self.regions.content_area.intersects(point) => {
                 if mouse.modifiers.contains(KeyModifiers::SHIFT) {
                     self.pan(4)
                 } else {
-                    self.scroll_content(3)
+                    self.scroll_content(1)
                 }
             }
             MouseEventKind::ScrollUp if self.regions.content_area.intersects(point) => {
                 if mouse.modifiers.contains(KeyModifiers::SHIFT) {
                     self.pan(-4)
                 } else {
-                    self.scroll_content(-3)
+                    self.scroll_content(-1)
                 }
             }
             _ => {}
@@ -802,7 +801,6 @@ fn unified_text_lines(
         fallback,
         theme,
     );
-    let compact_gutter = one_sided_document(document);
     let mut lines = Vec::new();
     for (hunk_index, hunk) in text.hunks.iter().enumerate() {
         push_hunk_separator(&mut lines, text, hunk_index, width, theme);
@@ -813,15 +811,13 @@ fn unified_text_lines(
                     push_source_line(
                         &mut lines,
                         anchor,
-                        row.old.as_ref(),
-                        row.new.as_ref(),
+                        row.old.as_ref().or(row.new.as_ref()).expect("context row has a side"),
                         None,
                         &text.old,
                         &old_highlights,
                         theme,
                         app.new_horizontal_scroll,
                         width,
-                        compact_gutter,
                     );
                 }
                 RowKind::Changed => {
@@ -829,30 +825,26 @@ fn unified_text_lines(
                         push_source_line(
                             &mut lines,
                             anchor,
-                            Some(old),
-                            None,
+                            old,
                             Some(ChangeSide::Deletion),
                             &text.old,
                             &old_highlights,
                             theme,
                             app.old_horizontal_scroll,
                             width,
-                            compact_gutter,
                         );
                     }
                     if let Some(new) = &row.new {
                         push_source_line(
                             &mut lines,
                             anchor,
-                            None,
-                            Some(new),
+                            new,
                             Some(ChangeSide::Addition),
                             &text.new,
                             &new_highlights,
                             theme,
                             app.new_horizontal_scroll,
                             width,
-                            compact_gutter,
                         );
                     }
                 }
@@ -1056,28 +1048,14 @@ fn pad_spans(spans: &mut Vec<Span<'static>>, width: usize, style: Style) {
 fn push_source_line(
     output: &mut Vec<RenderedLine>,
     anchor: ReviewAnchor,
-    old: Option<&LineCell>,
-    new: Option<&LineCell>,
+    cell: &LineCell,
     change: Option<ChangeSide>,
     snapshot: &TextSnapshot,
     highlights: &[Vec<Span<'static>>],
     theme: TuiTheme,
     horizontal_scroll: usize,
     width: usize,
-    compact_gutter: bool,
 ) {
-    let cell = old.or(new).expect("a rendered source row has a side");
-    let old_number = old.map(|cell| cell.line_index + 1);
-    let new_number = new.map(|cell| cell.line_index + 1);
-    let gutter = if compact_gutter {
-        format!("{:>5} ", old_number.or(new_number).unwrap_or_default())
-    } else {
-        format!(
-            "{:>5} {:>5} ",
-            old_number.map(|value| value.to_string()).unwrap_or_default(),
-            new_number.map(|value| value.to_string()).unwrap_or_default()
-        )
-    };
     let background = change.map(|side| change_background(theme, side));
     let base = background
         .map(|color| Style::default().fg(theme.text).bg(color))
@@ -1091,11 +1069,8 @@ fn push_source_line(
     );
     let newline_marker = cell.missing_newline.then_some("  ⏎ no newline");
     let marker_width = newline_marker.map(UnicodeWidthStr::width).unwrap_or(0);
-    let gutter_width = if compact_gutter { SINGLE_GUTTER_WIDTH } else { PAIRED_GUTTER_WIDTH };
-    let available = width.saturating_sub(gutter_width + marker_width);
-    let gutter_foreground = readable_foreground(theme.text_muted, background, theme);
-    let mut spans = vec![Span::styled(gutter, base.fg(gutter_foreground))];
-    spans.push(change_indicator(change, base, theme));
+    let available = width.saturating_sub(CHANGE_INDICATOR_WIDTH + marker_width);
+    let mut spans = vec![change_indicator(change, base, theme)];
     spans.extend(crop_spans(styled, horizontal_scroll, available));
     if let Some(marker) = newline_marker {
         spans.push(Span::styled(marker, base.fg(theme.warning).add_modifier(Modifier::ITALIC)));
@@ -1656,6 +1631,43 @@ mod tests {
     }
 
     #[test]
+    fn each_vertical_wheel_event_moves_exactly_one_row() {
+        let mut app = DiffApp::new(Vec::new(), NORD, ViewMode::Unified);
+        app.regions.tree_area = Rect::new(0, 0, 20, 10);
+        app.regions.content_area = Rect::new(20, 0, 20, 10);
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 25,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.tree_scroll, 1);
+        assert_eq!(app.content_scroll, 1);
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 25,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.tree_scroll, 0);
+        assert_eq!(app.content_scroll, 0);
+    }
+
+    #[test]
     fn explicit_states_are_visible_and_empty_repository_is_honest() {
         let backend = TestBackend::new(90, 20);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1810,6 +1822,31 @@ mod tests {
             .iter()
             .flat_map(|line| &line.line.spans)
             .all(|span| { !matches!(span.content.as_ref(), "+" | "-" | "+ " | "- ") }));
+    }
+
+    #[test]
+    fn unified_rows_omit_line_numbers_and_keep_only_the_change_indicator() {
+        let document = document(
+            ChangeGroup::Changes,
+            "src/lib.rs",
+            "same\nold\ntail\n",
+            "same\nnew\nextra\ntail\n",
+        );
+        let DiffBody::Text(text) = &document.body else {
+            panic!("text fixture");
+        };
+        let app = DiffApp::new(vec![document.clone()], NORD, ViewMode::Unified);
+        let rendered = unified_text_lines(&document, text, &app, 100);
+        let source_lines =
+            rendered.iter().filter(|line| line.anchor.row.is_some()).collect::<Vec<_>>();
+
+        assert!(!source_lines.is_empty());
+        assert!(source_lines.iter().all(|line| {
+            line.line
+                .spans
+                .first()
+                .is_some_and(|indicator| UnicodeWidthStr::width(indicator.content.as_ref()) == 2)
+        }));
     }
 
     #[test]
