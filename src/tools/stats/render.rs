@@ -13,7 +13,10 @@ use super::model::{
     SampleReadiness,
 };
 use super::report;
-use crate::tui::{theme::NORD, NavigationMap, NavigationRegion};
+use crate::tui::{
+    render_split_divider, theme::NORD, NavigationMap, NavigationRegion, SplitDividerStyle,
+    SplitFrame, SplitMinimums,
+};
 
 const BACKGROUND: Color = NORD.background;
 const PANEL: Color = NORD.surface;
@@ -27,11 +30,14 @@ const HIGHLIGHT: Color = NORD.focus;
 const GOOD: Color = NORD.info;
 const WARN: Color = NORD.warning;
 const SELECTED: Color = NORD.selection;
+const CORE_TILE_WIDTH: u16 = 5;
+const CORE_OVERFLOW_WIDTH: usize = 5;
 
 #[derive(Default)]
 pub(super) struct UiRegions {
     pub(super) processes: Option<Rect>,
     pub(super) inspector: Option<Rect>,
+    pub(super) split: Option<SplitFrame>,
     pub(super) cores: Vec<(Rect, u16)>,
     pub(super) rows: Vec<(Rect, usize)>,
     pub(super) headers: Vec<(Rect, SortBy)>,
@@ -67,22 +73,6 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &StatsApp) -> UiRegions {
     let area = frame.area();
     let mut regions = UiRegions::default();
     frame.render_widget(Block::new().style(Style::default().bg(BACKGROUND)), area);
-    if area.width < 72 || area.height < 20 {
-        frame.render_widget(
-            Paragraph::new("KIT / STATS\n\nProcess Investigator needs at least 72 × 20\n\nq  quit")
-                .style(Style::default().fg(TEXT).bg(BACKGROUND))
-                .block(
-                    Block::bordered()
-                        .border_type(BorderType::Rounded)
-                        .border_style(Style::default().fg(BORDER))
-                        .title(Span::styled(" KIT STATS ", Style::default().fg(ACCENT))),
-                )
-                .wrap(Wrap { trim: true }),
-            area,
-        );
-        return regions;
-    }
-
     let chunks = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(3),
@@ -94,10 +84,22 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &StatsApp) -> UiRegions {
     render_system_band(frame, app, chunks[1], &mut regions);
     let wide = area.width >= 120;
     if wide {
-        let columns = Layout::horizontal([Constraint::Percentage(64), Constraint::Percentage(36)])
-            .split(chunks[2]);
-        render_processes(frame, app, columns[0], true, &mut regions);
-        render_inspector(frame, app, columns[1], false, &mut regions);
+        let split = SplitFrame::horizontal(chunks[2], app.split_ratio, SplitMinimums::new(54, 42));
+        regions.split = Some(split);
+        render_processes(frame, app, split.first, true, &mut regions);
+        render_inspector(frame, app, split.second, false, &mut regions);
+        render_split_divider(
+            frame,
+            split,
+            app.split_drag.is_some(),
+            SplitDividerStyle {
+                idle_color: BORDER,
+                active_color: HIGHLIGHT,
+                idle_line: "│",
+                idle_grip: "┋",
+                active_line: "┃",
+            },
+        );
     } else if app.active_region == ActiveRegion::Inspector {
         render_inspector(frame, app, chunks[2], true, &mut regions);
     } else {
@@ -164,7 +166,12 @@ fn render_system_band(frame: &mut Frame<'_>, app: &StatsApp, area: Rect, regions
 
     let mut spans = vec![Span::styled("CORES  ", Style::default().fg(MUTED))];
     let available = inner.width.saturating_sub(7) as usize;
-    let visible = (available / 6).min(system.cpus.len());
+    let capacity = available / usize::from(CORE_TILE_WIDTH);
+    let visible = if system.cpus.len() <= capacity {
+        system.cpus.len()
+    } else {
+        available.saturating_sub(CORE_OVERFLOW_WIDTH) / usize::from(CORE_TILE_WIDTH)
+    };
     for (index, cpu) in system.cpus.iter().take(visible).enumerate() {
         let graph = spark(app.histories.get(index)).chars().last().unwrap_or('▁');
         spans.push(Span::styled(
@@ -183,8 +190,8 @@ fn render_system_band(frame: &mut Frame<'_>, app: &StatsApp, area: Rect, regions
     frame.render_widget(Paragraph::new(Line::from(spans)), core_line);
     let mut x = core_line.x + 7;
     for cpu in system.cpus.iter().take(visible) {
-        regions.cores.push((Rect::new(x, core_line.y, 4, 1), cpu.logical_index));
-        x += 6;
+        regions.cores.push((Rect::new(x, core_line.y, CORE_TILE_WIDTH, 1), cpu.logical_index));
+        x += CORE_TILE_WIDTH;
     }
 }
 
@@ -899,6 +906,10 @@ fn render_footer(frame: &mut Frame<'_>, app: &StatsApp, area: Rect) {
                 Span::styled("search   ", Style::default().fg(MUTED)),
                 Span::styled("f ", key),
                 Span::styled("focus root   ", Style::default().fg(MUTED)),
+                Span::styled("drag/<> ", key),
+                Span::styled("resize   ", Style::default().fg(MUTED)),
+                Span::styled("= ", key),
+                Span::styled("reset   ", Style::default().fg(MUTED)),
                 Span::styled("q ", key),
                 Span::styled("quit", Style::default().fg(MUTED)),
             ]),
@@ -965,7 +976,7 @@ fn render_confirmation(frame: &mut Frame<'_>, app: &StatsApp, regions: &mut UiRe
         Constraint::Length(13),
         Constraint::Min(0),
     ])
-    .split(Rect::new(inner.x, inner.bottom() - 1, inner.width, 1));
+    .split(Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1));
     regions.confirm_yes = Some(buttons[0]);
     regions.confirm_force = Some(buttons[1]);
     regions.confirm_cancel = Some(buttons[2]);

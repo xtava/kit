@@ -20,6 +20,7 @@ kit stats --interval 500
 | Jump to the hottest/top row | `Home` | click a sort header to reorder from the top |
 | Expand/collapse a process family | `Space`, `←`/`→` | click the disclosure marker |
 | Move between processes and inspector | `Tab`/`Shift-Tab`, `←`/`→` at a tree boundary | click either region |
+| Resize process and inspector panels | `<`/`>`; `=` resets | drag the divider |
 | Open the inspector | `Enter` | click an inspector tab |
 | Change inspector tab | `←`/`→` while the inspector is active | click Overview, Family, Threads, Resources, or Profile |
 | Focus the selected family | `f` | — |

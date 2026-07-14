@@ -211,13 +211,20 @@ mod tests {
 
     #[test]
     fn compact_and_wide_render_without_panicking() {
-        for size in [(30, 8), (100, 32), (160, 50)] {
+        for size in [(1, 1), (20, 5), (30, 8), (60, 18), (71, 20), (72, 20), (100, 32), (160, 50)] {
             let backend = ratatui::backend::TestBackend::new(size.0, size.1);
             let mut terminal = ratatui::Terminal::new(backend).unwrap();
             let app = StatsApp::new(snapshot());
             let regions = draw_app(&mut terminal, &app);
-            if size.0 >= 72 && size.1 >= 20 {
-                assert!(!regions.cores.is_empty());
+            let screen = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(!screen.contains("needs at least"), "size {size:?} rendered a refusal");
+            if size.0 >= 60 && size.1 >= 18 {
                 assert!(!regions.rows.is_empty());
             }
         }
@@ -562,6 +569,58 @@ mod tests {
     }
 
     #[test]
+    fn wide_panel_divider_drags_resizes_and_resets() {
+        let mut app = StatsApp::new(snapshot());
+        let backend = ratatui::backend::TestBackend::new(160, 40);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let regions = draw_app(&mut terminal, &app);
+        let original = regions.split.expect("wide split");
+
+        app.on_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: original.separator.x,
+                row: original.separator.y + original.separator.height / 2,
+                modifiers: KeyModifiers::NONE,
+            },
+            &regions,
+        );
+        assert!(app.split_drag.is_some());
+
+        let target = original.content.x + original.content.width * 3 / 4;
+        app.on_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: target,
+                row: original.separator.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            &regions,
+        );
+        app.on_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: target,
+                row: original.separator.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            &regions,
+        );
+        assert!(app.split_drag.is_none());
+
+        let resized = draw_app(&mut terminal, &app).split.expect("resized split");
+        assert!(resized.separator.x > original.separator.x);
+
+        app.on_key(KeyEvent::new(KeyCode::Char('='), KeyModifiers::NONE), &regions);
+        let reset = draw_app(&mut terminal, &app).split.expect("reset split");
+        assert_eq!(reset.separator.x, original.separator.x);
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        assert!(draw_app(&mut terminal, &app).split.is_none());
+    }
+
+    #[test]
     fn threads_tab_requests_only_the_selected_process_threads() {
         let mut app = StatsApp::new(snapshot());
         let selected = app.selected.unwrap();
@@ -767,19 +826,25 @@ mod tests {
     fn drawn_core_and_confirmation_buttons_are_clickable() {
         let backend = ratatui::backend::TestBackend::new(130, 35);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        let mut app = StatsApp::new(snapshot());
+        let mut app = StatsApp::new(snapshot_with_cores(16));
         let mut regions = draw_app(&mut terminal, &app);
-        let core = regions.cores[0].0;
-        app.on_mouse(
-            MouseEvent {
-                kind: MouseEventKind::Down(MouseButton::Left),
-                column: core.x,
-                row: core.y,
-                modifiers: KeyModifiers::NONE,
-            },
-            &regions,
-        );
-        assert_eq!(app.focused_core, Some(0));
+        assert_eq!(regions.cores.len(), 16);
+        for (index, (core, logical_index)) in regions.cores.iter().copied().enumerate() {
+            assert_eq!(core.width, 5);
+            if index > 0 {
+                assert_eq!(core.x, regions.cores[index - 1].0.right());
+            }
+            app.on_mouse(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: core.x + core.width / 2,
+                    row: core.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &regions,
+            );
+            assert_eq!(app.focused_core, Some(logical_index));
+        }
 
         app.focused_core = None;
         app.reproject();

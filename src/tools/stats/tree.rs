@@ -78,18 +78,32 @@ impl ProcessForest {
                 .filter(|key| *key != process.identity);
             parent.insert(process.identity, process_parent);
         }
+        let system_root = processes
+            .iter()
+            .find(|process| {
+                is_system_root(process)
+                    && parent.get(&process.identity).copied().flatten().is_none()
+            })
+            .map(|process| process.identity);
+        if let Some(system_root) = system_root {
+            for process_parent in parent.values_mut() {
+                if *process_parent == Some(system_root) {
+                    *process_parent = None;
+                }
+            }
+        }
         let mut all = processes.iter().map(|process| process.identity).collect::<Vec<_>>();
         all.sort_by(identity_cmp);
         let mut roots = all
             .iter()
             .copied()
-            .filter(|key| parent.get(key).copied().flatten().is_none())
+            .filter(|key| Some(*key) != system_root && parent.get(key).copied().flatten().is_none())
             .collect::<Vec<_>>();
         repair_unreachable_roots(&mut roots, &all, &mut parent);
         roots.sort_by(identity_cmp);
         roots.dedup();
         let mut children = HashMap::<Option<ProcessIdentity>, Vec<ProcessIdentity>>::new();
-        for key in &all {
+        for key in all.iter().filter(|key| Some(**key) != system_root) {
             children.entry(parent.get(key).copied().flatten()).or_default().push(*key);
         }
         let (family_cpu, family_memory, descendants) =
@@ -260,6 +274,11 @@ impl ProcessForest {
     }
 }
 
+fn is_system_root(process: &ProcessSample) -> bool {
+    process.identity.pid() == 1
+        && ["systemd", "init", "launchd"].iter().any(|name| process.name.eq_ignore_ascii_case(name))
+}
+
 /// Repairs the sampled parent relation into a deterministic forest and projects visible rows.
 ///
 /// Missing parents become roots. Cycles are cut at the first not-yet-emitted node in sibling order.
@@ -425,6 +444,41 @@ mod tests {
         assert_eq!(rows[0].hidden_descendants, 1);
         assert_eq!(rows[0].family_cpu_percent, 3.0);
         assert_eq!(rows[0].family_memory_bytes, 300);
+    }
+
+    #[test]
+    fn system_manager_is_hidden_and_its_children_become_roots() {
+        let processes = vec![
+            process(1, None, "systemd", 0.1),
+            process(2, Some(1), "shell", 5.0),
+            process(3, Some(2), "worker", 10.0),
+            process(4, Some(1), "daemon", 7.0),
+        ];
+        let forest = ProcessForest::new(&processes);
+        let rows = forest.project(&processes, query(&HashSet::new(), ""));
+
+        assert_eq!(
+            rows.iter().map(|row| (row.key.pid(), row.depth)).collect::<Vec<_>>(),
+            vec![(4, 0), (2, 0), (3, 1)]
+        );
+        assert_eq!(forest.parent(processes[1].identity), None);
+        assert_eq!(forest.parent(processes[2].identity), Some(processes[1].identity));
+        assert_eq!(rows[1].family_cpu_percent, 15.0);
+
+        let filtered = forest.project(&processes, query(&HashSet::new(), "worker"));
+        assert_eq!(filtered.iter().map(|row| row.key.pid()).collect::<Vec<_>>(), vec![2, 3]);
+    }
+
+    #[test]
+    fn application_running_as_pid_one_remains_visible() {
+        let processes =
+            vec![process(1, None, "my-server", 2.0), process(2, Some(1), "worker", 1.0)];
+        let rows = project(&processes, query(&HashSet::new(), ""));
+
+        assert_eq!(
+            rows.iter().map(|row| (row.key.pid(), row.depth)).collect::<Vec<_>>(),
+            vec![(1, 0), (2, 1)]
+        );
     }
 
     #[test]

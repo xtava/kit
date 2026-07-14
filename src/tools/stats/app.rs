@@ -15,9 +15,10 @@ use super::model::{
 };
 use super::render::UiRegions;
 use super::tree::{FamilyView, ProcessForest, TreeQuery, TreeSort};
-use crate::tui::{Direction, LineEditor};
+use crate::tui::{Direction, LineEditor, SplitDrag, SplitRatio};
 
 const HISTORY: usize = 120;
+const DEFAULT_SPLIT_RATIO: SplitRatio = SplitRatio::new(640);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SortBy {
@@ -204,6 +205,8 @@ pub(super) struct StatsApp {
     pub(super) thread_offset: usize,
     pub(super) thread_sort: ThreadSortBy,
     pub(super) thread_descending: bool,
+    pub(super) split_ratio: SplitRatio,
+    pub(super) split_drag: Option<SplitDrag<()>>,
     pub(super) active_region: ActiveRegion,
     pub(super) filter: LineEditor,
     pub(super) filtering: bool,
@@ -249,6 +252,8 @@ impl StatsApp {
             thread_offset: 0,
             thread_sort: ThreadSortBy::Cpu,
             thread_descending: true,
+            split_ratio: DEFAULT_SPLIT_RATIO,
+            split_drag: None,
             active_region: ActiveRegion::Processes,
             filter: LineEditor::default(),
             filtering: false,
@@ -574,6 +579,10 @@ impl StatsApp {
         match event {
             Event::Key(key) => self.on_key(key, regions),
             Event::Mouse(mouse) => self.on_mouse(mouse, regions),
+            Event::Resize(_, _) => {
+                self.split_drag = None;
+                Action::None
+            }
             _ => Action::None,
         }
     }
@@ -744,6 +753,18 @@ impl StatsApp {
             }
             KeyCode::Char('4') => {
                 self.set_sort(SortBy::Name);
+                Action::None
+            }
+            KeyCode::Char('<') if regions.split.is_some() => {
+                self.split_ratio = self.split_ratio.adjusted(-50);
+                Action::None
+            }
+            KeyCode::Char('>') if regions.split.is_some() => {
+                self.split_ratio = self.split_ratio.adjusted(50);
+                Action::None
+            }
+            KeyCode::Char('=') if regions.split.is_some() => {
+                self.split_ratio = DEFAULT_SPLIT_RATIO;
                 Action::None
             }
             _ => Action::None,
@@ -1051,7 +1072,53 @@ impl StatsApp {
     }
 
     pub(super) fn on_mouse(&mut self, mouse: MouseEvent, regions: &UiRegions) -> Action {
+        let point = (mouse.column, mouse.row);
+        if self.command_viewer.is_some() {
+            self.split_drag = None;
+            if mouse.kind == MouseEventKind::Down(MouseButton::Left)
+                && regions.command_close.is_some_and(|area| contains(area, point))
+            {
+                self.command_viewer = None;
+            }
+            return Action::None;
+        }
+        if self.confirm.is_some() {
+            self.split_drag = None;
+            if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+                return Action::None;
+            }
+            if regions.confirm_yes.is_some_and(|area| contains(area, point)) {
+                return self.confirm_action(ConfirmationChoice::Confirm);
+            }
+            if regions.confirm_force.is_some_and(|area| contains(area, point)) {
+                return self.confirm_action(ConfirmationChoice::Force);
+            }
+            if regions.confirm_cancel.is_some_and(|area| contains(area, point)) {
+                self.confirm = None;
+            }
+            return Action::None;
+        }
         match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.split_drag = regions.split.and_then(|split| {
+                    SplitDrag::begin((), split, self.split_ratio, mouse.column, mouse.row)
+                });
+                if self.split_drag.is_some() {
+                    return Action::None;
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.split_drag.is_some() => {
+                if let Some(ratio) = self.split_drag.and_then(|drag| {
+                    regions.split.and_then(|split| drag.ratio_for_column((), split, mouse.column))
+                }) {
+                    self.split_ratio = ratio;
+                }
+                return Action::None;
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.split_drag = None;
+                return Action::None;
+            }
             MouseEventKind::ScrollUp => {
                 match (self.active_region, self.inspector_tab) {
                     (ActiveRegion::Inspector, InspectorTab::Family) => {
@@ -1079,27 +1146,7 @@ impl StatsApp {
                 }
                 return Action::None;
             }
-            MouseEventKind::Down(MouseButton::Left) => {}
             _ => return Action::None,
-        }
-        let point = (mouse.column, mouse.row);
-        if self.command_viewer.is_some() {
-            if regions.command_close.is_some_and(|area| contains(area, point)) {
-                self.command_viewer = None;
-            }
-            return Action::None;
-        }
-        if self.confirm.is_some() {
-            if regions.confirm_yes.is_some_and(|area| contains(area, point)) {
-                return self.confirm_action(ConfirmationChoice::Confirm);
-            }
-            if regions.confirm_force.is_some_and(|area| contains(area, point)) {
-                return self.confirm_action(ConfirmationChoice::Force);
-            }
-            if regions.confirm_cancel.is_some_and(|area| contains(area, point)) {
-                self.confirm = None;
-            }
-            return Action::None;
         }
         if let Some(region) = regions.navigation().hit_test(mouse.column, mouse.row) {
             self.active_region = region;
