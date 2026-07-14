@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -16,7 +16,9 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::time;
 use unicode_width::UnicodeWidthStr;
 
-use crate::tui::{fuzzy, EventReader, LineEditor, Session, SessionOptions};
+use crate::tui::{
+    fuzzy, EventReader, LineEditor, Session, SessionOptions, Suggestion, SuggestionMenu,
+};
 
 use super::{
     artifacts_report, cancel_args, current_recording_dir, events_summary, normalize_repo,
@@ -88,21 +90,9 @@ enum FeedItem {
     Output { label: String, stream: Stream, line: String },
 }
 
-#[derive(Clone)]
-struct Candidate {
-    insert: String,
-    hint: String,
-}
-
 struct Completion {
     start: usize,
-    candidates: Vec<Candidate>,
-}
-
-struct Suggestions {
-    candidates: Vec<Candidate>,
-    start: usize,
-    selected: Option<usize>,
+    candidates: Vec<Suggestion>,
 }
 
 struct Ghost {
@@ -124,7 +114,7 @@ struct App {
     help_open: bool,
     recording: bool,
     replay_stdin: Option<ChildStdin>,
-    suggestions: Option<Suggestions>,
+    suggestions: Option<SuggestionMenu>,
     muted_at: Option<usize>,
 }
 
@@ -582,8 +572,7 @@ impl App {
             self.suggestions = None;
             return;
         }
-        self.suggestions =
-            Some(Suggestions { candidates: found.candidates, start: found.start, selected: None });
+        self.suggestions = Some(SuggestionMenu::new(found.candidates, found.start));
     }
 
     fn complete(&self, line: &str) -> Option<Completion> {
@@ -595,14 +584,14 @@ impl App {
             match tokens[0].as_str() {
                 "replay" => self.replay_candidates(),
                 "scenario" => self.scenario_candidates(),
-                "rename" => vec![Candidate {
+                "rename" => vec![Suggestion {
                     insert: default_recording_name(&self.scenario),
                     hint: "archive current recording".to_owned(),
                 }],
                 "start" | "record" if word.starts_with('-') => {
-                    vec![Candidate { insert: "--out".to_owned(), hint: "output dir".to_owned() }]
+                    vec![Suggestion { insert: "--out".to_owned(), hint: "output dir".to_owned() }]
                 }
-                "repo" => vec![Candidate {
+                "repo" => vec![Suggestion {
                     insert: self.repo.display().to_string(),
                     hint: "current Modular checkout".to_owned(),
                 }],
@@ -613,8 +602,8 @@ impl App {
         (!ranked.is_empty()).then_some(Completion { start, candidates: ranked })
     }
 
-    fn replay_candidates(&self) -> Vec<Candidate> {
-        let mut candidates = vec![Candidate {
+    fn replay_candidates(&self) -> Vec<Suggestion> {
+        let mut candidates = vec![Suggestion {
             insert: current_recording_dir(&self.repo, &self.scenario).display().to_string(),
             hint: "current recording".to_owned(),
         }];
@@ -622,7 +611,7 @@ impl App {
         candidates
     }
 
-    fn scenario_candidates(&self) -> Vec<Candidate> {
+    fn scenario_candidates(&self) -> Vec<Suggestion> {
         let mut names = vec![self.scenario.clone()];
         let current_root =
             current_recording_dir(&self.repo, &self.scenario).parent().map(PathBuf::from);
@@ -637,47 +626,39 @@ impl App {
         }
         names.sort();
         names.dedup();
-        names.into_iter().map(|insert| Candidate { insert, hint: "scenario".to_owned() }).collect()
+        names.into_iter().map(|insert| Suggestion { insert, hint: "scenario".to_owned() }).collect()
     }
 
     fn engaged(&self) -> bool {
-        self.suggestions.as_ref().is_some_and(|menu| menu.selected.is_some())
+        self.suggestions.as_ref().is_some_and(SuggestionMenu::is_engaged)
     }
 
     fn cycle_selection(&mut self, step: isize) {
         let Some(menu) = &mut self.suggestions else {
             return;
         };
-        if menu.candidates.is_empty() {
-            return;
-        }
-        let len = menu.candidates.len() as isize;
-        menu.selected = Some(match menu.selected {
-            None if step > 0 => 0,
-            None => (len - 1) as usize,
-            Some(at) => ((at as isize + step).rem_euclid(len)) as usize,
-        });
+        menu.cycle(step);
     }
 
     fn accept_selected(&mut self) {
         let Some(menu) = self.suggestions.take() else {
             return;
         };
-        let Some(candidate) = menu.selected.and_then(|at| menu.candidates.get(at)) else {
+        let Some(candidate) = menu.selected() else {
             return;
         };
-        self.replace_current_word(menu.start, &candidate.insert);
+        self.replace_current_word(menu.start(), &candidate.insert);
         self.refresh_suggestions();
     }
 
     fn disengage(&mut self) {
         if let Some(menu) = &mut self.suggestions {
-            menu.selected = None;
+            menu.disengage();
         }
     }
 
     fn mute_suggestions(&mut self) {
-        self.muted_at = self.suggestions.as_ref().map(|menu| menu.start);
+        self.muted_at = self.suggestions.as_ref().map(SuggestionMenu::start);
         self.suggestions = None;
     }
 
@@ -879,7 +860,7 @@ fn parse_out_arg(words: &[String]) -> Result<Option<PathBuf>> {
     }
 }
 
-fn command_candidates() -> Vec<Candidate> {
+fn command_candidates() -> Vec<Suggestion> {
     [
         ("start", "start recording"),
         ("stop", "stop and flush artifacts"),
@@ -896,11 +877,11 @@ fn command_candidates() -> Vec<Candidate> {
         ("quit", "exit"),
     ]
     .into_iter()
-    .map(|(insert, hint)| Candidate { insert: insert.to_owned(), hint: hint.to_owned() })
+    .map(|(insert, hint)| Suggestion { insert: insert.to_owned(), hint: hint.to_owned() })
     .collect()
 }
 
-fn saved_recording_candidates(repo: &PathBuf) -> Vec<Candidate> {
+fn saved_recording_candidates(repo: &Path) -> Vec<Suggestion> {
     let root = saved_recording_root(repo);
     let Ok(entries) = fs::read_dir(root) else {
         return Vec::new();
@@ -909,7 +890,7 @@ fn saved_recording_candidates(repo: &PathBuf) -> Vec<Candidate> {
     let mut candidates = Vec::new();
     for entry in entries.flatten() {
         if entry.file_type().is_ok_and(|ty| ty.is_dir()) {
-            candidates.push(Candidate {
+            candidates.push(Suggestion {
                 insert: entry.path().display().to_string(),
                 hint: "saved recording".to_owned(),
             });
@@ -940,12 +921,12 @@ fn current_word(text: &str) -> (usize, &str) {
     }
 }
 
-fn rank_candidates(candidates: Vec<Candidate>, needle: &str) -> Vec<Candidate> {
+fn rank_candidates(candidates: Vec<Suggestion>, needle: &str) -> Vec<Suggestion> {
     if needle.is_empty() {
         return candidates;
     }
 
-    let mut scored: Vec<(u16, Candidate)> = candidates
+    let mut scored: Vec<(u16, Suggestion)> = candidates
         .into_iter()
         .filter_map(|candidate| {
             fuzzy::score_ci(&candidate.insert, needle).map(|score| (score, candidate))
@@ -963,7 +944,7 @@ fn starts_with_ci(text: &str, prefix: &str) -> bool {
 
 fn render(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
-    let shown = app.suggestions.as_ref().map_or(0, |menu| menu_rows(menu, area));
+    let shown = app.suggestions.as_ref().map_or(0, |menu| menu.visible_rows(area, 6, 7));
     let menu_height = if shown == 0 { 0 } else { shown as u16 + 1 };
     let chunks = Layout::vertical([
         Constraint::Length(3),
@@ -980,7 +961,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     render_feed(frame, chunks[1], app, lines);
     if shown > 0 {
         if let Some(menu) = &app.suggestions {
-            render_suggestions(frame, chunks[2], menu, shown);
+            menu.render(frame, chunks[2], shown, 28, crate::tui::theme::NORD);
         }
     }
     render_input(frame, chunks[3], app);
@@ -988,56 +969,6 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     if app.help_open {
         render_help(frame, area);
     }
-}
-
-fn menu_rows(menu: &Suggestions, area: Rect) -> usize {
-    const ROWS: usize = 6;
-    let room = (area.height as usize).saturating_sub(7);
-    menu.candidates.len().min(ROWS).min(room)
-}
-
-fn render_suggestions(frame: &mut Frame<'_>, area: Rect, menu: &Suggestions, shown: usize) {
-    let offset = menu.selected.unwrap_or(0).saturating_sub(shown - 1);
-    let hint_width = (area.width as usize).saturating_sub(34);
-    let mut lines = vec![menu_rule(menu, offset, shown, area.width as usize)];
-
-    for (index, candidate) in menu.candidates.iter().enumerate().skip(offset).take(shown) {
-        let engaged = menu.selected == Some(index);
-        let marker = if engaged { "▌ " } else { "  " };
-        let insert_style = if engaged {
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::Gray)
-        };
-        lines.push(Line::from(vec![
-            Span::styled(marker, Style::default().fg(Color::Cyan)),
-            Span::styled(format!("{:<28}", truncate(&candidate.insert, 28)), insert_style),
-            Span::styled(
-                format!("  {}", truncate(&candidate.hint, hint_width)),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]));
-    }
-
-    frame.render_widget(Paragraph::new(lines), area);
-}
-
-fn menu_rule(menu: &Suggestions, offset: usize, shown: usize, width: usize) -> Line<'static> {
-    let mut label = format!("─ suggestions · {} ", menu.candidates.len());
-    if offset > 0 {
-        label.push_str(&format!("· ↑ {offset} "));
-    }
-    let below = menu.candidates.len() - offset - shown;
-    if below > 0 {
-        label.push_str(&format!("· ↓ {below} "));
-    }
-    let keys =
-        if menu.selected.is_some() { " ⏎ accept · esc back ─" } else { " ⇥ select ─" };
-    let fill = width.saturating_sub(label.chars().count() + keys.chars().count());
-    Line::from(Span::styled(
-        format!("{label}{}{keys}", "─".repeat(fill)),
-        Style::default().fg(Color::DarkGray),
-    ))
 }
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -1180,16 +1111,4 @@ fn panel_titled(title: String) -> Block<'static> {
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::DarkGray))
         .padding(Padding::new(1, 1, 0, 0))
-}
-
-fn truncate(text: &str, max: usize) -> String {
-    let mut out = String::new();
-    for ch in text.chars() {
-        if out.chars().count() + 1 >= max {
-            out.push('…');
-            return out;
-        }
-        out.push(ch);
-    }
-    out
 }

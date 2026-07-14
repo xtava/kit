@@ -10,9 +10,13 @@ mod commandline;
 mod editor;
 mod events;
 pub mod fuzzy;
+pub mod markdown;
 mod session;
+mod suggestions;
+pub mod theme;
 
 pub use commandline::{CommandSet, CommandSpec, ParsedInput};
 pub use editor::LineEditor;
 pub use events::EventReader;
 pub use session::{Session, SessionOptions};
+pub use suggestions::{Suggestion, SuggestionMenu};

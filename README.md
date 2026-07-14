@@ -35,6 +35,10 @@ kit record cancel          # cancel active recording and close its window
 kit record replay          # replay the current Modular recording
 kit record rename drag-smoke
                            # save current recording under a stable name
+kit render README.md       # scrollable, presentation-rendered Markdown viewer
+kit render                 # fuzzy-search Markdown, including visibly labeled ignored files
+kit render --theme nord README.md
+                           # built-in or custom TOML theme override
 ```
 
 Every tool inherits the same spine for free: a global `--json`, headless-vs-TUI
@@ -47,6 +51,8 @@ rules, redacted bundles, profiles, cleanup), and the verification loop: locators
 settle, `wait`/`expect`/`verify`, `do` batches, flows, watches, and `snap --diff`.
 For the Modular Playwright recorder lane, see **[docs/record.md](./docs/record.md)**.
 For the CPU and process monitor, see **[docs/stats.md](./docs/stats.md)**.
+For the Markdown viewer and its fuzzy file prompt, see
+**[docs/render.md](./docs/render.md)**.
 The live playground every feature is verified against lives in
 [`testbed/`](./testbed/README.md).
 
@@ -64,14 +70,15 @@ architecture (`tools → framework | tui | cdp`, never tool↔tool, never `spine
 src/
 ├─ main.rs            Registry::new().register(cdp::tool()).register(scout::tool())….dispatch()
 ├─ framework/         Tool · Context · Output · ConfigStore · Registry   — the spine (no UI deps)
-├─ tui/               Session (panic-safe terminal) · EventReader · LineEditor · CommandSet
+├─ tui/               Session · EventReader · LineEditor · CommandSet · SuggestionMenu
 ├─ cdp/               Chrome DevTools Protocol engine — client · discovery · target · timeline
 └─ tools/
    ├─ cdp/            warm CDP debugger — daemon · client · snapshot · readiness · lenses
    ├─ scout/          proc · cdp (via kit::cdp) · survey · correlate · report · tui · dive
    ├─ stats/          sampler · Linux task identity/control · report · tui
    ├─ domain/         engine{dns,rdap,whois,market} · config · report · tui
-   └─ record/         Modular Playwright recorder operator shell
+   ├─ record/         Modular Playwright recorder operator shell
+   └─ render/         Markdown viewer · ignored-file-aware catalog · fuzzy file prompt
 ```
 
 A tool implements one trait — `Tool { meta, command, run }` — and decides

@@ -4,5 +4,6 @@
 pub mod cdp;
 pub mod domain;
 pub mod record;
+pub mod render;
 pub mod scout;
 pub mod stats;

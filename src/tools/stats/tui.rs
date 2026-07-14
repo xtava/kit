@@ -16,22 +16,20 @@ use super::model::{DetailScope, ProcessKey, ProcessSample, StatsSnapshot};
 use super::report;
 use super::sampler::{Sampler, SamplerWorker};
 use super::signal::{self, ProcessSignal};
-use crate::tui::{EventReader, LineEditor, Session, SessionOptions};
+use crate::tui::{theme::NORD, EventReader, LineEditor, Session, SessionOptions};
 
-// The exact Nord roles from the user's active btop theme. btop has theme_background=false,
-// so normal surfaces intentionally preserve the terminal's transparent background.
-const BACKGROUND: Color = Color::Reset;
-const PANEL: Color = Color::Reset;
-const BORDER: Color = Color::Rgb(76, 86, 106);
-const TEXT: Color = Color::Rgb(216, 222, 233);
-const PAPER: Color = Color::Rgb(236, 239, 244);
-const MUTED: Color = Color::Rgb(76, 86, 106);
-const ACCENT: Color = Color::Rgb(143, 188, 187);
-const CPU_ACCENT: Color = Color::Rgb(136, 192, 208);
-const HIGHLIGHT: Color = Color::Rgb(94, 129, 172);
-const GOOD: Color = Color::Rgb(129, 161, 193);
-const WARN: Color = Color::Rgb(235, 203, 139);
-const SELECTED: Color = Color::Rgb(76, 86, 106);
+const BACKGROUND: Color = NORD.background;
+const PANEL: Color = NORD.surface;
+const BORDER: Color = NORD.border;
+const TEXT: Color = NORD.text;
+const PAPER: Color = NORD.text_strong;
+const MUTED: Color = NORD.text_muted;
+const ACCENT: Color = NORD.accent;
+const CPU_ACCENT: Color = NORD.accent_alt;
+const HIGHLIGHT: Color = NORD.focus;
+const GOOD: Color = NORD.info;
+const WARN: Color = NORD.warning;
+const SELECTED: Color = NORD.selection;
 const HISTORY: usize = 120;
 
 pub async fn run(interval: Duration, mouse_capture: bool) -> Result<()> {

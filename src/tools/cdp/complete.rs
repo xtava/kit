@@ -14,23 +14,15 @@
 use clap::CommandFactory;
 
 use crate::cdp::TrackKind;
-use crate::tui::fuzzy;
+use crate::tui::{fuzzy, Suggestion};
 
 use super::protocol::NAMED_KEYS;
-
-/// One offered completion: what replaces the word under the cursor, and a dimmed annotation
-/// (a command's about-line, an element's role and name).
-#[derive(Debug, Clone)]
-pub struct Candidate {
-    pub insert: String,
-    pub hint: String,
-}
 
 /// A completion result: candidates for the word starting at byte `start` of the line.
 #[derive(Debug)]
 pub struct Completion {
     pub start: usize,
-    pub candidates: Vec<Candidate>,
+    pub candidates: Vec<Suggestion>,
 }
 
 /// The inline ghost rendered after the cursor.
@@ -84,7 +76,7 @@ enum ValueKind {
 }
 
 impl ValueKind {
-    fn candidates(self, line: &Line<'_>, ctx: &Context) -> Vec<Candidate> {
+    fn candidates(self, line: &Line<'_>, ctx: &Context) -> Vec<Suggestion> {
         match self {
             Self::Command => first_words(),
             Self::Subcommand => subcommands(line.node),
@@ -101,7 +93,7 @@ impl ValueKind {
                 .iter()
                 .map(|kind| kind.as_str())
                 .chain(["watch"])
-                .map(|name| Candidate { insert: name.to_owned(), hint: String::new() })
+                .map(|name| Suggestion { insert: name.to_owned(), hint: String::new() })
                 .collect(),
             Self::Free(_) => Vec::new(),
         }
@@ -341,9 +333,9 @@ fn value_flag<'a>(node: &'a clap::Command, long: &str) -> Option<&'a clap::Arg> 
 /// can be found by its name, not to shadow the words being typed. A leading `@` is the element
 /// operator, not part of the name: it is stripped before hint matching, and a bare `@` therefore
 /// narrows to the `@ref` inserts alone.
-fn rank(pool: Vec<Candidate>, needle: &str) -> Vec<Candidate> {
+fn rank(pool: Vec<Suggestion>, needle: &str) -> Vec<Suggestion> {
     let by_name = needle.trim_start_matches('@');
-    let mut ranked: Vec<(u32, Candidate)> = pool
+    let mut ranked: Vec<(u32, Suggestion)> = pool
         .into_iter()
         .filter_map(|candidate| {
             if needle.is_empty() {
@@ -396,15 +388,17 @@ const META: &[(&str, &str)] = &[
     ("quit", "leave the session"),
 ];
 
-fn first_words() -> Vec<Candidate> {
-    let mut out: Vec<Candidate> = grammar()
+fn first_words() -> Vec<Suggestion> {
+    let mut out: Vec<Suggestion> = grammar()
         .get_subcommands()
         .filter(|cmd| !cmd.is_hide_set() && !NOT_IN_SESSION.contains(&cmd.get_name()))
-        .map(|cmd| Candidate { insert: cmd.get_name().to_owned(), hint: about(cmd) })
+        .map(|cmd| Suggestion { insert: cmd.get_name().to_owned(), hint: about(cmd) })
         .collect();
     out.extend(
-        META.iter()
-            .map(|(word, hint)| Candidate { insert: (*word).to_owned(), hint: (*hint).to_owned() }),
+        META.iter().map(|(word, hint)| Suggestion {
+            insert: (*word).to_owned(),
+            hint: (*hint).to_owned(),
+        }),
     );
     out
 }
@@ -416,10 +410,10 @@ fn grammar() -> &'static clap::Command {
     GRAMMAR.get_or_init(super::CdpArgs::command)
 }
 
-fn subcommands(node: &clap::Command) -> Vec<Candidate> {
+fn subcommands(node: &clap::Command) -> Vec<Suggestion> {
     node.get_subcommands()
         .filter(|sub| !sub.is_hide_set())
-        .map(|sub| Candidate { insert: sub.get_name().to_owned(), hint: about(sub) })
+        .map(|sub| Suggestion { insert: sub.get_name().to_owned(), hint: about(sub) })
         .collect()
 }
 
@@ -427,13 +421,13 @@ fn subcommand_names(node: &clap::Command) -> Vec<&str> {
     node.get_subcommands().filter(|sub| !sub.is_hide_set()).map(|sub| sub.get_name()).collect()
 }
 
-fn flag_candidates(node: &clap::Command) -> Option<Vec<Candidate>> {
-    let flags: Vec<Candidate> = node
+fn flag_candidates(node: &clap::Command) -> Option<Vec<Suggestion>> {
+    let flags: Vec<Suggestion> = node
         .get_arguments()
         .filter(|arg| !arg.is_hide_set())
         .filter_map(|arg| {
             let long = arg.get_long()?;
-            Some(Candidate {
+            Some(Suggestion {
                 insert: format!("--{long}"),
                 hint: arg.get_help().map(ToString::to_string).unwrap_or_default(),
             })
@@ -444,13 +438,13 @@ fn flag_candidates(node: &clap::Command) -> Option<Vec<Candidate>> {
 
 /// Each element twice: the short `@ref` and the navigation-proof quoted `role:name` — fuzzy
 /// filtering narrows to whichever form the user started typing.
-fn ref_candidates(ctx: &Context) -> Vec<Candidate> {
+fn ref_candidates(ctx: &Context) -> Vec<Suggestion> {
     let mut out = Vec::with_capacity(ctx.refs.len() * 2);
     for element in &ctx.refs {
         let identity = format!("{} \"{}\"", element.role, element.name.trim());
-        out.push(Candidate { insert: format!("@{}", element.reference), hint: identity });
+        out.push(Suggestion { insert: format!("@{}", element.reference), hint: identity });
         if !element.name.trim().is_empty() {
-            out.push(Candidate {
+            out.push(Suggestion {
                 insert: quote(&format!("{}:{}", element.role, element.name.trim())),
                 hint: format!("@{}", element.reference),
             });
@@ -459,12 +453,12 @@ fn ref_candidates(ctx: &Context) -> Vec<Candidate> {
     out
 }
 
-fn named(names: &[String]) -> Vec<Candidate> {
-    names.iter().map(|name| Candidate { insert: name.clone(), hint: String::new() }).collect()
+fn named(names: &[String]) -> Vec<Suggestion> {
+    names.iter().map(|name| Suggestion { insert: name.clone(), hint: String::new() }).collect()
 }
 
-fn plain(values: &[&str]) -> Vec<Candidate> {
-    values.iter().map(|v| Candidate { insert: (*v).to_owned(), hint: String::new() }).collect()
+fn plain(values: &[&str]) -> Vec<Suggestion> {
+    values.iter().map(|v| Suggestion { insert: (*v).to_owned(), hint: String::new() }).collect()
 }
 
 fn about(cmd: &clap::Command) -> String {

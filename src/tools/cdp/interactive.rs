@@ -24,7 +24,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::time;
 
 use crate::cdp::{Source, TargetKind, TimelineEvent, TrackKind};
-use crate::tui::{fuzzy, EventReader, LineEditor, Session, SessionOptions};
+use crate::tui::{fuzzy, EventReader, LineEditor, Session, SessionOptions, SuggestionMenu};
 
 use super::protocol::{Command, Frame, Reply, SubscriptionOverload, TargetActivity};
 use super::registry::Record;
@@ -141,18 +141,9 @@ struct Repl {
     /// Live data the completion engine draws on beyond the static grammar.
     complete_ctx: complete::Context,
     /// The always-on suggestion menu, when the current word has candidates and isn't muted.
-    suggestions: Option<Suggestions>,
+    suggestions: Option<SuggestionMenu>,
     /// Word start Esc silenced — the menu stays hidden until the cursor enters a new word.
     muted_at: Option<usize>,
-}
-
-/// The always-on suggestion menu: candidates for the word under the cursor, recomputed after
-/// every edit. `selected: None` is the passive display — Enter still submits and typing still
-/// types; Tab/↓ engage a selection, which Enter/→ then accept.
-struct Suggestions {
-    candidates: Vec<complete::Candidate>,
-    start: usize,
-    selected: Option<usize>,
 }
 
 impl Repl {
@@ -446,12 +437,11 @@ impl Repl {
             return;
         }
         // Edits always return the menu to passive — selection is an explicit gesture.
-        self.suggestions =
-            Some(Suggestions { candidates: found.candidates, start: found.start, selected: None });
+        self.suggestions = Some(SuggestionMenu::new(found.candidates, found.start));
     }
 
     fn engaged(&self) -> bool {
-        self.suggestions.as_ref().is_some_and(|menu| menu.selected.is_some())
+        self.suggestions.as_ref().is_some_and(SuggestionMenu::is_engaged)
     }
 
     fn cycle_selection(&mut self, step: isize) {
@@ -459,27 +449,22 @@ impl Repl {
             return;
         };
         // A single candidate has nothing to choose between — engaging it accepts it.
-        if menu.selected.is_none() && menu.candidates.len() == 1 {
-            menu.selected = Some(0);
+        if !menu.is_engaged() && menu.len() == 1 {
+            menu.cycle(1);
             self.accept_selected();
             return;
         }
-        let len = menu.candidates.len() as isize;
-        menu.selected = Some(match menu.selected {
-            None if step > 0 => 0,
-            None => (len - 1) as usize,
-            Some(at) => ((at as isize + step).rem_euclid(len)) as usize,
-        });
+        menu.cycle(step);
     }
 
     fn disengage(&mut self) {
         if let Some(menu) = &mut self.suggestions {
-            menu.selected = None;
+            menu.disengage();
         }
     }
 
     fn mute_suggestions(&mut self) {
-        self.muted_at = self.suggestions.as_ref().map(|menu| menu.start);
+        self.muted_at = self.suggestions.as_ref().map(SuggestionMenu::start);
         self.suggestions = None;
     }
 
@@ -487,10 +472,10 @@ impl Repl {
         let Some(menu) = self.suggestions.take() else {
             return;
         };
-        let Some(candidate) = menu.selected.and_then(|at| menu.candidates.get(at)) else {
+        let Some(candidate) = menu.selected() else {
             return;
         };
-        let mut line = self.input.value()[..menu.start].to_owned();
+        let mut line = self.input.value()[..menu.start()].to_owned();
         line.push_str(&candidate.insert);
         line.push(' ');
         self.input.set(line);
@@ -992,7 +977,7 @@ fn parse_source_filter(rest: &[String]) -> Result<Option<Source>, String> {
 
 fn render(frame: &mut TuiFrame, repl: &mut Repl) {
     let area = frame.area();
-    let shown = repl.suggestions.as_ref().map_or(0, |menu| menu_rows(menu, area));
+    let shown = repl.suggestions.as_ref().map_or(0, |menu| menu.visible_rows(area, 8, 8));
     let menu_height = if shown == 0 { 0 } else { shown as u16 + 1 };
     let chunks = Layout::vertical([
         Constraint::Length(3),
@@ -1009,7 +994,7 @@ fn render(frame: &mut TuiFrame, repl: &mut Repl) {
     render_feed(frame, chunks[1], repl, lines);
     if shown > 0 {
         if let Some(menu) = &repl.suggestions {
-            render_suggestions(frame, chunks[2], menu, shown);
+            menu.render(frame, chunks[2], shown, 24, crate::tui::theme::NORD);
         }
     }
     render_input(frame, chunks[3], repl);
@@ -1020,63 +1005,6 @@ fn render(frame: &mut TuiFrame, repl: &mut Repl) {
     if let Some(picker) = &repl.picker {
         render_picker(frame, area, picker);
     }
-}
-
-/// Rows the suggestion section may claim: capped, and never enough to squeeze the feed
-/// below a few visible lines.
-fn menu_rows(menu: &Suggestions, area: Rect) -> usize {
-    const ROWS: usize = 8;
-    let room = (area.height as usize).saturating_sub(8);
-    menu.candidates.len().min(ROWS).min(room)
-}
-
-/// The suggestion section: a dedicated band between the feed and the prompt — part of the
-/// layout, never painted over content. Passive rows are unlit; ⇥/↓ engage a picker-style
-/// bar, and the rule line says what ⏎ will do. Windows around the selection when the list
-/// outgrows the band.
-fn render_suggestions(frame: &mut TuiFrame, area: Rect, menu: &Suggestions, shown: usize) {
-    let offset = menu.selected.unwrap_or(0).saturating_sub(shown - 1);
-    let hint_width = (area.width as usize).saturating_sub(32);
-
-    let mut lines = vec![menu_rule(menu, offset, shown, area.width as usize)];
-    for (index, candidate) in menu.candidates.iter().enumerate().skip(offset).take(shown) {
-        let engaged = menu.selected == Some(index);
-        let marker = if engaged { "▌ " } else { "  " };
-        let insert_style = if engaged {
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::Gray)
-        };
-        let hint = if candidate.hint.is_empty() {
-            String::new()
-        } else {
-            format!("  {}", truncate(&candidate.hint, hint_width))
-        };
-        lines.push(Line::from(vec![
-            Span::styled(marker, Style::default().fg(Color::Cyan)),
-            Span::styled(format!("{:<24}", truncate(&candidate.insert, 24)), insert_style),
-            Span::styled(hint, Style::default().fg(Color::DarkGray)),
-        ]));
-    }
-    frame.render_widget(Paragraph::new(lines), area);
-}
-
-/// The band's top rule: match count, hidden-row indicators, and the keys that matter right
-/// now — ⇥ to engage while passive, ⏎/esc once a row is engaged.
-fn menu_rule(menu: &Suggestions, offset: usize, shown: usize, width: usize) -> Line<'static> {
-    let mut label = format!("─ suggestions · {} ", menu.candidates.len());
-    if offset > 0 {
-        label.push_str(&format!("· ↑ {offset} "));
-    }
-    let below = menu.candidates.len() - offset - shown;
-    if below > 0 {
-        label.push_str(&format!("· ↓ {below} "));
-    }
-    let keys =
-        if menu.selected.is_some() { " ⏎ accept · esc back ─" } else { " ⇥ select ─" };
-    let fill = width.saturating_sub(label.chars().count() + keys.chars().count());
-    let rule = format!("{label}{}{keys}", "─".repeat(fill));
-    Line::from(Span::styled(rule, Style::default().fg(Color::DarkGray)))
 }
 
 fn render_header(frame: &mut TuiFrame, area: Rect, repl: &Repl) {
@@ -1411,45 +1339,6 @@ mod tests {
             Input::Session(_) => "session",
             Input::Error(_) => "error",
         }
-    }
-
-    fn menu(count: usize, selected: Option<usize>) -> Suggestions {
-        let candidates = (0..count)
-            .map(|n| complete::Candidate { insert: format!("c{n}"), hint: String::new() })
-            .collect();
-        Suggestions { candidates, start: 0, selected }
-    }
-
-    fn rule_text(menu: &Suggestions, offset: usize, shown: usize) -> String {
-        menu_rule(menu, offset, shown, 80).spans.iter().map(|span| span.content.clone()).collect()
-    }
-
-    /// The band's rule line carries the whole story: match count, hidden rows on either side
-    /// of the window, and the keys whose meaning depends on engagement.
-    #[test]
-    fn menu_rule_reports_window_and_keys() {
-        let passive = menu(12, None);
-        let rule = rule_text(&passive, 0, 8);
-        assert!(rule.contains("suggestions · 12"), "{rule}");
-        assert!(rule.contains("↓ 4"), "{rule}");
-        assert!(!rule.contains('↑'), "{rule}");
-        assert!(rule.contains("⇥ select"), "{rule}");
-
-        let engaged = menu(12, Some(9));
-        let rule = rule_text(&engaged, 2, 8);
-        assert!(rule.contains("↑ 2"), "{rule}");
-        assert!(rule.contains("↓ 2"), "{rule}");
-        assert!(rule.contains("⏎ accept"), "{rule}");
-    }
-
-    /// The band scales to its content but never starves the feed on a short terminal.
-    #[test]
-    fn menu_rows_cap_against_short_terminals() {
-        let area = |height| Rect { x: 0, y: 0, width: 80, height };
-        assert_eq!(menu_rows(&menu(3, None), area(40)), 3);
-        assert_eq!(menu_rows(&menu(20, None), area(40)), 8);
-        assert_eq!(menu_rows(&menu(20, None), area(12)), 4);
-        assert_eq!(menu_rows(&menu(20, None), area(8)), 0);
     }
 
     /// The interactive prompt speaks the whole verification grammar — a typed `do`, `watch`,

@@ -20,11 +20,14 @@ directories = "6"
 unicode-width = "0.2"
 thiserror = "2"
 shell-words = "1"
+ignore = "0.4"
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "process", "signal"] }
 
 ratatui = "0.30"
 crossterm = "0.29"
+pulldown-cmark = "0.13"
+syntect = "5"
 sysinfo = { version = "=0.37.2", default-features = false, features = ["system", "user"] }
 
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
