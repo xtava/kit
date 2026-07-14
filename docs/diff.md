@@ -1,8 +1,9 @@
 # `kit diff`
 
-`kit diff` is a read-only terminal viewer for the current Git repository. It shows staged changes
+`kit diff` is a terminal review surface for the current Git repository. It shows staged changes
 (`HEAD` to index) and unstaged changes (`index` to worktree) as separate tree groups, so a path with
-both kinds of changes appears once in each group with the correct comparison.
+both kinds of changes appears once in each group with the correct comparison. The selected file can
+be staged or unstaged without leaving the viewer.
 
 ```bash
 kit diff
@@ -26,15 +27,17 @@ its 50-column content minimum for genuinely two-sided comparisons instead of sil
 | `←` / `→` | Move between the Changes, old-file, and new-file regions |
 | `h` / `l` | Pan the active code region horizontally |
 | `v` | Toggle unified and split projections |
+| `s` | Stage the selected Changes file or unstage the selected Staged file |
+| `r` | Refresh staged, unstaged, and untracked changes from Git |
 | `Tab` / `Shift-Tab` | Cycle the visible interactive regions |
 | `Home` / `End` | Return to the start and reset panning, or jump to the end |
 | `q`, `Esc`, `Ctrl-C`, `Ctrl-D` | Quit and restore the terminal |
 
 The cyan border identifies the active region. Click a file to select it, or click a group/directory
-to expand or collapse it. The wheel scrolls the surface under the pointer; Shift-wheel pans the
-active code region. In split mode, click a region to activate it and drag the center divider to
-resize it. The divider is clamped so neither side disappears. Use `--no-mouse` to keep terminal
-mouse reporting disabled.
+to expand or collapse it. Each wheel event scrolls the surface under the pointer by one row;
+Shift-wheel pans the active code region. In split mode, click a region to activate it and drag the
+center divider to resize it. The divider is clamped so neither side disappears. Use `--no-mouse` to
+keep terminal mouse reporting disabled.
 
 ## Review presentation
 
@@ -66,10 +69,11 @@ CRLF and missing-final-newline information. Paths that are not valid UTF-8 are b
 
 ## Scope and limitations
 
-`kit diff` never stages, unstages, discards, edits, commits, or writes repository state. It has no
-watch mode or automatic refresh; quit and reopen it to load new repository state. It does not show
-ignored files, recurse into submodules, compare arbitrary commits/ranges, read patch files or stdin,
-or perform semantic/AST diffing.
+`kit diff` writes only the Git index when `s` is pressed. It never discards or edits worktree content,
+creates commits, or changes branches. Press `r` to refresh manually; the current snapshot remains
+visible if reloading fails. It has no automatic watch mode. It does not show ignored files, recurse
+into submodules, compare arbitrary commits/ranges, read patch files or stdin, or perform semantic/AST
+diffing.
 
 The default code behavior is horizontal scrolling rather than wrapping, because wrapping would break
 the shared row identity required by the side-by-side projection.

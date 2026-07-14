@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{anyhow, Context as _, Result};
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -13,6 +13,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use super::git::{load_repository, stage_document, unstage_document};
 use super::model::{
     ChangeGroup, ChangeKind, DiffBody, DiffDocument, LineCell, RowKind, SpecialState,
     TextDiffDocument, TextSnapshot,
@@ -68,6 +69,7 @@ struct ReviewAnchor {
 }
 
 pub async fn run(
+    cwd: PathBuf,
     documents: Vec<DiffDocument>,
     theme: TuiTheme,
     mouse_capture: bool,
@@ -76,28 +78,128 @@ pub async fn run(
     let mut app = DiffApp::new(documents, theme, mode);
     let mut session = Session::open(SessionOptions { mouse_capture })?;
     let mut events = EventReader::start();
+    let mut repository_task = None;
 
     loop {
         session.draw(|frame| render(frame, &mut app))?;
-        match events.recv().await {
-            Some(Event::Key(key)) if key.is_press() => {
-                if app.on_key(key) == Flow::Quit {
-                    break;
+        let event = if let Some(task) = repository_task.as_mut() {
+            tokio::select! {
+                event = events.recv() => RuntimeEvent::Terminal(event),
+                result = task => RuntimeEvent::RepositoryUpdated(result),
+            }
+        } else {
+            RuntimeEvent::Terminal(events.recv().await)
+        };
+        let flow = match event {
+            RuntimeEvent::Terminal(event) => handle_terminal_event(&mut app, event),
+            RuntimeEvent::RepositoryUpdated(result) => {
+                repository_task = None;
+                app.finish_repository_operation(match result {
+                    Ok(result) => result,
+                    Err(error) => Err(anyhow!("repository task failed: {error}")),
+                });
+                Flow::Continue
+            }
+        };
+        match flow {
+            Flow::Quit => break,
+            Flow::Refresh if repository_task.is_none() => {
+                let operation = RepositoryOperation::Refresh;
+                app.repository_status = Some(RepositoryStatus::Running(operation.running_label()));
+                repository_task = Some(spawn_repository_operation(cwd.clone(), operation));
+            }
+            Flow::ToggleStage if repository_task.is_none() => {
+                if let Some(operation) = app.selected_repository_operation() {
+                    app.repository_status =
+                        Some(RepositoryStatus::Running(operation.running_label()));
+                    repository_task = Some(spawn_repository_operation(cwd.clone(), operation));
                 }
             }
-            Some(Event::Mouse(mouse)) => app.on_mouse(mouse),
-            Some(Event::Resize(_, _)) => {}
-            None => break,
-            _ => {}
+            Flow::Continue | Flow::Refresh | Flow::ToggleStage => {}
         }
     }
     Ok(())
 }
 
+fn handle_terminal_event(app: &mut DiffApp, event: Option<Event>) -> Flow {
+    match event {
+        Some(Event::Key(key)) if key.is_press() => app.on_key(key),
+        Some(Event::Mouse(mouse)) => {
+            app.on_mouse(mouse);
+            Flow::Continue
+        }
+        Some(Event::Resize(_, _)) => Flow::Continue,
+        None => Flow::Quit,
+        _ => Flow::Continue,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Flow {
     Continue,
+    Refresh,
+    ToggleStage,
     Quit,
+}
+
+enum RuntimeEvent {
+    Terminal(Option<Event>),
+    RepositoryUpdated(
+        std::result::Result<Result<(Vec<DiffDocument>, &'static str)>, tokio::task::JoinError>,
+    ),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RepositoryStatus {
+    Running(&'static str),
+    Success(&'static str),
+    Error(String),
+}
+
+#[derive(Clone, Debug)]
+enum RepositoryOperation {
+    Refresh,
+    Stage(DiffDocument),
+    Unstage(DiffDocument),
+}
+
+impl RepositoryOperation {
+    fn running_label(&self) -> &'static str {
+        match self {
+            Self::Refresh => "refreshing…",
+            Self::Stage(_) => "staging…",
+            Self::Unstage(_) => "unstaging…",
+        }
+    }
+
+    fn success_label(&self) -> &'static str {
+        match self {
+            Self::Refresh => "refreshed",
+            Self::Stage(_) => "staged",
+            Self::Unstage(_) => "unstaged",
+        }
+    }
+
+    fn execute(&self, cwd: &Path) -> Result<()> {
+        match self {
+            Self::Refresh => Ok(()),
+            Self::Stage(document) => stage_document(cwd, document).context("stage selected file"),
+            Self::Unstage(document) => {
+                unstage_document(cwd, document).context("unstage selected file")
+            }
+        }
+    }
+}
+
+fn spawn_repository_operation(
+    cwd: PathBuf,
+    operation: RepositoryOperation,
+) -> tokio::task::JoinHandle<Result<(Vec<DiffDocument>, &'static str)>> {
+    tokio::task::spawn_blocking(move || {
+        operation.execute(&cwd)?;
+        let documents = load_repository(&cwd).context("reload repository after operation")?;
+        Ok((documents, operation.success_label()))
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -143,6 +245,7 @@ struct DiffApp {
     active_region: ActiveRegion,
     divider_percent: u16,
     dragging_divider: bool,
+    repository_status: Option<RepositoryStatus>,
     theme: TuiTheme,
     regions: UiRegions,
 }
@@ -167,6 +270,7 @@ impl DiffApp {
             active_region: ActiveRegion::Changes,
             divider_percent: 50,
             dragging_divider: false,
+            repository_status: None,
             theme,
             regions: UiRegions::default(),
         }
@@ -180,6 +284,8 @@ impl DiffApp {
         }
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return Flow::Quit,
+            KeyCode::Char('r') if key.modifiers.is_empty() => return Flow::Refresh,
+            KeyCode::Char('s') if key.modifiers.is_empty() => return Flow::ToggleStage,
             KeyCode::Down | KeyCode::Char('j') => match self.active_region {
                 ActiveRegion::Changes => self.select_relative(1),
                 ActiveRegion::Old | ActiveRegion::New => self.scroll_content(1),
@@ -214,6 +320,72 @@ impl DiffApp {
             _ => {}
         }
         Flow::Continue
+    }
+
+    fn finish_repository_operation(&mut self, result: Result<(Vec<DiffDocument>, &'static str)>) {
+        match result {
+            Ok((documents, label)) => {
+                self.replace_documents(documents);
+                self.repository_status = Some(RepositoryStatus::Success(label));
+            }
+            Err(error) => self.repository_status = Some(RepositoryStatus::Error(error.to_string())),
+        }
+    }
+
+    fn selected_repository_operation(&self) -> Option<RepositoryOperation> {
+        let document = self.selected.and_then(|index| self.documents.get(index))?.clone();
+        Some(match document.group {
+            ChangeGroup::Staged => RepositoryOperation::Unstage(document),
+            ChangeGroup::Changes => RepositoryOperation::Stage(document),
+        })
+    }
+
+    fn replace_documents(&mut self, documents: Vec<DiffDocument>) {
+        let previous_index = self.selected.unwrap_or(0);
+        let previous_identity = self
+            .selected
+            .and_then(|index| self.documents.get(index))
+            .map(|document| (document.group, document.display_path().map(Path::to_path_buf)));
+        let previous_keys = directory_keys(&self.documents).into_iter().collect::<HashSet<_>>();
+        let new_keys = directory_keys(&documents);
+        self.expanded = new_keys
+            .into_iter()
+            .filter(|key| !previous_keys.contains(key) || self.expanded.contains(key))
+            .collect();
+        self.documents = documents;
+        self.selected = previous_identity
+            .as_ref()
+            .and_then(|(group, path)| {
+                self.documents.iter().position(|document| {
+                    document.group == *group && document.display_path() == path.as_deref()
+                })
+            })
+            .or_else(|| {
+                previous_identity.as_ref().and_then(|(_, path)| {
+                    self.documents
+                        .iter()
+                        .position(|document| document.display_path() == path.as_deref())
+                })
+            })
+            .or_else(|| {
+                (!self.documents.is_empty()).then_some(previous_index.min(self.documents.len() - 1))
+            });
+        self.reset_document_position();
+        if self.selected.is_none() {
+            self.tree_scroll = 0;
+        }
+    }
+
+    fn reset_document_position(&mut self) {
+        self.content_scroll = 0;
+        self.old_horizontal_scroll = 0;
+        self.new_horizontal_scroll = 0;
+        self.selected_hunk = 0;
+        self.anchor = ReviewAnchor { hunk: 0, row: None };
+        self.rendered_anchors.clear();
+        self.restore_anchor = false;
+        self.last_effective_mode = None;
+        self.dragging_divider = false;
     }
 
     fn on_mouse(&mut self, mouse: MouseEvent) {
@@ -300,13 +472,13 @@ impl DiffApp {
     fn select(&mut self, index: usize) {
         if self.selected != Some(index) {
             self.selected = Some(index);
-            self.content_scroll = 0;
-            self.old_horizontal_scroll = 0;
-            self.new_horizontal_scroll = 0;
-            self.selected_hunk = 0;
-            self.anchor = ReviewAnchor { hunk: 0, row: None };
+            self.reset_document_position();
             self.restore_anchor = true;
         }
+        self.reveal(index);
+    }
+
+    fn reveal(&mut self, index: usize) {
         if let Some(document) = self.documents.get(index) {
             self.expanded.insert((document.group, PathBuf::new()));
             if let Some(path) = document.display_path() {
@@ -627,10 +799,17 @@ fn change_glyph(kind: Option<ChangeKind>) -> &'static str {
 fn render_document(frame: &mut Frame<'_>, area: Rect, app: &mut DiffApp) {
     let effective = app.effective_mode(area.width.saturating_sub(2));
     let controls = match effective {
-        EffectiveMode::Single => " ↑↓ move  ←→ region  h/l pan  n/N change  q quit ",
-        EffectiveMode::Unified => " ↑↓ move  ←→ region  h/l pan  n/N change  v view  q quit ",
-        EffectiveMode::Split => " ↑↓ move  ←→ region  h/l pan  n/N change  Tab cycle  q quit ",
+        EffectiveMode::Single => {
+            " ↑↓ move  ←→ region  h/l pan  n/N change  s stage/unstage  r refresh  q quit "
+        }
+        EffectiveMode::Unified => {
+            " ↑↓ move  ←→ region  h/l pan  n/N change  v view  s stage/unstage  r refresh  q quit "
+        }
+        EffectiveMode::Split => {
+            " ↑↓ move  ←→ region  h/l pan  n/N change  Tab cycle  s stage/unstage  r refresh  q quit "
+        }
     };
+    let footer = repository_footer(app, controls);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -640,7 +819,7 @@ fn render_document(frame: &mut Frame<'_>, area: Rect, app: &mut DiffApp) {
             app.theme.accent
         }))
         .title(document_title(app))
-        .title_bottom(Line::from(controls));
+        .title_bottom(footer);
     let inner = block.inner(area);
     app.regions.content_inner = inner;
     frame.render_widget(block, area);
@@ -692,6 +871,20 @@ fn render_document(frame: &mut Frame<'_>, area: Rect, app: &mut DiffApp) {
             .scroll((app.content_scroll.min(u16::MAX as usize) as u16, 0)),
         inner,
     );
+}
+
+fn repository_footer(app: &DiffApp, controls: &'static str) -> Line<'static> {
+    let Some(status) = &app.repository_status else {
+        return Line::from(controls);
+    };
+    let (message, color) = match status {
+        RepositoryStatus::Running(label) => (format!(" {label} "), app.theme.warning),
+        RepositoryStatus::Success(label) => (format!(" {label} "), app.theme.success),
+        RepositoryStatus::Error(error) => {
+            (format!(" operation failed: {error} "), app.theme.danger)
+        }
+    };
+    Line::from(vec![Span::styled(message, Style::default().fg(color)), Span::raw(controls)])
 }
 
 fn document_title(app: &DiffApp) -> Line<'static> {
@@ -757,9 +950,10 @@ fn document_lines(
             app.theme,
         ),
         DiffBody::Unavailable(error) => special_lines(&format!("Unavailable: {error}"), app.theme),
-        DiffBody::Special(SpecialState::Conflict) => {
-            special_lines("Unmerged conflict. Resolve it outside this read-only viewer.", app.theme)
-        }
+        DiffBody::Special(SpecialState::Conflict) => special_lines(
+            "Unmerged conflict. Resolve it in the worktree, then press s to stage it.",
+            app.theme,
+        ),
         DiffBody::Special(SpecialState::Submodule { state }) => {
             special_lines(&format!("Submodule state: {state}"), app.theme)
         }
@@ -1568,6 +1762,111 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert!(screen(&terminal).contains("b.rs"));
         assert!(!app.regions.tree.is_empty());
+    }
+
+    #[test]
+    fn refresh_key_is_an_explicit_runtime_action() {
+        let mut app = DiffApp::new(Vec::new(), NORD, ViewMode::Unified);
+
+        assert_eq!(
+            app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
+            Flow::Refresh
+        );
+        assert_eq!(
+            app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+            Flow::Continue
+        );
+        assert_eq!(
+            app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)),
+            Flow::ToggleStage
+        );
+    }
+
+    #[test]
+    fn selected_group_determines_the_index_operation() {
+        let mut app = DiffApp::new(
+            vec![
+                document(ChangeGroup::Staged, "staged.rs", "old\n", "new\n"),
+                document(ChangeGroup::Changes, "changed.rs", "old\n", "new\n"),
+            ],
+            NORD,
+            ViewMode::Unified,
+        );
+
+        assert!(matches!(
+            app.selected_repository_operation(),
+            Some(RepositoryOperation::Unstage(document))
+                if document.display_path() == Some(Path::new("staged.rs"))
+        ));
+        app.select(1);
+        assert!(matches!(
+            app.selected_repository_operation(),
+            Some(RepositoryOperation::Stage(document))
+                if document.display_path() == Some(Path::new("changed.rs"))
+        ));
+    }
+
+    #[test]
+    fn successful_refresh_preserves_identity_and_expansion_policy() {
+        let documents = vec![
+            document(ChangeGroup::Changes, "src/lib.rs", "old\n", "new\n"),
+            document(ChangeGroup::Changes, "src/nested/keep.rs", "old\n", "new\n"),
+        ];
+        let mut app = DiffApp::new(documents, NORD, ViewMode::Unified);
+        app.select(1);
+        app.expanded.remove(&(ChangeGroup::Changes, "src/nested".into()));
+        app.content_scroll = 12;
+
+        app.finish_repository_operation(Ok((
+            vec![
+                document(ChangeGroup::Changes, "fresh/deep/new.rs", "before\n", "after\n"),
+                document(ChangeGroup::Changes, "src/nested/keep.rs", "old\n", "newer\nextra\n"),
+            ],
+            "refreshed",
+        )));
+
+        let selected = app.selected.and_then(|index| app.documents.get(index)).unwrap();
+        assert_eq!(selected.display_path(), Some(Path::new("src/nested/keep.rs")));
+        assert!(!app.expanded.contains(&(ChangeGroup::Changes, "src/nested".into())));
+        assert!(app.expanded.contains(&(ChangeGroup::Changes, "fresh/deep".into())));
+        assert_eq!(app.content_scroll, 0);
+        assert_eq!(app.repository_status, Some(RepositoryStatus::Success("refreshed")));
+    }
+
+    #[test]
+    fn refresh_follows_a_selected_path_between_change_groups() {
+        let mut app = DiffApp::new(
+            vec![document(ChangeGroup::Changes, "src/lib.rs", "old\n", "new\n")],
+            NORD,
+            ViewMode::Unified,
+        );
+
+        app.finish_repository_operation(Ok((
+            vec![document(ChangeGroup::Staged, "src/lib.rs", "old\n", "new\n")],
+            "staged",
+        )));
+
+        let selected = app.selected.and_then(|index| app.documents.get(index)).unwrap();
+        assert_eq!(selected.group, ChangeGroup::Staged);
+        assert_eq!(selected.display_path(), Some(Path::new("src/lib.rs")));
+    }
+
+    #[test]
+    fn failed_refresh_keeps_the_last_valid_snapshot() {
+        let mut app = DiffApp::new(
+            vec![document(ChangeGroup::Changes, "src/lib.rs", "old\n", "new\n")],
+            NORD,
+            ViewMode::Unified,
+        );
+
+        app.finish_repository_operation(Err(anyhow!("git status failed")));
+
+        assert_eq!(app.documents.len(), 1);
+        assert_eq!(app.documents[0].display_path(), Some(Path::new("src/lib.rs")));
+        assert_eq!(
+            app.repository_status,
+            Some(RepositoryStatus::Error("git status failed".to_owned()))
+        );
     }
 
     #[test]

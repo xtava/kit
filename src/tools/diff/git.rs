@@ -45,6 +45,78 @@ pub fn load_repository(cwd: &Path) -> Result<Vec<DiffDocument>> {
     Ok(documents)
 }
 
+pub fn stage_document(cwd: &Path, document: &DiffDocument) -> Result<()> {
+    if document.group != ChangeGroup::Changes {
+        bail!("only an unstaged document can be staged");
+    }
+    let root = repository_root(cwd)?;
+    let paths = document_paths(document)?;
+    let mut arguments = vec![OsString::from("add"), OsString::from("-A"), OsString::from("--")];
+    arguments.extend(paths.iter().map(|path| path.as_os_str().to_os_string()));
+    git_output_os(&root, &arguments)?;
+    Ok(())
+}
+
+pub fn unstage_document(cwd: &Path, document: &DiffDocument) -> Result<()> {
+    if document.group != ChangeGroup::Staged {
+        bail!("only a staged document can be unstaged");
+    }
+    let root = repository_root(cwd)?;
+    let paths = document_paths(document)?;
+    let mut arguments = if repository_has_head(&root)? {
+        vec![OsString::from("restore"), OsString::from("--staged"), OsString::from("--")]
+    } else {
+        vec![
+            OsString::from("rm"),
+            OsString::from("--cached"),
+            OsString::from("--force"),
+            OsString::from("--ignore-unmatch"),
+            OsString::from("--"),
+        ]
+    };
+    arguments.extend(paths.iter().map(|path| path.as_os_str().to_os_string()));
+    git_output_os(&root, &arguments)?;
+    Ok(())
+}
+
+fn document_paths(document: &DiffDocument) -> Result<Vec<PathBuf>> {
+    let candidates: [Option<&Path>; 2] = match document.kind {
+        ChangeKind::Renamed => [document.old_path.as_deref(), document.new_path.as_deref()],
+        ChangeKind::Copied => [None, document.new_path.as_deref()],
+        _ => [None, document.display_path()],
+    };
+    let mut paths = Vec::new();
+    for path in candidates.into_iter().flatten() {
+        if !paths.iter().any(|candidate| candidate == path) {
+            paths.push(path.to_path_buf());
+        }
+    }
+    if paths.is_empty() {
+        bail!("selected document has no Git path");
+    }
+    Ok(paths)
+}
+
+fn repository_has_head(root: &Path) -> Result<bool> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", "HEAD"])
+        .current_dir(root)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output()
+        .with_context(|| format!("check Git HEAD in {}", root.display()))?;
+    if output.status.success() {
+        return Ok(true);
+    }
+    if output.status.code() == Some(1) && output.stderr.is_empty() {
+        return Ok(false);
+    }
+    bail!(
+        "git rev-parse --verify --quiet HEAD failed in {}: {}",
+        root.display(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    )
+}
+
 fn repository_root(cwd: &Path) -> Result<PathBuf> {
     let output = git_output(cwd, &["rev-parse", "--show-toplevel"])?;
     let root = trim_line_ending(&output.stdout);
@@ -477,6 +549,67 @@ mod tests {
     }
 
     #[test]
+    fn stages_and_unstages_only_the_selected_path() {
+        let repo = TestRepo::new();
+        repo.write("selected file.txt", "base\n");
+        repo.write("other.txt", "base\n");
+        repo.git(&["add", "."]);
+        repo.git(&["commit", "-m", "base"]);
+        repo.write("selected file.txt", "selected change\n");
+        repo.write("other.txt", "other change\n");
+
+        let documents = load_repository(&repo.path).unwrap();
+        let selected = find(&documents, ChangeGroup::Changes, "selected file.txt").clone();
+        stage_document(&repo.path, &selected).unwrap();
+
+        let documents = load_repository(&repo.path).unwrap();
+        assert!(has(&documents, ChangeGroup::Staged, "selected file.txt", ChangeKind::Modified));
+        assert!(has(&documents, ChangeGroup::Changes, "other.txt", ChangeKind::Modified));
+        let selected = find(&documents, ChangeGroup::Staged, "selected file.txt").clone();
+        unstage_document(&repo.path, &selected).unwrap();
+
+        let documents = load_repository(&repo.path).unwrap();
+        assert!(has(&documents, ChangeGroup::Changes, "selected file.txt", ChangeKind::Modified));
+        assert!(!documents.iter().any(|document| document.group == ChangeGroup::Staged));
+        assert_eq!(fs::read(repo.path.join("selected file.txt")).unwrap(), b"selected change\n");
+    }
+
+    #[test]
+    fn unstaging_a_rename_restores_both_index_paths_and_keeps_the_worktree() {
+        let repo = TestRepo::new();
+        repo.write("old name.txt", "content\n");
+        repo.git(&["add", "."]);
+        repo.git(&["commit", "-m", "base"]);
+        repo.git(&["mv", "old name.txt", "new name.txt"]);
+
+        let documents = load_repository(&repo.path).unwrap();
+        let renamed = find(&documents, ChangeGroup::Staged, "new name.txt").clone();
+        assert_eq!(renamed.kind, ChangeKind::Renamed);
+        unstage_document(&repo.path, &renamed).unwrap();
+
+        let documents = load_repository(&repo.path).unwrap();
+        assert!(!documents.iter().any(|document| document.group == ChangeGroup::Staged));
+        assert_eq!(fs::read(repo.path.join("new name.txt")).unwrap(), b"content\n");
+        assert!(!repo.path.join("old name.txt").exists());
+    }
+
+    #[test]
+    fn unstaging_in_an_unborn_repository_preserves_the_worktree_file() {
+        let repo = TestRepo::new();
+        repo.write("first.txt", "first\n");
+        repo.git(&["add", "first.txt"]);
+
+        let documents = load_repository(&repo.path).unwrap();
+        let staged = find(&documents, ChangeGroup::Staged, "first.txt").clone();
+        unstage_document(&repo.path, &staged).unwrap();
+
+        let documents = load_repository(&repo.path).unwrap();
+        assert!(has(&documents, ChangeGroup::Changes, "first.txt", ChangeKind::Untracked));
+        assert!(!documents.iter().any(|document| document.group == ChangeGroup::Staged));
+        assert_eq!(fs::read(repo.path.join("first.txt")).unwrap(), b"first\n");
+    }
+
+    #[test]
     fn represents_merge_conflicts_explicitly() {
         let repo = TestRepo::new();
         repo.write("conflict.txt", "base\n");
@@ -526,6 +659,15 @@ mod tests {
                 && document.kind == kind
                 && document.display_path() == Some(Path::new(path))
         })
+    }
+
+    fn find<'a>(documents: &'a [DiffDocument], group: ChangeGroup, path: &str) -> &'a DiffDocument {
+        documents
+            .iter()
+            .find(|document| {
+                document.group == group && document.display_path() == Some(Path::new(path))
+            })
+            .expect("document")
     }
 
     #[derive(Debug, Eq, PartialEq)]

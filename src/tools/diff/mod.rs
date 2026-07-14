@@ -1,4 +1,4 @@
-//! `diff` — read-only Git working-tree comparison and interactive review.
+//! `diff` — Git working-tree comparison and index review.
 
 mod git;
 mod model;
@@ -25,7 +25,7 @@ pub struct DiffTool;
 #[command(
     name = "diff",
     about = "Review staged and unstaged Git changes",
-    long_about = "Opens a read-only terminal viewer for the current repository's staged, unstaged, and untracked changes."
+    long_about = "Opens a terminal viewer for the current repository's staged, unstaged, and untracked changes, with selected-file staging controls."
 )]
 struct DiffArgs {
     /// Initial projection. Auto uses split when the content pane is wide enough.
@@ -76,6 +76,6 @@ impl Tool for DiffTool {
             ModeArg::Unified => tui::ViewMode::Unified,
             ModeArg::Split => tui::ViewMode::Split,
         };
-        tui::run(documents, theme, !args.no_mouse, mode).await
+        tui::run(cwd, documents, theme, !args.no_mouse, mode).await
     }
 }
