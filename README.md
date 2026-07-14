@@ -27,6 +27,8 @@ kit scout dive             # capture a window's heap snapshot → memlab
 kit stats                  # interactive CPU/core/process monitor
 kit stats --once           # warmed-up top-process snapshot
 kit update                 # rebuild + replace the installed binary from this checkout
+kit diff                   # staged + unstaged Git review in auto unified/split mode
+kit diff --mode split      # force the side-by-side projection
 kit domain example.com io  # authoritative domain checker (+ aftermarket sale price)
 kit domain --for-sale ink  # …only names listed for sale, with buy-now/offer prices
 kit domain                 # …its TUI
@@ -55,6 +57,7 @@ rules, redacted bundles, profiles, cleanup), and the verification loop: locators
 settle, `wait`/`expect`/`verify`, `do` batches, flows, watches, and `snap --diff`.
 For the Modular Playwright recorder lane, see **[docs/record.md](./docs/record.md)**.
 For the CPU and process monitor, see **[docs/stats.md](./docs/stats.md)**.
+For the read-only staged/unstaged Git viewer, see **[docs/diff.md](./docs/diff.md)**.
 For the config-driven deploy launcher, Journal, and rollback schema, see
 **[docs/deploy.md](./docs/deploy.md)**.
 For the Markdown viewer and its fuzzy file prompt, see
@@ -82,6 +85,7 @@ src/
    ├─ cdp/            warm CDP debugger — daemon · client · snapshot · readiness · lenses
    ├─ scout/          proc · cdp (via kit::cdp) · survey · correlate · report · tui · dive
    ├─ stats/          sampler · Linux task identity/control · report · tui
+   ├─ diff/           Git porcelain source · canonical hunks/rows · unified/split TUI
    ├─ domain/         engine{dns,rdap,whois,market} · config · report · tui
    ├─ deploy/         typed plan · journal · runner · selection/history TUI
    ├─ record/         Modular Playwright recorder operator shell

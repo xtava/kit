@@ -24,10 +24,11 @@ ignore = "0.4"
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "process", "signal"] }
 
-ratatui = "0.30"
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 crossterm = "0.29"
 pulldown-cmark = "0.13"
 syntect = "5"
+similar = { version = "3", features = ["inline", "unicode"] }
 time = { version = "0.3", features = ["formatting"] }
 sysinfo = { version = "=0.37.2", default-features = false, features = ["system", "user"] }
 

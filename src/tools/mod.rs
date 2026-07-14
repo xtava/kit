@@ -3,6 +3,7 @@
 
 pub mod cdp;
 pub mod deploy;
+pub mod diff;
 pub mod domain;
 pub mod record;
 pub mod render;
