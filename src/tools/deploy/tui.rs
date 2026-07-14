@@ -1,0 +1,1457 @@
+use std::{path::Path, time::SystemTime};
+
+use ::time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use anyhow::{anyhow, Result};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::{
+    layout::{Alignment, Constraint, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, BorderType, Borders, List, ListItem, ListState, Padding, Paragraph, Wrap},
+    Frame,
+};
+use tokio::{
+    sync::{mpsc, watch},
+    task::JoinHandle,
+    time,
+};
+use unicode_width::UnicodeWidthStr;
+
+use super::{
+    cloudflare::{
+        CloudflareDeployment, CloudflareEnvironment, CloudflarePagesClient, CloudflareStageStatus,
+    },
+    config::{DeployAction, DeployTarget, LoadedPlan},
+    journal::{DeployJournal, JournalEntry, JournalStatus, JournalStore, VersionId},
+    layout::{DeployLayout, LayoutFrame, LayoutStore, SplitSurface},
+    runner::{self, OutputStream, RunOperation, RunOutcome, RunSpec, RunTargetSpec},
+    state::{App, Phase, ProgressStatus, RunIntent, VersionsSource, VersionsState},
+};
+use crate::tui::{EventReader, Session, SessionOptions};
+
+const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const CYAN: Color = Color::Rgb(136, 192, 208);
+const GREEN: Color = Color::Rgb(163, 190, 140);
+const YELLOW: Color = Color::Rgb(235, 203, 139);
+const RED: Color = Color::Rgb(191, 97, 106);
+const MAGENTA: Color = Color::Rgb(180, 142, 173);
+const TEXT: Color = Color::Rgb(216, 222, 233);
+const MUTED: Color = Color::Rgb(129, 139, 157);
+const BORDER: Color = Color::Rgb(76, 86, 106);
+const SELECTED: Color = Color::Rgb(59, 66, 82);
+
+pub async fn run(
+    loaded: LoadedPlan,
+    journal_store: JournalStore,
+    journal: DeployJournal,
+    layout_store: LayoutStore,
+    layout: DeployLayout,
+    layout_warning: Option<String>,
+) -> Result<Option<RunOutcome>> {
+    let mut session = Session::open(SessionOptions { mouse_capture: true })?;
+    let mut events = EventReader::start();
+    let mut app = App::new(loaded, journal, layout);
+    app.notice = layout_warning;
+    let (_idle_tx, mut run_events) = tokio::sync::mpsc::channel(1);
+    let (backend_tx, mut backend_events) = mpsc::channel(8);
+    let mut cancel: Option<watch::Sender<bool>> = None;
+    let mut run_handle: Option<JoinHandle<()>> = None;
+    let mut versions_handle: Option<JoinHandle<()>> = None;
+    let mut run_active = false;
+    let mut quit_after_run = false;
+    let mut fatal_error = None;
+    let mut layout_dirty = false;
+    let mut tick = time::interval(std::time::Duration::from_millis(90));
+
+    loop {
+        session.draw(|frame| render(frame, &mut app, journal_store.path().as_path()))?;
+
+        tokio::select! {
+            _ = tick.tick() => {
+                if app.phase == Phase::Running
+                    || matches!(app.versions, VersionsState::CloudflareLoading)
+                {
+                    app.spinner = app.spinner.wrapping_add(1);
+                }
+            }
+            event = run_events.recv(), if run_active => {
+                match event {
+                    Some(event) => {
+                        let finished = matches!(event, runner::RunEvent::Finished { .. });
+                        app.ingest(event);
+                        if finished {
+                            run_active = false;
+                            if !matches!(app.active_operation, Some(RunOperation::CloudflarePagesRollback { .. })) {
+                                if let Err(error) = persist_run(&mut app, &journal_store) {
+                                    app.notice = Some(format!("Could not record deploy Journal: {error:#}"));
+                                    app.outcome = Some(RunOutcome::Failed);
+                                    fatal_error = Some(error);
+                                }
+                            }
+                            if quit_after_run {
+                                break;
+                            }
+                        }
+                    }
+                    None => {
+                        fatal_error = Some(anyhow!("deploy runner stopped before reporting a Summary"));
+                        break;
+                    }
+                }
+            }
+            event = backend_events.recv() => {
+                if let Some(BackendEvent::VersionsLoaded { target_id, result }) = event {
+                    app.set_cloudflare_versions(target_id, result);
+                }
+            }
+            event = events.recv() => {
+                let action = match event {
+                    Some(event) => handle_event(event, &mut app),
+                    None => {
+                        if run_active {
+                            if let Some(cancel) = &cancel {
+                                let _ = cancel.send(true);
+                            }
+                            quit_after_run = true;
+                            continue;
+                        } else {
+                            break;
+                        }
+                    },
+                };
+
+                match action {
+                    UiAction::None => {}
+                    UiAction::Quit => break,
+                    UiAction::Cancel => {
+                        if let Some(cancel) = &cancel {
+                            let _ = cancel.send(true);
+                            app.notice = Some("Cancelling the active Step…".to_owned());
+                        }
+                    }
+                    UiAction::LoadVersions => {
+                        if let Some(handle) = versions_handle.take() {
+                            handle.abort();
+                        }
+                        match spawn_versions_load(&app, backend_tx.clone()) {
+                            Ok(handle) => versions_handle = Some(handle),
+                            Err(error) => {
+                                let target_id = app
+                                    .focused_target()
+                                    .map(|target| target.id.clone())
+                                    .unwrap_or_default();
+                                app.set_cloudflare_versions(target_id, Err(format!("{error:#}")));
+                            }
+                        }
+                    }
+                    UiAction::PersistLayout => {
+                        layout_dirty = true;
+                        persist_layout(&mut app, &layout_store, &mut layout_dirty);
+                    }
+                    UiAction::Start => {
+                        match app.intent.clone() {
+                            Some(RunIntent::CloudflarePagesRollback {
+                                target_index,
+                                deployment,
+                            }) => {
+                                let target = app
+                                    .loaded
+                                    .plan
+                                    .targets
+                                    .get(target_index)
+                                    .cloned()
+                                    .ok_or_else(|| anyhow!("selected Cloudflare Pages Target no longer exists"))?;
+                                let environment = app
+                                    .loaded
+                                    .environments
+                                    .get(&target.id)
+                                    .ok_or_else(|| anyhow!("Target '{}' has no loaded environment", target.id))?;
+                                let client = CloudflarePagesClient::for_target(&target, environment)?
+                                    .ok_or_else(|| anyhow!("selected Target has no Cloudflare Pages backend"))?;
+                                app.begin_cloudflare_rollback(&target, &deployment);
+                                let (receiver, cancel_tx, handle) =
+                                    spawn_cloudflare_rollback(client, deployment.id);
+                                run_events = receiver;
+                                cancel = Some(cancel_tx);
+                                run_handle = Some(handle);
+                                run_active = true;
+                            }
+                            Some(RunIntent::Deploy | RunIntent::Rollback { .. }) => {
+                                let spec = prepare_run(&app, &journal_store).await?;
+                                app.begin_run(&spec);
+                                let (receiver, cancel_tx, handle) = runner::spawn(spec);
+                                run_events = receiver;
+                                cancel = Some(cancel_tx);
+                                run_handle = Some(handle);
+                                run_active = true;
+                            }
+                            None => return Err(anyhow!("no deploy Run is selected")),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if run_active {
+        if let Some(cancel) = &cancel {
+            let _ = cancel.send(true);
+        }
+    }
+    if let Some(handle) = run_handle {
+        let _ = handle.await;
+    }
+    if let Some(handle) = versions_handle {
+        handle.abort();
+    }
+    let layout_exit_warning = if layout_dirty {
+        layout_store
+            .save(app.layout)
+            .err()
+            .map(|error| format!("could not save panel layout after retry: {error}"))
+    } else {
+        None
+    };
+    drop(session);
+
+    if let Some(warning) = layout_exit_warning {
+        eprintln!("kit deploy: warning: {warning}");
+    }
+
+    if let Some(error) = fatal_error {
+        return Err(error);
+    }
+    Ok(app.outcome)
+}
+
+enum UiAction {
+    None,
+    Quit,
+    Start,
+    Cancel,
+    LoadVersions,
+    PersistLayout,
+}
+
+fn handle_event(event: Event, app: &mut App) -> UiAction {
+    match event {
+        Event::Key(key) => handle_key(key, app),
+        Event::Mouse(mouse) => handle_mouse(mouse, app),
+        Event::Resize(_, _) => {
+            app.cancel_layout_drag();
+            UiAction::None
+        }
+        Event::FocusGained | Event::FocusLost | Event::Paste(_) => UiAction::None,
+    }
+}
+
+fn handle_mouse(mouse: MouseEvent, app: &mut App) -> UiAction {
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            app.begin_layout_drag(mouse.column, mouse.row);
+            UiAction::None
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            app.update_layout_drag(mouse.column);
+            UiAction::None
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            if app.finish_layout_drag() {
+                UiAction::PersistLayout
+            } else {
+                UiAction::None
+            }
+        }
+        MouseEventKind::Down(_)
+        | MouseEventKind::Up(_)
+        | MouseEventKind::Drag(_)
+        | MouseEventKind::Moved
+        | MouseEventKind::ScrollDown
+        | MouseEventKind::ScrollUp
+        | MouseEventKind::ScrollLeft
+        | MouseEventKind::ScrollRight => UiAction::None,
+    }
+}
+
+fn handle_key(key: KeyEvent, app: &mut App) -> UiAction {
+    let control_c = key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
+    if control_c {
+        app.cancel_layout_drag();
+        return if app.phase == Phase::Running { UiAction::Cancel } else { UiAction::Quit };
+    }
+
+    if app.layout_drag.is_some() {
+        if key.code == KeyCode::Esc {
+            app.cancel_layout_drag();
+        }
+        return UiAction::None;
+    }
+
+    if key.code == KeyCode::Char('=') && app.reset_active_layout().is_some() {
+        return UiAction::PersistLayout;
+    }
+
+    match app.phase {
+        Phase::Browse => match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => UiAction::Quit,
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.move_cursor(-1);
+                UiAction::None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.move_cursor(1);
+                UiAction::None
+            }
+            KeyCode::Char(' ') => {
+                app.toggle_focused();
+                UiAction::None
+            }
+            KeyCode::Char('a') => {
+                app.toggle_all();
+                UiAction::None
+            }
+            KeyCode::Char('v') => match app.open_versions() {
+                VersionsSource::Journal => UiAction::None,
+                VersionsSource::CloudflarePages => UiAction::LoadVersions,
+            },
+            KeyCode::Enter => {
+                app.review_deploy();
+                UiAction::None
+            }
+            KeyCode::Char('r') if app.versions_source() == VersionsSource::CloudflarePages => {
+                app.open_versions();
+                UiAction::LoadVersions
+            }
+            _ => UiAction::None,
+        },
+        Phase::Versions => match key.code {
+            KeyCode::Char('q') => UiAction::Quit,
+            KeyCode::Esc => {
+                app.back_to_browse();
+                UiAction::None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.move_history_cursor(-1);
+                UiAction::None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.move_history_cursor(1);
+                UiAction::None
+            }
+            KeyCode::Enter => {
+                app.review_rollback();
+                UiAction::None
+            }
+            _ => UiAction::None,
+        },
+        Phase::Review => match key.code {
+            KeyCode::Esc => {
+                app.back_from_review();
+                UiAction::None
+            }
+            KeyCode::Char('q') => UiAction::Quit,
+            KeyCode::Enter => UiAction::Start,
+            _ => UiAction::None,
+        },
+        Phase::Running => UiAction::None,
+        Phase::Summary => match key.code {
+            KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') => UiAction::Quit,
+            _ => UiAction::None,
+        },
+    }
+}
+
+fn persist_layout(app: &mut App, store: &LayoutStore, dirty: &mut bool) {
+    match store.save(app.layout) {
+        Ok(()) => {
+            *dirty = false;
+            if app.notice.as_deref().is_some_and(|notice| {
+                notice.starts_with("Could not load saved panel layout")
+                    || notice.starts_with("Could not save panel layout")
+            }) {
+                app.notice = None;
+            }
+        }
+        Err(error) => {
+            *dirty = true;
+            app.notice = Some(format!(
+                "Could not save panel layout: {error}. The current layout remains active; quit to retry."
+            ));
+        }
+    }
+}
+
+async fn prepare_run(app: &App, journal_store: &JournalStore) -> Result<RunSpec> {
+    match app.intent.as_ref().ok_or_else(|| anyhow!("no deploy Run is selected"))? {
+        RunIntent::Deploy => {
+            let mut targets = Vec::new();
+            for target in app.selected_targets() {
+                let working_dir = target_working_dir(&app.loaded.base_dir, &target);
+                let version = journal_store.current_version(&target.id, &working_dir).await?;
+                let environment =
+                    app.loaded.environments.get(&target.id).cloned().ok_or_else(|| {
+                        anyhow!("Target '{}' has no loaded environment", target.id)
+                    })?;
+                targets.push(RunTargetSpec { target, version, environment });
+            }
+            Ok(RunSpec {
+                base_dir: app.loaded.base_dir.clone(),
+                operation: RunOperation::Deploy,
+                targets,
+            })
+        }
+        RunIntent::Rollback { version, .. } => {
+            let target = app
+                .review_targets()
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow!("selected Target has no rollback Steps"))?;
+            let environment = app
+                .loaded
+                .environments
+                .get(&target.id)
+                .cloned()
+                .ok_or_else(|| anyhow!("Target '{}' has no loaded environment", target.id))?;
+            Ok(RunSpec {
+                base_dir: app.loaded.base_dir.clone(),
+                operation: RunOperation::Rollback { selected_version: version.clone() },
+                targets: vec![RunTargetSpec { target, version: version.clone(), environment }],
+            })
+        }
+        RunIntent::CloudflarePagesRollback { .. } => {
+            Err(anyhow!("Cloudflare Pages rollback must use the platform API"))
+        }
+    }
+}
+
+enum BackendEvent {
+    VersionsLoaded { target_id: String, result: Result<Vec<CloudflareDeployment>, String> },
+}
+
+fn spawn_versions_load(app: &App, sender: mpsc::Sender<BackendEvent>) -> Result<JoinHandle<()>> {
+    let target = app.focused_target().ok_or_else(|| anyhow!("no Target is selected"))?;
+    let target_id = target.id.clone();
+    let environment = app
+        .loaded
+        .environments
+        .get(&target.id)
+        .ok_or_else(|| anyhow!("Target '{}' has no loaded environment", target.id))?;
+    let client = CloudflarePagesClient::for_target(target, environment)?
+        .ok_or_else(|| anyhow!("selected Target has no Cloudflare Pages backend"))?;
+    Ok(tokio::spawn(async move {
+        let result = client.list_deployments().await.map_err(|error| error.to_string());
+        let _ = sender.send(BackendEvent::VersionsLoaded { target_id, result }).await;
+    }))
+}
+
+fn spawn_cloudflare_rollback(
+    client: CloudflarePagesClient,
+    deployment_id: String,
+) -> (mpsc::Receiver<runner::RunEvent>, watch::Sender<bool>, JoinHandle<()>) {
+    let (event_tx, event_rx) = mpsc::channel(16);
+    let (cancel_tx, mut cancel_rx) = watch::channel(false);
+    let handle = tokio::spawn(async move {
+        let started = time::Instant::now();
+        if event_tx.send(runner::RunEvent::TargetStarted { target: 0 }).await.is_err()
+            || event_tx.send(runner::RunEvent::StepStarted { target: 0, step: 0 }).await.is_err()
+        {
+            return;
+        }
+
+        let cancellation = async {
+            loop {
+                if *cancel_rx.borrow() || cancel_rx.changed().await.is_err() {
+                    return;
+                }
+            }
+        };
+        tokio::pin!(cancellation);
+        let result = tokio::select! {
+            result = client.rollback(&deployment_id) => Some(result),
+            () = &mut cancellation => None,
+        };
+        let elapsed = started.elapsed();
+        let (step_outcome, target_outcome, run_outcome) = match result {
+            Some(Ok(deployment)) => {
+                let _ = event_tx
+                    .send(runner::RunEvent::Output {
+                        stream: OutputStream::Stdout,
+                        line: format!(
+                            "Cloudflare Pages rollback accepted: {}  {}",
+                            deployment.short_id, deployment.url
+                        ),
+                    })
+                    .await;
+                (
+                    runner::StepOutcome::Succeeded,
+                    runner::TargetOutcome::Succeeded,
+                    RunOutcome::Succeeded,
+                )
+            }
+            Some(Err(error)) => (
+                runner::StepOutcome::Failed(error.to_string()),
+                runner::TargetOutcome::Failed,
+                RunOutcome::Failed,
+            ),
+            None => (
+                runner::StepOutcome::Cancelled,
+                runner::TargetOutcome::Cancelled,
+                RunOutcome::Cancelled,
+            ),
+        };
+        if event_tx
+            .send(runner::RunEvent::StepFinished {
+                target: 0,
+                step: 0,
+                outcome: step_outcome,
+                elapsed,
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
+        if event_tx
+            .send(runner::RunEvent::TargetFinished { target: 0, outcome: target_outcome, elapsed })
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let _ = event_tx.send(runner::RunEvent::Finished { outcome: run_outcome, elapsed }).await;
+    });
+    (event_rx, cancel_tx, handle)
+}
+
+fn target_working_dir(base_dir: &Path, target: &DeployTarget) -> std::path::PathBuf {
+    match target.working_dir.as_deref() {
+        Some(path) if path.is_absolute() => path.to_path_buf(),
+        Some(path) => base_dir.join(path),
+        None => base_dir.to_path_buf(),
+    }
+}
+
+fn persist_run(app: &mut App, store: &JournalStore) -> Result<()> {
+    let timestamp_secs = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|_| anyhow!("system clock is before the Unix epoch"))?
+        .as_secs();
+    let entries = app.journal_entries(timestamp_secs);
+    if entries.is_empty() {
+        return Ok(());
+    }
+    store.record_many(entries)?;
+    app.journal = store.load()?;
+    Ok(())
+}
+
+fn render(frame: &mut Frame<'_>, app: &mut App, journal_path: &Path) {
+    let areas = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(8),
+        Constraint::Length(if app.notice.is_some() { 3 } else { 1 }),
+    ])
+    .split(frame.area());
+    app.set_layout_frame(LayoutFrame::default());
+    render_header(frame, areas[0], app);
+    match app.phase {
+        Phase::Browse => render_browse(frame, areas[1], app),
+        Phase::Versions => render_versions(frame, areas[1], app),
+        Phase::Review => render_review(frame, areas[1], app),
+        Phase::Running => render_running(frame, areas[1], app),
+        Phase::Summary => render_summary(frame, areas[1], app, journal_path),
+    }
+    render_footer(frame, areas[2], app);
+}
+
+fn install_split_frame(app: &mut App, surface: SplitSurface, area: Rect) -> LayoutFrame {
+    let layout_frame = LayoutFrame::split(surface, area, app.layout.ratio(surface));
+    app.set_layout_frame(layout_frame);
+    layout_frame
+}
+
+fn render_split_divider(frame: &mut Frame<'_>, layout_frame: LayoutFrame, dragging: bool) {
+    if layout_frame.separator.width == 0 || layout_frame.separator.height == 0 {
+        return;
+    }
+    let color = if dragging { CYAN } else { MUTED };
+    let midpoint = layout_frame.separator.height / 2;
+    let lines = (0..layout_frame.separator.height)
+        .map(|row| {
+            let symbol = if dragging {
+                "┃"
+            } else if row.abs_diff(midpoint) <= 1 {
+                "┋"
+            } else {
+                " "
+            };
+            Line::styled(symbol, Style::default().fg(color))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines), layout_frame.separator);
+}
+
+fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let phase = match app.phase {
+        Phase::Browse => "targets",
+        Phase::Versions => "versions",
+        Phase::Review => "review",
+        Phase::Running => "running",
+        Phase::Summary => "summary",
+    };
+    let title = Line::from(vec![
+        Span::styled("deploy", Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
+        Span::styled("  /  ", Style::default().fg(BORDER)),
+        Span::styled(phase, Style::default().fg(TEXT)),
+        Span::styled(
+            format!("    {}", app.loaded.path.display()),
+            Style::default().fg(MUTED).add_modifier(Modifier::DIM),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(title).block(panel(" kit ")), area);
+}
+
+fn render_browse(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let layout_frame = install_split_frame(app, SplitSurface::Browse, area);
+
+    let items = app
+        .loaded
+        .plan
+        .targets
+        .iter()
+        .enumerate()
+        .map(|(index, target)| {
+            let selected = app.selected.get(index).copied().unwrap_or(false);
+            let versions = if target.backend.is_some() {
+                "Cloudflare Pages".to_owned()
+            } else {
+                format!("{} versions", app.journal.entries(&target.id).len())
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    if selected { "● " } else { "○ " },
+                    Style::default().fg(if selected { CYAN } else { BORDER }),
+                ),
+                Span::styled(
+                    target.name.clone(),
+                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  {} steps · {versions}", target.steps.len()),
+                    Style::default().fg(MUTED),
+                ),
+            ]))
+        })
+        .collect::<Vec<_>>();
+    let mut state = ListState::default().with_selected(Some(app.cursor));
+    let list = List::new(items)
+        .block(panel(format!(
+            " Targets · {} selected · {} Steps ",
+            app.selected_count(),
+            app.selected_step_count()
+        )))
+        .highlight_style(Style::default().bg(SELECTED))
+        .highlight_symbol("▌");
+    frame.render_stateful_widget(list, layout_frame.first, &mut state);
+
+    render_target_detail(frame, layout_frame.second, app.focused_target());
+    render_split_divider(frame, layout_frame, app.layout_drag.is_some());
+}
+
+fn render_target_detail(frame: &mut Frame<'_>, area: Rect, target: Option<&DeployTarget>) {
+    let Some(target) = target else {
+        frame.render_widget(Paragraph::new("No Targets configured").block(panel(" Target ")), area);
+        return;
+    };
+    let rollback = match (&target.backend, &target.rollback) {
+        (Some(_), _) => Span::styled(
+            " platform history + rollback ",
+            Style::default().fg(MAGENTA).add_modifier(Modifier::BOLD),
+        ),
+        (None, Some(_)) => Span::styled(
+            " rollback ready ",
+            Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+        ),
+        (None, None) => Span::styled(" deploy only ", Style::default().fg(YELLOW)),
+    };
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(
+                target.name.clone(),
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            rollback,
+        ]),
+        Line::styled(
+            target.description.clone().unwrap_or_else(|| "No description".to_owned()),
+            Style::default().fg(MUTED),
+        ),
+        Line::raw(""),
+    ];
+    for (index, step) in target.steps.iter().enumerate() {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:>2}  ", index + 1), Style::default().fg(BORDER)),
+            Span::styled(step.name.clone(), Style::default().fg(TEXT)),
+            Span::styled(format!("  {}", action_label(&step.action)), Style::default().fg(MUTED)),
+        ]));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(panel(" Plan ")),
+        area,
+    );
+}
+
+fn render_versions(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let target_name = app
+        .focused_target()
+        .map(|target| target.name.clone())
+        .unwrap_or_else(|| "Target".to_owned());
+    let has_split = match &app.versions {
+        VersionsState::CloudflareReady { deployments } => !deployments.is_empty(),
+        VersionsState::Journal => !app.history().is_empty(),
+        VersionsState::CloudflareLoading | VersionsState::CloudflareError { .. } => false,
+    };
+    let layout_frame = has_split.then(|| install_split_frame(app, SplitSurface::Versions, area));
+    match &app.versions {
+        VersionsState::CloudflareLoading => {
+            let spinner = SPINNER[app.spinner % SPINNER.len()];
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::styled(
+                        format!("{spinner}  Loading Cloudflare Pages deployments…"),
+                        Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+                    ),
+                    Line::raw(""),
+                    Line::styled(
+                        "Version history is read directly from the platform.",
+                        Style::default().fg(MUTED),
+                    ),
+                ])
+                .block(panel(format!(" {target_name} · Versions "))),
+                area,
+            );
+            return;
+        }
+        VersionsState::CloudflareError { message, .. } => {
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::styled(
+                        "Could not load Cloudflare Pages deployments.",
+                        Style::default().fg(RED).add_modifier(Modifier::BOLD),
+                    ),
+                    Line::raw(""),
+                    Line::styled(message.clone(), Style::default().fg(TEXT)),
+                    Line::raw(""),
+                    Line::styled("Press r to retry.", Style::default().fg(MUTED)),
+                ])
+                .wrap(Wrap { trim: false })
+                .block(panel(format!(" {target_name} · Versions "))),
+                area,
+            );
+            return;
+        }
+        VersionsState::CloudflareReady { deployments } => {
+            render_cloudflare_versions(
+                frame,
+                area,
+                &target_name,
+                deployments,
+                app.history_cursor,
+                layout_frame,
+                app.layout_drag.is_some(),
+            );
+            return;
+        }
+        VersionsState::Journal => {}
+    }
+
+    let entries = app.history();
+    if entries.is_empty() {
+        let message = vec![
+            Line::styled(
+                "No recorded Versions yet.",
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            ),
+            Line::raw(""),
+            Line::styled(
+                "Run this Target once; every completed Run is written to the deploy Journal.",
+                Style::default().fg(MUTED),
+            ),
+        ];
+        frame.render_widget(
+            Paragraph::new(message).block(panel(format!(" {target_name} · Versions "))),
+            area,
+        );
+        return;
+    }
+
+    let Some(layout_frame) = layout_frame else {
+        return;
+    };
+    let items =
+        entries.iter().rev().map(|entry| ListItem::new(version_line(entry))).collect::<Vec<_>>();
+    let mut state = ListState::default().with_selected(Some(app.history_cursor));
+    let list = List::new(items)
+        .block(panel(format!(" {target_name} · Versions ")))
+        .highlight_style(Style::default().bg(SELECTED))
+        .highlight_symbol("▌");
+    frame.render_stateful_widget(list, layout_frame.first, &mut state);
+
+    let detail = app
+        .selected_history_entry()
+        .map(version_detail)
+        .unwrap_or_else(|| vec![Line::styled("No Version selected", Style::default().fg(MUTED))]);
+    frame.render_widget(Paragraph::new(detail).block(panel(" Recorded Run ")), layout_frame.second);
+    render_split_divider(frame, layout_frame, app.layout_drag.is_some());
+}
+
+fn render_cloudflare_versions(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    target_name: &str,
+    deployments: &[CloudflareDeployment],
+    cursor: usize,
+    layout_frame: Option<LayoutFrame>,
+    dragging: bool,
+) {
+    if deployments.is_empty() {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::styled(
+                    "No Cloudflare Pages deployments found.",
+                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                ),
+                Line::raw(""),
+                Line::styled(
+                    "The project has no deployments visible to this API token.",
+                    Style::default().fg(MUTED),
+                ),
+            ])
+            .block(panel(format!(" {target_name} · Versions "))),
+            area,
+        );
+        return;
+    }
+
+    let Some(layout_frame) = layout_frame else {
+        return;
+    };
+    let items =
+        deployments.iter().map(cloudflare_version_line).map(ListItem::new).collect::<Vec<_>>();
+    let mut state = ListState::default().with_selected(Some(cursor));
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(panel(format!(" {target_name} · Cloudflare Pages ")))
+            .highlight_style(Style::default().bg(SELECTED))
+            .highlight_symbol("▌"),
+        layout_frame.first,
+        &mut state,
+    );
+    let detail = deployments.get(cursor).map(cloudflare_version_detail).unwrap_or_else(|| {
+        vec![Line::styled("No deployment selected", Style::default().fg(MUTED))]
+    });
+    frame.render_widget(
+        Paragraph::new(detail).wrap(Wrap { trim: false }).block(panel(" Platform deployment ")),
+        layout_frame.second,
+    );
+    render_split_divider(frame, layout_frame, dragging);
+}
+
+fn cloudflare_version_line(deployment: &CloudflareDeployment) -> Line<'static> {
+    let status = deployment.latest_stage.as_ref().map(|stage| stage.status);
+    let (symbol, color) = cloudflare_status(status);
+    let commit = deployment.commit_hash().map(short_text).unwrap_or_else(|| "no commit".to_owned());
+    Line::from(vec![
+        Span::styled(format!("{symbol} "), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            deployment.short_id.clone(),
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(
+                "  {commit}  {}  {}",
+                deployment.created_on,
+                cloudflare_environment(deployment.environment)
+            ),
+            Style::default().fg(MUTED),
+        ),
+    ])
+}
+
+fn cloudflare_version_detail(deployment: &CloudflareDeployment) -> Vec<Line<'static>> {
+    let status = deployment.latest_stage.as_ref().map(|stage| stage.status);
+    let (symbol, color) = cloudflare_status(status);
+    vec![
+        Line::from(vec![
+            Span::styled(
+                format!("{symbol} "),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                deployment.short_id.clone(),
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::raw(""),
+        detail_line("Commit", deployment.commit_hash().unwrap_or("—")),
+        detail_line("Created", &deployment.created_on),
+        detail_line("Environment", cloudflare_environment(deployment.environment)),
+        detail_line("Status", cloudflare_status_label(status)),
+        Line::raw(""),
+        Line::styled(deployment.url.clone(), Style::default().fg(CYAN)),
+        Line::raw(""),
+        Line::styled(
+            if deployment.rollback_eligible() {
+                "Enter  roll back to this production deployment"
+            } else {
+                "Rollback requires a successful production deployment"
+            },
+            Style::default().fg(if deployment.rollback_eligible() { MAGENTA } else { MUTED }),
+        ),
+    ]
+}
+
+fn detail_line(label: &'static str, value: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label:<12}"), Style::default().fg(MUTED)),
+        Span::styled(value.to_owned(), Style::default().fg(TEXT)),
+    ])
+}
+
+fn version_line(entry: &JournalEntry) -> Line<'static> {
+    let (symbol, color) = journal_status(entry.status);
+    Line::from(vec![
+        Span::styled(format!("{symbol} "), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            entry.version.0.clone(),
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(
+                "  {}  {}",
+                format_timestamp(entry.timestamp_secs),
+                duration_ms(entry.duration_ms)
+            ),
+            Style::default().fg(MUTED),
+        ),
+    ])
+}
+
+fn version_detail(entry: &JournalEntry) -> Vec<Line<'static>> {
+    let (symbol, color) = journal_status(entry.status);
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(
+                format!("{symbol} "),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                entry.version.0.clone(),
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::styled(format_timestamp(entry.timestamp_secs), Style::default().fg(MUTED)),
+        Line::raw(""),
+    ];
+    for step in &entry.steps {
+        lines.push(Line::from(vec![
+            Span::styled("· ", Style::default().fg(BORDER)),
+            Span::styled(step.name.clone(), Style::default().fg(TEXT)),
+            Span::styled(
+                format!("  {}", duration_ms(step.duration_ms)),
+                Style::default().fg(MUTED),
+            ),
+        ]));
+    }
+    lines
+}
+
+fn render_review(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let rollback = matches!(
+        app.intent,
+        Some(RunIntent::Rollback { .. } | RunIntent::CloudflarePagesRollback { .. })
+    );
+    let platform_rollback = matches!(app.intent, Some(RunIntent::CloudflarePagesRollback { .. }));
+    let accent = if rollback { MAGENTA } else { CYAN };
+    let heading = if rollback { "Rollback plan" } else { "Deployment plan" };
+    let mut lines = vec![
+        Line::styled(heading, Style::default().fg(accent).add_modifier(Modifier::BOLD)),
+        Line::styled(
+            if rollback {
+                if platform_rollback {
+                    "Cloudflare Pages will restore the selected production deployment."
+                } else {
+                    "The selected recorded Version will be passed to every rollback Step."
+                }
+            } else {
+                "Targets and Steps will run sequentially in configuration order."
+            },
+            Style::default().fg(MUTED),
+        ),
+        Line::raw(""),
+    ];
+    if let Some(RunIntent::Rollback { version, .. }) = &app.intent {
+        lines.push(Line::from(vec![
+            Span::styled("Version  ", Style::default().fg(MUTED)),
+            Span::styled(version.0.clone(), Style::default().fg(TEXT).add_modifier(Modifier::BOLD)),
+        ]));
+        lines.push(Line::raw(""));
+    }
+    if let Some(RunIntent::CloudflarePagesRollback { deployment, .. }) = &app.intent {
+        lines.push(detail_line("Deployment", &deployment.short_id));
+        lines.push(detail_line("Commit", deployment.commit_hash().unwrap_or("—")));
+        lines.push(detail_line("Created", &deployment.created_on));
+        lines.push(detail_line("URL", &deployment.url));
+        lines.push(Line::raw(""));
+    }
+    for target in app.review_targets() {
+        lines.push(Line::styled(
+            target.name,
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        ));
+        if platform_rollback {
+            lines.push(Line::from(vec![
+                Span::styled("   ↶  ", Style::default().fg(MAGENTA)),
+                Span::styled("Request platform rollback", Style::default().fg(TEXT)),
+                Span::styled("  Cloudflare API", Style::default().fg(MUTED)),
+            ]));
+        } else {
+            for (index, step) in target.steps.iter().enumerate() {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {:>2}  ", index + 1), Style::default().fg(BORDER)),
+                    Span::styled(step.name.clone(), Style::default().fg(TEXT)),
+                    Span::styled(
+                        format!("  {}", action_label(&step.action)),
+                        Style::default().fg(MUTED),
+                    ),
+                ]));
+            }
+        }
+        lines.push(Line::raw(""));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(panel(" Confirm ")),
+        area,
+    );
+}
+
+fn render_running(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let layout_frame = install_split_frame(app, SplitSurface::Running, area);
+    let spinner = SPINNER[app.spinner % SPINNER.len()];
+    let mut progress = vec![
+        Line::from(vec![
+            Span::styled(
+                format!("{spinner} "),
+                Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("Run in progress", Style::default().fg(TEXT).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::raw(""),
+    ];
+    for target in &app.progress {
+        progress.push(Line::from(vec![
+            status_span(target.status),
+            Span::raw(" "),
+            Span::styled(
+                target.name.clone(),
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  {}", short_version(&target.version)),
+                Style::default().fg(MUTED),
+            ),
+        ]));
+        for step in &target.steps {
+            progress.push(Line::from(vec![
+                Span::raw("   "),
+                status_span(step.status),
+                Span::raw(" "),
+                Span::styled(
+                    step.name.clone(),
+                    Style::default().fg(if step.status == ProgressStatus::Skipped {
+                        MUTED
+                    } else {
+                        TEXT
+                    }),
+                ),
+                Span::styled(
+                    step.elapsed
+                        .map(|elapsed| format!("  {}", duration(elapsed)))
+                        .unwrap_or_default(),
+                    Style::default().fg(MUTED),
+                ),
+            ]));
+        }
+    }
+    frame.render_widget(Paragraph::new(progress).block(panel(" Progress ")), layout_frame.first);
+
+    let inner_height = layout_frame.second.height.saturating_sub(2) as usize;
+    let output = app
+        .output
+        .iter()
+        .rev()
+        .take(inner_height)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|line| {
+            let style = match line.stream {
+                OutputStream::Stdout => Style::default().fg(TEXT),
+                OutputStream::Stderr => Style::default().fg(YELLOW),
+            };
+            Line::styled(
+                truncate(&line.text, layout_frame.second.width.saturating_sub(4) as usize),
+                style,
+            )
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(output).block(panel(" Live output ")), layout_frame.second);
+    render_split_divider(frame, layout_frame, app.layout_drag.is_some());
+}
+
+fn render_summary(frame: &mut Frame<'_>, area: Rect, app: &App, journal_path: &Path) {
+    let rollback = matches!(
+        app.active_operation,
+        Some(RunOperation::Rollback { .. } | RunOperation::CloudflarePagesRollback { .. })
+    );
+    let (title, color) = match app.outcome {
+        Some(RunOutcome::Succeeded) if rollback => ("Rollback complete", MAGENTA),
+        Some(RunOutcome::Succeeded) => ("Deploy complete", GREEN),
+        Some(RunOutcome::Failed) if rollback => ("Rollback failed", RED),
+        Some(RunOutcome::Failed) => ("Deploy failed", RED),
+        Some(RunOutcome::Cancelled) if rollback => ("Rollback cancelled", YELLOW),
+        Some(RunOutcome::Cancelled) => ("Deploy cancelled", YELLOW),
+        None => ("Run ended", MUTED),
+    };
+    let mut lines = vec![
+        Line::styled(title, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        Line::styled(
+            app.run_elapsed.map(duration).unwrap_or_else(|| "—".to_owned()),
+            Style::default().fg(MUTED),
+        ),
+        Line::raw(""),
+    ];
+    for target in &app.progress {
+        lines.push(Line::from(vec![
+            status_span(target.status),
+            Span::raw(" "),
+            Span::styled(
+                target.name.clone(),
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  {}", short_version(&target.version)),
+                Style::default().fg(MUTED),
+            ),
+            Span::styled(
+                target
+                    .elapsed
+                    .map(|elapsed| format!("  {}", duration(elapsed)))
+                    .unwrap_or_default(),
+                Style::default().fg(MUTED),
+            ),
+        ]));
+        for step in &target.steps {
+            if step.status == ProgressStatus::Skipped {
+                continue;
+            }
+            lines.push(Line::from(vec![
+                Span::raw("   "),
+                status_span(step.status),
+                Span::raw(" "),
+                Span::styled(step.name.clone(), Style::default().fg(TEXT)),
+                Span::styled(
+                    step.elapsed
+                        .map(|elapsed| format!("  {}", duration(elapsed)))
+                        .unwrap_or_default(),
+                    Style::default().fg(MUTED),
+                ),
+            ]));
+            if let Some(failure) = &step.failure {
+                lines.push(Line::styled(format!("      {failure}"), Style::default().fg(RED)));
+            }
+        }
+        lines.push(Line::raw(""));
+    }
+    lines.push(Line::styled(
+        if matches!(app.active_operation, Some(RunOperation::CloudflarePagesRollback { .. })) {
+            "History  Cloudflare Pages".to_owned()
+        } else {
+            format!("Journal  {}", journal_path.display())
+        },
+        Style::default().fg(MUTED),
+    ));
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(panel(" Summary ")),
+        area,
+    );
+}
+
+fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let controls = match app.phase {
+        Phase::Browse => {
+            "↑↓ navigate   Space select   a all   v versions   drag divider   = reset   Enter review   q quit"
+        }
+        Phase::Versions => {
+            if app.layout_frame.surface.is_none() {
+                if app.versions_source() == VersionsSource::CloudflarePages {
+                    "r refresh   Esc targets   q quit"
+                } else {
+                    "Esc targets   q quit"
+                }
+            } else if app.versions_source() == VersionsSource::CloudflarePages {
+                "↑↓ navigate   Enter rollback   r refresh   drag divider   = reset   Esc targets   q quit"
+            } else {
+                "↑↓ navigate   Enter rollback   drag divider   = reset   Esc targets   q quit"
+            }
+        }
+        Phase::Review => "Enter run   Esc back   q quit",
+        Phase::Running => "drag divider   = reset   Ctrl-C cancel safely",
+        Phase::Summary => "Enter close",
+    };
+    if let Some(notice) = &app.notice {
+        let lines = vec![
+            Line::styled(notice.clone(), Style::default().fg(YELLOW)),
+            Line::styled(controls, Style::default().fg(MUTED)),
+        ];
+        frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), area);
+    } else {
+        frame.render_widget(
+            Paragraph::new(controls).style(Style::default().fg(MUTED)).alignment(Alignment::Center),
+            area,
+        );
+    }
+}
+
+fn panel(title: impl Into<String>) -> Block<'static> {
+    Block::default()
+        .title(title.into())
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(BORDER))
+        .padding(Padding::horizontal(1))
+}
+
+fn status_span(status: ProgressStatus) -> Span<'static> {
+    let (symbol, color) = match status {
+        ProgressStatus::Pending => ("○", BORDER),
+        ProgressStatus::Running => ("●", CYAN),
+        ProgressStatus::Succeeded => ("✓", GREEN),
+        ProgressStatus::Failed => ("✗", RED),
+        ProgressStatus::Cancelled => ("■", YELLOW),
+        ProgressStatus::Skipped => ("–", MUTED),
+    };
+    Span::styled(symbol, Style::default().fg(color).add_modifier(Modifier::BOLD))
+}
+
+fn journal_status(status: JournalStatus) -> (&'static str, Color) {
+    match status {
+        JournalStatus::Success => ("✓", GREEN),
+        JournalStatus::Failed => ("✗", RED),
+        JournalStatus::Cancelled => ("■", YELLOW),
+        JournalStatus::RolledBack => ("↶", MAGENTA),
+    }
+}
+
+fn cloudflare_environment(environment: CloudflareEnvironment) -> &'static str {
+    match environment {
+        CloudflareEnvironment::Production => "production",
+        CloudflareEnvironment::Preview => "preview",
+        CloudflareEnvironment::Unknown => "unknown",
+    }
+}
+
+fn cloudflare_status(status: Option<CloudflareStageStatus>) -> (&'static str, Color) {
+    match status {
+        Some(CloudflareStageStatus::Success) => ("✓", GREEN),
+        Some(CloudflareStageStatus::Active) => ("●", CYAN),
+        Some(CloudflareStageStatus::Failure) => ("✗", RED),
+        Some(CloudflareStageStatus::Canceled) => ("■", YELLOW),
+        Some(CloudflareStageStatus::Idle) => ("○", BORDER),
+        Some(CloudflareStageStatus::Unknown) | None => ("?", MUTED),
+    }
+}
+
+fn cloudflare_status_label(status: Option<CloudflareStageStatus>) -> &'static str {
+    match status {
+        Some(CloudflareStageStatus::Success) => "success",
+        Some(CloudflareStageStatus::Active) => "active",
+        Some(CloudflareStageStatus::Failure) => "failure",
+        Some(CloudflareStageStatus::Canceled) => "canceled",
+        Some(CloudflareStageStatus::Idle) => "idle",
+        Some(CloudflareStageStatus::Unknown) => "unknown",
+        None => "—",
+    }
+}
+
+fn short_text(text: &str) -> String {
+    if text.chars().count() > 12 {
+        format!("{}…", text.chars().take(12).collect::<String>())
+    } else {
+        text.to_owned()
+    }
+}
+
+fn action_label(action: &DeployAction) -> &'static str {
+    match action {
+        DeployAction::Command { .. } => "command",
+        DeployAction::Shell { .. } => "shell",
+    }
+}
+
+fn short_version(version: &VersionId) -> String {
+    if version.0.chars().count() > 12 {
+        format!("{}…", version.0.chars().take(12).collect::<String>())
+    } else {
+        version.0.clone()
+    }
+}
+
+fn duration(elapsed: std::time::Duration) -> String {
+    if elapsed.as_secs() >= 60 {
+        format!("{}m {:02}s", elapsed.as_secs() / 60, elapsed.as_secs() % 60)
+    } else {
+        format!("{:.1}s", elapsed.as_secs_f64())
+    }
+}
+
+fn duration_ms(milliseconds: u64) -> String {
+    duration(std::time::Duration::from_millis(milliseconds))
+}
+
+fn format_timestamp(timestamp_secs: u64) -> String {
+    let Ok(timestamp) = i64::try_from(timestamp_secs) else {
+        return format!("unix:{timestamp_secs}");
+    };
+    OffsetDateTime::from_unix_timestamp(timestamp)
+        .ok()
+        .and_then(|timestamp| timestamp.format(&Rfc3339).ok())
+        .unwrap_or_else(|| format!("unix:{timestamp_secs}"))
+}
+
+fn truncate(text: &str, width: usize) -> String {
+    if text.width() <= width {
+        return text.to_owned();
+    }
+    if width <= 1 {
+        return "…".chars().take(width).collect();
+    }
+    let mut out = String::new();
+    let target = width - 1;
+    let mut used = 0;
+    for character in text.chars() {
+        let character_width = unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
+        if used + character_width > target {
+            break;
+        }
+        out.push(character);
+        used += character_width;
+    }
+    out.push('…');
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use ratatui::{backend::TestBackend, Terminal};
+
+    use super::*;
+    use crate::tools::deploy::config::{DeployStep, DeploymentPlan, RollbackStrategy};
+
+    fn test_app() -> App {
+        App::new(
+            LoadedPlan {
+                path: PathBuf::from(".kit/deploy.toml"),
+                base_dir: PathBuf::from(".kit"),
+                plan: DeploymentPlan {
+                    version: 1,
+                    targets: vec![DeployTarget {
+                        id: "preview".to_owned(),
+                        name: "Preview".to_owned(),
+                        description: Some("Publish preview artifacts".to_owned()),
+                        working_dir: None,
+                        env_file: None,
+                        steps: vec![DeployStep {
+                            name: "Build".to_owned(),
+                            working_dir: None,
+                            action: DeployAction::Command {
+                                program: "builder".to_owned(),
+                                args: Vec::new(),
+                            },
+                        }],
+                        backend: None,
+                        rollback: Some(RollbackStrategy::Redeploy),
+                    }],
+                },
+                environments: Default::default(),
+            },
+            DeployJournal::default(),
+            DeployLayout::default(),
+        )
+    }
+
+    #[test]
+    fn browse_state_renders_target_plan_and_controls() -> Result<()> {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend)?;
+        let mut app = test_app();
+        app.toggle_focused();
+
+        terminal.draw(|frame| render(frame, &mut app, Path::new("journal.json")))?;
+        let buffer = terminal.backend().buffer();
+        let screen = buffer.content.iter().map(|cell| cell.symbol()).collect::<Vec<_>>().join("");
+
+        assert!(screen.contains("Preview"));
+        assert!(screen.contains("Build"));
+        assert!(screen.contains("rollback ready"));
+        assert!(screen.contains("Space select"));
+        Ok(())
+    }
+
+    #[test]
+    fn journal_and_cloudflare_versions_share_the_saved_split() -> Result<()> {
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend)?;
+        let mut app = test_app();
+        app.layout.versions = crate::tools::deploy::layout::SplitRatio::new_unchecked(700);
+        app.phase = Phase::Versions;
+        app.journal.targets.push(crate::tools::deploy::journal::TargetJournal {
+            target_id: "preview".to_owned(),
+            entries: vec![JournalEntry {
+                version: VersionId("version-1".to_owned()),
+                timestamp_secs: 1,
+                operation: crate::tools::deploy::journal::JournalOperation::Deploy,
+                status: JournalStatus::Success,
+                duration_ms: 1,
+                steps: Vec::new(),
+            }],
+        });
+
+        terminal.draw(|frame| render(frame, &mut app, Path::new("journal.json")))?;
+        let journal_width = app.layout_frame.first.width;
+
+        app.versions = VersionsState::CloudflareReady {
+            deployments: vec![CloudflareDeployment {
+                id: "deployment-placeholder".to_owned(),
+                short_id: "short-id".to_owned(),
+                created_on: "2026-01-02T03:04:05Z".to_owned(),
+                environment: CloudflareEnvironment::Production,
+                url: "https://placeholder.invalid".to_owned(),
+                latest_stage: Some(crate::tools::deploy::cloudflare::CloudflareStage {
+                    status: CloudflareStageStatus::Success,
+                }),
+                deployment_trigger: None,
+            }],
+        };
+        terminal.draw(|frame| render(frame, &mut app, Path::new("journal.json")))?;
+
+        assert_eq!(app.layout_frame.first.width, journal_width);
+        assert!(journal_width > app.layout_frame.second.width);
+        Ok(())
+    }
+}

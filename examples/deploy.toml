@@ -1,0 +1,57 @@
+# Copy to .kit/deploy.toml or $XDG_CONFIG_HOME/kit/deploy.toml, then replace placeholders.
+version = 1
+
+[[targets]]
+id = "staging"
+name = "Staging"
+description = "Build and publish the staging artifact"
+working_dir = "<path-to-your-project>"
+
+[[targets.steps]]
+name = "Build release"
+action = { type = "command", program = "<your-build-command>", args = ["<arg-one>"] }
+
+[[targets.steps]]
+name = "Publish artifact"
+action = { type = "shell", script = "<your-publish-script> <your-host>" }
+
+[targets.rollback]
+type = "steps"
+
+[[targets.rollback.steps]]
+name = "Restore selected artifact"
+action = { type = "command", program = "<your-restore-command>", args = ["{{version}}"] }
+
+[[targets]]
+id = "production"
+name = "Production"
+description = "Run the production deployment workflow"
+working_dir = "<path-to-your-project>"
+
+[[targets.steps]]
+name = "Run verified deployment"
+action = { type = "command", program = "<your-deploy-command>", args = ["<environment>", "{{version}}"] }
+
+[targets.rollback]
+type = "redeploy"
+
+[[targets]]
+id = "pages"
+name = "Cloudflare Pages"
+description = "Build and publish a Pages project"
+working_dir = "<path-to-your-project>"
+env_file = "<path-to-env-file>"
+
+[targets.backend]
+type = "cloudflare-pages"
+account_id = "<account-id>"
+project = "<pages-project>"
+token_env = "CLOUDFLARE_API_TOKEN"
+
+[[targets.steps]]
+name = "Build site"
+action = { type = "command", program = "<your-build-command>", args = ["<build-argument>"] }
+
+[[targets.steps]]
+name = "Publish site"
+action = { type = "command", program = "<your-pages-deploy-command>", args = ["<output-directory>", "--project-name=<pages-project>"] }

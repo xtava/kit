@@ -1413,6 +1413,7 @@ dependencies = [
  "syntect",
  "sysinfo",
  "thiserror 2.0.18",
+ "time",
  "tokio",
  "tokio-tungstenite",
  "toml",

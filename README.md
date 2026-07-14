@@ -29,6 +29,9 @@ kit stats --once           # warmed-up top-process snapshot
 kit domain example.com io  # authoritative domain checker (+ aftermarket sale price)
 kit domain --for-sale ink  # …only names listed for sale, with buy-now/offer prices
 kit domain                 # …its TUI
+kit deploy                 # browse Targets, run Steps, inspect Versions, roll back
+kit deploy --config deploy.toml
+                           # …load an explicit typed deployment plan
 kit record -i              # Modular recorder REPL
 kit record status          # current recording artifact/run state
 kit record cancel          # cancel active recording and close its window
@@ -51,6 +54,8 @@ rules, redacted bundles, profiles, cleanup), and the verification loop: locators
 settle, `wait`/`expect`/`verify`, `do` batches, flows, watches, and `snap --diff`.
 For the Modular Playwright recorder lane, see **[docs/record.md](./docs/record.md)**.
 For the CPU and process monitor, see **[docs/stats.md](./docs/stats.md)**.
+For the config-driven deploy launcher, Journal, and rollback schema, see
+**[docs/deploy.md](./docs/deploy.md)**.
 For the Markdown viewer and its fuzzy file prompt, see
 **[docs/render.md](./docs/render.md)**.
 The live playground every feature is verified against lives in
@@ -77,6 +82,7 @@ src/
    ├─ scout/          proc · cdp (via kit::cdp) · survey · correlate · report · tui · dive
    ├─ stats/          sampler · Linux task identity/control · report · tui
    ├─ domain/         engine{dns,rdap,whois,market} · config · report · tui
+   ├─ deploy/         typed plan · journal · runner · selection/history TUI
    ├─ record/         Modular Playwright recorder operator shell
    └─ render/         Markdown viewer · ignored-file-aware catalog · fuzzy file prompt
 ```

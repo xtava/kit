@@ -5,3 +5,7 @@
 /docs/plan.md
 /plans/
 /docs/adr/
+
+# kit deploy — project-local config holds paths, account IDs, and secret-file refs; never commit it
+.kit/deploy.toml
+.kit/*.env

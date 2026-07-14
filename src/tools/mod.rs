@@ -2,6 +2,7 @@
 //! the `tui` harness, and the shared `cdp` engine.
 
 pub mod cdp;
+pub mod deploy;
 pub mod domain;
 pub mod record;
 pub mod render;
