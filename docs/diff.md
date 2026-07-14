@@ -40,6 +40,8 @@ mouse reporting disabled.
 
 The tree presents untracked files as additions (`A`) rather than exposing Git porcelain's `?`
 marker. Addition counts are green, deletion counts are red, and zero-valued sides are omitted.
+Uninterrupted single-child directory chains are compacted into one row while preserving the terminal
+directory as the expansion identity; mixed and branching directories remain separate rows.
 
 Code rows use narrow colored bars and muted row backgrounds instead of literal patch `+` / `-`
 prefixes. Omitted context is labeled as “N unmodified lines” rather than displaying raw `@@` hunk

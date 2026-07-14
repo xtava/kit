@@ -1359,19 +1359,30 @@ fn append_tree_rows(
     expanded: &HashSet<(ChangeGroup, PathBuf)>,
 ) {
     for (name, child) in &node.directories {
-        let path = parent.join(name);
-        let indices = descendant_files(child);
+        let mut path = parent.join(name);
+        let mut label = display_os(name);
+        let mut terminal = child;
+        while terminal.files.is_empty() && terminal.directories.len() == 1 {
+            let Some((name, child)) = terminal.directories.iter().next() else {
+                break;
+            };
+            path.push(name);
+            label.push('/');
+            label.push_str(&display_os(name));
+            terminal = child;
+        }
+        let indices = descendant_files(terminal);
         let (additions, deletions) = totals(documents, &indices);
         rows.push(TreeRow {
             target: TreeTarget::Directory(group, path.clone()),
             depth,
-            label: display_os(name),
+            label,
             additions,
             deletions,
             kind: None,
         });
         if expanded.contains(&(group, path.clone())) {
-            append_tree_rows(rows, documents, group, child, &path, depth + 1, expanded);
+            append_tree_rows(rows, documents, group, terminal, &path, depth + 1, expanded);
         }
     }
     for &index in &node.files {
@@ -1841,6 +1852,43 @@ mod tests {
             NORD,
         ))
         .contains("-0"));
+    }
+
+    #[test]
+    fn tree_compacts_uninterrupted_directory_chains_with_terminal_identity() {
+        let documents =
+            vec![document(ChangeGroup::Changes, "packages/diffs/src/render.rs", "old\n", "new\n")];
+        let mut expanded = directory_keys(&documents).into_iter().collect::<HashSet<_>>();
+
+        let rows = tree_rows(&documents, &expanded);
+        let compact = rows.iter().find(|row| row.label == "packages/diffs/src").unwrap();
+        assert_eq!(compact.depth, 1);
+        assert!(matches!(
+            &compact.target,
+            TreeTarget::Directory(group, path)
+                if *group == ChangeGroup::Changes && path == Path::new("packages/diffs/src")
+        ));
+        assert!(rows.iter().any(|row| row.label == "render.rs" && row.depth == 2));
+
+        expanded.remove(&(ChangeGroup::Changes, "packages/diffs/src".into()));
+        let collapsed = tree_rows(&documents, &expanded);
+        assert!(!collapsed.iter().any(|row| row.label == "render.rs"));
+    }
+
+    #[test]
+    fn tree_compaction_stops_at_mixed_and_branching_directories() {
+        let documents = vec![
+            document(ChangeGroup::Changes, "src/lib.rs", "old\n", "new\n"),
+            document(ChangeGroup::Changes, "src/tools/diff.rs", "old\n", "new\n"),
+            document(ChangeGroup::Changes, "src/ui/view.rs", "old\n", "new\n"),
+        ];
+        let expanded = directory_keys(&documents).into_iter().collect::<HashSet<_>>();
+        let rows = tree_rows(&documents, &expanded);
+
+        assert!(rows.iter().any(|row| row.label == "src" && row.depth == 1));
+        assert!(rows.iter().any(|row| row.label == "tools" && row.depth == 2));
+        assert!(rows.iter().any(|row| row.label == "ui" && row.depth == 2));
+        assert!(!rows.iter().any(|row| row.label == "src/tools"));
     }
 
     #[test]
