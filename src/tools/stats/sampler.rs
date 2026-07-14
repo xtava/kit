@@ -471,7 +471,10 @@ fn collect_resources(
     if let Err(reason) = verify_process(process) {
         return unavailable_detail(request, started, reason);
     }
-    let mut resources = host::read_process_resources(process.pid);
+    let mut resources = match host::read_process_resources(process.pid) {
+        Ok(resources) => resources,
+        Err(reason) => return unavailable_detail(request, started, reason),
+    };
     if let Err(reason) = verify_process(process) {
         return unavailable_detail(request, started, reason);
     }
