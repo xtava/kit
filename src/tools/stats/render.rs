@@ -387,161 +387,16 @@ fn render_inspector(
     frame.render_widget(Paragraph::new(Line::from(tab_spans)), tab_area);
 
     let content = Rect::new(inner.x, inner.y + 2, inner.width, inner.height.saturating_sub(3));
-    let core = process.last_cpu.map_or_else(|| "—".into(), |core| format!("C{core}"));
     let lines = match app.inspector_tab {
         InspectorTab::Overview => {
-            let mut lines = vec![
-                Line::from(vec![
-                    Span::styled(
-                        format!("CPU       {:>7.1}%", process.cpu_percent),
-                        Style::default().fg(CPU_ACCENT),
-                    ),
-                    Span::styled(
-                        format!("    FAMILY {:>7.1}%", family_cpu),
-                        Style::default().fg(ACCENT),
-                    ),
-                ]),
-                Line::from(format!(
-                    "MEMORY    {:>8}    FAMILY {:>8}",
-                    report::bytes(process.rss_bytes),
-                    report::bytes(family_memory)
-                )),
-                Line::from(format!(
-                    "LAST OBSERVED CPU  {core:<6}  UPTIME {}",
-                    report::duration(process.run_time_seconds)
-                )),
-            ];
-            if let Some(history) = app.selected_history() {
-                let width = content.width.saturating_sub(14) as usize;
-                lines.push(Line::from(format!(
-                    "CPU HISTORY  {}",
-                    history_bars(history.points().map(|point| point.cpu_percent as f64), width)
-                )));
-                lines.push(Line::from(format!(
-                    "RSS HISTORY  {}",
-                    history_bars(history.points().map(|point| point.rss_bytes as f64), width)
-                )));
-            }
-            let command_line = content.y + lines.len() as u16 + 1;
-            regions.command_open = Some(Rect::new(
-                content.x,
-                command_line,
-                content.width,
-                content.bottom().saturating_sub(command_line),
-            ));
-            lines.extend([
-                Line::from(""),
-                Line::from(vec![
-                    Span::styled("COMMAND", Style::default().fg(MUTED)),
-                    Span::styled("  v / click to inspect", Style::default().fg(ACCENT)),
-                ]),
-                Line::styled(process.command.clone(), Style::default().fg(TEXT)),
-            ]);
-            lines
+            overview_lines(app, process, family_cpu, family_memory, content, regions)
         }
         InspectorTab::Family => {
             family_lines(app, process, family_cpu, family_memory, content, regions)
         }
-        InspectorTab::Threads => {
-            let detail = app.detail.as_deref();
-            let outcome = detail.and_then(|detail| match &detail.detail {
-                DetailData::Threads { outcome, .. } | DetailData::Core { outcome, .. } => {
-                    Some(outcome)
-                }
-                DetailData::Resources { .. } => None,
-            });
-            let mut lines = vec![Line::styled(
-                format!(
-                    "{}  ·  SORT {} {}",
-                    match outcome {
-                        Some(DetailOutcome::Available { readiness, completeness, .. }) => {
-                            format!(
-                                "THREADS · {}",
-                                detail_status(
-                                    app,
-                                    detail.expect("outcome came from detail"),
-                                    *readiness,
-                                    *completeness,
-                                )
-                            )
-                        }
-                        Some(DetailOutcome::Unavailable(reason)) => {
-                            format!("THREADS · {}", detail_unavailable(reason))
-                        }
-                        None => "THREADS · LOADING…".to_owned(),
-                    },
-                    app.thread_sort.label(),
-                    if app.thread_descending { "▼" } else { "▲" }
-                ),
-                Style::default().fg(MUTED),
-            )];
-            let rows = app.sorted_threads();
-            for (index, thread) in rows
-                .iter()
-                .enumerate()
-                .skip(app.thread_offset)
-                .take(content.height.saturating_sub(2) as usize)
-            {
-                regions.thread_rows.push((
-                    Rect::new(content.x, content.y + lines.len() as u16, content.width, 1),
-                    index,
-                ));
-                let style = if index == app.thread_cursor {
-                    Style::default().fg(PANEL).bg(SELECTED).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(TEXT)
-                };
-                lines.push(Line::styled(
-                    format!(
-                        "{:>8}  {:>7}  {:>5}  {:>8}  {:>9}  {}",
-                        observed_percent(&thread.cpu_percent),
-                        thread.tid,
-                        observed_core(&thread.last_cpu),
-                        observed_seconds(&thread.accumulated_cpu_seconds),
-                        observed_process_state(&thread.state),
-                        observed_string(&thread.name),
-                    ),
-                    style,
-                ));
-            }
-            lines
-        }
-        InspectorTab::Resources => match app.snapshot.host.resources {
-            CapabilityState::Available => match app.detail.as_deref() {
-                Some(detail) => match &detail.detail {
-                    DetailData::Resources { outcome, .. } => match outcome {
-                        DetailOutcome::Available { readiness, completeness, value: resources } => {
-                            resource_lines(
-                                &detail_status(app, detail, *readiness, *completeness),
-                                resources,
-                            )
-                        }
-                        DetailOutcome::Unavailable(reason) => vec![Line::styled(
-                            format!("RESOURCES · {}", detail_unavailable(reason)),
-                            Style::default().fg(MUTED),
-                        )],
-                    },
-                    DetailData::Threads { .. } | DetailData::Core { .. } => {
-                        vec![Line::styled("RESOURCES · LOADING…", Style::default().fg(MUTED))]
-                    }
-                },
-                None => vec![Line::styled("RESOURCES · LOADING…", Style::default().fg(MUTED))],
-            },
-            CapabilityState::Unsupported { reason } => vec![
-                Line::styled("RESOURCES UNAVAILABLE", Style::default().fg(MUTED)),
-                Line::from(reason),
-            ],
-        },
-        InspectorTab::Profile => match app.snapshot.host.code_profile {
-            CapabilityState::Available => vec![
-                Line::styled("BOUNDED CODE PROFILE", Style::default().fg(ACCENT)),
-                Line::from("2s   [5s]   10s   · 99 Hz"),
-            ],
-            CapabilityState::Unsupported { reason } => vec![
-                Line::styled("PROFILE UNAVAILABLE", Style::default().fg(MUTED)),
-                Line::from(reason),
-            ],
-        },
+        InspectorTab::Threads => thread_lines(app, content, regions),
+        InspectorTab::Resources => resources_lines(app),
+        InspectorTab::Profile => profile_lines(app),
     };
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), content);
     if inner.height >= 5 && is_live {
@@ -560,6 +415,161 @@ fn render_inspector(
         regions.profile = Some(Rect::new(inner.x, action_line.y, 10.min(inner.width), 1));
         regions.end_process =
             Some(Rect::new(inner.right().saturating_sub(6), action_line.y, 6.min(inner.width), 1));
+    }
+}
+
+fn overview_lines(
+    app: &StatsApp,
+    process: &super::model::ProcessSample,
+    family_cpu: f32,
+    family_memory: u64,
+    area: Rect,
+    regions: &mut UiRegions,
+) -> Vec<Line<'static>> {
+    let core = process.last_cpu.map_or_else(|| "—".into(), |core| format!("C{core}"));
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(
+                format!("CPU       {:>7.1}%", process.cpu_percent),
+                Style::default().fg(CPU_ACCENT),
+            ),
+            Span::styled(format!("    FAMILY {:>7.1}%", family_cpu), Style::default().fg(ACCENT)),
+        ]),
+        Line::from(format!(
+            "MEMORY    {:>8}    FAMILY {:>8}",
+            report::bytes(process.rss_bytes),
+            report::bytes(family_memory)
+        )),
+        Line::from(format!(
+            "LAST OBSERVED CPU  {core:<6}  UPTIME {}",
+            report::duration(process.run_time_seconds)
+        )),
+    ];
+    if let Some(history) = app.selected_history() {
+        let width = area.width.saturating_sub(14) as usize;
+        lines.push(Line::from(format!(
+            "CPU HISTORY  {}",
+            history_bars(history.points().map(|point| point.cpu_percent as f64), width)
+        )));
+        lines.push(Line::from(format!(
+            "RSS HISTORY  {}",
+            history_bars(history.points().map(|point| point.rss_bytes as f64), width)
+        )));
+    }
+    let command_line = area.y + lines.len() as u16 + 1;
+    regions.command_open = Some(Rect::new(
+        area.x,
+        command_line,
+        area.width,
+        area.bottom().saturating_sub(command_line),
+    ));
+    lines.extend([
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("COMMAND", Style::default().fg(MUTED)),
+            Span::styled("  v / click to inspect", Style::default().fg(ACCENT)),
+        ]),
+        Line::styled(process.command.clone(), Style::default().fg(TEXT)),
+    ]);
+    lines
+}
+
+fn thread_lines(app: &StatsApp, area: Rect, regions: &mut UiRegions) -> Vec<Line<'static>> {
+    let detail = app.detail.as_deref();
+    let outcome = detail.and_then(|detail| match &detail.detail {
+        DetailData::Threads { outcome, .. } | DetailData::Core { outcome, .. } => Some(outcome),
+        DetailData::Resources { .. } => None,
+    });
+    let state = match outcome {
+        Some(DetailOutcome::Available { readiness, completeness, .. }) => format!(
+            "THREADS · {}",
+            detail_status(
+                app,
+                detail.expect("outcome came from detail"),
+                *readiness,
+                *completeness,
+            )
+        ),
+        Some(DetailOutcome::Unavailable(reason)) => {
+            format!("THREADS · {}", detail_unavailable(reason))
+        }
+        None => "THREADS · LOADING…".to_owned(),
+    };
+    let mut lines = vec![Line::styled(
+        format!(
+            "{state}  ·  SORT {} {}",
+            app.thread_sort.label(),
+            if app.thread_descending { "▼" } else { "▲" }
+        ),
+        Style::default().fg(MUTED),
+    )];
+    let rows = app.sorted_threads();
+    for (index, thread) in
+        rows.iter().enumerate().skip(app.thread_offset).take(area.height.saturating_sub(2) as usize)
+    {
+        regions
+            .thread_rows
+            .push((Rect::new(area.x, area.y + lines.len() as u16, area.width, 1), index));
+        let style = if index == app.thread_cursor {
+            Style::default().fg(PANEL).bg(SELECTED).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(TEXT)
+        };
+        lines.push(Line::styled(
+            format!(
+                "{:>8}  {:>7}  {:>5}  {:>8}  {:>9}  {}",
+                observed_percent(&thread.cpu_percent),
+                thread.tid,
+                observed_core(&thread.last_cpu),
+                observed_seconds(&thread.accumulated_cpu_seconds),
+                observed_process_state(&thread.state),
+                observed_string(&thread.name),
+            ),
+            style,
+        ));
+    }
+    lines
+}
+
+fn resources_lines(app: &StatsApp) -> Vec<Line<'static>> {
+    match app.snapshot.host.resources {
+        CapabilityState::Available => match app.detail.as_deref() {
+            Some(detail) => match &detail.detail {
+                DetailData::Resources { outcome, .. } => match outcome {
+                    DetailOutcome::Available { readiness, completeness, value: resources } => {
+                        resource_lines(
+                            &detail_status(app, detail, *readiness, *completeness),
+                            resources,
+                        )
+                    }
+                    DetailOutcome::Unavailable(reason) => vec![Line::styled(
+                        format!("RESOURCES · {}", detail_unavailable(reason)),
+                        Style::default().fg(MUTED),
+                    )],
+                },
+                DetailData::Threads { .. } | DetailData::Core { .. } => {
+                    vec![Line::styled("RESOURCES · LOADING…", Style::default().fg(MUTED))]
+                }
+            },
+            None => vec![Line::styled("RESOURCES · LOADING…", Style::default().fg(MUTED))],
+        },
+        CapabilityState::Unsupported { reason } => vec![
+            Line::styled("RESOURCES UNAVAILABLE", Style::default().fg(MUTED)),
+            Line::from(reason),
+        ],
+    }
+}
+
+fn profile_lines(app: &StatsApp) -> Vec<Line<'static>> {
+    match app.snapshot.host.code_profile {
+        CapabilityState::Available => vec![
+            Line::styled("BOUNDED CODE PROFILE", Style::default().fg(ACCENT)),
+            Line::from("2s   [5s]   10s   · 99 Hz"),
+        ],
+        CapabilityState::Unsupported { reason } => vec![
+            Line::styled("PROFILE UNAVAILABLE", Style::default().fg(MUTED)),
+            Line::from(reason),
+        ],
     }
 }
 
@@ -739,8 +749,8 @@ fn detail_status(
         .and_then(|now| u64::try_from(now.as_millis()).ok())
         .map(|now| now.saturating_sub(detail.sampled_at_ms))
         .unwrap_or_default();
-    let minimum_ms = u64::try_from(detail.detail.kind().minimum_interval().as_millis())
-        .unwrap_or(u64::MAX);
+    let minimum_ms =
+        u64::try_from(detail.detail.kind().minimum_interval().as_millis()).unwrap_or(u64::MAX);
     let cadence_ms = app.snapshot.interval_ms.max(minimum_ms);
     if age_ms > cadence_ms.saturating_mul(2) {
         format!("STALE {:.1}s · {}", age_ms as f64 / 1_000.0, detail_state(readiness, completeness))
