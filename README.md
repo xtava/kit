@@ -26,6 +26,7 @@ kit scout --once           # …one survey, headless table
 kit scout dive             # capture a window's heap snapshot → memlab
 kit stats                  # interactive CPU/core/process monitor
 kit stats --once           # warmed-up top-process snapshot
+kit update                 # rebuild + replace the installed binary from this checkout
 kit domain example.com io  # authoritative domain checker (+ aftermarket sale price)
 kit domain --for-sale ink  # …only names listed for sale, with buy-now/offer prices
 kit domain                 # …its TUI
@@ -98,6 +99,10 @@ cargo watch -x check     # tight feedback loop
 cargo run -- scout       # run a tool
 cargo install --path .   # → ~/.cargo/bin/kit
 ```
+
+After that, run `kit update` from anywhere to rebuild the same source checkout and replace the
+installed binary. The command uses the checkout exactly as it exists and does not pull or modify
+Git state.
 
 Efficient builds (fast linker, the edit→run loop, when to split crates) and code
 practices are in **[docs/dev-guide.md](./docs/dev-guide.md)**. The architecture and

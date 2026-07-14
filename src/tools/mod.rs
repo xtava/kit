@@ -8,3 +8,4 @@ pub mod record;
 pub mod render;
 pub mod scout;
 pub mod stats;
+pub mod update;
