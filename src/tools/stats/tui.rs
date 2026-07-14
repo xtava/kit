@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 
+use super::actions::ActionController;
 use super::app::{Action, StatsApp};
-use super::host;
 use super::render::{render, UiRegions};
 use super::sampler::{Sampler, SamplerWorker};
 use crate::tui::{EventReader, Session, SessionOptions};
@@ -16,8 +16,11 @@ pub async fn run(interval: Duration, mouse_capture: bool) -> Result<()> {
     let mut app = StatsApp::new(initial);
     let mut session = Session::open(SessionOptions { mouse_capture })?;
     let mut events = EventReader::start();
+    let mut actions = ActionController::new();
     let mut hit_map = UiRegions::default();
-    app.expected_detail = worker.request_detail(app.detail_kind());
+    if let Some(intent) = app.reconcile_detail_intent() {
+        worker.set_detail(intent.request());
+    }
 
     loop {
         session.draw(|frame| hit_map = render(frame, &app))?;
@@ -40,22 +43,29 @@ pub async fn run(interval: Duration, mouse_capture: bool) -> Result<()> {
                 match app.on_event(event, &hit_map) {
                     Action::Quit => break,
                     Action::Process(key, requested) => {
-                        app.status = Some(match host::send_action(key, requested) {
-                            Ok(()) => {
-                                worker.refresh();
-                                format!("Requested {} for PID {}", requested.label(), key.pid)
+                        match actions.start(key, requested) {
+                            Ok(request) => app.action_started(request),
+                            Err(active) => {
+                                app.status = Some(format!(
+                                    "Action already running for PID {}",
+                                    active.key.pid
+                                ));
                             }
-                            Err(error) => error.to_string(),
-                        });
+                        }
                     }
                     Action::None => {}
                 }
             }
+            result = actions.recv() => {
+                let succeeded = result.result.is_ok();
+                app.action_finished(result);
+                if succeeded {
+                    worker.refresh();
+                }
+            }
         }
-        let desired_detail = app.detail_kind();
-        if app.expected_detail.map(|request| request.kind) != desired_detail {
-            app.detail = None;
-            app.expected_detail = worker.request_detail(desired_detail);
+        if let Some(intent) = app.reconcile_detail_intent() {
+            worker.set_detail(intent.request());
         }
     }
     Ok(())
@@ -65,12 +75,12 @@ pub async fn run(interval: Duration, mouse_capture: bool) -> Result<()> {
 mod tests {
     use std::time::Instant;
 
-    use super::super::app::{ActiveRegion, InspectorTab};
+    use super::super::app::{ActiveRegion, DetailIntent, InspectorTab};
     use super::super::host::ProcessAction;
     use super::super::model::{
-        CpuSample, DetailOutcome, DetailPayload, DetailRequest, DetailRequestKind, DetailSnapshot,
-        ProcessIdentity, ProcessKey, ProcessSample, ProcessState, SampleReadiness, StatsSnapshot,
-        SystemSample, ThreadKey, ThreadSample,
+        CpuSample, DetailCompleteness, DetailData, DetailOutcome, DetailRequest, DetailRequestKind,
+        DetailSnapshot, Observed, ProcessIdentity, ProcessKey, ProcessSample, ProcessState,
+        SampleReadiness, StatsSnapshot, SystemSample, ThreadSample,
     };
     use super::*;
     use crossterm::event::{
@@ -170,6 +180,22 @@ mod tests {
             started_at_ms: 0,
             run_time_seconds: 1,
             last_cpu: Some(0),
+        }
+    }
+
+    fn ready<T>(value: T) -> DetailOutcome<T> {
+        DetailOutcome::Available {
+            readiness: SampleReadiness::Ready,
+            completeness: DetailCompleteness::Complete,
+            value,
+        }
+    }
+
+    fn warming<T>(value: T) -> DetailOutcome<T> {
+        DetailOutcome::Available {
+            readiness: SampleReadiness::Warming,
+            completeness: DetailCompleteness::Complete,
+            value,
         }
     }
 
@@ -367,12 +393,10 @@ mod tests {
             DetailRequest { request_id: 3, kind: DetailRequestKind::Threads { process } };
         app.expected_detail = Some(current_request);
         let late = Arc::new(DetailSnapshot {
-            request: DetailRequest { request_id: 1, kind: DetailRequestKind::Threads { process } },
+            request_id: 1,
             sampled_at_ms: 0,
             collection_duration_ms: 1,
-            outcome: DetailOutcome::Ready {
-                payload: DetailPayload::Threads { process, rows: Vec::new() },
-            },
+            detail: DetailData::Threads { process, outcome: ready(Vec::new()) },
             warnings: Vec::new(),
         });
         app.ingest_detail(Some(late));
@@ -380,31 +404,24 @@ mod tests {
 
         let other = ProcessKey { pid: process.pid + 1, start_token: process.start_token + 1 };
         let wrong_target = Arc::new(DetailSnapshot {
-            request: DetailRequest {
-                request_id: current_request.request_id,
-                kind: DetailRequestKind::Threads { process: other },
-            },
+            request_id: current_request.request_id,
             sampled_at_ms: 0,
             collection_duration_ms: 1,
-            outcome: DetailOutcome::Ready {
-                payload: DetailPayload::Threads { process: other, rows: Vec::new() },
-            },
+            detail: DetailData::Threads { process: other, outcome: ready(Vec::new()) },
             warnings: Vec::new(),
         });
         app.ingest_detail(Some(wrong_target));
         assert!(app.detail.is_none());
 
         let current = Arc::new(DetailSnapshot {
-            request: current_request,
+            request_id: current_request.request_id,
             sampled_at_ms: 0,
             collection_duration_ms: 1,
-            outcome: DetailOutcome::Ready {
-                payload: DetailPayload::Threads { process, rows: Vec::new() },
-            },
+            detail: DetailData::Threads { process, outcome: ready(Vec::new()) },
             warnings: Vec::new(),
         });
         app.ingest_detail(Some(Arc::clone(&current)));
-        assert_eq!(app.detail.as_ref().unwrap().request.request_id, 3);
+        assert_eq!(app.detail.as_ref().unwrap().request_id, 3);
     }
 
     #[test]
@@ -504,23 +521,20 @@ mod tests {
         let mut app = StatsApp::new(Arc::new(snapshot));
         app.focused_core = Some(0);
         app.detail = Some(Arc::new(DetailSnapshot {
-            request: DetailRequest {
-                request_id: 1,
-                kind: DetailRequestKind::Core { logical_index: 0 },
-            },
+            request_id: 1,
             sampled_at_ms: 0,
             collection_duration_ms: 1,
-            outcome: DetailOutcome::Ready {
-                payload: DetailPayload::Core {
-                    logical_index: 0,
-                    rows: vec![ThreadSample {
-                        key: ThreadKey { tid: 20, start_token: 20 },
-                        process,
-                        name: "worker".into(),
-                        cpu_percent: 12.5,
-                        last_cpu: Some(0),
-                    }],
-                },
+            detail: DetailData::Core {
+                logical_index: 0,
+                outcome: ready(vec![ThreadSample {
+                    tid: 20,
+                    process,
+                    name: Observed::Value("worker".into()),
+                    state: Observed::Value(ProcessState::Running),
+                    cpu_percent: Observed::Value(12.5),
+                    accumulated_cpu_seconds: Observed::Value(1.0),
+                    last_cpu: Observed::Value(0),
+                }]),
             },
             warnings: Vec::new(),
         }));
@@ -528,6 +542,165 @@ mod tests {
         assert_eq!(app.visible.len(), 1);
         assert_eq!(app.visible[0].pid, process.pid);
         assert_eq!(app.visible[0].cpu, 12.5);
+    }
+
+    #[test]
+    fn core_focus_invalidates_process_detail_before_filtering_the_tree() {
+        let mut app = StatsApp::new(snapshot());
+        let process = app.selected.unwrap().stable_key().unwrap();
+        app.inspector_tab = InspectorTab::Threads;
+        let DetailIntent::Request(thread_request) = app.reconcile_detail_intent().unwrap() else {
+            panic!("threads tab should request process detail")
+        };
+        app.ingest_detail(Some(Arc::new(DetailSnapshot {
+            request_id: thread_request.request_id,
+            sampled_at_ms: 0,
+            collection_duration_ms: 1,
+            detail: DetailData::Threads {
+                process,
+                outcome: ready(vec![ThreadSample {
+                    tid: 20,
+                    process,
+                    name: Observed::Value("worker".into()),
+                    state: Observed::Value(ProcessState::Running),
+                    cpu_percent: Observed::Value(12.5),
+                    accumulated_cpu_seconds: Observed::Value(1.0),
+                    last_cpu: Observed::Value(0),
+                }]),
+            },
+            warnings: Vec::new(),
+        })));
+
+        app.focus_core(1);
+        let DetailIntent::Request(core_request) = app.reconcile_detail_intent().unwrap() else {
+            panic!("core focus should request core detail")
+        };
+        assert_eq!(core_request.kind, DetailRequestKind::Core { logical_index: 0 });
+        assert!(app.detail.is_none());
+        assert_eq!(app.visible.len(), app.snapshot.processes.len());
+    }
+
+    #[test]
+    fn family_rankings_select_exact_processes_without_changing_tabs() {
+        let mut source = Arc::unwrap_or_clone(snapshot());
+        source.processes[1].parent_pid = Some(source.processes[0].identity.pid());
+        let mut app = StatsApp::new(Arc::new(source));
+        app.set_inspector_tab(InspectorTab::Family);
+        app.active_region = ActiveRegion::Inspector;
+        let backend = ratatui::backend::TestBackend::new(130, 35);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let regions = draw_app(&mut terminal, &app);
+        let (area, _, expected) = regions.family_rows[0];
+        app.on_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: area.x,
+                row: area.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            &regions,
+        );
+        assert_eq!(app.selected, Some(expected));
+        assert_eq!(app.inspector_tab, InspectorTab::Family);
+        assert_eq!(app.active_region, ActiveRegion::Inspector);
+    }
+
+    #[test]
+    fn family_keyboard_navigation_reaches_rows_hidden_by_the_viewport() {
+        let mut source = Arc::unwrap_or_clone(snapshot());
+        let root = process(1, "root", 1.0);
+        source.processes = std::iter::once(root.clone())
+            .chain((0..20).map(|index| {
+                let mut child = process(100 + index, &format!("child-{index:02}"), index as f32);
+                child.parent_pid = Some(root.identity.pid());
+                child
+            }))
+            .collect();
+        let mut app = StatsApp::new(Arc::new(source));
+        app.selected = Some(root.identity);
+        app.set_inspector_tab(InspectorTab::Family);
+        app.active_region = ActiveRegion::Inspector;
+        let backend = ratatui::backend::TestBackend::new(130, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let regions = draw_app(&mut terminal, &app);
+        assert!(app.family_row_count() > regions.family_rows.len());
+
+        for _ in 0..30 {
+            app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &regions);
+        }
+        assert!(app.family_cursor >= regions.family_rows.len());
+        let expected = app.family_row_key(app.family_cursor).unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &regions);
+        assert_eq!(app.selected, Some(expected));
+    }
+
+    #[test]
+    fn thread_sorting_preserves_warming_as_distinct_from_zero() {
+        let mut app = StatsApp::new(snapshot());
+        let process = app.selected.unwrap().stable_key().unwrap();
+        app.inspector_tab = InspectorTab::Threads;
+        app.active_region = ActiveRegion::Inspector;
+        app.detail = Some(Arc::new(DetailSnapshot {
+            request_id: 1,
+            sampled_at_ms: 0,
+            collection_duration_ms: 1,
+            detail: DetailData::Threads {
+                process,
+                outcome: warming(vec![
+                    ThreadSample {
+                        tid: 40,
+                        process,
+                        name: Observed::Value("warming".into()),
+                        state: Observed::Value(ProcessState::Sleeping),
+                        cpu_percent: Observed::Warming,
+                        accumulated_cpu_seconds: Observed::Value(2.0),
+                        last_cpu: Observed::Value(0),
+                    },
+                    ThreadSample {
+                        tid: 20,
+                        process,
+                        name: Observed::Value("measured".into()),
+                        state: Observed::Value(ProcessState::Running),
+                        cpu_percent: Observed::Value(0.0),
+                        accumulated_cpu_seconds: Observed::Value(1.0),
+                        last_cpu: Observed::Value(0),
+                    },
+                ]),
+            },
+            warnings: Vec::new(),
+        }));
+        assert_eq!(app.sorted_threads()[0].tid, 20);
+        app.on_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE), &UiRegions::default());
+        assert_eq!(
+            app.sorted_threads().iter().map(|thread| thread.tid).collect::<Vec<_>>(),
+            vec![20, 40]
+        );
+    }
+
+    #[test]
+    fn full_command_viewer_freezes_observed_text_and_scrolls_without_copying() {
+        let mut source = Arc::unwrap_or_clone(snapshot());
+        source.processes[0].command = format!("secret-token={}\nsecond line", "x".repeat(180));
+        let selected = source.processes[0].identity;
+        let original = source.processes[0].command.clone();
+        let mut app = StatsApp::new(Arc::new(source));
+        app.selected = Some(selected);
+        app.inspector_tab = InspectorTab::Overview;
+        app.active_region = ActiveRegion::Inspector;
+        app.on_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE), &UiRegions::default());
+
+        let mut replacement = Arc::unwrap_or_clone(snapshot());
+        replacement.processes[0].command = "replacement command".into();
+        app.ingest(Arc::new(replacement));
+        assert_eq!(app.command_viewer.as_ref().unwrap().command, original);
+
+        let backend = ratatui::backend::TestBackend::new(130, 35);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let regions = draw_app(&mut terminal, &app);
+        app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &regions);
+        assert!(app.command_viewer.as_ref().unwrap().column_offset > 0);
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &regions);
+        assert!(app.command_viewer.is_none());
     }
 
     #[test]
@@ -551,25 +724,25 @@ mod tests {
         app.focused_core = None;
         app.reproject();
         app.open_confirmation(ProcessAction::GracefulTerminate);
+        assert_eq!(
+            app.confirm.as_ref().unwrap().choice,
+            super::super::app::ConfirmationChoice::Cancel
+        );
+        assert!(matches!(
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &regions),
+            Action::None
+        ));
+        assert!(app.confirm.is_none());
+
+        app.open_confirmation(ProcessAction::GracefulTerminate);
         regions = draw_app(&mut terminal, &app);
         let force = regions.confirm_force.unwrap();
-        app.on_mouse(
-            MouseEvent {
-                kind: MouseEventKind::Down(MouseButton::Left),
-                column: force.x,
-                row: force.y,
-                modifiers: KeyModifiers::NONE,
-            },
-            &regions,
-        );
-        assert_eq!(app.confirm.as_ref().unwrap().action, ProcessAction::ForceTerminate);
-        let yes = regions.confirm_yes.unwrap();
         assert!(matches!(
             app.on_mouse(
                 MouseEvent {
                     kind: MouseEventKind::Down(MouseButton::Left),
-                    column: yes.x,
-                    row: yes.y,
+                    column: force.x,
+                    row: force.y,
                     modifiers: KeyModifiers::NONE,
                 },
                 &regions

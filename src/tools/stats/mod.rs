@@ -1,5 +1,6 @@
 //! stats — an interactive, process-aware system monitor.
 
+mod actions;
 mod app;
 mod history;
 mod host;

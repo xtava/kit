@@ -4,14 +4,31 @@ use std::io;
 
 use thiserror::Error;
 
-use super::model::{CapabilityState, HostCapabilities};
+use super::model::{CapabilityState, HostCapabilities, Observed, ProcessState};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TaskStat {
-    pub name: String,
-    pub cpu_ticks: u64,
+pub struct ProcessObservation {
     pub start_token: u64,
     pub last_cpu: Option<u16>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TaskStat {
+    pub name: Observed<String>,
+    pub state: Observed<ProcessState>,
+    pub cpu_time_seconds: Observed<f64>,
+    pub start_token: Option<u64>,
+    pub last_cpu: Observed<u16>,
+}
+
+pub struct TaskBatch {
+    pub tasks: Vec<(u32, TaskStat)>,
+    pub failures: Vec<TaskReadFailure>,
+}
+
+pub struct TaskReadFailure {
+    pub tid: Option<u32>,
+    pub error: io::Error,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -33,8 +50,14 @@ impl ProcessAction {
 pub enum ActionError {
     #[error("refusing to act on PID 1")]
     Init,
+    #[error("refusing to act on a system process")]
+    #[cfg(target_os = "windows")]
+    SystemProcess,
     #[error("refusing to act on the monitor itself")]
     SelfProcess,
+    #[error("refusing to terminate critical process {0}")]
+    #[cfg(target_os = "windows")]
+    Protected(u32),
     #[error("invalid process id {0}")]
     InvalidPid(u32),
     #[error("process {0} is no longer available")]
@@ -137,33 +160,39 @@ pub fn capabilities() -> HostCapabilities {
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
-pub use linux::{read_process_resources, read_process_stat, read_process_tasks, send_action};
+pub use linux::{
+    read_process_observation, read_process_resources, read_process_tasks, send_action,
+};
 
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
-pub use macos::{read_process_resources, read_process_stat, read_process_tasks, send_action};
+pub use macos::{
+    read_process_observation, read_process_resources, read_process_tasks, send_action,
+};
 
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "windows")]
-pub use windows::{read_process_resources, read_process_stat, read_process_tasks, send_action};
+pub use windows::{
+    read_process_observation, read_process_resources, read_process_tasks, send_action,
+};
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 mod fallback {
     use std::io;
 
-    use super::{ActionError, ProcessAction, TaskStat};
+    use super::{ActionError, ProcessAction, ProcessObservation, TaskBatch};
     use crate::tools::stats::model::{DetailUnavailable, ProcessKey, ResourceSample};
 
-    pub fn read_process_stat(_pid: u32) -> io::Result<TaskStat> {
+    pub fn read_process_observation(_pid: u32) -> io::Result<ProcessObservation> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "native process generation is not implemented for this target",
         ))
     }
 
-    pub fn read_process_tasks(_pid: u32) -> io::Result<Vec<(u32, TaskStat)>> {
+    pub fn read_process_tasks(_pid: u32) -> io::Result<TaskBatch> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "native thread detail is not implemented for this target",
@@ -182,4 +211,6 @@ mod fallback {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-pub use fallback::{read_process_resources, read_process_stat, read_process_tasks, send_action};
+pub use fallback::{
+    read_process_observation, read_process_resources, read_process_tasks, send_action,
+};

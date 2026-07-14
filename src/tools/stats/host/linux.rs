@@ -8,8 +8,10 @@ use std::io;
 use rustix::process::{pidfd_open, pidfd_send_signal, Pid, PidfdFlags, Signal};
 use thiserror::Error;
 
-use super::{ActionError, ProcessAction, TaskStat};
-use crate::tools::stats::model::{DetailUnavailable, Observed, ProcessKey, ResourceSample};
+use super::{ActionError, ProcessAction, ProcessObservation, TaskBatch, TaskReadFailure, TaskStat};
+use crate::tools::stats::model::{
+    DetailUnavailable, Observed, ProcessKey, ProcessState, ResourceSample,
+};
 
 #[derive(Debug, Error)]
 pub enum StatParseError {
@@ -21,26 +23,48 @@ pub enum StatParseError {
     InvalidField { field: u8, value: String },
 }
 
-pub fn read_process_stat(pid: u32) -> io::Result<TaskStat> {
+pub fn read_process_observation(pid: u32) -> io::Result<ProcessObservation> {
+    let stat = read_process_stat(pid)?;
+    Ok(ProcessObservation { start_token: stat.start_token, last_cpu: stat.last_cpu })
+}
+
+fn read_process_stat(pid: u32) -> io::Result<ProcStat> {
     read_stat_path(format!("/proc/{pid}/stat"))
 }
 
 pub fn read_thread_stat(pid: u32, tid: u32) -> io::Result<TaskStat> {
-    read_stat_path(format!("/proc/{pid}/task/{tid}/stat"))
+    let stat = read_stat_path(format!("/proc/{pid}/task/{tid}/stat"))?;
+    Ok(TaskStat {
+        name: Observed::Value(stat.name),
+        state: Observed::Value(stat.state),
+        cpu_time_seconds: Observed::Value(stat.cpu_time_seconds),
+        start_token: Some(stat.start_token),
+        last_cpu: stat.last_cpu.map_or(Observed::Unsupported, Observed::Value),
+    })
 }
 
-pub fn read_process_tasks(pid: u32) -> io::Result<Vec<(u32, TaskStat)>> {
+pub fn read_process_tasks(pid: u32) -> io::Result<TaskBatch> {
     let entries = std::fs::read_dir(format!("/proc/{pid}/task"))?;
     let mut tasks = Vec::new();
-    for entry in entries.flatten() {
+    let mut failures = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                failures.push(TaskReadFailure { tid: None, error });
+                continue;
+            }
+        };
         let Some(tid) = entry.file_name().to_str().and_then(|name| name.parse::<u32>().ok()) else {
             continue;
         };
-        if let Ok(stat) = read_thread_stat(pid, tid) {
-            tasks.push((tid, stat));
+        match read_thread_stat(pid, tid) {
+            Ok(stat) => tasks.push((tid, stat)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => failures.push(TaskReadFailure { tid: Some(tid), error }),
         }
     }
-    Ok(tasks)
+    Ok(TaskBatch { tasks, failures })
 }
 
 pub fn read_process_resources(pid: u32) -> Result<ResourceSample, DetailUnavailable> {
@@ -91,7 +115,7 @@ fn read_virtual_bytes(path: &str) -> io::Result<u64> {
 }
 
 fn count_directory_entries(path: &str) -> io::Result<u64> {
-    Ok(std::fs::read_dir(path)?.filter_map(Result::ok).count() as u64)
+    std::fs::read_dir(path)?.try_fold(0_u64, |count, entry| entry.map(|_| count.saturating_add(1)))
 }
 
 fn read_io_counters(path: &str) -> io::Result<(u64, u64)> {
@@ -100,6 +124,9 @@ fn read_io_counters(path: &str) -> io::Result<(u64, u64)> {
     let mut write_bytes = None;
     for line in text.lines() {
         let Some((name, value)) = line.split_once(':') else { continue };
+        if name != "read_bytes" && name != "write_bytes" {
+            continue;
+        }
         let value = value
             .trim()
             .parse::<u64>()
@@ -147,15 +174,28 @@ pub fn send_action(key: ProcessKey, action: ProcessAction) -> Result<(), ActionE
     })
 }
 
-fn read_stat_path(path: String) -> io::Result<TaskStat> {
+#[derive(Debug, PartialEq)]
+struct ProcStat {
+    name: String,
+    state: ProcessState,
+    cpu_time_seconds: f64,
+    start_token: u64,
+    last_cpu: Option<u16>,
+}
+
+fn read_stat_path(path: String) -> io::Result<ProcStat> {
     let text = std::fs::read_to_string(path)?;
     parse_stat(&text).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
-pub fn parse_stat(text: &str) -> Result<TaskStat, StatParseError> {
+fn parse_stat(text: &str) -> Result<ProcStat, StatParseError> {
     let command_end = text.rfind(") ").ok_or(StatParseError::MissingCommand)?;
     let command_start = text.find('(').ok_or(StatParseError::MissingCommand)? + 1;
     let fields = text[command_end + 2..].split_whitespace().collect::<Vec<_>>();
+    let state = fields
+        .first()
+        .and_then(|value| value.chars().next())
+        .map_or(Err(StatParseError::MissingField(3)), |state| Ok(parse_state(state)))?;
     let user_ticks = parse_field::<u64>(&fields, 14, 11)?;
     let system_ticks = parse_field::<u64>(&fields, 15, 12)?;
     let start = parse_field::<u64>(&fields, 22, 19)?;
@@ -167,12 +207,26 @@ pub fn parse_stat(text: &str) -> Result<TaskStat, StatParseError> {
                 .map_err(|_| StatParseError::InvalidField { field: 39, value: (*value).to_owned() })
         })
         .transpose()?;
-    Ok(TaskStat {
+    Ok(ProcStat {
         name: text[command_start..command_end].to_owned(),
-        cpu_ticks: user_ticks.saturating_add(system_ticks),
+        state,
+        cpu_time_seconds: user_ticks.saturating_add(system_ticks) as f64
+            / rustix::param::clock_ticks_per_second().max(1) as f64,
         start_token: start,
         last_cpu,
     })
+}
+
+fn parse_state(state: char) -> ProcessState {
+    match state {
+        'R' => ProcessState::Running,
+        'S' | 'I' => ProcessState::Sleeping,
+        'D' | 'W' => ProcessState::Waiting,
+        'T' | 't' => ProcessState::Stopped,
+        'Z' => ProcessState::Zombie,
+        'X' | 'x' => ProcessState::Dead,
+        _ => ProcessState::Unknown,
+    }
 }
 
 fn parse_field<T>(fields: &[&str], number: u8, index: usize) -> Result<T, StatParseError>
@@ -198,9 +252,10 @@ mod tests {
         let stat = "77 (name with ) parens) R 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 4242 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 7";
         assert_eq!(
             parse_stat(stat).unwrap(),
-            TaskStat {
+            ProcStat {
                 name: "name with ) parens".to_owned(),
-                cpu_ticks: 23,
+                state: ProcessState::Running,
+                cpu_time_seconds: 23.0 / rustix::param::clock_ticks_per_second().max(1) as f64,
                 start_token: 4242,
                 last_cpu: Some(7),
             }
@@ -212,7 +267,13 @@ mod tests {
         let stat = "1 (init) S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 99";
         assert_eq!(
             parse_stat(stat).unwrap(),
-            TaskStat { name: "init".to_owned(), cpu_ticks: 0, start_token: 99, last_cpu: None }
+            ProcStat {
+                name: "init".to_owned(),
+                state: ProcessState::Sleeping,
+                cpu_time_seconds: 0.0,
+                start_token: 99,
+                last_cpu: None,
+            }
         );
     }
 

@@ -1,16 +1,17 @@
 //! Named, serializable system-sampling types shared by the headless and interactive projections.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use serde::Serialize;
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct ProcessKey {
     pub pid: u32,
     pub start_token: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProcessIdentity {
     Stable { key: ProcessKey },
@@ -37,7 +38,7 @@ impl ProcessIdentity {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IdentityUnavailable {
     PermissionDenied,
@@ -106,18 +107,22 @@ impl ProcessState {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
-pub struct ThreadKey {
-    pub tid: u32,
-    pub start_token: u64,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DetailRequestKind {
     Threads { process: ProcessKey },
     Resources { process: ProcessKey },
     Core { logical_index: u16 },
+}
+
+impl DetailRequestKind {
+    pub fn minimum_interval(self) -> Duration {
+        match self {
+            Self::Core { .. } | Self::Resources { .. } => Duration::from_secs(4),
+            Self::Threads { .. } if cfg!(target_os = "windows") => Duration::from_secs(4),
+            Self::Threads { .. } => Duration::from_secs(2),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -128,50 +133,69 @@ pub struct DetailRequest {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct DetailSnapshot {
-    pub request: DetailRequest,
+    pub request_id: u64,
     pub sampled_at_ms: u64,
     pub collection_duration_ms: u64,
-    pub outcome: DetailOutcome,
+    pub detail: DetailData,
     pub warnings: Vec<SampleWarning>,
 }
 
 impl DetailSnapshot {
+    pub fn request(&self) -> DetailRequest {
+        DetailRequest { request_id: self.request_id, kind: self.detail.kind() }
+    }
+
     pub fn threads(&self) -> Option<&[ThreadSample]> {
-        match self.payload()? {
-            DetailPayload::Threads { rows, .. } | DetailPayload::Core { rows, .. } => Some(rows),
-            DetailPayload::Resources(_) => None,
+        match &self.detail {
+            DetailData::Threads { outcome, .. } | DetailData::Core { outcome, .. } => {
+                outcome.value().map(Vec::as_slice)
+            }
+            DetailData::Resources { .. } => None,
         }
     }
-
-    pub fn resources(&self) -> Option<&ResourceSample> {
-        match self.payload()? {
-            DetailPayload::Resources(resources) => Some(resources),
-            DetailPayload::Threads { .. } | DetailPayload::Core { .. } => None,
-        }
-    }
-
-    pub fn payload(&self) -> Option<&DetailPayload> {
-        match &self.outcome {
-            DetailOutcome::Warming { payload } | DetailOutcome::Ready { payload } => Some(payload),
-            DetailOutcome::Unavailable { .. } => None,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub enum DetailOutcome {
-    Warming { payload: DetailPayload },
-    Ready { payload: DetailPayload },
-    Unavailable { reason: DetailUnavailable },
 }
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum DetailPayload {
-    Threads { process: ProcessKey, rows: Vec<ThreadSample> },
-    Resources(ResourceSample),
-    Core { logical_index: u16, rows: Vec<ThreadSample> },
+pub enum DetailData {
+    Threads { process: ProcessKey, outcome: DetailOutcome<Vec<ThreadSample>> },
+    Resources { process: ProcessKey, outcome: DetailOutcome<ResourceSample> },
+    Core { logical_index: u16, outcome: DetailOutcome<Vec<ThreadSample>> },
+}
+
+impl DetailData {
+    pub fn kind(&self) -> DetailRequestKind {
+        match self {
+            Self::Threads { process, .. } => DetailRequestKind::Threads { process: *process },
+            Self::Resources { process, .. } => DetailRequestKind::Resources { process: *process },
+            Self::Core { logical_index, .. } => {
+                DetailRequestKind::Core { logical_index: *logical_index }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "state", content = "value", rename_all = "snake_case")]
+pub enum DetailOutcome<T> {
+    Available { readiness: SampleReadiness, completeness: DetailCompleteness, value: T },
+    Unavailable(DetailUnavailable),
+}
+
+impl<T> DetailOutcome<T> {
+    pub fn value(&self) -> Option<&T> {
+        match self {
+            Self::Available { value, .. } => Some(value),
+            Self::Unavailable(_) => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DetailCompleteness {
+    Complete,
+    Partial,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -268,11 +292,13 @@ pub struct ProcessSample {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ThreadSample {
-    pub key: ThreadKey,
+    pub tid: u32,
     pub process: ProcessKey,
-    pub name: String,
-    pub cpu_percent: f32,
-    pub last_cpu: Option<u16>,
+    pub name: Observed<String>,
+    pub state: Observed<ProcessState>,
+    pub cpu_percent: Observed<f32>,
+    pub accumulated_cpu_seconds: Observed<f64>,
+    pub last_cpu: Observed<u16>,
 }
 
 #[derive(Clone, Debug, Serialize)]

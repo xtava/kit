@@ -6,9 +6,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Cell, Clear, Paragraph, Row, Table, Wrap};
 use ratatui::Frame;
 
-use super::app::{ActiveRegion, InspectorTab, SortBy, StatsApp};
+use super::app::{ActiveRegion, ConfirmationChoice, InspectorTab, SortBy, StatsApp};
 use super::host::ProcessAction;
-use super::model::{CapabilityState, DetailOutcome, Observed};
+use super::model::{
+    CapabilityState, DetailCompleteness, DetailData, DetailOutcome, Observed, ResourceSample,
+    SampleReadiness,
+};
 use super::report;
 use crate::tui::{theme::NORD, NavigationMap, NavigationRegion};
 
@@ -33,8 +36,13 @@ pub(super) struct UiRegions {
     pub(super) rows: Vec<(Rect, usize)>,
     pub(super) headers: Vec<(Rect, SortBy)>,
     pub(super) disclosures: Vec<(Rect, super::model::ProcessIdentity)>,
+    pub(super) family_rows: Vec<(Rect, usize, super::model::ProcessIdentity)>,
+    pub(super) thread_rows: Vec<(Rect, usize)>,
     pub(super) tabs: Vec<(Rect, InspectorTab)>,
     pub(super) profile: Option<Rect>,
+    pub(super) command_open: Option<Rect>,
+    pub(super) command_content: Option<Rect>,
+    pub(super) command_close: Option<Rect>,
     pub(super) back: Option<Rect>,
     pub(super) end_process: Option<Rect>,
     pub(super) confirm_yes: Option<Rect>,
@@ -98,6 +106,8 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &StatsApp) -> UiRegions {
     render_footer(frame, app, chunks[3]);
     if app.confirm.is_some() {
         render_confirmation(frame, app, &mut regions);
+    } else if app.command_viewer.is_some() {
+        render_command_viewer(frame, app, &mut regions);
     }
     regions
 }
@@ -412,112 +422,111 @@ fn render_inspector(
                     history_bars(history.points().map(|point| point.rss_bytes as f64), width)
                 )));
             }
+            let command_line = content.y + lines.len() as u16 + 1;
+            regions.command_open = Some(Rect::new(
+                content.x,
+                command_line,
+                content.width,
+                content.bottom().saturating_sub(command_line),
+            ));
             lines.extend([
                 Line::from(""),
-                Line::styled("COMMAND", Style::default().fg(MUTED)),
+                Line::from(vec![
+                    Span::styled("COMMAND", Style::default().fg(MUTED)),
+                    Span::styled("  v / click to inspect", Style::default().fg(ACCENT)),
+                ]),
                 Line::styled(process.command.clone(), Style::default().fg(TEXT)),
             ]);
             lines
         }
-        InspectorTab::Family => vec![
-            Line::styled("DESCENDANT-INCLUSIVE TOTALS", Style::default().fg(MUTED)),
-            Line::from(format!("CPU      {:.1}%", family_cpu)),
-            Line::from(format!("MEMORY   {}", report::bytes(family_memory))),
-            Line::from(format!(
-                "CHILDREN {} direct",
-                app.snapshot
-                    .processes
-                    .iter()
-                    .filter(|candidate| candidate.parent_pid == Some(process.identity.pid()))
-                    .count()
-            )),
-        ],
+        InspectorTab::Family => {
+            family_lines(app, process, family_cpu, family_memory, content, regions)
+        }
         InspectorTab::Threads => {
             let detail = app.detail.as_deref();
+            let outcome = detail.and_then(|detail| match &detail.detail {
+                DetailData::Threads { outcome, .. } | DetailData::Core { outcome, .. } => {
+                    Some(outcome)
+                }
+                DetailData::Resources { .. } => None,
+            });
             let mut lines = vec![Line::styled(
-                match detail.map(|detail| &detail.outcome) {
-                    Some(DetailOutcome::Ready { .. }) => "THREADS · LIVE DETAIL".to_owned(),
-                    Some(DetailOutcome::Warming { .. }) => "THREADS · WARMING DELTAS…".to_owned(),
-                    Some(DetailOutcome::Unavailable { reason }) => {
-                        format!("THREADS · {}", detail_unavailable(reason))
-                    }
-                    None => "THREADS · LOADING…".to_owned(),
-                },
+                format!(
+                    "{}  ·  SORT {} {}",
+                    match outcome {
+                        Some(DetailOutcome::Available { readiness, completeness, .. }) => {
+                            format!(
+                                "THREADS · {}",
+                                detail_status(
+                                    app,
+                                    detail.expect("outcome came from detail"),
+                                    *readiness,
+                                    *completeness,
+                                )
+                            )
+                        }
+                        Some(DetailOutcome::Unavailable(reason)) => {
+                            format!("THREADS · {}", detail_unavailable(reason))
+                        }
+                        None => "THREADS · LOADING…".to_owned(),
+                    },
+                    app.thread_sort.label(),
+                    if app.thread_descending { "▼" } else { "▲" }
+                ),
                 Style::default().fg(MUTED),
             )];
-            lines.extend(
-                detail
-                    .into_iter()
-                    .flat_map(|detail| detail.threads().into_iter().flatten())
-                    .filter(|thread| process.identity.stable_key() == Some(thread.process))
-                    .take(content.height.saturating_sub(2) as usize)
-                    .map(|thread| {
-                        Line::from(format!(
-                            "{:>7.1}%  {:>8}  {}",
-                            thread.cpu_percent,
-                            thread.last_cpu.map_or_else(|| "—".into(), |core| format!("C{core}")),
-                            thread.name
-                        ))
-                    }),
-            );
+            let rows = app.sorted_threads();
+            for (index, thread) in rows
+                .iter()
+                .enumerate()
+                .skip(app.thread_offset)
+                .take(content.height.saturating_sub(2) as usize)
+            {
+                regions.thread_rows.push((
+                    Rect::new(content.x, content.y + lines.len() as u16, content.width, 1),
+                    index,
+                ));
+                let style = if index == app.thread_cursor {
+                    Style::default().fg(PANEL).bg(SELECTED).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(TEXT)
+                };
+                lines.push(Line::styled(
+                    format!(
+                        "{:>8}  {:>7}  {:>5}  {:>8}  {:>9}  {}",
+                        observed_percent(&thread.cpu_percent),
+                        thread.tid,
+                        observed_core(&thread.last_cpu),
+                        observed_seconds(&thread.accumulated_cpu_seconds),
+                        observed_process_state(&thread.state),
+                        observed_string(&thread.name),
+                    ),
+                    style,
+                ));
+            }
             lines
         }
         InspectorTab::Resources => match app.snapshot.host.resources {
-            CapabilityState::Available => app
-                .detail
-                .as_deref()
-                .and_then(|detail| detail.resources().map(|resources| (detail, resources)))
-                .map_or_else(
-                    || vec![Line::styled("RESOURCES · LOADING…", Style::default().fg(MUTED))],
-                    |(detail, resources)| {
-                        vec![
-                            Line::styled(
-                                format!(
-                                    "RESOURCES · {}",
-                                    match &detail.outcome {
-                                        DetailOutcome::Ready { .. } => "LIVE".to_owned(),
-                                        DetailOutcome::Warming { .. } => {
-                                            "WARMING I/O RATE…".to_owned()
-                                        }
-                                        DetailOutcome::Unavailable { reason } => {
-                                            detail_unavailable(reason).to_owned()
-                                        }
-                                    }
-                                ),
-                                Style::default().fg(MUTED),
-                            ),
-                            Line::from(format!(
-                                "EXEC      {}",
-                                observed_path(&resources.executable)
-                            )),
-                            Line::from(format!(
-                                "CWD       {}",
-                                observed_path(&resources.current_directory)
-                            )),
-                            Line::from(format!(
-                                "VIRTUAL / ADDRESS SPACE  {}",
-                                observed_bytes(&resources.virtual_bytes)
-                            )),
-                            Line::from(format!(
-                                "{}  {}",
-                                resources.open_resource_label.to_ascii_uppercase(),
-                                observed_number(&resources.open_resources)
-                            )),
-                            Line::from(format!(
-                                "{} READ   {} total  {} /s",
-                                resources.io_label.to_ascii_uppercase(),
-                                observed_bytes(&resources.read_bytes),
-                                observed_rate(&resources.read_bytes_per_second)
-                            )),
-                            Line::from(format!(
-                                "{} WRITE  {} total  {} /s",
-                                resources.io_label.to_ascii_uppercase(),
-                                observed_bytes(&resources.write_bytes),
-                                observed_rate(&resources.write_bytes_per_second)
-                            )),
-                        ]
+            CapabilityState::Available => match app.detail.as_deref() {
+                Some(detail) => match &detail.detail {
+                    DetailData::Resources { outcome, .. } => match outcome {
+                        DetailOutcome::Available { readiness, completeness, value: resources } => {
+                            resource_lines(
+                                &detail_status(app, detail, *readiness, *completeness),
+                                resources,
+                            )
+                        }
+                        DetailOutcome::Unavailable(reason) => vec![Line::styled(
+                            format!("RESOURCES · {}", detail_unavailable(reason)),
+                            Style::default().fg(MUTED),
+                        )],
                     },
-                ),
+                    DetailData::Threads { .. } | DetailData::Core { .. } => {
+                        vec![Line::styled("RESOURCES · LOADING…", Style::default().fg(MUTED))]
+                    }
+                },
+                None => vec![Line::styled("RESOURCES · LOADING…", Style::default().fg(MUTED))],
+            },
             CapabilityState::Unsupported { reason } => vec![
                 Line::styled("RESOURCES UNAVAILABLE", Style::default().fg(MUTED)),
                 Line::from(reason),
@@ -554,6 +563,150 @@ fn render_inspector(
     }
 }
 
+fn family_lines<'a>(
+    app: &StatsApp,
+    process: &super::model::ProcessSample,
+    family_cpu: f32,
+    family_memory: u64,
+    area: Rect,
+    regions: &mut UiRegions,
+) -> Vec<Line<'a>> {
+    let Some(family) = app.selected_family() else {
+        return vec![Line::styled(
+            "FAMILY RANKINGS UNAVAILABLE FOR EXITED TARGET",
+            Style::default().fg(MUTED),
+        )];
+    };
+    let cpu_share = if family_cpu > 0.0 {
+        format!("{:.1}%", process.cpu_percent as f64 / family_cpu as f64 * 100.0)
+    } else {
+        "—".to_owned()
+    };
+    let memory_share = if family_memory > 0 {
+        format!("{:.1}%", process.rss_bytes as f64 / family_memory as f64 * 100.0)
+    } else {
+        "—".to_owned()
+    };
+    let mut lines = vec![
+        Line::styled("FAMILY · COMPLETE REPAIRED SUBTREE", Style::default().fg(MUTED)),
+        Line::from(format!(
+            "CHILDREN {} direct  ·  {} descendants",
+            family.direct_children.len(),
+            family.descendant_count
+        )),
+        Line::from(format!(
+            "CPU  own {:.1}%  ·  family {:.1}%  ·  share {cpu_share}",
+            process.cpu_percent, family_cpu
+        )),
+        Line::from(format!(
+            "RSS  own {}  ·  summed family {}  ·  share {memory_share}",
+            report::bytes(process.rss_bytes),
+            report::bytes(family_memory)
+        )),
+        Line::from(""),
+    ];
+    let ranking_space = area.height.saturating_sub(lines.len() as u16) as usize;
+    let row_space = ranking_space.saturating_sub(3);
+    let base_rows = row_space / 3;
+    let extra_rows = row_space % 3;
+    let mut row_base = 0;
+    for (index, (title, members)) in [
+        ("BUSY CHILD BRANCHES", family.direct_children.as_slice()),
+        ("HOT DESCENDANTS", family.hot_descendants.as_slice()),
+        ("MEMORY DESCENDANTS", family.memory_descendants.as_slice()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let capacity = base_rows + usize::from(index < extra_rows);
+        let active = app.family_cursor.checked_sub(row_base).filter(|local| *local < members.len());
+        let start = if capacity > 0 && members.len() > capacity {
+            active
+                .map(|local| local.saturating_sub(capacity / 2).min(members.len() - capacity))
+                .unwrap_or_default()
+        } else {
+            0
+        };
+        let end = start.saturating_add(capacity).min(members.len());
+        let title = if members.len() > capacity && capacity > 0 {
+            format!("{title} · {}–{}/{}", start + 1, end, members.len())
+        } else {
+            format!("{title} · {}", members.len())
+        };
+        lines.push(Line::styled(title, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)));
+        for (local_index, member) in members.iter().enumerate().skip(start).take(capacity) {
+            let Some(candidate) =
+                app.snapshot.processes.iter().find(|candidate| candidate.identity == member.key)
+            else {
+                continue;
+            };
+            let name_width = area.width.saturating_sub(34).max(6) as usize;
+            let name = truncate(&candidate.name, name_width);
+            let row_index = row_base + local_index;
+            regions.family_rows.push((
+                Rect::new(area.x, area.y + lines.len() as u16, area.width, 1),
+                row_index,
+                member.key,
+            ));
+            lines.push(Line::styled(
+                format!(
+                    "{name:<name_width$} {:>6}  {:>6.1}%  F {:>6.1}%  {}",
+                    candidate.identity.pid(),
+                    candidate.cpu_percent,
+                    member.family_cpu_percent,
+                    report::bytes(candidate.rss_bytes),
+                ),
+                if row_index == app.family_cursor {
+                    Style::default().fg(PANEL).bg(SELECTED).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(TEXT)
+                },
+            ));
+        }
+        row_base += members.len();
+    }
+    lines
+}
+
+fn truncate(value: &str, width: usize) -> String {
+    let mut characters = value.chars();
+    let mut output = characters.by_ref().take(width).collect::<String>();
+    if characters.next().is_some() && width > 0 {
+        output.pop();
+        output.push('…');
+    }
+    output
+}
+
+fn resource_lines<'a>(state: &str, resources: &ResourceSample) -> Vec<Line<'a>> {
+    vec![
+        Line::styled(format!("RESOURCES · {state}"), Style::default().fg(MUTED)),
+        Line::from(format!("EXEC      {}", observed_path(&resources.executable))),
+        Line::from(format!("CWD       {}", observed_path(&resources.current_directory))),
+        Line::from(format!(
+            "VIRTUAL / ADDRESS SPACE  {}",
+            observed_bytes(&resources.virtual_bytes)
+        )),
+        Line::from(format!(
+            "{}  {}",
+            resources.open_resource_label.to_ascii_uppercase(),
+            observed_number(&resources.open_resources)
+        )),
+        Line::from(format!(
+            "{} READ   {} total  {} /s",
+            resources.io_label.to_ascii_uppercase(),
+            observed_bytes(&resources.read_bytes),
+            observed_rate(&resources.read_bytes_per_second)
+        )),
+        Line::from(format!(
+            "{} WRITE  {} total  {} /s",
+            resources.io_label.to_ascii_uppercase(),
+            observed_bytes(&resources.write_bytes),
+            observed_rate(&resources.write_bytes_per_second)
+        )),
+    ]
+}
+
 fn detail_unavailable(reason: &super::model::DetailUnavailable) -> &'static str {
     use super::model::DetailUnavailable;
     match reason {
@@ -565,10 +718,70 @@ fn detail_unavailable(reason: &super::model::DetailUnavailable) -> &'static str 
     }
 }
 
+fn detail_state(readiness: SampleReadiness, completeness: DetailCompleteness) -> &'static str {
+    match (readiness, completeness) {
+        (SampleReadiness::Warming, DetailCompleteness::Complete) => "WARMING DELTAS…",
+        (SampleReadiness::Warming, DetailCompleteness::Partial) => "WARMING · PARTIAL",
+        (SampleReadiness::Ready, DetailCompleteness::Complete) => "LIVE DETAIL",
+        (SampleReadiness::Ready, DetailCompleteness::Partial) => "LIVE · PARTIAL",
+    }
+}
+
+fn detail_status(
+    app: &StatsApp,
+    detail: &super::model::DetailSnapshot,
+    readiness: SampleReadiness,
+    completeness: DetailCompleteness,
+) -> String {
+    let age_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|now| u64::try_from(now.as_millis()).ok())
+        .map(|now| now.saturating_sub(detail.sampled_at_ms))
+        .unwrap_or_default();
+    let minimum_ms = u64::try_from(detail.detail.kind().minimum_interval().as_millis())
+        .unwrap_or(u64::MAX);
+    let cadence_ms = app.snapshot.interval_ms.max(minimum_ms);
+    if age_ms > cadence_ms.saturating_mul(2) {
+        format!("STALE {:.1}s · {}", age_ms as f64 / 1_000.0, detail_state(readiness, completeness))
+    } else {
+        format!("{} · {:.1}s ago", detail_state(readiness, completeness), age_ms as f64 / 1_000.0)
+    }
+}
+
 fn observed_path(value: &Observed<std::path::PathBuf>) -> String {
     value
         .value()
         .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| observed_state(value).to_owned())
+}
+
+fn observed_string(value: &Observed<String>) -> String {
+    value.value().cloned().unwrap_or_else(|| observed_state(value).to_owned())
+}
+
+fn observed_percent(value: &Observed<f32>) -> String {
+    value
+        .value()
+        .map(|percent| format!("{percent:.1}%"))
+        .unwrap_or_else(|| observed_state(value).to_owned())
+}
+
+fn observed_seconds(value: &Observed<f64>) -> String {
+    value
+        .value()
+        .map(|seconds| format!("{seconds:.1}s"))
+        .unwrap_or_else(|| observed_state(value).to_owned())
+}
+
+fn observed_core(value: &Observed<u16>) -> String {
+    value.value().map(|core| format!("C{core}")).unwrap_or_else(|| observed_state(value).to_owned())
+}
+
+fn observed_process_state(value: &Observed<super::model::ProcessState>) -> String {
+    value
+        .value()
+        .map(|state| state.label().to_owned())
         .unwrap_or_else(|| observed_state(value).to_owned())
 }
 
@@ -623,7 +836,7 @@ fn render_footer(frame: &mut Frame<'_>, app: &StatsApp, area: Rect) {
                 .style(Style::default().fg(TEXT).bg(BACKGROUND)),
             area,
         );
-    } else if let Some(status) = &app.status {
+    } else if let Some(status) = app.action_lifecycle.status().or_else(|| app.status.clone()) {
         frame.render_widget(
             Paragraph::new(format!(" {status}  │  q quit  / search  f focus  enter inspect"))
                 .style(Style::default().fg(MUTED).bg(BACKGROUND)),
@@ -668,7 +881,9 @@ fn render_confirmation(frame: &mut Frame<'_>, app: &StatsApp, regions: &mut UiRe
     let area = centered(frame.area(), 58, 9);
     frame.render_widget(Clear, area);
     frame.render_widget(Block::new().style(Style::default().bg(PANEL)), area);
-    let warning = if confirm.action == ProcessAction::ForceTerminate {
+    let warning = if confirm.action == ProcessAction::ForceTerminate
+        || confirm.choice == ConfirmationChoice::Force
+    {
         "Force kill cannot be handled or cleaned up by the process."
     } else {
         "The process may save work and shut down cleanly."
@@ -682,7 +897,7 @@ fn render_confirmation(frame: &mut Frame<'_>, app: &StatsApp, regions: &mut UiRe
         ),
         Line::from(warning),
         Line::from(""),
-        Line::styled("ENTER confirm   F force kill   ESC cancel", Style::default().fg(ACCENT)),
+        Line::styled("←→ choose   ENTER activate   ESC cancel", Style::default().fg(ACCENT)),
     ];
     frame.render_widget(
         Paragraph::new(text)
@@ -711,6 +926,65 @@ fn render_confirmation(frame: &mut Frame<'_>, app: &StatsApp, regions: &mut UiRe
     regions.confirm_yes = Some(buttons[0]);
     regions.confirm_force = Some(buttons[1]);
     regions.confirm_cancel = Some(buttons[2]);
+    for (area, label, choice) in [
+        (buttons[0], " End process ", ConfirmationChoice::Confirm),
+        (buttons[1], " Force terminate ", ConfirmationChoice::Force),
+        (buttons[2], " Cancel ", ConfirmationChoice::Cancel),
+    ] {
+        let style = if confirm.choice == choice {
+            Style::default().fg(PANEL).bg(ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(TEXT).bg(PANEL)
+        };
+        frame.render_widget(Paragraph::new(label).style(style), area);
+    }
+}
+
+fn render_command_viewer(frame: &mut Frame<'_>, app: &StatsApp, regions: &mut UiRegions) {
+    let viewer = app.command_viewer.as_ref().expect("called only with command viewer");
+    let width = frame.area().width.saturating_sub(8).min(120);
+    let height = frame.area().height.saturating_sub(6).min(36);
+    let area = centered(frame.area(), width, height);
+    frame.render_widget(Clear, area);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .style(Style::default().fg(TEXT).bg(PANEL))
+        .border_style(Style::default().fg(ACCENT))
+        .title(format!(" FULL COMMAND · {} · PID {} ", viewer.name, viewer.pid));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let chunks = Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).split(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                "Command lines may contain credentials. Nothing is copied or retained. ",
+                Style::default().fg(WARN),
+            ),
+            Span::styled("Esc close", Style::default().fg(ACCENT)),
+        ]))
+        .wrap(Wrap { trim: true }),
+        chunks[0],
+    );
+    let command_lines = if viewer.command.is_empty() {
+        vec![String::new()]
+    } else {
+        viewer.command.lines().map(str::to_owned).collect::<Vec<_>>()
+    };
+    let lines = command_lines
+        .iter()
+        .skip(viewer.row_offset)
+        .take(chunks[1].height as usize)
+        .map(|line| {
+            Line::from(horizontal_slice(line, viewer.column_offset, chunks[1].width as usize))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines).style(Style::default().fg(TEXT)), chunks[1]);
+    regions.command_content = Some(chunks[1]);
+    regions.command_close = Some(Rect::new(area.right().saturating_sub(12), area.y, 11, 1));
+}
+
+fn horizontal_slice(value: &str, start: usize, width: usize) -> String {
+    value.chars().skip(start).take(width).collect()
 }
 
 fn spark(history: Option<&VecDeque<u64>>) -> String {

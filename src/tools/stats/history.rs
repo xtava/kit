@@ -44,11 +44,40 @@ impl HistoryStore {
         self.last_recorded_ms = Some(self.elapsed_ms);
         let protected = protected.into_iter().collect::<HashSet<_>>();
         self.prune_expired();
-        for process in &snapshot.processes {
-            let Some(key) = process.identity.stable_key() else { continue };
-            if !self.series.contains_key(&key)
-                && !self.admit(key, process.cpu_percent, process.rss_bytes, &protected)
-            {
+        let incoming = snapshot
+            .processes
+            .iter()
+            .filter_map(|process| process.identity.stable_key().map(|key| (key, process)))
+            .collect::<Vec<_>>();
+        let new_count = incoming.iter().filter(|(key, _)| !self.series.contains_key(key)).count();
+        let admitted = if self.series.len().saturating_add(new_count) > MAX_IDENTITIES {
+            let mut candidates = self
+                .series
+                .iter()
+                .map(|(key, series)| (*key, (series.current_cpu, series.current_rss)))
+                .collect::<HashMap<_, _>>();
+            for (key, process) in &incoming {
+                candidates.insert(*key, (process.cpu_percent, process.rss_bytes));
+            }
+            let mut ranked = candidates.into_iter().collect::<Vec<_>>();
+            ranked.sort_by(|(left_key, left), (right_key, right)| {
+                protected
+                    .contains(right_key)
+                    .cmp(&protected.contains(left_key))
+                    .then_with(|| right.0.total_cmp(&left.0))
+                    .then_with(|| right.1.cmp(&left.1))
+                    .then_with(|| right_key.pid.cmp(&left_key.pid))
+                    .then_with(|| right_key.start_token.cmp(&left_key.start_token))
+            });
+            let admitted =
+                ranked.into_iter().take(MAX_IDENTITIES).map(|(key, _)| key).collect::<HashSet<_>>();
+            self.series.retain(|key, _| admitted.contains(key));
+            Some(admitted)
+        } else {
+            None
+        };
+        for (key, process) in incoming {
+            if admitted.as_ref().is_some_and(|admitted| !admitted.contains(&key)) {
                 continue;
             }
             let series = self.series.entry(key).or_insert_with(|| HistorySeries {
@@ -98,41 +127,6 @@ impl HistoryStore {
             }
             !series.points.is_empty()
         });
-    }
-
-    fn admit(
-        &mut self,
-        incoming: ProcessKey,
-        cpu: f32,
-        rss: u64,
-        protected: &HashSet<ProcessKey>,
-    ) -> bool {
-        if self.series.len() < MAX_IDENTITIES {
-            return true;
-        }
-        let victim = self
-            .series
-            .iter()
-            .filter(|(key, _)| !protected.contains(key))
-            .min_by(|(left_key, left), (right_key, right)| {
-                left.current_cpu
-                    .total_cmp(&right.current_cpu)
-                    .then_with(|| left.current_rss.cmp(&right.current_rss))
-                    .then_with(|| left_key.pid.cmp(&right_key.pid))
-                    .then_with(|| left_key.start_token.cmp(&right_key.start_token))
-            })
-            .map(|(key, series)| (*key, series.current_cpu, series.current_rss));
-        let Some((victim, victim_cpu, victim_rss)) = victim else { return false };
-        let hotter = cpu
-            .total_cmp(&victim_cpu)
-            .then_with(|| rss.cmp(&victim_rss))
-            .then_with(|| incoming.pid.cmp(&victim.pid))
-            .then_with(|| incoming.start_token.cmp(&victim.start_token))
-            .is_gt();
-        if hotter {
-            self.series.remove(&victim);
-        }
-        hotter
     }
 }
 

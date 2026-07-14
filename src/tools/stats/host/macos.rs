@@ -1,7 +1,7 @@
 use std::io;
 use std::mem::{size_of, MaybeUninit};
 
-use super::{ActionError, ProcessAction, TaskStat};
+use super::{ActionError, ProcessAction, ProcessObservation, TaskBatch};
 use crate::tools::stats::model::{DetailUnavailable, ProcessKey, ResourceSample};
 
 const PROC_PIDTBSDINFO: libc::c_int = 3;
@@ -43,7 +43,7 @@ unsafe extern "C" {
     ) -> libc::c_int;
 }
 
-pub fn read_process_stat(pid: u32) -> io::Result<TaskStat> {
+pub fn read_process_observation(pid: u32) -> io::Result<ProcessObservation> {
     let pid = libc::c_int::try_from(pid)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "PID exceeds c_int"))?;
     let mut info = MaybeUninit::<ProcBsdInfo>::zeroed();
@@ -58,9 +58,7 @@ pub fn read_process_stat(pid: u32) -> io::Result<TaskStat> {
     }
     // SAFETY: the exact structure size was written above.
     let info = unsafe { info.assume_init() };
-    Ok(TaskStat {
-        name: String::new(),
-        cpu_ticks: 0,
+    Ok(ProcessObservation {
         start_token: info
             .pbi_start_tvsec
             .saturating_mul(1_000_000)
@@ -69,7 +67,7 @@ pub fn read_process_stat(pid: u32) -> io::Result<TaskStat> {
     })
 }
 
-pub fn read_process_tasks(_pid: u32) -> io::Result<Vec<(u32, TaskStat)>> {
+pub fn read_process_tasks(_pid: u32) -> io::Result<TaskBatch> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "macOS thread detail is not implemented in this build",
