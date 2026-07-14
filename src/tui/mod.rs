@@ -13,6 +13,8 @@ pub mod fuzzy;
 pub mod markdown;
 mod navigation;
 mod session;
+pub mod settings;
+mod split;
 mod suggestions;
 pub mod syntax;
 pub mod theme;
@@ -22,4 +24,8 @@ pub use editor::LineEditor;
 pub use events::EventReader;
 pub use navigation::{Direction, NavigationMap, NavigationRegion};
 pub use session::{Session, SessionOptions};
+pub use settings::{SettingsEditor, SettingsFlow};
+pub use split::{
+    render_split_divider, SplitDividerStyle, SplitDrag, SplitFrame, SplitMinimums, SplitRatio,
+};
 pub use suggestions::{Suggestion, SuggestionMenu};
