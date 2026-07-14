@@ -198,13 +198,15 @@ impl ProcessForest {
         roots: Vec<ProcessIdentity>,
     ) -> Vec<TreeRow> {
         let filter = query.filter.trim().to_ascii_lowercase();
-        let matches = processes
-            .iter()
-            .filter(|process| matches_filter(process, &filter))
-            .map(|process| process.identity)
-            .collect::<HashSet<_>>();
-        let mut required = matches.clone();
-        if !filter.is_empty() {
+        let (matches, required) = if filter.is_empty() {
+            (HashSet::new(), HashSet::new())
+        } else {
+            let matches = processes
+                .iter()
+                .filter(|process| matches_filter(process, &filter))
+                .map(|process| process.identity)
+                .collect::<HashSet<_>>();
+            let mut required = matches.clone();
             for key in &matches {
                 let mut cursor = self.parent.get(key).copied().flatten();
                 let mut seen = HashSet::new();
@@ -216,7 +218,8 @@ impl ProcessForest {
                     cursor = self.parent.get(&ancestor).copied().flatten();
                 }
             }
-        }
+            (matches, required)
+        };
 
         let projection_roots = query.focus.map_or(roots, |key| vec![key]);
         let mut rows = Vec::new();

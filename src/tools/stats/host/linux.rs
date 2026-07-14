@@ -59,9 +59,9 @@ pub fn read_process_tasks(pid: u32) -> io::Result<TaskBatch> {
             continue;
         };
         match read_thread_stat(pid, tid) {
-            Ok(stat) => tasks.push((tid, stat)),
+            Ok(stat) => tasks.push((u64::from(tid), stat)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => failures.push(TaskReadFailure { tid: Some(tid), error }),
+            Err(error) => failures.push(TaskReadFailure { tid: Some(u64::from(tid)), error }),
         }
     }
     Ok(TaskBatch { tasks, failures })

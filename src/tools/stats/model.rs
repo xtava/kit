@@ -292,7 +292,7 @@ pub struct ProcessSample {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ThreadSample {
-    pub tid: u32,
+    pub tid: u64,
     pub process: ProcessKey,
     pub name: Observed<String>,
     pub state: Observed<ProcessState>,

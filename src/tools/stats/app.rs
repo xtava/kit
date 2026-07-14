@@ -142,7 +142,6 @@ pub(super) enum ActiveRegion {
 
 pub(super) struct VisibleRow {
     pub(super) key: ProcessIdentity,
-    pub(super) name: String,
     pub(super) pid: u32,
     pub(super) cpu: f32,
     pub(super) memory: u64,
@@ -391,7 +390,6 @@ impl StatsApp {
                 }
                 Some(VisibleRow {
                     key: process.identity,
-                    name: process.name.clone(),
                     pid: process.identity.pid(),
                     cpu: core_cpu
                         .as_ref()
@@ -446,8 +444,11 @@ impl StatsApp {
     }
 
     pub(super) fn selected_process(&self) -> Option<&ProcessSample> {
-        let key = self.selected?;
-        self.snapshot.processes.iter().find(|process| process.identity == key)
+        self.process(self.selected?)
+    }
+
+    pub(super) fn process(&self, key: ProcessIdentity) -> Option<&ProcessSample> {
+        self.forest.process(&self.snapshot.processes, key)
     }
 
     pub(super) fn selected_inspection(&self) -> Option<(&ProcessSample, bool)> {

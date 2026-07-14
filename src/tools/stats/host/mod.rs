@@ -22,12 +22,12 @@ pub struct TaskStat {
 }
 
 pub struct TaskBatch {
-    pub tasks: Vec<(u32, TaskStat)>,
+    pub tasks: Vec<(u64, TaskStat)>,
     pub failures: Vec<TaskReadFailure>,
 }
 
 pub struct TaskReadFailure {
-    pub tid: Option<u32>,
+    pub tid: Option<u64>,
     pub error: io::Error,
 }
 
@@ -86,7 +86,7 @@ pub fn capabilities() -> HostCapabilities {
             graceful_terminate: CapabilityState::Available,
             force_terminate: CapabilityState::Available,
             code_profile: CapabilityState::Unsupported {
-                reason: "perf handshake has not been validated for this host",
+                reason: "local perf produced no actionable DWARF stacks under current host policy",
             },
         }
     }
@@ -96,18 +96,14 @@ pub fn capabilities() -> HostCapabilities {
             last_observed_core: CapabilityState::Unsupported {
                 reason: "last-observed CPU is unavailable on this platform",
             },
-            threads: CapabilityState::Unsupported {
-                reason: "native thread detail is not implemented for this target",
-            },
-            resources: CapabilityState::Unsupported {
-                reason: "native resource detail is not implemented for this target",
-            },
+            threads: CapabilityState::Available,
+            resources: CapabilityState::Available,
             graceful_terminate: CapabilityState::Unsupported {
                 reason: "safe graceful termination is unavailable on this platform",
             },
             force_terminate: CapabilityState::Unsupported { reason: "macOS is read-only" },
             code_profile: CapabilityState::Unsupported {
-                reason: "bounded code profiling is unavailable on this platform",
+                reason: "macOS profiling cannot bind atomically to the selected process generation",
             },
         }
     }
@@ -117,18 +113,14 @@ pub fn capabilities() -> HostCapabilities {
             last_observed_core: CapabilityState::Unsupported {
                 reason: "last-observed CPU is unavailable on Windows",
             },
-            threads: CapabilityState::Unsupported {
-                reason: "native thread detail is not implemented for Windows",
-            },
-            resources: CapabilityState::Unsupported {
-                reason: "native resource detail is not implemented for Windows",
-            },
+            threads: CapabilityState::Available,
+            resources: CapabilityState::Available,
             graceful_terminate: CapabilityState::Unsupported {
                 reason: "Windows has no safe generic graceful process termination",
             },
             force_terminate: CapabilityState::Available,
             code_profile: CapabilityState::Unsupported {
-                reason: "bounded code profiling is unavailable on Windows",
+                reason: "Windows has no bounded non-elevated generation-bound process collector",
             },
         }
     }
@@ -207,6 +199,26 @@ mod fallback {
         Err(ActionError::Unsupported {
             reason: "safe native process actions are not implemented for this target",
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profile_capability_exposes_the_exact_platform_gap() {
+        let CapabilityState::Unsupported { reason } = capabilities().code_profile else {
+            panic!("profiling must remain unavailable until its host gate is actionable");
+        };
+        #[cfg(target_os = "linux")]
+        assert!(reason.contains("no actionable DWARF stacks"));
+        #[cfg(target_os = "macos")]
+        assert!(reason.contains("cannot bind atomically"));
+        #[cfg(target_os = "windows")]
+        assert!(reason.contains("no bounded non-elevated generation-bound"));
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        assert!(reason.contains("unavailable"));
     }
 }
 

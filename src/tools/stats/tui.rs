@@ -301,7 +301,7 @@ mod tests {
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         let regions = draw_app(&mut terminal, &app);
 
-        assert_eq!(app.visible[0].name, "process-29");
+        assert_eq!(app.process(app.visible[0].key).unwrap().name, "process-29");
         assert_eq!(regions.rows[0].1, 0);
         assert_eq!(app.selected, Some(quiet));
     }

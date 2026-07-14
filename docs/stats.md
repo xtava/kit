@@ -26,6 +26,7 @@ kit stats --interval 500
 | Return from CPU focus | `Esc` or `c` | click the active CPU tile |
 | Search name, command, PID, or user | `/`, type, `Enter` | — |
 | Sort CPU, RAM, PID, name | `1`, `2`, `3`, `4` | click a column header |
+| Open the full observed command | `v` from Overview | click **View full command** |
 | Open Profile | `p` | click **Profile** |
 | Gracefully end a process | `x` or `Delete`, then confirm | click **End process**, then confirm |
 | Force kill | `X`, or `f` in confirmation | choose force in confirmation |
@@ -46,6 +47,28 @@ one active region at a time, with the same Tab and arrow navigation. The cyan bo
 active region. The inspector exposes Overview, Family, Threads, Resources, and Profile as explicit
 capability-aware surfaces rather than expanding expensive detail inline in the process table.
 
+Overview distinguishes the selected process's own CPU and memory from the complete repaired family
+aggregate. Family ranks direct children, CPU-heavy descendants, and memory-heavy descendants across
+the full subtree. Threads can be ordered by live CPU, accumulated CPU, TID, or name. Resources is
+deliberately aggregate-only: executable, working directory where available, virtual address space,
+platform-labelled process I/O, and an aggregate file-descriptor or handle count. Kit does not read
+process environments, memory contents, socket payloads, or individual descriptor targets.
+
+## Platform capabilities
+
+| Capability | Linux | macOS | Windows |
+| --- | --- | --- | --- |
+| Stable process generation | `/proc` start ticks | `proc_pidinfo` start time | creation `FILETIME` |
+| Threads | native task records, including last-observed core | libproc thread records; core unavailable | Toolhelp thread records; name/state/core unavailable |
+| Resources | executable, cwd, virtual bytes, process I/O, file descriptors | executable, virtual bytes, file descriptors | executable, process I/O, handles |
+| Process action | pidfd graceful and force termination | read-only | verified-handle force termination |
+| Code profile | unavailable on this host: local perf emitted no actionable DWARF stacks | unavailable: no atomic generation-bound attach | unavailable: no bounded non-elevated generation-bound collector |
+
+Unsupported and permission-denied fields remain visible as typed states; Kit does not replace them
+with zeros or inferred values. Opening an unavailable Profile surface never starts an external
+profiler. Kit does not change perf policy, request elevation, download symbols, or silently fall
+back to a PID-only or system-wide capture.
+
 ## Safety and performance
 
 The overview keeps one persistent `sysinfo::System`, publishes only the latest snapshot, and does
@@ -59,3 +82,8 @@ revalidate stable process identity before acting. On Linux, Kit opens a pidfd, r
 start token, and sends through that descriptor. It refuses PID 1, itself, an exited or replaced
 process, and any target that cannot be addressed safely. Graceful termination is the default and
 force termination is a separate confirmation path.
+
+History is admitted every two seconds and bounded to eight minutes (240 points) for at most 1,024
+stable process generations. Exited history expires; a replacement that reuses the same PID receives
+a distinct generation. Focused-core collection scans native task records cooperatively and yields
+to an overdue overview refresh between processes.

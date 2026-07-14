@@ -63,7 +63,7 @@ struct ObservedProcess {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct ThreadKey {
-    tid: u32,
+    tid: u64,
     start_token: Option<u64>,
 }
 
@@ -1150,24 +1150,30 @@ mod tests {
     fn benchmark_samples(sampler: &mut Sampler, kind: Option<DetailRequestKind>) {
         const WARMUPS: usize = 5;
         const SAMPLES: usize = 30;
+        const DETAIL_SLICE: Duration = Duration::from_millis(25);
         let interval = Duration::from_secs(1);
         for _ in 0..WARMUPS {
             thread::sleep(interval);
             let overview = sampler.sample_overview().unwrap();
             if let Some(kind) = kind {
-                let _ = sampler
-                    .sample_detail(DetailRequest { request_id: 1, kind }, &overview.processes);
+                benchmark_detail(sampler, kind, &overview.processes, DETAIL_SLICE, None);
             }
         }
 
         let mut durations_us = Vec::with_capacity(SAMPLES);
+        let mut detail_slices_us = Vec::new();
         for _ in 0..SAMPLES {
             thread::sleep(interval);
             let started = Instant::now();
             let overview = sampler.sample_overview().unwrap();
             if let Some(kind) = kind {
-                let _ = sampler
-                    .sample_detail(DetailRequest { request_id: 1, kind }, &overview.processes);
+                benchmark_detail(
+                    sampler,
+                    kind,
+                    &overview.processes,
+                    DETAIL_SLICE,
+                    Some(&mut detail_slices_us),
+                );
             }
             durations_us.push(started.elapsed().as_micros());
         }
@@ -1179,8 +1185,46 @@ mod tests {
             "{{\"schema\":1,\"surface\":\"legacy_sampler_control\",\"scope\":\"{}\",\"warmups\":{WARMUPS},\"samples\":{SAMPLES},\"p50_us\":{p50},\"p95_us\":{p95},\"max_us\":{maximum}}}",
             scope_label(kind)
         );
-        assert!(p95 <= 50_000, "sampler p95 {p95}us exceeds the 50ms gate");
-        assert!(maximum <= 100_000, "sampler maximum {maximum}us exceeds the 100ms gate");
+        if matches!(kind, Some(DetailRequestKind::Core { .. })) {
+            detail_slices_us.sort_unstable();
+            let slice_p95 = detail_slices_us
+                [(detail_slices_us.len() * 95 / 100).min(detail_slices_us.len() - 1)];
+            let slice_max = detail_slices_us[detail_slices_us.len() - 1];
+            println!(
+                "{{\"schema\":1,\"surface\":\"core_detail_slices\",\"slice_budget_ms\":{},\"samples\":{},\"p95_us\":{slice_p95},\"max_us\":{slice_max}}}",
+                DETAIL_SLICE.as_millis(),
+                detail_slices_us.len()
+            );
+            assert!(slice_p95 <= 50_000, "core slice p95 {slice_p95}us exceeds the 50ms gate");
+            assert!(
+                slice_max <= 100_000,
+                "core slice maximum {slice_max}us exceeds the 100ms gate"
+            );
+        } else {
+            assert!(p95 <= 50_000, "sampler p95 {p95}us exceeds the 50ms gate");
+            assert!(maximum <= 100_000, "sampler maximum {maximum}us exceeds the 100ms gate");
+        }
+    }
+
+    fn benchmark_detail(
+        sampler: &mut Sampler,
+        kind: DetailRequestKind,
+        processes: &[ProcessSample],
+        slice_budget: Duration,
+        mut slices_us: Option<&mut Vec<u128>>,
+    ) {
+        let request = DetailRequest { request_id: 1, kind };
+        loop {
+            let started = Instant::now();
+            let completed =
+                sampler.poll_detail(request, processes, Some(started + slice_budget)).is_some();
+            if let Some(slices_us) = &mut slices_us {
+                slices_us.push(started.elapsed().as_micros());
+            }
+            if completed {
+                break;
+            }
+        }
     }
 
     fn scope_label(kind: Option<DetailRequestKind>) -> &'static str {

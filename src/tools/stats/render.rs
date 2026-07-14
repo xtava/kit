@@ -217,7 +217,8 @@ fn render_processes(
         ),
     ]);
     let inner = area.inner(Margin { horizontal: 1, vertical: 1 });
-    let rows = app.visible.iter().skip(app.row_offset).map(|item| {
+    let visible_height = inner.height.saturating_sub(1) as usize;
+    let rows = app.visible.iter().skip(app.row_offset).take(visible_height).map(|item| {
         let selected = Some(item.key) == app.selected;
         let marker = if !item.has_children {
             " "
@@ -231,7 +232,8 @@ fn render_processes(
         } else {
             String::new()
         };
-        let program = format!("{}{marker} {}{suffix}", "  ".repeat(item.depth as usize), item.name);
+        let name = app.process(item.key).map_or("<exited>", |process| process.name.as_str());
+        let program = format!("{}{marker} {name}{suffix}", "  ".repeat(item.depth as usize));
         let row_fg = if item.is_context {
             MUTED
         } else if item.is_match {
@@ -298,7 +300,6 @@ fn render_processes(
     }
     regions.headers.push((Rect::new(inner.x, inner.y, inner.width / 2, 1), SortBy::Name));
     let row_top = inner.y + 1;
-    let visible_height = inner.height.saturating_sub(1) as usize;
     for (screen_index, index) in
         (app.row_offset..app.visible.len()).take(visible_height).enumerate()
     {
