@@ -1,13 +1,15 @@
 use std::{
     collections::HashSet,
-    fs,
+    fs, future,
     path::{Path, PathBuf},
     process::Command,
+    time::Duration,
 };
 
 use anyhow::{anyhow, Context, Result};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ignore::WalkBuilder;
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Modifier, Style},
@@ -15,6 +17,8 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Padding, Paragraph},
     Frame,
 };
+use tokio::sync::mpsc::{self, UnboundedReceiver};
+use tokio::time::{self, Instant};
 use unicode_width::UnicodeWidthStr;
 
 use super::config::{self, Config};
@@ -28,6 +32,7 @@ use crate::tui::{
 
 const SUGGESTION_ROWS: usize = 8;
 const SCROLL_STEP: isize = 3;
+const WATCH_SETTLE_TIME: Duration = Duration::from_millis(60);
 const COMMANDS: CommandSet = CommandSet::new(&[
     CommandSpec {
         name: "configure",
@@ -62,23 +67,97 @@ pub async fn run(
     let mut app = App::new(root, catalog, initial, config, theme_spec, theme)?;
     let mut session = Session::open(SessionOptions { mouse_capture: true })?;
     let mut events = EventReader::start();
+    let mut document_watch = DocumentWatch::start()?;
+    document_watch.follow(app.document_path())?;
+    let mut reload_at = None;
 
     loop {
         session.draw(|frame| render(frame, &mut app))?;
-        match events.recv().await {
-            Some(Event::Key(key)) if key.is_press() => {
-                if matches!(app.on_key(key), Flow::Quit) {
-                    break;
+        tokio::select! {
+            event = events.recv() => match event {
+                Some(Event::Key(key)) if key.is_press() => {
+                    let previous_document = app.document_path().map(Path::to_path_buf);
+                    if matches!(app.on_key(key), Flow::Quit) {
+                        break;
+                    }
+                    if app.document_path() != previous_document.as_deref() {
+                        reload_at = None;
+                    }
+                    if let Err(error) = document_watch.follow(app.document_path()) {
+                        app.notice = Notice::error(format!("watch document: {error:#}"));
+                    }
                 }
-            }
-            Some(Event::Mouse(mouse)) => app.on_mouse(mouse),
-            Some(Event::Resize(_, _)) => {}
-            None => break,
-            _ => {}
+                Some(Event::Mouse(mouse)) => app.on_mouse(mouse),
+                Some(Event::Resize(_, _)) => {}
+                None => break,
+                _ => {}
+            },
+            change = document_watch.recv() => match change {
+                Some(Ok(event)) if app.document_affected(&event) => {
+                    reload_at = Some(Instant::now() + WATCH_SETTLE_TIME);
+                }
+                Some(Ok(_)) => {}
+                Some(Err(error)) => {
+                    app.notice = Notice::error(format!("watch document: {error}"));
+                }
+                None => break,
+            },
+            () = wait_for_reload(reload_at) => {
+                reload_at = None;
+                app.reload_document(false);
+            },
         }
     }
 
     Ok(())
+}
+
+async fn wait_for_reload(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => time::sleep_until(deadline).await,
+        None => future::pending().await,
+    }
+}
+
+struct DocumentWatch {
+    watcher: RecommendedWatcher,
+    receiver: UnboundedReceiver<notify::Result<notify::Event>>,
+    parent: Option<PathBuf>,
+}
+
+impl DocumentWatch {
+    fn start() -> Result<Self> {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let watcher = notify::recommended_watcher(move |event| {
+            let _ = sender.send(event);
+        })
+        .context("start document watcher")?;
+        Ok(Self { watcher, receiver, parent: None })
+    }
+
+    fn follow(&mut self, path: Option<&Path>) -> Result<()> {
+        let parent = path.and_then(Path::parent).map(Path::to_path_buf);
+        if parent == self.parent {
+            return Ok(());
+        }
+
+        if let Some(parent) = &parent {
+            self.watcher
+                .watch(parent, RecursiveMode::NonRecursive)
+                .with_context(|| format!("watch {}", parent.display()))?;
+        }
+        let previous = std::mem::replace(&mut self.parent, parent);
+        if let Some(previous) = previous {
+            self.watcher
+                .unwatch(&previous)
+                .with_context(|| format!("stop watching {}", previous.display()))?;
+        }
+        Ok(())
+    }
+
+    async fn recv(&mut self) -> Option<notify::Result<notify::Event>> {
+        self.receiver.recv().await
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -155,6 +234,14 @@ impl App {
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('u') {
             self.clear_search();
+            return Flow::Continue;
+        }
+        if key.modifiers.is_empty()
+            && key.code == KeyCode::Char('r')
+            && self.input.value().is_empty()
+            && self.document.is_some()
+        {
+            self.reload_document(true);
             return Flow::Continue;
         }
 
@@ -421,10 +508,50 @@ impl App {
         }
     }
 
+    fn document_path(&self) -> Option<&Path> {
+        self.document.as_ref().map(|document| document.path.as_path())
+    }
+
+    fn document_affected(&self, event: &notify::Event) -> bool {
+        if !matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_))
+        {
+            return false;
+        }
+        let Some(path) = self.document_path() else {
+            return false;
+        };
+        event.paths.iter().any(|changed| changed == path)
+    }
+
+    fn reload_document(&mut self, announce_unchanged: bool) {
+        let Some(path) = self.document_path().map(Path::to_path_buf) else {
+            return;
+        };
+        match Document::load(&self.root, path) {
+            Ok(document)
+                if self
+                    .document
+                    .as_ref()
+                    .is_some_and(|open| open.markdown == document.markdown) =>
+            {
+                if announce_unchanged {
+                    self.notice = Notice::info(format!("refreshed {}", document.display));
+                }
+            }
+            Ok(document) => {
+                self.notice = Notice::info(format!("reloaded {}", document.display));
+                self.document = Some(document);
+            }
+            Err(error) => {
+                self.notice = Notice::error(format!("reload document: {error:#}"));
+            }
+        }
+    }
+
     fn open(&mut self, path: PathBuf) -> Result<()> {
         let path = if path.is_absolute() { path } else { self.root.join(path) };
         let document = Document::load(&self.root, path)?;
-        self.notice = Notice::info(format!("opened {}", document.display));
+        self.notice = Notice::info(format!("opened {} · r refreshes", document.display));
         self.document = Some(document);
         self.scroll_top = 0;
         self.input.clear();
@@ -946,6 +1073,100 @@ mod tests {
         );
         assert!(app.input.value().is_empty());
         assert!(app.suggestions.is_none());
+    }
+
+    #[test]
+    fn document_events_only_match_the_open_file() {
+        let temp = TempDir::new();
+        let open_path = temp.0.join("README.md");
+        let neighbor_path = temp.0.join("notes.md");
+        fs::write(&open_path, "# Open").unwrap();
+        fs::write(&neighbor_path, "# Neighbor").unwrap();
+        let root = temp.0.canonicalize().unwrap();
+        let mut app = App::new(
+            root.clone(),
+            Catalog::discover(&root),
+            Some(open_path.clone()),
+            test_config(&temp),
+            "nord".to_owned(),
+            theme::NORD,
+        )
+        .unwrap();
+
+        let open_change = notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+            .add_path(open_path.clone());
+        let neighbor_change = notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+            .add_path(neighbor_path);
+        let access = notify::Event::new(EventKind::Access(notify::event::AccessKind::Any))
+            .add_path(open_path);
+
+        assert!(app.document_affected(&open_change));
+        assert!(!app.document_affected(&neighbor_change));
+        assert!(!app.document_affected(&access));
+
+        app.document = None;
+        assert!(!app.document_affected(&open_change));
+    }
+
+    #[test]
+    fn r_refreshes_the_open_document_without_resetting_scroll() {
+        let temp = TempDir::new();
+        let path = temp.0.join("README.md");
+        fs::write(&path, "# Before").unwrap();
+        let root = temp.0.canonicalize().unwrap();
+        let mut app = App::new(
+            root.clone(),
+            Catalog::discover(&root),
+            Some(path.clone()),
+            test_config(&temp),
+            "nord".to_owned(),
+            theme::NORD,
+        )
+        .unwrap();
+        app.set_geometry(100, 20);
+        app.scroll_top = 12;
+        fs::write(path, "# After").unwrap();
+
+        assert_eq!(
+            app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
+            Flow::Continue
+        );
+
+        assert_eq!(
+            app.document.as_ref().map(|document| document.markdown.as_str()),
+            Some("# After")
+        );
+        assert_eq!(app.scroll_top, 12);
+        assert!(app.input.value().is_empty());
+        assert_eq!(app.notice.text, "reloaded README.md");
+    }
+
+    #[tokio::test]
+    async fn watcher_reports_changes_to_a_file_in_the_watched_parent() {
+        let temp = TempDir::new();
+        let path = temp.0.join("README.md");
+        fs::write(&path, "# Before").unwrap();
+        let path = path.canonicalize().unwrap();
+        let mut watcher = DocumentWatch::start().unwrap();
+        watcher.follow(Some(&path)).unwrap();
+
+        fs::write(&path, "# After").unwrap();
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let event = watcher.recv().await.unwrap().unwrap();
+                if event.paths.iter().any(|changed| changed == &path)
+                    && matches!(
+                        event.kind,
+                        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+                    )
+                {
+                    break;
+                }
+            }
+        })
+        .await;
+
+        assert!(observed.is_ok(), "watcher did not report the file write");
     }
 
     #[test]
