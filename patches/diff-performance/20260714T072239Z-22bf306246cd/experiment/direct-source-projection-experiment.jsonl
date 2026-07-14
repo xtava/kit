@@ -1,0 +1,6 @@
+{"schema":2,"surface":"projection_build","case":"ordinary","source_lines":250,"p50_us":25,"p95_us":27,"max_us":28}
+{"schema":2,"surface":"projection_build","case":"realistic","source_lines":5000,"p50_us":703,"p95_us":716,"max_us":716}
+{"schema":2,"surface":"projection_build","case":"extreme","source_lines":25000,"p50_us":35641,"p95_us":35674,"max_us":35674}
+{"schema":2,"surface":"tree_selection_event_to_frame","case":"ordinary","source_lines":250,"p50_us":113,"p95_us":230,"max_us":263}
+{"schema":2,"surface":"tree_selection_event_to_frame","case":"realistic","source_lines":5000,"p50_us":923,"p95_us":933,"max_us":933}
+{"schema":2,"surface":"tree_selection_event_to_frame","case":"extreme","source_lines":25000,"p50_us":35763,"p95_us":36077,"max_us":36077}

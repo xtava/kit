@@ -6,10 +6,36 @@ use std::time::{Duration, Instant};
 
 use similar::{Algorithm, ChangeTag, DiffOp, InlineChangeOptions, TextDiff};
 
-const CONTEXT_LINES: usize = 3;
+const DEFAULT_CONTEXT_LINES: usize = 3;
 const DIFF_TIMEOUT: Duration = Duration::from_millis(250);
 const INLINE_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_DIFF_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiffContext {
+    Lines(usize),
+    All,
+}
+
+impl Default for DiffContext {
+    fn default() -> Self {
+        Self::Lines(DEFAULT_CONTEXT_LINES)
+    }
+}
+
+impl std::str::FromStr for DiffContext {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.eq_ignore_ascii_case("all") {
+            return Ok(Self::All);
+        }
+        value
+            .parse()
+            .map(Self::Lines)
+            .map_err(|_| format!("expected a non-negative line count or 'all', got {value:?}"))
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ChangeGroup {
@@ -162,12 +188,12 @@ pub struct LineCell {
 }
 
 impl DiffDocument {
-    pub fn build(input: DiffInput) -> Self {
+    pub fn build(input: DiffInput, context: DiffContext) -> Self {
         let DiffInput { group, kind, old_path, new_path, old, new, special } = input;
         let (body, additions, deletions) = if let Some(special) = special {
             (DiffBody::Special(special), None, None)
         } else {
-            build_body(old, new)
+            build_body(old, new, context)
         };
         Self { group, kind, old_path, new_path, additions, deletions, body }
     }
@@ -180,6 +206,7 @@ impl DiffDocument {
 fn build_body(
     old: SourceSnapshot,
     new: SourceSnapshot,
+    context: DiffContext,
 ) -> (DiffBody, Option<usize>, Option<usize>) {
     let old = match snapshot_bytes(old) {
         Ok(bytes) => bytes,
@@ -207,7 +234,11 @@ fn build_body(
     let diff = config.diff_lines(old.as_ref(), new.as_ref());
     let old_snapshot = TextSnapshot::new(Arc::clone(&old));
     let new_snapshot = TextSnapshot::new(Arc::clone(&new));
-    let hunks = build_hunks(&diff, &old_snapshot, &new_snapshot);
+    let context_lines = match context {
+        DiffContext::Lines(lines) => lines,
+        DiffContext::All => old_snapshot.line_count().max(new_snapshot.line_count()),
+    };
+    let hunks = build_hunks(&diff, &old_snapshot, &new_snapshot, context_lines);
     let additions = hunks
         .iter()
         .flat_map(|hunk| &hunk.rows)
@@ -234,8 +265,13 @@ fn snapshot_bytes(snapshot: SourceSnapshot) -> Result<Arc<[u8]>, String> {
     }
 }
 
-fn build_hunks(diff: &TextDiff<'_, '_, str>, old: &TextSnapshot, new: &TextSnapshot) -> Vec<Hunk> {
-    diff.grouped_ops(CONTEXT_LINES)
+fn build_hunks(
+    diff: &TextDiff<'_, '_, str>,
+    old: &TextSnapshot,
+    new: &TextSnapshot,
+    context_lines: usize,
+) -> Vec<Hunk> {
+    diff.grouped_ops(context_lines)
         .into_iter()
         .enumerate()
         .map(|(id, ops)| {
@@ -366,15 +402,50 @@ mod tests {
     use super::*;
 
     fn document(old: &[u8], new: &[u8]) -> DiffDocument {
-        DiffDocument::build(DiffInput {
-            group: ChangeGroup::Changes,
-            kind: ChangeKind::Modified,
-            old_path: Some("sample.rs".into()),
-            new_path: Some("sample.rs".into()),
-            old: SourceSnapshot::from_bytes(old),
-            new: SourceSnapshot::from_bytes(new),
-            special: None,
-        })
+        document_with_context(old, new, DiffContext::default())
+    }
+
+    fn document_with_context(old: &[u8], new: &[u8], context: DiffContext) -> DiffDocument {
+        DiffDocument::build(
+            DiffInput {
+                group: ChangeGroup::Changes,
+                kind: ChangeKind::Modified,
+                old_path: Some("sample.rs".into()),
+                new_path: Some("sample.rs".into()),
+                old: SourceSnapshot::from_bytes(old),
+                new: SourceSnapshot::from_bytes(new),
+                special: None,
+            },
+            context,
+        )
+    }
+
+    #[test]
+    fn context_policy_controls_unchanged_rows_without_changing_counts() {
+        let old = (0..10).map(|index| format!("line {index}\n")).collect::<String>();
+        let new = old.replace("line 5\n", "changed 5\n");
+        let build = |context| document_with_context(old.as_bytes(), new.as_bytes(), context);
+
+        let none = build(DiffContext::Lines(0));
+        let one = build(DiffContext::Lines(1));
+        let all = build(DiffContext::All);
+
+        assert_eq!(text(&none).hunks[0].rows.len(), 1);
+        assert_eq!(text(&one).hunks[0].rows.len(), 3);
+        assert_eq!(text(&all).hunks[0].rows.len(), 10);
+        assert_eq!((none.additions, none.deletions), (Some(1), Some(1)));
+        assert_eq!((one.additions, one.deletions), (Some(1), Some(1)));
+        assert_eq!((all.additions, all.deletions), (Some(1), Some(1)));
+    }
+
+    #[test]
+    fn context_parser_accepts_counts_and_all() {
+        assert_eq!("0".parse(), Ok(DiffContext::Lines(0)));
+        assert_eq!("12".parse(), Ok(DiffContext::Lines(12)));
+        assert_eq!("all".parse(), Ok(DiffContext::All));
+        assert_eq!("ALL".parse(), Ok(DiffContext::All));
+        assert!("-1".parse::<DiffContext>().is_err());
+        assert!("everything".parse::<DiffContext>().is_err());
     }
 
     fn text(document: &DiffDocument) -> &TextDiffDocument {
@@ -453,15 +524,18 @@ mod tests {
     fn binary_non_utf8_and_unavailable_are_explicit() {
         assert!(matches!(document(b"a\0b", b"a\0c").body, DiffBody::Binary));
         assert!(matches!(document(&[0xff], &[0xfe]).body, DiffBody::NonUtf8));
-        let document = DiffDocument::build(DiffInput {
-            group: ChangeGroup::Changes,
-            kind: ChangeKind::Modified,
-            old_path: Some("gone".into()),
-            new_path: Some("gone".into()),
-            old: SourceSnapshot::Unavailable("read failed".into()),
-            new: SourceSnapshot::Absent,
-            special: None,
-        });
+        let document = DiffDocument::build(
+            DiffInput {
+                group: ChangeGroup::Changes,
+                kind: ChangeKind::Modified,
+                old_path: Some("gone".into()),
+                new_path: Some("gone".into()),
+                old: SourceSnapshot::Unavailable("read failed".into()),
+                new: SourceSnapshot::Absent,
+                special: None,
+            },
+            DiffContext::default(),
+        );
         assert!(
             matches!(document.body, DiffBody::Unavailable(ref error) if error == "read failed")
         );
@@ -470,15 +544,18 @@ mod tests {
     #[test]
     fn conflict_and_submodule_bypass_text_diffing() {
         for special in [SpecialState::Conflict, SpecialState::Submodule { state: "SCMU".into() }] {
-            let document = DiffDocument::build(DiffInput {
-                group: ChangeGroup::Changes,
-                kind: ChangeKind::Conflict,
-                old_path: Some("path".into()),
-                new_path: Some("path".into()),
-                old: SourceSnapshot::Absent,
-                new: SourceSnapshot::Absent,
-                special: Some(special.clone()),
-            });
+            let document = DiffDocument::build(
+                DiffInput {
+                    group: ChangeGroup::Changes,
+                    kind: ChangeKind::Conflict,
+                    old_path: Some("path".into()),
+                    new_path: Some("path".into()),
+                    old: SourceSnapshot::Absent,
+                    new: SourceSnapshot::Absent,
+                    special: Some(special.clone()),
+                },
+                DiffContext::default(),
+            );
             assert!(matches!(document.body, DiffBody::Special(ref value) if value == &special));
         }
     }

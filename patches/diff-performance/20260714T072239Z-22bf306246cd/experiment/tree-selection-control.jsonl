@@ -1,0 +1,3 @@
+{"schema":2,"surface":"tree_selection_event_to_frame","case":"ordinary","source_lines":250,"files":25,"samples":30,"p50_us":7156,"p95_us":7178,"max_us":7207}
+{"schema":2,"surface":"tree_selection_event_to_frame","case":"realistic","source_lines":5000,"files":250,"samples":12,"p50_us":142521,"p95_us":147622,"max_us":147622}
+{"schema":2,"surface":"tree_selection_event_to_frame","case":"extreme","source_lines":25000,"files":2000,"samples":4,"p50_us":811088,"p95_us":815320,"max_us":815320}

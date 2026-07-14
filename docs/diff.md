@@ -7,15 +7,21 @@ be staged or unstaged without leaving the viewer.
 
 ```bash
 kit diff
-kit diff --mode unified
+kit diff --mode inline
 kit diff --mode split
+kit diff --context 10
+kit diff --context all
 kit diff --theme terminal
 ```
 
 `--mode auto` is the default. Modified files use side-by-side mode when the content pane is at least
-72 columns wide and unified mode below that. Added and untracked files always use one full-width new
+72 columns wide and inline mode below that. Added and untracked files always use one full-width new
 file pane; deleted files always use one full-width old file pane. An explicit split request reports
 its 50-column content minimum for genuinely two-sided comparisons instead of silently changing modes.
+
+`--context` controls unchanged lines around each change. It defaults to `3`, accepts any
+non-negative line count, and accepts `all` to show every unchanged line between changes and at the
+start and end of the file.
 
 ## Controls
 
@@ -26,7 +32,7 @@ its 50-column content minimum for genuinely two-sided comparisons instead of sil
 | `PageUp` / `PageDown` | Scroll the selected comparison |
 | `←` / `→` | Move between the Changes, old-file, and new-file regions |
 | `h` / `l` | Pan the active code region horizontally |
-| `v` | Toggle unified and split projections |
+| `v` | Toggle inline and side-by-side split views |
 | `s` | Stage the selected Changes file or unstage the selected Staged file |
 | `r` | Refresh staged, unstaged, and untracked changes from Git |
 | `Tab` / `Shift-Tab` | Cycle the visible interactive regions |
@@ -34,7 +40,9 @@ its 50-column content minimum for genuinely two-sided comparisons instead of sil
 | `q`, `Esc`, `Ctrl-C`, `Ctrl-D` | Quit and restore the terminal |
 
 The cyan border identifies the active region. Click a file to select it, or click a group/directory
-to expand or collapse it. Each wheel event scrolls the surface under the pointer by one row;
+to expand or collapse it. Hover a file row to replace its change counts with a `+` button for
+unstaged files or a `-` button for staged files; click that exact adornment to stage or unstage the
+file. Each wheel event scrolls the surface under the pointer by one row;
 Shift-wheel pans the active code region. In split mode, click a region to activate it and drag the
 center divider to resize it. The divider is clamped so neither side disappears. Use `--no-mouse` to
 keep terminal mouse reporting disabled.
@@ -47,7 +55,7 @@ Uninterrupted single-child directory chains are compacted into one row while pre
 directory as the expansion identity; mixed and branching directories remain separate rows.
 
 Code rows use narrow colored bars and muted row backgrounds instead of literal patch `+` / `-`
-prefixes. Unified mode omits line numbers to maximize code width; split mode retains one number per
+prefixes. Inline mode omits line numbers to maximize code width; split mode retains one number per
 pane for side alignment. Omitted context is labeled as “N unmodified lines” rather than displaying
 raw `@@` hunk headers. These are presentation choices only: every staged, unstaged, and untracked
 path reported by Git remains visible in the viewer.
@@ -60,8 +68,8 @@ attributes for unstaged comparisons. This preserves installed Git behavior for l
 clean/smudge attributes instead of turning those transformations into false whole-file changes.
 
 The two render modes project one canonical set of hunks and aligned rows. Switching modes preserves
-the selected file, hunk, and logical row. Syntax highlighting runs over each complete file side in
-source order before visible hunks are projected, so multiline syntax state remains correct.
+the selected file, hunk, and logical row. Source rows retain change backgrounds and character-level
+emphasis without delaying the first frame for whole-file syntax parsing.
 
 The viewer explicitly labels conflicts, submodules, binary content, non-UTF-8 content, unavailable
 files, and text inputs whose combined old/new size exceeds the 8 MiB safety limit. It also preserves

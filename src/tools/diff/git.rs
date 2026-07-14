@@ -7,7 +7,7 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 
 use super::model::{
-    ChangeGroup, ChangeKind, DiffDocument, DiffInput, SourceSnapshot, SpecialState,
+    ChangeGroup, ChangeKind, DiffContext, DiffDocument, DiffInput, SourceSnapshot, SpecialState,
 };
 
 #[derive(Clone, Debug)]
@@ -29,13 +29,13 @@ enum RecordKind {
     Untracked,
 }
 
-pub fn load_repository(cwd: &Path) -> Result<Vec<DiffDocument>> {
+pub fn load_repository(cwd: &Path, context: DiffContext) -> Result<Vec<DiffDocument>> {
     let root = repository_root(cwd)?;
     let output = git_output(&root, &["status", "--porcelain=v2", "-z", "--untracked-files=all"])?;
     let entries = parse_status(&output.stdout)?;
     let mut documents = Vec::new();
     for entry in entries {
-        append_documents(&mut documents, &root, entry);
+        append_documents(&mut documents, &root, entry, context);
     }
     documents.sort_by(|left, right| {
         group_order(left.group)
@@ -126,9 +126,15 @@ fn repository_root(cwd: &Path) -> Result<PathBuf> {
     path_from_bytes(root).context("decode Git repository root")
 }
 
-fn append_documents(documents: &mut Vec<DiffDocument>, root: &Path, entry: StatusEntry) {
+fn append_documents(
+    documents: &mut Vec<DiffDocument>,
+    root: &Path,
+    entry: StatusEntry,
+    context: DiffContext,
+) {
+    let build = |input| DiffDocument::build(input, context);
     if entry.record == RecordKind::Unmerged {
-        documents.push(DiffDocument::build(DiffInput {
+        documents.push(build(DiffInput {
             group: ChangeGroup::Changes,
             kind: ChangeKind::Conflict,
             old_path: Some(entry.path.clone()),
@@ -145,7 +151,7 @@ fn append_documents(documents: &mut Vec<DiffDocument>, root: &Path, entry: Statu
             [(ChangeGroup::Staged, entry.status[0]), (ChangeGroup::Changes, entry.status[1])]
         {
             if is_changed(code) {
-                documents.push(DiffDocument::build(DiffInput {
+                documents.push(build(DiffInput {
                     group,
                     kind: ChangeKind::Submodule,
                     old_path: Some(entry.path.clone()),
@@ -160,7 +166,7 @@ fn append_documents(documents: &mut Vec<DiffDocument>, root: &Path, entry: Statu
     }
 
     if entry.record == RecordKind::Untracked {
-        documents.push(DiffDocument::build(DiffInput {
+        documents.push(build(DiffInput {
             group: ChangeGroup::Changes,
             kind: ChangeKind::Untracked,
             old_path: None,
@@ -176,7 +182,7 @@ fn append_documents(documents: &mut Vec<DiffDocument>, root: &Path, entry: Statu
         let kind = change_kind(entry.status[0]);
         let (old_path, new_path) =
             comparison_paths(kind, &entry.path, entry.original_path.as_deref());
-        documents.push(DiffDocument::build(DiffInput {
+        documents.push(build(DiffInput {
             group: ChangeGroup::Staged,
             kind,
             old_path,
@@ -191,7 +197,7 @@ fn append_documents(documents: &mut Vec<DiffDocument>, root: &Path, entry: Statu
         let kind = change_kind(entry.status[1]);
         let (old_path, new_path) =
             comparison_paths(kind, &entry.path, entry.original_path.as_deref());
-        documents.push(DiffDocument::build(DiffInput {
+        documents.push(build(DiffInput {
             group: ChangeGroup::Changes,
             kind,
             old_path,
@@ -449,6 +455,7 @@ fn git_output_os(cwd: &Path, args: &[OsString]) -> Result<Output> {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
 
     use super::*;
     use crate::tools::diff::model::DiffBody;
@@ -516,7 +523,7 @@ mod tests {
         repo.write("unusual\npath.txt", "new\n");
 
         let before = repo.evidence();
-        let documents = load_repository(&repo.path).unwrap();
+        let documents = load_repository(&repo.path, DiffContext::default()).unwrap();
         let after = repo.evidence();
 
         assert_eq!(before, after, "loading the viewer source must be read-only");
@@ -558,17 +565,17 @@ mod tests {
         repo.write("selected file.txt", "selected change\n");
         repo.write("other.txt", "other change\n");
 
-        let documents = load_repository(&repo.path).unwrap();
+        let documents = load_repository(&repo.path, DiffContext::default()).unwrap();
         let selected = find(&documents, ChangeGroup::Changes, "selected file.txt").clone();
         stage_document(&repo.path, &selected).unwrap();
 
-        let documents = load_repository(&repo.path).unwrap();
+        let documents = load_repository(&repo.path, DiffContext::default()).unwrap();
         assert!(has(&documents, ChangeGroup::Staged, "selected file.txt", ChangeKind::Modified));
         assert!(has(&documents, ChangeGroup::Changes, "other.txt", ChangeKind::Modified));
         let selected = find(&documents, ChangeGroup::Staged, "selected file.txt").clone();
         unstage_document(&repo.path, &selected).unwrap();
 
-        let documents = load_repository(&repo.path).unwrap();
+        let documents = load_repository(&repo.path, DiffContext::default()).unwrap();
         assert!(has(&documents, ChangeGroup::Changes, "selected file.txt", ChangeKind::Modified));
         assert!(!documents.iter().any(|document| document.group == ChangeGroup::Staged));
         assert_eq!(fs::read(repo.path.join("selected file.txt")).unwrap(), b"selected change\n");
@@ -582,12 +589,12 @@ mod tests {
         repo.git(&["commit", "-m", "base"]);
         repo.git(&["mv", "old name.txt", "new name.txt"]);
 
-        let documents = load_repository(&repo.path).unwrap();
+        let documents = load_repository(&repo.path, DiffContext::default()).unwrap();
         let renamed = find(&documents, ChangeGroup::Staged, "new name.txt").clone();
         assert_eq!(renamed.kind, ChangeKind::Renamed);
         unstage_document(&repo.path, &renamed).unwrap();
 
-        let documents = load_repository(&repo.path).unwrap();
+        let documents = load_repository(&repo.path, DiffContext::default()).unwrap();
         assert!(!documents.iter().any(|document| document.group == ChangeGroup::Staged));
         assert_eq!(fs::read(repo.path.join("new name.txt")).unwrap(), b"content\n");
         assert!(!repo.path.join("old name.txt").exists());
@@ -599,11 +606,11 @@ mod tests {
         repo.write("first.txt", "first\n");
         repo.git(&["add", "first.txt"]);
 
-        let documents = load_repository(&repo.path).unwrap();
+        let documents = load_repository(&repo.path, DiffContext::default()).unwrap();
         let staged = find(&documents, ChangeGroup::Staged, "first.txt").clone();
         unstage_document(&repo.path, &staged).unwrap();
 
-        let documents = load_repository(&repo.path).unwrap();
+        let documents = load_repository(&repo.path, DiffContext::default()).unwrap();
         assert!(has(&documents, ChangeGroup::Changes, "first.txt", ChangeKind::Untracked));
         assert!(!documents.iter().any(|document| document.group == ChangeGroup::Staged));
         assert_eq!(fs::read(repo.path.join("first.txt")).unwrap(), b"first\n");
@@ -623,7 +630,7 @@ mod tests {
         repo.git(&["commit", "-am", "ours"]);
         assert!(!repo.git_status(&["merge", "other"]).success());
 
-        let documents = load_repository(&repo.path).unwrap();
+        let documents = load_repository(&repo.path, DiffContext::default()).unwrap();
 
         assert!(has(&documents, ChangeGroup::Changes, "conflict.txt", ChangeKind::Conflict));
         assert!(documents
@@ -644,13 +651,66 @@ mod tests {
         };
         let mut documents = Vec::new();
 
-        append_documents(&mut documents, Path::new("/does/not/exist"), entry);
+        append_documents(
+            &mut documents,
+            Path::new("/does/not/exist"),
+            entry,
+            DiffContext::default(),
+        );
 
         assert_eq!(documents.len(), 1);
         assert!(matches!(
             documents[0].body,
             DiffBody::Special(SpecialState::Submodule { ref state }) if state == "S.MU"
         ));
+    }
+
+    #[test]
+    #[ignore = "deterministic repository-load performance harness"]
+    fn benchmark_repository_load() {
+        for (case, files, samples) in
+            [("ordinary", 25, 8), ("realistic", 250, 4), ("extreme", 1_000, 2)]
+        {
+            let repo = TestRepo::new();
+            for index in 0..files {
+                repo.write(
+                    &format!("src/group-{}/file-{index}.rs", index % 20),
+                    &format!("pub fn value_{index}() -> usize {{ {index} }}\n"),
+                );
+            }
+            repo.git(&["add", "."]);
+            repo.git(&["commit", "-m", "base"]);
+            for index in 0..files {
+                repo.write(
+                    &format!("src/group-{}/file-{index}.rs", index % 20),
+                    &format!("pub fn value_{index}() -> usize {{ {} }}\n", index + 1),
+                );
+            }
+            repo.git(&["add", "."]);
+            for index in (1..files).step_by(2) {
+                repo.write(
+                    &format!("src/group-{}/file-{index}.rs", index % 20),
+                    &format!("pub fn value_{index}() -> usize {{ {} }}\n", index + 2),
+                );
+            }
+
+            let _ = load_repository(&repo.path, DiffContext::default()).unwrap();
+            let mut micros = Vec::with_capacity(samples);
+            for _ in 0..samples {
+                let started = Instant::now();
+                let documents = load_repository(&repo.path, DiffContext::default()).unwrap();
+                assert_eq!(documents.len(), files + files / 2);
+                micros.push(started.elapsed().as_micros());
+            }
+            micros.sort_unstable();
+            let p50 = micros[samples / 2];
+            let p95 = micros[(samples * 95 / 100).min(samples - 1)];
+            let maximum = micros[samples - 1];
+            println!(
+                "{{\"schema\":2,\"surface\":\"repository_load\",\"case\":\"{case}\",\"files\":{files},\"documents\":{},\"warmups\":1,\"samples\":{samples},\"p50_us\":{p50},\"p95_us\":{p95},\"max_us\":{maximum}}}",
+                files + files / 2
+            );
+        }
     }
 
     fn has(documents: &[DiffDocument], group: ChangeGroup, path: &str, kind: ChangeKind) -> bool {

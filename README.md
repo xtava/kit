@@ -20,7 +20,7 @@ does not pull or modify Git state.
 | `kit cdp` | Attach to running Chrome or Electron instances, inspect CDP timelines, interact with targets, assert behavior, trace code, and capture diagnostic bundles. |
 | `kit scout` | Inspect Electron memory by instance and process role, with CDP target attribution and optional heap capture. |
 | `kit stats` | Monitor CPU, memory, process trees, threads, and resources; safely terminate a selected process. |
-| `kit diff` | Review staged, unstaged, and untracked Git changes in unified or split mode; stage or unstage the selected file. |
+| `kit diff` | Review staged, unstaged, and untracked Git changes inline or side by side; stage or unstage the selected file. |
 | `kit domain` | Check domain registration through DNS, RDAP, and WHOIS, including aftermarket listings. |
 | `kit deploy` | Run typed deployment plans, inspect version history, and execute configured rollbacks. |
 | `kit record` | Start, stop, inspect, save, and replay Modular Playwright recorder runs. |

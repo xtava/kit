@@ -36,6 +36,11 @@ impl EventReader {
     pub async fn recv(&mut self) -> Option<Event> {
         self.receiver.recv().await
     }
+
+    /// Returns the next event already waiting in the queue without blocking.
+    pub fn try_recv(&mut self) -> Option<Event> {
+        self.receiver.try_recv().ok()
+    }
 }
 
 impl Drop for EventReader {

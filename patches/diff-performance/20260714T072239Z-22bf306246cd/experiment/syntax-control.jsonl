@@ -1,0 +1,6 @@
+{"schema":2,"surface":"projection_build","case":"ordinary","source_lines":250,"p95_us":7105}
+{"schema":2,"surface":"projection_build_without_syntax","case":"ordinary","source_lines":250,"p95_us":53}
+{"schema":2,"surface":"projection_build","case":"realistic","source_lines":5000,"p95_us":144938}
+{"schema":2,"surface":"projection_build_without_syntax","case":"realistic","source_lines":5000,"p95_us":1220}
+{"schema":2,"surface":"projection_build","case":"extreme","source_lines":25000,"p95_us":896083}
+{"schema":2,"surface":"projection_build_without_syntax","case":"extreme","source_lines":25000,"p95_us":40267}

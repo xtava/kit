@@ -15,18 +15,19 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::git::{load_repository, stage_document, unstage_document};
 use super::model::{
-    ChangeGroup, ChangeKind, DiffBody, DiffDocument, LineCell, RowKind, SpecialState,
+    ChangeGroup, ChangeKind, DiffBody, DiffContext, DiffDocument, LineCell, RowKind, SpecialState,
     TextDiffDocument, TextSnapshot,
 };
 use crate::tui::theme::TuiTheme;
 use crate::tui::{
-    syntax, Direction, EventReader, NavigationMap, NavigationRegion, Session, SessionOptions,
+    Direction, EventReader, NavigationMap, NavigationRegion, Session, SessionOptions,
 };
 
 const WIDE_MIN_WIDTH: u16 = 84;
 const MIN_WIDTH: u16 = 30;
 const MIN_HEIGHT: u16 = 8;
 const TREE_WIDTH: u16 = 34;
+const TREE_ACTION_WIDTH: u16 = 3;
 const CHANGE_INDICATOR_WIDTH: usize = 2;
 const SPLIT_GUTTER_WIDTH: usize = 8;
 const SPLIT_MIN_WIDTH: u16 = 50;
@@ -38,14 +39,14 @@ const LIGHT_DELETED_BACKGROUND: Color = Color::Rgb(255, 235, 233);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ViewMode {
     Auto,
-    Unified,
+    Inline,
     Split,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EffectiveMode {
     Single,
-    Unified,
+    Inline,
     Split,
 }
 
@@ -74,6 +75,7 @@ pub async fn run(
     theme: TuiTheme,
     mouse_capture: bool,
     mode: ViewMode,
+    context: DiffContext,
 ) -> Result<()> {
     let mut app = DiffApp::new(documents, theme, mode);
     let mut session = Session::open(SessionOptions { mouse_capture })?;
@@ -91,7 +93,9 @@ pub async fn run(
             RuntimeEvent::Terminal(events.recv().await)
         };
         let flow = match event {
-            RuntimeEvent::Terminal(event) => handle_terminal_event(&mut app, event),
+            RuntimeEvent::Terminal(event) => {
+                handle_terminal_events(&mut app, event, || events.try_recv())
+            }
             RuntimeEvent::RepositoryUpdated(result) => {
                 repository_task = None;
                 app.finish_repository_operation(match result {
@@ -106,13 +110,14 @@ pub async fn run(
             Flow::Refresh if repository_task.is_none() => {
                 let operation = RepositoryOperation::Refresh;
                 app.repository_status = Some(RepositoryStatus::Running(operation.running_label()));
-                repository_task = Some(spawn_repository_operation(cwd.clone(), operation));
+                repository_task = Some(spawn_repository_operation(cwd.clone(), operation, context));
             }
             Flow::ToggleStage if repository_task.is_none() => {
                 if let Some(operation) = app.selected_repository_operation() {
                     app.repository_status =
                         Some(RepositoryStatus::Running(operation.running_label()));
-                    repository_task = Some(spawn_repository_operation(cwd.clone(), operation));
+                    repository_task =
+                        Some(spawn_repository_operation(cwd.clone(), operation, context));
                 }
             }
             Flow::Continue | Flow::Refresh | Flow::ToggleStage => {}
@@ -121,13 +126,25 @@ pub async fn run(
     Ok(())
 }
 
+fn handle_terminal_events(
+    app: &mut DiffApp,
+    event: Option<Event>,
+    mut try_recv: impl FnMut() -> Option<Event>,
+) -> Flow {
+    let mut flow = handle_terminal_event(app, event);
+    while flow == Flow::Continue {
+        let Some(event) = try_recv() else {
+            break;
+        };
+        flow = handle_terminal_event(app, Some(event));
+    }
+    flow
+}
+
 fn handle_terminal_event(app: &mut DiffApp, event: Option<Event>) -> Flow {
     match event {
         Some(Event::Key(key)) if key.is_press() => app.on_key(key),
-        Some(Event::Mouse(mouse)) => {
-            app.on_mouse(mouse);
-            Flow::Continue
-        }
+        Some(Event::Mouse(mouse)) => app.on_mouse(mouse),
         Some(Event::Resize(_, _)) => Flow::Continue,
         None => Flow::Quit,
         _ => Flow::Continue,
@@ -194,10 +211,12 @@ impl RepositoryOperation {
 fn spawn_repository_operation(
     cwd: PathBuf,
     operation: RepositoryOperation,
+    context: DiffContext,
 ) -> tokio::task::JoinHandle<Result<(Vec<DiffDocument>, &'static str)>> {
     tokio::task::spawn_blocking(move || {
         operation.execute(&cwd)?;
-        let documents = load_repository(&cwd).context("reload repository after operation")?;
+        let documents =
+            load_repository(&cwd, context).context("reload repository after operation")?;
         Ok((documents, operation.success_label()))
     })
 }
@@ -222,10 +241,26 @@ struct TreeRow {
 #[derive(Default)]
 struct UiRegions {
     tree: Vec<(Rect, TreeTarget)>,
+    tree_actions: Vec<(Rect, usize)>,
     tree_area: Rect,
     content_area: Rect,
     content_inner: Rect,
     divider: Option<Rect>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProjectionKey {
+    document: usize,
+    mode: EffectiveMode,
+    width: usize,
+    old_horizontal_scroll: usize,
+    new_horizontal_scroll: usize,
+    divider_percent: u16,
+}
+
+struct DocumentProjection {
+    key: ProjectionKey,
+    lines: Vec<RenderedLine>,
 }
 
 struct DiffApp {
@@ -238,13 +273,14 @@ struct DiffApp {
     new_horizontal_scroll: usize,
     selected_hunk: usize,
     anchor: ReviewAnchor,
-    rendered_anchors: Vec<ReviewAnchor>,
+    document_projection: Option<DocumentProjection>,
     restore_anchor: bool,
     mode: ViewMode,
     last_effective_mode: Option<EffectiveMode>,
     active_region: ActiveRegion,
     divider_percent: u16,
     dragging_divider: bool,
+    hovered_file: Option<usize>,
     repository_status: Option<RepositoryStatus>,
     theme: TuiTheme,
     regions: UiRegions,
@@ -263,13 +299,14 @@ impl DiffApp {
             new_horizontal_scroll: 0,
             selected_hunk: 0,
             anchor: ReviewAnchor { hunk: 0, row: None },
-            rendered_anchors: Vec::new(),
+            document_projection: None,
             restore_anchor: false,
             mode,
             last_effective_mode: None,
             active_region: ActiveRegion::Changes,
             divider_percent: 50,
             dragging_divider: false,
+            hovered_file: None,
             repository_status: None,
             theme,
             regions: UiRegions::default(),
@@ -314,7 +351,10 @@ impl DiffApp {
                 self.sync_anchor_from_scroll();
             }
             KeyCode::End => {
-                self.content_scroll = self.rendered_anchors.len().saturating_sub(1);
+                self.content_scroll = self
+                    .document_projection
+                    .as_ref()
+                    .map_or(0, |projection| projection.lines.len().saturating_sub(1));
                 self.sync_anchor_from_scroll();
             }
             _ => {}
@@ -341,6 +381,7 @@ impl DiffApp {
     }
 
     fn replace_documents(&mut self, documents: Vec<DiffDocument>) {
+        self.hovered_file = None;
         let previous_index = self.selected.unwrap_or(0);
         let previous_identity = self
             .selected
@@ -382,19 +423,41 @@ impl DiffApp {
         self.new_horizontal_scroll = 0;
         self.selected_hunk = 0;
         self.anchor = ReviewAnchor { hunk: 0, row: None };
-        self.rendered_anchors.clear();
+        self.document_projection = None;
         self.restore_anchor = false;
         self.last_effective_mode = None;
         self.dragging_divider = false;
     }
 
-    fn on_mouse(&mut self, mouse: MouseEvent) {
+    fn on_mouse(&mut self, mouse: MouseEvent) -> Flow {
         let point = Rect::new(mouse.column, mouse.row, 1, 1);
         match mouse.kind {
+            MouseEventKind::Moved => {
+                self.hovered_file = self.regions.tree.iter().find_map(|(area, target)| {
+                    if area.intersects(point) {
+                        match target {
+                            TreeTarget::File(index) => Some(*index),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                });
+            }
             MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(index) = self
+                    .regions
+                    .tree_actions
+                    .iter()
+                    .find(|(area, _)| area.intersects(point))
+                    .map(|(_, index)| *index)
+                {
+                    self.select(index);
+                    return Flow::ToggleStage;
+                }
                 if self.regions.divider.is_some_and(|area| area.intersects(point)) {
                     self.dragging_divider = true;
-                    return;
+                    return Flow::Continue;
                 }
                 if let Some(target) = self
                     .regions
@@ -419,12 +482,15 @@ impl DiffApp {
             }
             MouseEventKind::Up(MouseButton::Left) => self.dragging_divider = false,
             MouseEventKind::ScrollDown if self.regions.tree_area.intersects(point) => {
+                self.hovered_file = None;
                 self.tree_scroll = self.tree_scroll.saturating_add(1)
             }
             MouseEventKind::ScrollUp if self.regions.tree_area.intersects(point) => {
+                self.hovered_file = None;
                 self.tree_scroll = self.tree_scroll.saturating_sub(1)
             }
             MouseEventKind::ScrollDown if self.regions.content_area.intersects(point) => {
+                self.hovered_file = None;
                 if mouse.modifiers.contains(KeyModifiers::SHIFT) {
                     self.pan(4)
                 } else {
@@ -432,6 +498,7 @@ impl DiffApp {
                 }
             }
             MouseEventKind::ScrollUp if self.regions.content_area.intersects(point) => {
+                self.hovered_file = None;
                 if mouse.modifiers.contains(KeyModifiers::SHIFT) {
                     self.pan(-4)
                 } else {
@@ -440,6 +507,7 @@ impl DiffApp {
             }
             _ => {}
         }
+        Flow::Continue
     }
 
     fn activate_tree_target(&mut self, target: TreeTarget) {
@@ -516,10 +584,9 @@ impl DiffApp {
     }
 
     fn toggle_mode(&mut self) {
-        self.sync_anchor_from_scroll();
         self.mode = match self.base_mode(self.regions.content_inner.width) {
-            EffectiveMode::Unified => ViewMode::Split,
-            EffectiveMode::Split => ViewMode::Unified,
+            EffectiveMode::Inline => ViewMode::Split,
+            EffectiveMode::Split => ViewMode::Inline,
             EffectiveMode::Single => unreachable!("base mode is never one-sided"),
         };
         self.restore_anchor = true;
@@ -527,10 +594,10 @@ impl DiffApp {
 
     fn base_mode(&self, width: u16) -> EffectiveMode {
         match self.mode {
-            ViewMode::Unified => EffectiveMode::Unified,
+            ViewMode::Inline => EffectiveMode::Inline,
             ViewMode::Split => EffectiveMode::Split,
             ViewMode::Auto if width >= 72 => EffectiveMode::Split,
-            ViewMode::Auto => EffectiveMode::Unified,
+            ViewMode::Auto => EffectiveMode::Inline,
         }
     }
 
@@ -558,12 +625,14 @@ impl DiffApp {
     }
 
     fn sync_anchor_from_scroll(&mut self) {
-        if let Some(anchor) = self
-            .rendered_anchors
-            .get(self.content_scroll.min(self.rendered_anchors.len().saturating_sub(1)))
-        {
-            self.anchor = *anchor;
-            self.selected_hunk = anchor.hunk;
+        if let Some(projection) = &self.document_projection {
+            if let Some(line) = projection
+                .lines
+                .get(self.content_scroll.min(projection.lines.len().saturating_sub(1)))
+            {
+                self.anchor = line.anchor;
+                self.selected_hunk = line.anchor.hunk;
+            }
         }
     }
 
@@ -713,11 +782,27 @@ fn render_tree(frame: &mut Frame<'_>, area: Rect, app: &mut DiffApp) {
             } else {
                 Style::default().fg(app.theme.text)
             };
-            app.regions.tree.push((
-                Rect::new(inner.x, inner.y + visible_index as u16, inner.width, 1),
-                row.target.clone(),
-            ));
-            tree_line(row, inner.width as usize, style, &app.expanded, app.theme)
+            let row_area = Rect::new(inner.x, inner.y + visible_index as u16, inner.width, 1);
+            app.regions.tree.push((row_area, row.target.clone()));
+            let hover_action = match row.target {
+                TreeTarget::File(index) if app.hovered_file == Some(index) => {
+                    app.documents.get(index).map(|document| document.group)
+                }
+                _ => None,
+            };
+            if let (TreeTarget::File(index), Some(_)) = (&row.target, hover_action) {
+                let action_width = TREE_ACTION_WIDTH.min(row_area.width);
+                app.regions.tree_actions.push((
+                    Rect::new(
+                        row_area.x + row_area.width.saturating_sub(action_width),
+                        row_area.y,
+                        action_width,
+                        1,
+                    ),
+                    *index,
+                ));
+            }
+            tree_line(row, inner.width as usize, style, &app.expanded, hover_action, app.theme)
         })
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(lines), inner);
@@ -728,6 +813,7 @@ fn tree_line(
     width: usize,
     style: Style,
     expanded: &HashSet<(ChangeGroup, PathBuf)>,
+    hover_action: Option<ChangeGroup>,
     theme: TuiTheme,
 ) -> Line<'static> {
     let prefix = match &row.target {
@@ -738,9 +824,11 @@ fn tree_line(
         TreeTarget::File(_) => change_glyph(row.kind),
     };
     let indent = "  ".repeat(row.depth);
-    let counts = tree_count_spans(row, style, theme);
+    let trailing = hover_action
+        .map(|group| tree_action_spans(group, style, theme))
+        .unwrap_or_else(|| tree_count_spans(row, style, theme));
     let reserved =
-        counts.iter().map(|span| UnicodeWidthStr::width(span.content.as_ref())).sum::<usize>();
+        trailing.iter().map(|span| UnicodeWidthStr::width(span.content.as_ref())).sum::<usize>();
     let available = width.saturating_sub(
         UnicodeWidthStr::width(indent.as_str()) + UnicodeWidthStr::width(prefix) + reserved,
     );
@@ -753,8 +841,16 @@ fn tree_line(
         Span::styled(prefix, style.fg(prefix_color)),
         Span::styled(format!("{label}{padding}"), style),
     ];
-    spans.extend(counts);
+    spans.extend(trailing);
     Line::from(spans).style(style)
+}
+
+fn tree_action_spans(group: ChangeGroup, style: Style, theme: TuiTheme) -> Vec<Span<'static>> {
+    let (label, color) = match group {
+        ChangeGroup::Changes => (" + ", theme.success),
+        ChangeGroup::Staged => (" - ", theme.danger),
+    };
+    vec![Span::styled(label, style.fg(color).add_modifier(Modifier::BOLD))]
 }
 
 fn tree_count_spans(row: &TreeRow, style: Style, theme: TuiTheme) -> Vec<Span<'static>> {
@@ -802,11 +898,11 @@ fn render_document(frame: &mut Frame<'_>, area: Rect, app: &mut DiffApp) {
         EffectiveMode::Single => {
             " ↑↓ move  ←→ region  h/l pan  n/N change  s stage/unstage  r refresh  q quit "
         }
-        EffectiveMode::Unified => {
+        EffectiveMode::Inline => {
             " ↑↓ move  ←→ region  h/l pan  n/N change  v view  s stage/unstage  r refresh  q quit "
         }
         EffectiveMode::Split => {
-            " ↑↓ move  ←→ region  h/l pan  n/N change  Tab cycle  s stage/unstage  r refresh  q quit "
+            " ↑↓ move  ←→ region  h/l pan  n/N change  v view  Tab cycle  s stage/unstage  r refresh  q quit "
         }
     };
     let footer = repository_footer(app, controls);
@@ -831,46 +927,62 @@ fn render_document(frame: &mut Frame<'_>, area: Rect, app: &mut DiffApp) {
     if effective == EffectiveMode::Split && inner.width < SPLIT_MIN_WIDTH {
         frame.render_widget(
             Paragraph::new(
-                "Split mode needs at least 50 content columns. Press v for unified mode.",
+                "Split mode needs at least 50 content columns. Press v for inline mode.",
             )
             .style(Style::default().fg(app.theme.warning)),
             inner,
         );
         return;
     }
-    let Some(document) = app.selected.and_then(|index| app.documents.get(index)) else {
+    let Some(document_index) = app.selected else {
         frame.render_widget(
             Paragraph::new("Working tree is clean.").style(Style::default().fg(app.theme.success)),
             inner,
         );
         return;
     };
-    let rendered = document_lines(document, app, effective, inner.width as usize);
-    app.rendered_anchors = rendered.iter().map(|line| line.anchor).collect();
+    let key = ProjectionKey {
+        document: document_index,
+        mode: effective,
+        width: inner.width as usize,
+        old_horizontal_scroll: app.old_horizontal_scroll,
+        new_horizontal_scroll: app.new_horizontal_scroll,
+        divider_percent: app.divider_percent,
+    };
+    if app.document_projection.as_ref().is_none_or(|projection| projection.key != key) {
+        let document = &app.documents[document_index];
+        let lines = document_lines(document, app, effective, inner.width as usize);
+        app.document_projection = Some(DocumentProjection { key, lines });
+    }
+    let projection = app.document_projection.as_ref().expect("projection was initialized");
     if app.restore_anchor {
         app.content_scroll =
-            app.rendered_anchors.iter().position(|anchor| *anchor == app.anchor).unwrap_or_else(
+            projection.lines.iter().position(|line| line.anchor == app.anchor).unwrap_or_else(
                 || {
-                    app.rendered_anchors
+                    projection
+                        .lines
                         .iter()
-                        .position(|anchor| anchor.hunk == app.anchor.hunk)
+                        .position(|line| line.anchor.hunk == app.anchor.hunk)
                         .unwrap_or(0)
                 },
             );
         app.restore_anchor = false;
     }
-    let max_scroll = rendered.len().saturating_sub(inner.height as usize);
+    let max_scroll = projection.lines.len().saturating_sub(inner.height as usize);
     app.content_scroll = app.content_scroll.min(max_scroll);
     if effective == EffectiveMode::Split {
         let left_width = split_widths(inner.width as usize, app.divider_percent).0;
         app.regions.divider =
             Some(Rect::new(inner.x + left_width as u16, inner.y, 1, inner.height));
     }
-    frame.render_widget(
-        Paragraph::new(rendered.into_iter().map(|line| line.line).collect::<Vec<_>>())
-            .scroll((app.content_scroll.min(u16::MAX as usize) as u16, 0)),
-        inner,
-    );
+    let visible = projection
+        .lines
+        .iter()
+        .skip(app.content_scroll)
+        .take(inner.height as usize)
+        .map(|rendered| rendered.line.clone())
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(visible), inner);
 }
 
 fn repository_footer(app: &DiffApp, controls: &'static str) -> Line<'static> {
@@ -936,10 +1048,8 @@ fn document_lines(
 ) -> Vec<RenderedLine> {
     match &document.body {
         DiffBody::Text(text) => match mode {
-            EffectiveMode::Single | EffectiveMode::Unified => {
-                unified_text_lines(document, text, app, width)
-            }
-            EffectiveMode::Split => split_text_lines(document, text, app, width),
+            EffectiveMode::Single | EffectiveMode::Inline => inline_text_lines(text, app, width),
+            EffectiveMode::Split => split_text_lines(text, app, width),
         },
         DiffBody::Binary => special_lines("Binary content cannot be rendered as text.", app.theme),
         DiffBody::NonUtf8 => {
@@ -970,31 +1080,8 @@ fn special_lines(message: &str, theme: TuiTheme) -> Vec<RenderedLine> {
     }]
 }
 
-fn unified_text_lines(
-    document: &DiffDocument,
-    text: &TextDiffDocument,
-    app: &DiffApp,
-    width: usize,
-) -> Vec<RenderedLine> {
+fn inline_text_lines(text: &TextDiffDocument, app: &DiffApp, width: usize) -> Vec<RenderedLine> {
     let theme = app.theme;
-    let hint = document
-        .display_path()
-        .and_then(Path::extension)
-        .and_then(|extension| extension.to_str())
-        .unwrap_or("");
-    let fallback = Style::default().fg(theme.text);
-    let old_highlights = syntax::highlight_lines(
-        (0..text.old.line_count()).map(|index| text.old.line(index)),
-        hint,
-        fallback,
-        theme,
-    );
-    let new_highlights = syntax::highlight_lines(
-        (0..text.new.line_count()).map(|index| text.new.line(index)),
-        hint,
-        fallback,
-        theme,
-    );
     let mut lines = Vec::new();
     for (hunk_index, hunk) in text.hunks.iter().enumerate() {
         push_hunk_separator(&mut lines, text, hunk_index, width, theme);
@@ -1008,7 +1095,6 @@ fn unified_text_lines(
                         row.old.as_ref().or(row.new.as_ref()).expect("context row has a side"),
                         None,
                         &text.old,
-                        &old_highlights,
                         theme,
                         app.new_horizontal_scroll,
                         width,
@@ -1022,7 +1108,6 @@ fn unified_text_lines(
                             old,
                             Some(ChangeSide::Deletion),
                             &text.old,
-                            &old_highlights,
                             theme,
                             app.old_horizontal_scroll,
                             width,
@@ -1035,7 +1120,6 @@ fn unified_text_lines(
                             new,
                             Some(ChangeSide::Addition),
                             &text.new,
-                            &new_highlights,
                             theme,
                             app.new_horizontal_scroll,
                             width,
@@ -1058,31 +1142,8 @@ fn unified_text_lines(
     lines
 }
 
-fn split_text_lines(
-    document: &DiffDocument,
-    text: &TextDiffDocument,
-    app: &DiffApp,
-    width: usize,
-) -> Vec<RenderedLine> {
+fn split_text_lines(text: &TextDiffDocument, app: &DiffApp, width: usize) -> Vec<RenderedLine> {
     let theme = app.theme;
-    let hint = document
-        .display_path()
-        .and_then(Path::extension)
-        .and_then(|extension| extension.to_str())
-        .unwrap_or("");
-    let fallback = Style::default().fg(theme.text);
-    let old_highlights = syntax::highlight_lines(
-        (0..text.old.line_count()).map(|index| text.old.line(index)),
-        hint,
-        fallback,
-        theme,
-    );
-    let new_highlights = syntax::highlight_lines(
-        (0..text.new.line_count()).map(|index| text.new.line(index)),
-        hint,
-        fallback,
-        theme,
-    );
     let (left_width, right_width) = split_widths(width, app.divider_percent);
     let mut lines = Vec::new();
     for (hunk_index, hunk) in text.hunks.iter().enumerate() {
@@ -1093,7 +1154,6 @@ fn split_text_lines(
                 row.old.as_ref(),
                 (row.kind == RowKind::Changed && row.old.is_some()).then_some(ChangeSide::Deletion),
                 &text.old,
-                &old_highlights,
                 theme,
                 app.old_horizontal_scroll,
                 left_width,
@@ -1103,7 +1163,6 @@ fn split_text_lines(
                 row.new.as_ref(),
                 (row.kind == RowKind::Changed && row.new.is_some()).then_some(ChangeSide::Addition),
                 &text.new,
-                &new_highlights,
                 theme,
                 app.new_horizontal_scroll,
                 right_width,
@@ -1129,7 +1188,6 @@ fn split_side(
     cell: Option<&LineCell>,
     change: Option<ChangeSide>,
     snapshot: &TextSnapshot,
-    highlights: &[Vec<Span<'static>>],
     theme: TuiTheme,
     horizontal_scroll: usize,
     width: usize,
@@ -1143,12 +1201,7 @@ fn split_side(
     };
     let gutter = format!("{:>5} ", cell.line_index + 1);
     let source = snapshot.display_line(cell.line_index);
-    let styled = apply_emphasis(
-        highlights.get(cell.line_index).cloned().unwrap_or_default(),
-        source.len(),
-        &cell.emphasis,
-        base,
-    );
+    let styled = apply_emphasis(source, &cell.emphasis, base);
     let newline_marker = cell.missing_newline.then_some(" ⏎");
     let marker_width = newline_marker.map(UnicodeWidthStr::width).unwrap_or(0);
     let available = width.saturating_sub(SPLIT_GUTTER_WIDTH + marker_width);
@@ -1245,7 +1298,6 @@ fn push_source_line(
     cell: &LineCell,
     change: Option<ChangeSide>,
     snapshot: &TextSnapshot,
-    highlights: &[Vec<Span<'static>>],
     theme: TuiTheme,
     horizontal_scroll: usize,
     width: usize,
@@ -1255,12 +1307,7 @@ fn push_source_line(
         .map(|color| Style::default().fg(theme.text).bg(color))
         .unwrap_or_else(|| Style::default().fg(theme.text));
     let source = snapshot.display_line(cell.line_index);
-    let styled = apply_emphasis(
-        highlights.get(cell.line_index).cloned().unwrap_or_default(),
-        source.len(),
-        &cell.emphasis,
-        base,
-    );
+    let styled = apply_emphasis(source, &cell.emphasis, base);
     let newline_marker = cell.missing_newline.then_some("  ⏎ no newline");
     let marker_width = newline_marker.map(UnicodeWidthStr::width).unwrap_or(0);
     let available = width.saturating_sub(CHANGE_INDICATOR_WIDTH + marker_width);
@@ -1273,48 +1320,28 @@ fn push_source_line(
 }
 
 fn apply_emphasis(
-    spans: Vec<Span<'static>>,
-    source_len: usize,
+    source: &str,
     emphasis: &[std::ops::Range<usize>],
     base: Style,
 ) -> Vec<Span<'static>> {
     let mut output = Vec::new();
-    let mut offset = 0;
-    for span in spans {
-        if offset >= source_len {
-            break;
-        }
-        let available = source_len - offset;
-        let mut content = span.content.into_owned();
-        if content.len() > available {
-            content.truncate(available);
-        }
-        let syntax_style = base.patch(span.style);
-        let mut current = String::new();
-        let mut current_emphasis = None;
-        for (local, character) in content.char_indices() {
-            let position = offset + local;
-            let emphasized = emphasis.iter().any(|range| range.contains(&position));
-            if current_emphasis.is_some_and(|value| value != emphasized) {
-                push_emphasis_span(
-                    &mut output,
-                    std::mem::take(&mut current),
-                    syntax_style,
-                    current_emphasis.unwrap(),
-                );
-            }
-            current_emphasis = Some(emphasized);
-            current.push(character);
-        }
-        if !current.is_empty() {
+    let mut current = String::new();
+    let mut current_emphasis = None;
+    for (position, character) in source.char_indices() {
+        let emphasized = emphasis.iter().any(|range| range.contains(&position));
+        if current_emphasis.is_some_and(|value| value != emphasized) {
             push_emphasis_span(
                 &mut output,
-                current,
-                syntax_style,
-                current_emphasis.unwrap_or(false),
+                std::mem::take(&mut current),
+                base,
+                current_emphasis.unwrap(),
             );
         }
-        offset += content.len();
+        current_emphasis = Some(emphasized);
+        current.push(character);
+    }
+    if !current.is_empty() {
+        push_emphasis_span(&mut output, current, base, current_emphasis.unwrap_or(false));
     }
     output
 }
@@ -1662,26 +1689,34 @@ fn truncate(value: &str, width: usize) -> String {
 }
 
 #[cfg(test)]
+#[path = "tui_perf_tests.rs"]
+mod perf_tests;
+
+#[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::sync::Arc;
 
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
     use super::*;
-    use crate::tools::diff::model::{DiffInput, SourceSnapshot};
+    use crate::tools::diff::model::{DiffContext, DiffInput, SourceSnapshot};
     use crate::tui::theme::NORD;
 
     fn document(group: ChangeGroup, path: &str, old: &str, new: &str) -> DiffDocument {
-        DiffDocument::build(DiffInput {
-            group,
-            kind: ChangeKind::Modified,
-            old_path: Some(path.into()),
-            new_path: Some(path.into()),
-            old: SourceSnapshot::Bytes(Arc::from(old.as_bytes())),
-            new: SourceSnapshot::Bytes(Arc::from(new.as_bytes())),
-            special: None,
-        })
+        DiffDocument::build(
+            DiffInput {
+                group,
+                kind: ChangeKind::Modified,
+                old_path: Some(path.into()),
+                new_path: Some(path.into()),
+                old: SourceSnapshot::Bytes(Arc::from(old.as_bytes())),
+                new: SourceSnapshot::Bytes(Arc::from(new.as_bytes())),
+                special: None,
+            },
+            DiffContext::default(),
+        )
     }
 
     fn document_of_kind(kind: ChangeKind, path: &str, old: &str, new: &str) -> DiffDocument {
@@ -1705,15 +1740,18 @@ mod tests {
                 SourceSnapshot::Bytes(Arc::from(new.as_bytes())),
             ),
         };
-        DiffDocument::build(DiffInput {
-            group: ChangeGroup::Changes,
-            kind,
-            old_path,
-            new_path,
-            old,
-            new,
-            special: None,
-        })
+        DiffDocument::build(
+            DiffInput {
+                group: ChangeGroup::Changes,
+                kind,
+                old_path,
+                new_path,
+                old,
+                new,
+                special: None,
+            },
+            DiffContext::default(),
+        )
     }
 
     fn screen(terminal: &Terminal<TestBackend>) -> String {
@@ -1733,7 +1771,7 @@ mod tests {
         for (width, height) in [(120, 30), (60, 20), (30, 8)] {
             let backend = TestBackend::new(width, height);
             let mut terminal = Terminal::new(backend).unwrap();
-            let mut app = DiffApp::new(documents.clone(), NORD, ViewMode::Unified);
+            let mut app = DiffApp::new(documents.clone(), NORD, ViewMode::Inline);
             terminal.draw(|frame| render(frame, &mut app)).unwrap();
             let mut evidence = screen(&terminal);
             assert!(evidence.contains("STAGED"));
@@ -1755,7 +1793,7 @@ mod tests {
         ];
         let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = DiffApp::new(documents, NORD, ViewMode::Unified);
+        let mut app = DiffApp::new(documents, NORD, ViewMode::Inline);
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(app.selected, Some(1));
@@ -1766,7 +1804,7 @@ mod tests {
 
     #[test]
     fn refresh_key_is_an_explicit_runtime_action() {
-        let mut app = DiffApp::new(Vec::new(), NORD, ViewMode::Unified);
+        let mut app = DiffApp::new(Vec::new(), NORD, ViewMode::Inline);
 
         assert_eq!(
             app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
@@ -1783,6 +1821,25 @@ mod tests {
     }
 
     #[test]
+    fn queued_navigation_is_applied_before_the_next_frame() {
+        let documents = (0..5)
+            .map(|index| {
+                document(ChangeGroup::Changes, &format!("src/file-{index}.rs"), "old\n", "new\n")
+            })
+            .collect();
+        let mut app = DiffApp::new(documents, NORD, ViewMode::Inline);
+        let mut events =
+            VecDeque::from(vec![Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)); 3]);
+
+        let flow = handle_terminal_events(&mut app, events.pop_front(), || events.pop_front());
+
+        assert_eq!(flow, Flow::Continue);
+        assert_eq!(app.selected, Some(3));
+        assert!(events.is_empty());
+        assert!(app.document_projection.is_none());
+    }
+
+    #[test]
     fn selected_group_determines_the_index_operation() {
         let mut app = DiffApp::new(
             vec![
@@ -1790,7 +1847,7 @@ mod tests {
                 document(ChangeGroup::Changes, "changed.rs", "old\n", "new\n"),
             ],
             NORD,
-            ViewMode::Unified,
+            ViewMode::Inline,
         );
 
         assert!(matches!(
@@ -1812,7 +1869,7 @@ mod tests {
             document(ChangeGroup::Changes, "src/lib.rs", "old\n", "new\n"),
             document(ChangeGroup::Changes, "src/nested/keep.rs", "old\n", "new\n"),
         ];
-        let mut app = DiffApp::new(documents, NORD, ViewMode::Unified);
+        let mut app = DiffApp::new(documents, NORD, ViewMode::Inline);
         app.select(1);
         app.expanded.remove(&(ChangeGroup::Changes, "src/nested".into()));
         app.content_scroll = 12;
@@ -1838,7 +1895,7 @@ mod tests {
         let mut app = DiffApp::new(
             vec![document(ChangeGroup::Changes, "src/lib.rs", "old\n", "new\n")],
             NORD,
-            ViewMode::Unified,
+            ViewMode::Inline,
         );
 
         app.finish_repository_operation(Ok((
@@ -1856,7 +1913,7 @@ mod tests {
         let mut app = DiffApp::new(
             vec![document(ChangeGroup::Changes, "src/lib.rs", "old\n", "new\n")],
             NORD,
-            ViewMode::Unified,
+            ViewMode::Inline,
         );
 
         app.finish_repository_operation(Err(anyhow!("git status failed")));
@@ -1931,7 +1988,7 @@ mod tests {
 
     #[test]
     fn each_vertical_wheel_event_moves_exactly_one_row() {
-        let mut app = DiffApp::new(Vec::new(), NORD, ViewMode::Unified);
+        let mut app = DiffApp::new(Vec::new(), NORD, ViewMode::Inline);
         app.regions.tree_area = Rect::new(0, 0, 20, 10);
         app.regions.content_area = Rect::new(20, 0, 20, 10);
 
@@ -1970,20 +2027,23 @@ mod tests {
     fn explicit_states_are_visible_and_empty_repository_is_honest() {
         let backend = TestBackend::new(90, 20);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut empty = DiffApp::new(Vec::new(), NORD, ViewMode::Unified);
+        let mut empty = DiffApp::new(Vec::new(), NORD, ViewMode::Inline);
         terminal.draw(|frame| render(frame, &mut empty)).unwrap();
         assert!(screen(&terminal).contains("Working tree is clean"));
 
-        let binary = DiffDocument::build(DiffInput {
-            group: ChangeGroup::Changes,
-            kind: ChangeKind::Modified,
-            old_path: Some("binary.dat".into()),
-            new_path: Some("binary.dat".into()),
-            old: SourceSnapshot::from_bytes(&b"a\0b"[..]),
-            new: SourceSnapshot::from_bytes(&b"a\0c"[..]),
-            special: None,
-        });
-        let mut app = DiffApp::new(vec![binary], NORD, ViewMode::Unified);
+        let binary = DiffDocument::build(
+            DiffInput {
+                group: ChangeGroup::Changes,
+                kind: ChangeKind::Modified,
+                old_path: Some("binary.dat".into()),
+                new_path: Some("binary.dat".into()),
+                old: SourceSnapshot::from_bytes(&b"a\0b"[..]),
+                new: SourceSnapshot::from_bytes(&b"a\0c"[..]),
+                special: None,
+            },
+            DiffContext::default(),
+        );
+        let mut app = DiffApp::new(vec![binary], NORD, ViewMode::Inline);
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert!(screen(&terminal).contains("Binary content"));
     }
@@ -1995,12 +2055,15 @@ mod tests {
         let documents = vec![document(ChangeGroup::Changes, "src/lib.rs", &old, &new)];
         let backend = TestBackend::new(120, 18);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = DiffApp::new(documents, NORD, ViewMode::Unified);
+        let mut app = DiffApp::new(documents, NORD, ViewMode::Inline);
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         app.content_scroll = app
-            .rendered_anchors
+            .document_projection
+            .as_ref()
+            .unwrap()
+            .lines
             .iter()
-            .position(|anchor| anchor.row == Some(2))
+            .position(|line| line.anchor.row == Some(2))
             .expect("canonical changed-row anchor");
         app.sync_anchor_from_scroll();
         let anchor = app.anchor;
@@ -2010,8 +2073,55 @@ mod tests {
 
         assert_eq!(app.last_effective_mode, Some(EffectiveMode::Split));
         assert_eq!(app.anchor, anchor);
-        assert!(app.rendered_anchors.contains(&anchor));
+        assert!(app
+            .document_projection
+            .as_ref()
+            .unwrap()
+            .lines
+            .iter()
+            .any(|line| line.anchor == anchor));
         assert!(screen(&terminal).contains('│'));
+
+        app.on_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.last_effective_mode, Some(EffectiveMode::Inline));
+        assert_eq!(app.anchor, anchor);
+    }
+
+    #[test]
+    fn vertical_scroll_reuses_projection_and_projection_inputs_rebuild_it() {
+        let documents = vec![document(
+            ChangeGroup::Changes,
+            "src/lib.rs",
+            "one\ntwo\nthree\nfour\nfive\n",
+            "one\nTWO\nthree\nFOUR\nfive\n",
+        )];
+        let backend = TestBackend::new(120, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = DiffApp::new(documents, NORD, ViewMode::Inline);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let initial_key = app.document_projection.as_ref().unwrap().key;
+        let initial_lines = app.document_projection.as_ref().unwrap().lines.as_ptr();
+
+        app.active_region = ActiveRegion::New;
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.document_projection.as_ref().unwrap().key, initial_key);
+        assert_eq!(app.document_projection.as_ref().unwrap().lines.as_ptr(), initial_lines);
+
+        app.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_ne!(app.document_projection.as_ref().unwrap().key, initial_key);
+
+        app.select(0);
+        assert!(app.document_projection.is_some());
+        app.replace_documents(vec![document(
+            ChangeGroup::Changes,
+            "src/lib.rs",
+            "one\ntwo\n",
+            "one\nTWO\n",
+        )]);
+        assert!(app.document_projection.is_none());
     }
 
     #[test]
@@ -2078,7 +2188,7 @@ mod tests {
         terminal.autoresize().unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
-        assert_eq!(app.last_effective_mode, Some(EffectiveMode::Unified));
+        assert_eq!(app.last_effective_mode, Some(EffectiveMode::Inline));
         assert_eq!(app.anchor, anchor);
     }
 
@@ -2110,8 +2220,8 @@ mod tests {
         let DiffBody::Text(text) = &document.body else {
             panic!("text fixture");
         };
-        let app = DiffApp::new(vec![document.clone()], NORD, ViewMode::Unified);
-        let rendered = unified_text_lines(&document, text, &app, 100);
+        let app = DiffApp::new(vec![document.clone()], NORD, ViewMode::Inline);
+        let rendered = inline_text_lines(text, &app, 100);
         let rows = rendered.iter().map(|line| line_text(&line.line)).collect::<Vec<_>>();
 
         assert!(rows.iter().any(|line| line.contains("unmodified lines")));
@@ -2124,7 +2234,7 @@ mod tests {
     }
 
     #[test]
-    fn unified_rows_omit_line_numbers_and_keep_only_the_change_indicator() {
+    fn inline_rows_omit_line_numbers_and_keep_only_the_change_indicator() {
         let document = document(
             ChangeGroup::Changes,
             "src/lib.rs",
@@ -2134,8 +2244,8 @@ mod tests {
         let DiffBody::Text(text) = &document.body else {
             panic!("text fixture");
         };
-        let app = DiffApp::new(vec![document.clone()], NORD, ViewMode::Unified);
-        let rendered = unified_text_lines(&document, text, &app, 100);
+        let app = DiffApp::new(vec![document.clone()], NORD, ViewMode::Inline);
+        let rendered = inline_text_lines(text, &app, 100);
         let source_lines =
             rendered.iter().filter(|line| line.anchor.row.is_some()).collect::<Vec<_>>();
 
@@ -2154,7 +2264,7 @@ mod tests {
         let new =
             old.replace("value 5\n", "first change\n").replace("value 24\n", "second change\n");
         let document = document(ChangeGroup::Changes, "src/lib.rs", &old, &new);
-        let mut app = DiffApp::new(vec![document], NORD, ViewMode::Unified);
+        let mut app = DiffApp::new(vec![document], NORD, ViewMode::Inline);
 
         app.select_hunk(1);
 
@@ -2172,7 +2282,7 @@ mod tests {
             deletions: 3,
             kind: Some(ChangeKind::Modified),
         };
-        let line = tree_line(&row, 40, Style::default(), &HashSet::new(), NORD);
+        let line = tree_line(&row, 40, Style::default(), &HashSet::new(), None, NORD);
         let addition = line.spans.iter().find(|span| span.content == " +12").unwrap();
         let deletion = line.spans.iter().find(|span| span.content == " -3").unwrap();
 
@@ -2185,9 +2295,96 @@ mod tests {
             40,
             Style::default(),
             &HashSet::new(),
+            None,
             NORD,
         ))
         .contains("-0"));
+    }
+
+    #[test]
+    fn hovered_file_replaces_counts_with_its_repository_action() {
+        let row = TreeRow {
+            target: TreeTarget::File(0),
+            depth: 1,
+            label: "lib.rs".to_owned(),
+            additions: 12,
+            deletions: 3,
+            kind: Some(ChangeKind::Modified),
+        };
+
+        let stage = tree_line(
+            &row,
+            40,
+            Style::default(),
+            &HashSet::new(),
+            Some(ChangeGroup::Changes),
+            NORD,
+        );
+        assert!(stage.spans.iter().any(|span| span.content == " + "));
+        assert!(!line_text(&stage).contains("+12"));
+        assert!(!line_text(&stage).contains("-3"));
+
+        let unstage =
+            tree_line(&row, 40, Style::default(), &HashSet::new(), Some(ChangeGroup::Staged), NORD);
+        assert!(unstage.spans.iter().any(|span| span.content == " - "));
+    }
+
+    #[test]
+    fn clicking_hover_adornment_selects_file_and_requests_stage_toggle() {
+        let documents = vec![
+            document(ChangeGroup::Staged, "src/staged.rs", "old\n", "new\n"),
+            document(ChangeGroup::Changes, "src/changes.rs", "old\n", "new\n"),
+        ];
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = DiffApp::new(documents, NORD, ViewMode::Inline);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let row = app
+            .regions
+            .tree
+            .iter()
+            .find_map(|(area, target)| match target {
+                TreeTarget::File(1) => Some(*area),
+                _ => None,
+            })
+            .expect("unstaged file row");
+        assert_eq!(
+            app.on_mouse(MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: row.x,
+                row: row.y,
+                modifiers: KeyModifiers::NONE,
+            }),
+            Flow::Continue
+        );
+        assert_eq!(app.hovered_file, Some(1));
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let action = app
+            .regions
+            .tree_actions
+            .iter()
+            .find_map(|(area, index)| (*index == 1).then_some(*area))
+            .expect("stage action hitbox");
+        assert_eq!(
+            app.on_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: action.x + action.width - 1,
+                row: action.y,
+                modifiers: KeyModifiers::NONE,
+            }),
+            Flow::ToggleStage
+        );
+        assert_eq!(app.selected, Some(1));
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: app.regions.content_area.x,
+            row: app.regions.content_area.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.hovered_file, None);
     }
 
     #[test]
@@ -2234,23 +2431,23 @@ mod tests {
         let DiffBody::Text(text) = &document.body else {
             panic!("text fixture");
         };
-        let app = DiffApp::new(vec![document.clone()], NORD, ViewMode::Unified);
-        let unified = unified_text_lines(&document, text, &app, 100);
-        let split = split_text_lines(&document, text, &app, 100);
+        let app = DiffApp::new(vec![document.clone()], NORD, ViewMode::Inline);
+        let inline = inline_text_lines(text, &app, 100);
+        let split = split_text_lines(text, &app, 100);
 
         for (hunk_index, hunk) in text.hunks.iter().enumerate() {
             for (row_index, row) in hunk.rows.iter().enumerate() {
                 let anchor = ReviewAnchor { hunk: hunk_index, row: Some(row_index) };
                 let split_count = split.iter().filter(|line| line.anchor == anchor).count();
-                let unified_count = unified.iter().filter(|line| line.anchor == anchor).count();
-                let expected_unified = match row.kind {
+                let inline_count = inline.iter().filter(|line| line.anchor == anchor).count();
+                let expected_inline = match row.kind {
                     RowKind::Context => 1,
                     RowKind::Changed => {
                         usize::from(row.old.is_some()) + usize::from(row.new.is_some())
                     }
                 };
                 assert_eq!(split_count, 1, "split row {anchor:?}");
-                assert_eq!(unified_count, expected_unified, "unified row {anchor:?}");
+                assert_eq!(inline_count, expected_inline, "inline row {anchor:?}");
             }
         }
     }
@@ -2291,7 +2488,7 @@ mod tests {
         };
         let app = DiffApp::new(vec![document.clone()], NORD, ViewMode::Split);
         let mut tinted_spans = 0;
-        for rendered in split_text_lines(&document, text, &app, 100) {
+        for rendered in split_text_lines(text, &app, 100) {
             for span in rendered.line.spans {
                 if let Some(background) = span.style.bg {
                     tinted_spans += 1;
@@ -2313,10 +2510,10 @@ mod tests {
         let DiffBody::Text(text) = &document.body else {
             panic!("text fixture");
         };
-        let app = DiffApp::new(vec![document.clone()], NORD, ViewMode::Unified);
+        let app = DiffApp::new(vec![document.clone()], NORD, ViewMode::Inline);
         let mut emphasized_fragments = 0;
 
-        for rendered in unified_text_lines(&document, text, &app, 100) {
+        for rendered in inline_text_lines(text, &app, 100) {
             for span in rendered.line.spans {
                 if span.style.add_modifier.contains(Modifier::UNDERLINED) {
                     emphasized_fragments += 1;
@@ -2326,22 +2523,5 @@ mod tests {
             }
         }
         assert!(emphasized_fragments > 0);
-    }
-
-    #[test]
-    fn changed_fragments_preserve_syntax_foregrounds() {
-        let emphasis = std::iter::once(0.."value".len()).collect::<Vec<_>>();
-        let spans = apply_emphasis(
-            vec![Span::styled("value", Style::default().fg(NORD.special))],
-            "value".len(),
-            &emphasis,
-            Style::default().fg(NORD.text).bg(DARK_ADDED_BACKGROUND),
-        );
-
-        assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].style.fg, Some(NORD.special));
-        assert_eq!(spans[0].style.bg, Some(DARK_ADDED_BACKGROUND));
-        assert!(spans[0].style.add_modifier.contains(Modifier::BOLD));
-        assert!(spans[0].style.add_modifier.contains(Modifier::UNDERLINED));
     }
 }

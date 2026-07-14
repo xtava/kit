@@ -13,7 +13,7 @@ use clap::{ArgMatches, Command, CommandFactory, FromArgMatches, Parser, ValueEnu
 use crate::framework::{Context, Tool, ToolMeta};
 
 pub use git::load_repository;
-pub use model::{ChangeGroup, ChangeKind, DiffDocument, DiffInput, SpecialState};
+pub use model::{ChangeGroup, ChangeKind, DiffContext, DiffDocument, DiffInput, SpecialState};
 
 pub fn tool() -> DiffTool {
     DiffTool
@@ -36,6 +36,10 @@ struct DiffArgs {
     #[arg(long, value_name = "THEME", default_value = "nord")]
     theme: String,
 
+    /// Unchanged lines around each change, or "all" for the complete file.
+    #[arg(long, value_name = "LINES|all", default_value = "3")]
+    context: DiffContext,
+
     /// Keep terminal mouse reporting disabled; keyboard controls remain available.
     #[arg(long)]
     no_mouse: bool,
@@ -44,7 +48,7 @@ struct DiffArgs {
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum ModeArg {
     Auto,
-    Unified,
+    Inline,
     Split,
 }
 
@@ -68,14 +72,36 @@ impl Tool for DiffTool {
             bail!("kit diff requires an interactive terminal");
         }
         let cwd = env::current_dir().context("resolve current directory")?;
-        let documents = load_repository(&cwd)?;
+        let documents = load_repository(&cwd, args.context)?;
         let (_, theme) = crate::tui::theme::resolve(&args.theme)
             .with_context(|| format!("load diff theme {:?}", args.theme))?;
         let mode = match args.mode {
             ModeArg::Auto => tui::ViewMode::Auto,
-            ModeArg::Unified => tui::ViewMode::Unified,
+            ModeArg::Inline => tui::ViewMode::Inline,
             ModeArg::Split => tui::ViewMode::Split,
         };
-        tui::run(cwd, documents, theme, !args.no_mouse, mode).await
+        tui::run(cwd, documents, theme, !args.no_mouse, mode, args.context).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_accepts_view_modes_and_context_policies() {
+        let default = DiffArgs::try_parse_from(["diff"]).unwrap();
+        let inline = DiffArgs::try_parse_from(["diff", "--mode", "inline"]).unwrap();
+        let split = DiffArgs::try_parse_from(["diff", "--mode", "split"]).unwrap();
+        let zero = DiffArgs::try_parse_from(["diff", "--context", "0"]).unwrap();
+        let all = DiffArgs::try_parse_from(["diff", "--context", "all"]).unwrap();
+
+        assert!(matches!(default.mode, ModeArg::Auto));
+        assert!(matches!(inline.mode, ModeArg::Inline));
+        assert!(matches!(split.mode, ModeArg::Split));
+        assert_eq!(default.context, DiffContext::Lines(3));
+        assert_eq!(zero.context, DiffContext::Lines(0));
+        assert_eq!(all.context, DiffContext::All);
+        assert!(DiffArgs::try_parse_from(["diff", "--context", "-1"]).is_err());
     }
 }

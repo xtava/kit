@@ -1,0 +1,6 @@
+{"schema":1,"run":1,"surface":"diff_scroll","case":"ordinary","source_lines":250,"files":25,"width":100,"height":32,"warmups":10,"samples":60,"p50_us":109,"p95_us":233,"max_us":266}
+{"schema":1,"run":1,"surface":"diff_scroll","case":"realistic","source_lines":5000,"files":250,"width":160,"height":50,"warmups":10,"samples":60,"p50_us":349,"p95_us":353,"max_us":355}
+{"schema":1,"run":1,"surface":"diff_scroll","case":"extreme","source_lines":25000,"files":2000,"width":160,"height":50,"warmups":10,"samples":60,"p50_us":585,"p95_us":590,"max_us":594}
+{"schema":1,"run":2,"surface":"diff_scroll","case":"ordinary","source_lines":250,"files":25,"width":100,"height":32,"warmups":10,"samples":60,"p50_us":114,"p95_us":122,"max_us":133}
+{"schema":1,"run":2,"surface":"diff_scroll","case":"realistic","source_lines":5000,"files":250,"width":160,"height":50,"warmups":10,"samples":60,"p50_us":347,"p95_us":356,"max_us":363}
+{"schema":1,"run":2,"surface":"diff_scroll","case":"extreme","source_lines":25000,"files":2000,"width":160,"height":50,"warmups":10,"samples":60,"p50_us":609,"p95_us":617,"max_us":626}
