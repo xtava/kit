@@ -25,6 +25,12 @@ pub enum Phase {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ActiveRegion {
+    Primary,
+    Secondary,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProgressStatus {
     Pending,
     Running,
@@ -87,6 +93,9 @@ pub struct App {
     pub layout_frame: LayoutFrame,
     pub layout_drag: Option<SplitDrag>,
     pub phase: Phase,
+    pub active_region: ActiveRegion,
+    pub primary_scroll: u16,
+    pub secondary_scroll: u16,
     pub cursor: usize,
     pub history_cursor: usize,
     pub versions: VersionsState,
@@ -111,6 +120,9 @@ impl App {
             layout_frame: LayoutFrame::default(),
             layout_drag: None,
             phase: Phase::Browse,
+            active_region: ActiveRegion::Primary,
+            primary_scroll: 0,
+            secondary_scroll: 0,
             cursor: 0,
             history_cursor: 0,
             versions: VersionsState::Journal,
@@ -181,12 +193,32 @@ impl App {
         self.active_split_surface().map(|surface| self.layout.reset(surface))
     }
 
+    pub fn set_active_region(&mut self, region: ActiveRegion) {
+        self.active_region = region;
+    }
+
+    pub fn scroll_active_region(&mut self, delta: isize, maximum: u16) {
+        let scroll = match (self.phase, self.active_region) {
+            (Phase::Browse | Phase::Versions, ActiveRegion::Secondary) => {
+                &mut self.secondary_scroll
+            }
+            (Phase::Running, ActiveRegion::Primary) => &mut self.primary_scroll,
+            (Phase::Running, ActiveRegion::Secondary) => {
+                adjust_scroll(&mut self.secondary_scroll, -delta, maximum);
+                return;
+            }
+            _ => return,
+        };
+        adjust_scroll(scroll, delta, maximum);
+    }
+
     pub fn move_cursor(&mut self, delta: isize) {
         let Some(last) = self.loaded.plan.targets.len().checked_sub(1) else {
             return;
         };
         self.cursor = (self.cursor as isize + delta).clamp(0, last as isize) as usize;
         self.history_cursor = 0;
+        self.secondary_scroll = 0;
     }
 
     pub fn toggle_focused(&mut self) {
@@ -269,6 +301,7 @@ impl App {
             return;
         }
         self.history_cursor = 0;
+        self.secondary_scroll = 0;
         self.versions = match result {
             Ok(deployments) => VersionsState::CloudflareReady { deployments },
             Err(message) => VersionsState::CloudflareError { message },
@@ -304,6 +337,7 @@ impl App {
         };
         self.history_cursor =
             (self.history_cursor as isize + delta).clamp(0, last as isize) as usize;
+        self.secondary_scroll = 0;
     }
 
     pub fn review_rollback(&mut self) {
@@ -583,10 +617,14 @@ impl App {
     }
 
     fn push_output(&mut self, line: OutputLine) {
-        if self.output.len() == OUTPUT_LIMIT {
+        let dropped_oldest = self.output.len() == OUTPUT_LIMIT;
+        if dropped_oldest {
             self.output.pop_front();
         }
         self.output.push_back(line);
+        if self.phase == Phase::Running && self.secondary_scroll > 0 && !dropped_oldest {
+            self.secondary_scroll = self.secondary_scroll.saturating_add(1);
+        }
     }
 
     fn active_split_surface(&self) -> Option<SplitSurface> {
@@ -602,6 +640,9 @@ impl App {
         self.cancel_layout_drag();
         self.layout_frame = LayoutFrame::default();
         self.phase = phase;
+        self.active_region = ActiveRegion::Primary;
+        self.primary_scroll = 0;
+        self.secondary_scroll = 0;
     }
 
     fn mark_unvisited(&mut self) {
@@ -616,6 +657,15 @@ impl App {
             }
         }
     }
+}
+
+fn adjust_scroll(scroll: &mut u16, delta: isize, maximum: u16) {
+    *scroll = if delta >= 0 {
+        scroll.saturating_add(delta.unsigned_abs().min(u16::MAX as usize) as u16)
+    } else {
+        scroll.saturating_sub(delta.unsigned_abs().min(u16::MAX as usize) as u16)
+    }
+    .min(maximum);
 }
 
 fn millis(duration: Duration) -> u64 {
@@ -738,6 +788,23 @@ mod tests {
         assert!(app.cancel_layout_drag());
         assert_eq!(app.layout.browse, start);
         assert!(app.layout_drag.is_none());
+    }
+
+    #[test]
+    fn active_region_scroll_is_local_and_phase_changes_reset_navigation() {
+        let mut app = app();
+        app.set_active_region(ActiveRegion::Secondary);
+        app.scroll_active_region(3, 5);
+
+        assert_eq!(app.active_region, ActiveRegion::Secondary);
+        assert_eq!(app.secondary_scroll, 3);
+        assert_eq!(app.cursor, 0);
+
+        app.open_versions();
+
+        assert_eq!(app.active_region, ActiveRegion::Primary);
+        assert_eq!(app.primary_scroll, 0);
+        assert_eq!(app.secondary_scroll, 0);
     }
 
     #[test]

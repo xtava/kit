@@ -41,6 +41,13 @@ Target and Step status, elapsed time, and a bounded live output tail update cont
 opens **Summary** with the final outcome and timing breakdown. Escape moves back before execution;
 `Ctrl-C` during execution cancels the active process group and stops the plan cleanly.
 
+Browse, Versions, and Run are keyboard-navigable split surfaces. `Left` / `Right` move between the
+visible panels, while `Tab` / `Shift-Tab` cycle them. The cyan border identifies the active region.
+Vertical input stays local: `Up` / `Down` (or `k` / `j`) changes the selected Target or Version in a
+list, and scrolls Plan, Version detail, Progress, or Live output when that region is active. Clicking
+or scrolling a panel activates it. Review, Summary, and Versions loading/error/empty states remain
+single-region screens, so navigation never lands on a hidden panel.
+
 ## Resizable panel layout
 
 Browse, Versions, and Run each have a draggable vertical divider. Hold the left mouse button on the
@@ -53,6 +60,9 @@ The three views retain independent sizes in Kit's XDG state location:
 local-data directory. The versioned JSON file contains only three normalized split ratios. It never
 contains terminal dimensions, rendered coordinates, config paths, Target data, commands, output, or
 secrets.
+
+The active region and scroll position are session state, not preferences. Each phase starts at its
+primary region; only the three divider ratios are saved.
 
 Kit clamps the rendered panels to useful minimum widths when the terminal is narrow without changing
 the saved preference, so widening the terminal restores the chosen balance. A missing state file uses

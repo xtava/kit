@@ -27,9 +27,11 @@ use super::{
     journal::{DeployJournal, JournalEntry, JournalStatus, JournalStore, VersionId},
     layout::{DeployLayout, LayoutFrame, LayoutStore, SplitSurface},
     runner::{self, OutputStream, RunOperation, RunOutcome, RunSpec, RunTargetSpec},
-    state::{App, Phase, ProgressStatus, RunIntent, VersionsSource, VersionsState},
+    state::{ActiveRegion, App, Phase, ProgressStatus, RunIntent, VersionsSource, VersionsState},
 };
-use crate::tui::{EventReader, Session, SessionOptions};
+use crate::tui::{
+    Direction, EventReader, NavigationMap, NavigationRegion, Session, SessionOptions,
+};
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const CYAN: Color = Color::Rgb(136, 192, 208);
@@ -250,7 +252,11 @@ fn handle_event(event: Event, app: &mut App) -> UiAction {
 fn handle_mouse(mouse: MouseEvent, app: &mut App) -> UiAction {
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            app.begin_layout_drag(mouse.column, mouse.row);
+            if !app.begin_layout_drag(mouse.column, mouse.row) {
+                if let Some(region) = navigation(app).hit_test(mouse.column, mouse.row) {
+                    app.set_active_region(region);
+                }
+            }
             UiAction::None
         }
         MouseEventKind::Drag(MouseButton::Left) => {
@@ -264,12 +270,18 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) -> UiAction {
                 UiAction::None
             }
         }
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            if let Some(region) = navigation(app).hit_test(mouse.column, mouse.row) {
+                app.set_active_region(region);
+                let delta = if mouse.kind == MouseEventKind::ScrollUp { -1 } else { 1 };
+                scroll_or_select(app, delta);
+            }
+            UiAction::None
+        }
         MouseEventKind::Down(_)
         | MouseEventKind::Up(_)
         | MouseEventKind::Drag(_)
         | MouseEventKind::Moved
-        | MouseEventKind::ScrollDown
-        | MouseEventKind::ScrollUp
         | MouseEventKind::ScrollLeft
         | MouseEventKind::ScrollRight => UiAction::None,
     }
@@ -293,15 +305,23 @@ fn handle_key(key: KeyEvent, app: &mut App) -> UiAction {
         return UiAction::PersistLayout;
     }
 
+    match key.code {
+        KeyCode::Left => move_active_region(app, Direction::Left),
+        KeyCode::Right => move_active_region(app, Direction::Right),
+        KeyCode::Tab => cycle_active_region(app, false),
+        KeyCode::BackTab => cycle_active_region(app, true),
+        _ => false,
+    };
+
     match app.phase {
         Phase::Browse => match key.code {
             KeyCode::Char('q') | KeyCode::Esc => UiAction::Quit,
             KeyCode::Up | KeyCode::Char('k') => {
-                app.move_cursor(-1);
+                scroll_or_select(app, -1);
                 UiAction::None
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                app.move_cursor(1);
+                scroll_or_select(app, 1);
                 UiAction::None
             }
             KeyCode::Char(' ') => {
@@ -333,11 +353,11 @@ fn handle_key(key: KeyEvent, app: &mut App) -> UiAction {
                 UiAction::None
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                app.move_history_cursor(-1);
+                scroll_or_select(app, -1);
                 UiAction::None
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                app.move_history_cursor(1);
+                scroll_or_select(app, 1);
                 UiAction::None
             }
             KeyCode::Enter => {
@@ -355,12 +375,99 @@ fn handle_key(key: KeyEvent, app: &mut App) -> UiAction {
             KeyCode::Enter => UiAction::Start,
             _ => UiAction::None,
         },
-        Phase::Running => UiAction::None,
+        Phase::Running => {
+            if matches!(key.code, KeyCode::Up | KeyCode::Char('k')) {
+                scroll_or_select(app, -1);
+            } else if matches!(key.code, KeyCode::Down | KeyCode::Char('j')) {
+                scroll_or_select(app, 1);
+            }
+            UiAction::None
+        }
         Phase::Summary => match key.code {
             KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') => UiAction::Quit,
             _ => UiAction::None,
         },
     }
+}
+
+fn navigation(app: &App) -> NavigationMap<ActiveRegion> {
+    let regions = app.layout_frame.surface.into_iter().flat_map(|_| {
+        [
+            NavigationRegion::new(ActiveRegion::Primary, app.layout_frame.first),
+            NavigationRegion::new(ActiveRegion::Secondary, app.layout_frame.second),
+        ]
+    });
+    NavigationMap::new(regions)
+}
+
+fn move_active_region(app: &mut App, direction: Direction) -> bool {
+    let Some(region) = navigation(app).neighbor(app.active_region, direction) else {
+        return false;
+    };
+    app.set_active_region(region);
+    clamp_scrolls(app);
+    true
+}
+
+fn cycle_active_region(app: &mut App, reverse: bool) -> bool {
+    let navigation = navigation(app);
+    let region = if reverse {
+        navigation.previous(app.active_region)
+    } else {
+        navigation.next(app.active_region)
+    };
+    let Some(region) = region else {
+        return false;
+    };
+    app.set_active_region(region);
+    clamp_scrolls(app);
+    true
+}
+
+fn scroll_or_select(app: &mut App, delta: isize) {
+    match (app.phase, app.active_region) {
+        (Phase::Browse, ActiveRegion::Primary) => app.move_cursor(delta),
+        (Phase::Versions, ActiveRegion::Primary) => app.move_history_cursor(delta),
+        _ => {
+            let maximum = scroll_limit(app, app.active_region);
+            app.scroll_active_region(delta, maximum);
+        }
+    }
+}
+
+fn clamp_scrolls(app: &mut App) {
+    app.primary_scroll = app.primary_scroll.min(scroll_limit(app, ActiveRegion::Primary));
+    app.secondary_scroll = app.secondary_scroll.min(scroll_limit(app, ActiveRegion::Secondary));
+}
+
+fn scroll_limit(app: &App, region: ActiveRegion) -> u16 {
+    let total = match (app.phase, region) {
+        (Phase::Browse, ActiveRegion::Secondary) => {
+            app.focused_target().map_or(0, |target| target.steps.len().saturating_add(3))
+        }
+        (Phase::Versions, ActiveRegion::Secondary) => match &app.versions {
+            VersionsState::Journal => {
+                app.selected_history_entry().map_or(0, |entry| version_detail(entry).len())
+            }
+            VersionsState::CloudflareReady { .. } => app
+                .selected_cloudflare_deployment()
+                .map_or(0, |deployment| cloudflare_version_detail(deployment).len()),
+            VersionsState::CloudflareLoading | VersionsState::CloudflareError { .. } => 0,
+        },
+        (Phase::Running, ActiveRegion::Primary) => {
+            app.progress.iter().fold(2usize, |total, target| {
+                total.saturating_add(target.steps.len().saturating_add(1))
+            })
+        }
+        (Phase::Running, ActiveRegion::Secondary) => app.output.len(),
+        _ => 0,
+    };
+    let area = match region {
+        ActiveRegion::Primary => app.layout_frame.first,
+        ActiveRegion::Secondary => app.layout_frame.second,
+    };
+    let visible = usize::from(area.height.saturating_sub(2));
+    u16::try_from(total.saturating_sub(visible)).unwrap_or(u16::MAX)
 }
 
 fn persist_layout(app: &mut App, store: &LayoutStore, dirty: &mut bool) {
@@ -569,6 +676,10 @@ fn render(frame: &mut Frame<'_>, app: &mut App, journal_path: &Path) {
 fn install_split_frame(app: &mut App, surface: SplitSurface, area: Rect) -> LayoutFrame {
     let layout_frame = LayoutFrame::split(surface, area, app.layout.ratio(surface));
     app.set_layout_frame(layout_frame);
+    if let Some(region) = navigation(app).normalize(app.active_region) {
+        app.set_active_region(region);
+    }
+    clamp_scrolls(app);
     layout_frame
 }
 
@@ -647,22 +758,40 @@ fn render_browse(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         .collect::<Vec<_>>();
     let mut state = ListState::default().with_selected(Some(app.cursor));
     let list = List::new(items)
-        .block(panel(format!(
-            " Targets · {} selected · {} Steps ",
-            app.selected_count(),
-            app.selected_step_count()
-        )))
+        .block(active_panel(
+            format!(
+                " Targets · {} selected · {} Steps ",
+                app.selected_count(),
+                app.selected_step_count()
+            ),
+            app.active_region == ActiveRegion::Primary,
+        ))
         .highlight_style(Style::default().bg(SELECTED))
         .highlight_symbol("▌");
     frame.render_stateful_widget(list, layout_frame.first, &mut state);
 
-    render_target_detail(frame, layout_frame.second, app.focused_target());
+    render_target_detail(
+        frame,
+        layout_frame.second,
+        app.focused_target(),
+        app.secondary_scroll,
+        app.active_region == ActiveRegion::Secondary,
+    );
     render_split_divider(frame, layout_frame, app.layout_drag.is_some());
 }
 
-fn render_target_detail(frame: &mut Frame<'_>, area: Rect, target: Option<&DeployTarget>) {
+fn render_target_detail(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    target: Option<&DeployTarget>,
+    scroll: u16,
+    active: bool,
+) {
     let Some(target) = target else {
-        frame.render_widget(Paragraph::new("No Targets configured").block(panel(" Target ")), area);
+        frame.render_widget(
+            Paragraph::new("No Targets configured").block(active_panel(" Target ", active)),
+            area,
+        );
         return;
     };
     let rollback = match (&target.backend, &target.rollback) {
@@ -699,12 +828,17 @@ fn render_target_detail(frame: &mut Frame<'_>, area: Rect, target: Option<&Deplo
         ]));
     }
     frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }).block(panel(" Plan ")),
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0))
+            .block(active_panel(" Plan ", active)),
         area,
     );
 }
 
 fn render_versions(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let active_region = app.active_region;
+    let detail_scroll = app.secondary_scroll;
     let target_name = app
         .focused_target()
         .map(|target| target.name.clone())
@@ -754,15 +888,7 @@ fn render_versions(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             return;
         }
         VersionsState::CloudflareReady { deployments } => {
-            render_cloudflare_versions(
-                frame,
-                area,
-                &target_name,
-                deployments,
-                app.history_cursor,
-                layout_frame,
-                app.layout_drag.is_some(),
-            );
+            render_cloudflare_versions(frame, area, &target_name, deployments, app);
             return;
         }
         VersionsState::Journal => {}
@@ -795,7 +921,10 @@ fn render_versions(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         entries.iter().rev().map(|entry| ListItem::new(version_line(entry))).collect::<Vec<_>>();
     let mut state = ListState::default().with_selected(Some(app.history_cursor));
     let list = List::new(items)
-        .block(panel(format!(" {target_name} · Versions ")))
+        .block(active_panel(
+            format!(" {target_name} · Versions "),
+            active_region == ActiveRegion::Primary,
+        ))
         .highlight_style(Style::default().bg(SELECTED))
         .highlight_symbol("▌");
     frame.render_stateful_widget(list, layout_frame.first, &mut state);
@@ -804,7 +933,12 @@ fn render_versions(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         .selected_history_entry()
         .map(version_detail)
         .unwrap_or_else(|| vec![Line::styled("No Version selected", Style::default().fg(MUTED))]);
-    frame.render_widget(Paragraph::new(detail).block(panel(" Recorded Run ")), layout_frame.second);
+    frame.render_widget(
+        Paragraph::new(detail)
+            .scroll((detail_scroll, 0))
+            .block(active_panel(" Recorded Run ", active_region == ActiveRegion::Secondary)),
+        layout_frame.second,
+    );
     render_split_divider(frame, layout_frame, app.layout_drag.is_some());
 }
 
@@ -813,9 +947,7 @@ fn render_cloudflare_versions(
     area: Rect,
     target_name: &str,
     deployments: &[CloudflareDeployment],
-    cursor: usize,
-    layout_frame: Option<LayoutFrame>,
-    dragging: bool,
+    app: &App,
 ) {
     if deployments.is_empty() {
         frame.render_widget(
@@ -836,28 +968,36 @@ fn render_cloudflare_versions(
         return;
     }
 
-    let Some(layout_frame) = layout_frame else {
+    let Some(layout_frame) =
+        (app.layout_frame.surface == Some(SplitSurface::Versions)).then_some(app.layout_frame)
+    else {
         return;
     };
     let items =
         deployments.iter().map(cloudflare_version_line).map(ListItem::new).collect::<Vec<_>>();
-    let mut state = ListState::default().with_selected(Some(cursor));
+    let mut state = ListState::default().with_selected(Some(app.history_cursor));
     frame.render_stateful_widget(
         List::new(items)
-            .block(panel(format!(" {target_name} · Cloudflare Pages ")))
+            .block(active_panel(
+                format!(" {target_name} · Cloudflare Pages "),
+                app.active_region == ActiveRegion::Primary,
+            ))
             .highlight_style(Style::default().bg(SELECTED))
             .highlight_symbol("▌"),
         layout_frame.first,
         &mut state,
     );
-    let detail = deployments.get(cursor).map(cloudflare_version_detail).unwrap_or_else(|| {
-        vec![Line::styled("No deployment selected", Style::default().fg(MUTED))]
-    });
+    let detail =
+        deployments.get(app.history_cursor).map(cloudflare_version_detail).unwrap_or_else(|| {
+            vec![Line::styled("No deployment selected", Style::default().fg(MUTED))]
+        });
     frame.render_widget(
-        Paragraph::new(detail).wrap(Wrap { trim: false }).block(panel(" Platform deployment ")),
+        Paragraph::new(detail).wrap(Wrap { trim: false }).scroll((app.secondary_scroll, 0)).block(
+            active_panel(" Platform deployment ", app.active_region == ActiveRegion::Secondary),
+        ),
         layout_frame.second,
     );
-    render_split_divider(frame, layout_frame, dragging);
+    render_split_divider(frame, layout_frame, app.layout_drag.is_some());
 }
 
 fn cloudflare_version_line(deployment: &CloudflareDeployment) -> Line<'static> {
@@ -1086,17 +1226,21 @@ fn render_running(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             ]));
         }
     }
-    frame.render_widget(Paragraph::new(progress).block(panel(" Progress ")), layout_frame.first);
+    frame.render_widget(
+        Paragraph::new(progress)
+            .scroll((app.primary_scroll, 0))
+            .block(active_panel(" Progress ", app.active_region == ActiveRegion::Primary)),
+        layout_frame.first,
+    );
 
     let inner_height = layout_frame.second.height.saturating_sub(2) as usize;
+    let output_end = app.output.len().saturating_sub(app.secondary_scroll as usize);
+    let output_start = output_end.saturating_sub(inner_height);
     let output = app
         .output
         .iter()
-        .rev()
-        .take(inner_height)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
+        .skip(output_start)
+        .take(output_end.saturating_sub(output_start))
         .map(|line| {
             let style = match line.stream {
                 OutputStream::Stdout => Style::default().fg(TEXT),
@@ -1108,7 +1252,11 @@ fn render_running(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             )
         })
         .collect::<Vec<_>>();
-    frame.render_widget(Paragraph::new(output).block(panel(" Live output ")), layout_frame.second);
+    frame.render_widget(
+        Paragraph::new(output)
+            .block(active_panel(" Live output ", app.active_region == ActiveRegion::Secondary)),
+        layout_frame.second,
+    );
     render_split_divider(frame, layout_frame, app.layout_drag.is_some());
 }
 
@@ -1192,8 +1340,11 @@ fn render_summary(frame: &mut Frame<'_>, area: Rect, app: &App, journal_path: &P
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let controls = match app.phase {
+        Phase::Browse if app.active_region == ActiveRegion::Secondary => {
+            "↑↓ scroll plan   ←→/Tab region   Space select   v versions   drag resize   = reset   Enter review   q quit"
+        }
         Phase::Browse => {
-            "↑↓ navigate   Space select   a all   v versions   drag divider   = reset   Enter review   q quit"
+            "↑↓ targets   ←→/Tab region   Space select   a all   v versions   drag resize   = reset   Enter review   q quit"
         }
         Phase::Versions => {
             if app.layout_frame.surface.is_none() {
@@ -1202,14 +1353,18 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 } else {
                     "Esc targets   q quit"
                 }
+            } else if app.active_region == ActiveRegion::Secondary {
+                "↑↓ scroll details   ←→/Tab region   Enter rollback   drag resize   = reset   Esc targets   q quit"
             } else if app.versions_source() == VersionsSource::CloudflarePages {
-                "↑↓ navigate   Enter rollback   r refresh   drag divider   = reset   Esc targets   q quit"
+                "↑↓ versions   ←→/Tab region   Enter rollback   r refresh   drag resize   = reset   Esc targets   q quit"
             } else {
-                "↑↓ navigate   Enter rollback   drag divider   = reset   Esc targets   q quit"
+                "↑↓ versions   ←→/Tab region   Enter rollback   drag resize   = reset   Esc targets   q quit"
             }
         }
         Phase::Review => "Enter run   Esc back   q quit",
-        Phase::Running => "drag divider   = reset   Ctrl-C cancel safely",
+        Phase::Running => {
+            "↑↓ scroll   ←→/Tab region   drag resize   = reset   Ctrl-C cancel safely"
+        }
         Phase::Summary => "Enter close",
     };
     if let Some(notice) = &app.notice {
@@ -1233,6 +1388,10 @@ fn panel(title: impl Into<String>) -> Block<'static> {
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(BORDER))
         .padding(Padding::horizontal(1))
+}
+
+fn active_panel(title: impl Into<String>, active: bool) -> Block<'static> {
+    panel(title).border_style(Style::default().fg(if active { CYAN } else { BORDER }))
 }
 
 fn status_span(status: ProgressStatus) -> Span<'static> {
@@ -1361,7 +1520,10 @@ mod tests {
     use ratatui::{backend::TestBackend, Terminal};
 
     use super::*;
-    use crate::tools::deploy::config::{DeployStep, DeploymentPlan, RollbackStrategy};
+    use crate::tools::deploy::{
+        config::{DeployStep, DeploymentPlan, RollbackStrategy},
+        environment::TargetEnvironment,
+    };
 
     fn test_app() -> App {
         App::new(
@@ -1414,6 +1576,97 @@ mod tests {
     }
 
     #[test]
+    fn deploy_regions_use_shared_navigation_and_keep_vertical_input_local() -> Result<()> {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend)?;
+        let mut app = test_app();
+        let step = app.loaded.plan.targets[0].steps[0].clone();
+        app.loaded.plan.targets[0].steps.extend((0..30).map(|index| {
+            let mut step = step.clone();
+            step.name = format!("Step {index}");
+            step
+        }));
+        let mut second = app.loaded.plan.targets[0].clone();
+        second.id = "production".to_owned();
+        second.name = "Production".to_owned();
+        app.loaded.plan.targets.push(second);
+        app.selected.push(false);
+
+        terminal.draw(|frame| render(frame, &mut app, Path::new("journal.json")))?;
+        let primary = app.layout_frame.first;
+        let secondary = app.layout_frame.second;
+        assert_eq!(terminal.backend().buffer()[(primary.x, primary.y)].fg, CYAN);
+
+        handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &mut app);
+        handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut app);
+        assert_eq!(app.active_region, ActiveRegion::Secondary);
+        assert_eq!(app.secondary_scroll, 1);
+        assert_eq!(app.cursor, 0);
+
+        terminal.draw(|frame| render(frame, &mut app, Path::new("journal.json")))?;
+        assert_eq!(terminal.backend().buffer()[(primary.x, primary.y)].fg, BORDER);
+        assert_eq!(terminal.backend().buffer()[(secondary.x, secondary.y)].fg, CYAN);
+
+        handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE), &mut app);
+        handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut app);
+        assert_eq!(app.active_region, ActiveRegion::Primary);
+        assert_eq!(app.cursor, 1);
+
+        handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: secondary.x.saturating_add(1),
+                row: secondary.y.saturating_add(1),
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut app,
+        );
+        assert_eq!(app.active_region, ActiveRegion::Secondary);
+        Ok(())
+    }
+
+    #[test]
+    fn running_regions_scroll_progress_and_live_output_independently() -> Result<()> {
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend)?;
+        let mut app = test_app();
+        let step = app.loaded.plan.targets[0].steps[0].clone();
+        app.loaded.plan.targets[0].steps.extend((0..30).map(|index| {
+            let mut step = step.clone();
+            step.name = format!("Step {index}");
+            step
+        }));
+        let target = app.loaded.plan.targets[0].clone();
+        app.begin_run(&RunSpec {
+            base_dir: PathBuf::from("."),
+            operation: RunOperation::Deploy,
+            targets: vec![RunTargetSpec {
+                target,
+                version: VersionId("version-placeholder".to_owned()),
+                environment: TargetEnvironment::default(),
+            }],
+        });
+        for index in 0..30 {
+            app.ingest(runner::RunEvent::Output {
+                stream: OutputStream::Stdout,
+                line: format!("output {index}"),
+            });
+        }
+
+        terminal.draw(|frame| render(frame, &mut app, Path::new("journal.json")))?;
+        handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut app);
+        assert_eq!(app.primary_scroll, 1);
+        assert_eq!(app.secondary_scroll, 0);
+
+        handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &mut app);
+        handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &mut app);
+        assert_eq!(app.active_region, ActiveRegion::Secondary);
+        assert_eq!(app.primary_scroll, 1);
+        assert_eq!(app.secondary_scroll, 1);
+        Ok(())
+    }
+
+    #[test]
     fn journal_and_cloudflare_versions_share_the_saved_split() -> Result<()> {
         let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend)?;
@@ -1434,6 +1687,12 @@ mod tests {
 
         terminal.draw(|frame| render(frame, &mut app, Path::new("journal.json")))?;
         let journal_width = app.layout_frame.first.width;
+        let primary = app.layout_frame.first;
+        let secondary = app.layout_frame.second;
+        handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &mut app);
+        terminal.draw(|frame| render(frame, &mut app, Path::new("journal.json")))?;
+        assert_eq!(terminal.backend().buffer()[(primary.x, primary.y)].fg, BORDER);
+        assert_eq!(terminal.backend().buffer()[(secondary.x, secondary.y)].fg, CYAN);
 
         app.versions = VersionsState::CloudflareReady {
             deployments: vec![CloudflareDeployment {
@@ -1452,6 +1711,7 @@ mod tests {
 
         assert_eq!(app.layout_frame.first.width, journal_width);
         assert!(journal_width > app.layout_frame.second.width);
+        assert_eq!(terminal.backend().buffer()[(secondary.x, secondary.y)].fg, CYAN);
         Ok(())
     }
 }
