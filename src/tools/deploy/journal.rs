@@ -1,6 +1,6 @@
 use std::{
-    fs::{File, OpenOptions},
-    io::{Read, Write},
+    fs::File,
+    io::Read,
     path::{Path, PathBuf},
 };
 
@@ -8,6 +8,8 @@ use directories::ProjectDirs;
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 use tokio::{process::Command, time};
+
+use crate::framework::{AtomicFileError, AtomicFileWriter};
 
 const JOURNAL_SCHEMA_VERSION: u32 = 1;
 const JOURNAL_FILE: &str = "deploy-journal.json";
@@ -133,24 +135,8 @@ pub struct JournalStore {
 pub enum JournalError {
     #[error("resolve Kit state directory")]
     StateDirectory,
-    #[error("create deploy state directory {}: {source}", path.display())]
-    CreateDirectory {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("open deploy journal lock {}: {source}", path.display())]
-    OpenLock {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("lock deploy journal {}: {source}", path.display())]
-    Lock {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
+    #[error(transparent)]
+    Storage(#[from] AtomicFileError),
     #[error("read deploy journal {}: {source}", path.display())]
     Read {
         path: PathBuf,
@@ -167,12 +153,6 @@ pub enum JournalError {
     Schema { path: PathBuf, actual: u32, expected: u32 },
     #[error("serialize deploy journal: {0}")]
     Serialize(#[from] serde_json::Error),
-    #[error("write deploy state {}: {source}", path.display())]
-    Write {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
     #[error("parse deploy version counter {}: {source}", path.display())]
     Counter {
         path: PathBuf,
@@ -205,16 +185,18 @@ impl JournalStore {
         &self,
         entries: impl IntoIterator<Item = (String, JournalEntry)>,
     ) -> Result<(), JournalError> {
-        let _lock = self.lock()?;
+        let writer = self.writer();
+        let _lock = writer.lock()?;
         let mut journal = self.load()?;
         for (target_id, entry) in entries {
             journal.append(&target_id, entry);
         }
-        self.write_json(&self.path(), &journal)
+        self.write_json(&writer, &self.path(), &journal)
     }
 
     pub fn reserve_monotonic_version(&self, target_id: &str) -> Result<VersionId, JournalError> {
-        let _lock = self.lock()?;
+        let writer = self.writer();
+        let _lock = writer.lock()?;
         let path = self.dir.join(format!("{COUNTER_FILE}-{target_id}"));
         let current = match std::fs::read_to_string(&path) {
             Ok(raw) => raw
@@ -225,7 +207,7 @@ impl JournalStore {
             Err(source) => return Err(JournalError::Read { path, source }),
         };
         let next = current.saturating_add(1);
-        self.write_bytes(&path, format!("{next}\n").as_bytes())?;
+        writer.replace(&path, format!("{next}\n").as_bytes())?;
         Ok(VersionId(format!("run-{next}")))
     }
 
@@ -255,44 +237,20 @@ impl JournalStore {
         self.reserve_monotonic_version(target_id)
     }
 
-    fn lock(&self) -> Result<File, JournalError> {
-        std::fs::create_dir_all(&self.dir)
-            .map_err(|source| JournalError::CreateDirectory { path: self.dir.clone(), source })?;
-        let path = self.dir.join(LOCK_FILE);
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&path)
-            .map_err(|source| JournalError::OpenLock { path: path.clone(), source })?;
-        file.lock().map_err(|source| JournalError::Lock { path, source })?;
-        Ok(file)
-    }
-
-    fn write_json(&self, path: &Path, journal: &DeployJournal) -> Result<(), JournalError> {
+    fn write_json(
+        &self,
+        writer: &AtomicFileWriter,
+        path: &Path,
+        journal: &DeployJournal,
+    ) -> Result<(), JournalError> {
         let mut bytes = serde_json::to_vec_pretty(journal)?;
         bytes.push(b'\n');
-        self.write_bytes(path, &bytes)
+        writer.replace(path, &bytes)?;
+        Ok(())
     }
 
-    fn write_bytes(&self, path: &Path, bytes: &[u8]) -> Result<(), JournalError> {
-        std::fs::create_dir_all(&self.dir)
-            .map_err(|source| JournalError::CreateDirectory { path: self.dir.clone(), source })?;
-        let temp = self.dir.join(format!(".deploy-state-{}.tmp", std::process::id()));
-        let result = (|| {
-            let mut file = File::create(&temp)
-                .map_err(|source| JournalError::Write { path: temp.clone(), source })?;
-            file.write_all(bytes)
-                .map_err(|source| JournalError::Write { path: temp.clone(), source })?;
-            file.sync_all().map_err(|source| JournalError::Write { path: temp.clone(), source })?;
-            std::fs::rename(&temp, path)
-                .map_err(|source| JournalError::Write { path: path.to_path_buf(), source })
-        })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(temp);
-        }
-        result
+    fn writer(&self) -> AtomicFileWriter {
+        AtomicFileWriter::new(&self.dir, LOCK_FILE, ".deploy-state")
     }
 }
 

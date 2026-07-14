@@ -1,5 +1,6 @@
 //! deploy — interactive, config-driven deployment launcher with version history and rollback.
 
+mod annotations;
 mod cloudflare;
 mod config;
 mod environment;
@@ -16,6 +17,7 @@ use async_trait::async_trait;
 use clap::{ArgMatches, Command, CommandFactory, FromArgMatches, Parser};
 
 use crate::framework::{Context, Tool, ToolMeta};
+use annotations::AnnotationStore;
 use config::LoadedPlan;
 use journal::JournalStore;
 use layout::{DeployLayout, LayoutStore};
@@ -66,6 +68,8 @@ impl Tool for DeployTool {
         let loaded = LoadedPlan::load(args.config, project_dir, cx.config.path("deploy"))?;
         let journal_store = JournalStore::bootstrap()?;
         let journal = journal_store.load()?;
+        let annotation_store = AnnotationStore::bootstrap()?;
+        let annotations = annotation_store.load()?;
         let layout_store = LayoutStore::bootstrap()?;
         let (layout, layout_warning) = match layout_store.load() {
             Ok(layout) => (layout, None),
@@ -77,7 +81,17 @@ impl Tool for DeployTool {
             ),
         };
 
-        match tui::run(loaded, journal_store, journal, layout_store, layout, layout_warning).await?
+        match tui::run(tui::Startup {
+            loaded,
+            journal_store,
+            journal,
+            annotation_store,
+            annotations,
+            layout_store,
+            layout,
+            layout_warning,
+        })
+        .await?
         {
             None | Some(RunOutcome::Succeeded) => Ok(()),
             Some(RunOutcome::Failed) => bail!("deploy failed"),

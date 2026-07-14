@@ -21,6 +21,12 @@ The data model is deliberately small and typed:
 - A **Version** is owned by the Target's history Backend. Local Targets use the working tree's Git
   commit when available, otherwise a monotonic Target-local `run-N` identifier. Cloudflare Pages
   Targets use Cloudflare deployment IDs and metadata directly.
+- A **Preview deploy** publishes a Cloudflare Pages Target to a branch alias instead of production.
+  It substitutes `{{branch}}` in command arguments and shell scripts, and sets `KIT_DEPLOY_BRANCH`,
+  with the branch you enter. A normal deploy fetches and substitutes the Cloudflare project's
+  current production branch.
+- An **Annotation** is a local, per-deployment `error` flag and free-text `note`, kept outside the
+  platform because Cloudflare Pages has no annotation surface of its own.
 - A **Rollback strategy** is an optional typed Target capability. `steps` runs a dedicated ordered
   Step set; `redeploy` runs the Target's deployment Steps again. Both receive the selected Version
   as `KIT_DEPLOY_VERSION` and `KIT_DEPLOY_REF`, and replace `{{version}}` / `{{ref}}` in command
@@ -32,11 +38,15 @@ The data model is deliberately small and typed:
 
 The TUI has five phases. **Browse** is a two-pane Target picker: navigation moves through Targets,
 Space toggles selection, and the detail pane previews the focused Target's Steps. Enter opens
-**Review**, which makes the exact ordered Run plan explicit. `v` opens **Versions** for the focused
-Target. Local history comes from the Journal; Cloudflare Pages history loads asynchronously from
-the platform with explicit loading, empty, and error states. Choosing an eligible entry opens a
-rollback Review when that Target has a rollback owner. A
-second Enter starts **Run**, where
+**Review**, which makes the exact ordered Run plan explicit. `p` starts a **preview deploy** of the
+focused Cloudflare Pages Target: a modal prompts for a branch (prefilled with the current Git
+branch), then Review and Run proceed against that branch alias. `v` opens **Versions** for the
+focused Target. Local history comes from the Journal; Cloudflare Pages history loads asynchronously
+from the platform with explicit loading, empty, and error states. In Cloudflare Versions the live
+production deployment is marked `● LIVE`; `e` toggles a local `⚠ ERROR` mark on the selected
+deployment, `n` attaches a note, and `d` deletes the deployment after a confirmation (the live
+deployment cannot be deleted). Choosing an eligible entry opens a rollback Review when that Target
+has a rollback owner. A second Enter starts **Run**, where
 Target and Step status, elapsed time, and a bounded live output tail update continuously. Completion
 opens **Summary** with the final outcome and timing breakdown. Escape moves back before execution;
 `Ctrl-C` during execution cancels the active process group and stops the plan cleanly.
@@ -108,20 +118,29 @@ token_env = "CLOUDFLARE_API_TOKEN"
 
 [[targets.steps]]
 name = "Publish site"
-action = { type = "command", program = "<your-pages-deploy-command>", args = ["<output-directory>", "--project-name=<pages-project>"] }
+action = { type = "command", program = "<your-pages-deploy-command>", args = ["<output-directory>", "--project-name=<pages-project>", "--branch={{branch}}"] }
 ```
 
 `account_id`, `project`, and `token_env` must be non-empty. `token_env` names the variable containing
 the API token; the token value never belongs in deploy TOML. Kit checks the real process environment
 first, then this Target's `env_file`. If neither contains a non-empty value, the Versions view shows
 an actionable error and supports `r` to retry. The token needs Cloudflare Pages read access to browse
-deployments and write access to roll back.
+deployments and write access to roll back, delete, and publish previews.
 
 For this Backend, `v` calls Cloudflare's deployments API and shows newest-first deployment ID,
-commit SHA when present, creation time, production/preview environment, latest-stage status, and
-URL. Rollback calls Cloudflare's rollback API and appears in the normal Run and Summary views.
-Cloudflare permits rollback only to successful production deployments, which Kit enforces before
-Review. Deploy itself still runs the configured Steps; Kit does not upload Pages artifacts.
+commit SHA when present, branch, creation time, production/preview environment, latest-stage status,
+and URL. The current production deployment (Cloudflare's canonical deployment) is marked `● LIVE`,
+and the panel title shows the project's `production_branch`. Rollback calls Cloudflare's rollback
+API and appears in the normal Run and Summary views. Cloudflare permits rollback only to successful
+production deployments, which Kit enforces before Review.
+
+`d` deletes the selected deployment through Cloudflare's delete API after a `y`/`n` confirmation,
+then refreshes the list; the live deployment is refused with an actionable notice. `e` and `n`
+manage local annotations (see below). `p` from Browse publishes a preview: Kit substitutes the
+entered branch into `{{branch}}` and sets `KIT_DEPLOY_BRANCH`, so the same publish Step targets a
+branch alias instead of production. Kit reads the project's current production branch before every
+Run; that branch is used for normal deploys and rejected for previews. Deploy itself still runs the
+configured Steps; Kit does not upload Pages artifacts.
 
 Do not add `[targets.rollback]` to a Cloudflare Pages Target. Platform-backed and local rollback are
 mutually exclusive so there is one authoritative owner. Cloudflare Pages Runs are not copied into
@@ -169,6 +188,17 @@ configured Target/Step names, Version, Unix timestamp, status (`success`, `faile
 replace the journal atomically. An unreadable, invalid, or unwritable journal is an actionable
 error; Kit never silently discards history.
 
+## Deployment annotations
+
+Cloudflare Pages has no place to record "this deployment was bad", so Kit keeps annotations locally
+at `$XDG_STATE_HOME/kit/deploy-annotations.json` (normally
+`~/.local/state/kit/deploy-annotations.json`). The versioned, typed JSON document maps a Cloudflare
+deployment ID to an `error` flag and an optional `note`. `e` toggles the flag and `n` edits the note
+from the Cloudflare Versions view; both persist immediately with the same lock-and-atomic-replace
+write the journal uses. An entry with neither an error flag nor a note is pruned, so cleared
+annotations leave no residue. Annotations are keyed by deployment ID and hold no commit, path, or
+secret; deleting a deployment on the platform simply leaves its annotation unreferenced.
+
 ## Schema
 
 ```toml
@@ -199,9 +229,9 @@ action = { type = "command", program = "./restore", args = ["{{version}}"] }
 
 `working_dir` on a Step overrides its Target's directory. Child processes inherit Kit's environment,
 then receive missing values from the Target's `env_file`, plus `KIT_DEPLOY_VERSION` and
-`KIT_DEPLOY_REF`. Standard input is terminal-independent; stdout and stderr are captured and streamed
-into the Run view. Put secret values in the dotenv file or an external secret manager, never in the
-deployment plan.
+`KIT_DEPLOY_REF` (and `KIT_DEPLOY_BRANCH` when the Run resolved a branch). Standard input is
+terminal-independent; stdout and stderr are captured and streamed into the Run view. Put secret
+values in the dotenv file or an external secret manager, never in the deployment plan.
 
 Rollback supports two typed shapes:
 

@@ -1,7 +1,7 @@
 use std::{path::Path, time::SystemTime};
 
 use ::time::{format_description::well_known::Rfc3339, OffsetDateTime};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -20,17 +20,23 @@ use tokio::{
 use unicode_width::UnicodeWidthStr;
 
 use super::{
+    annotations::{Annotation, AnnotationStore, DeployAnnotations},
     cloudflare::{
         CloudflareDeployment, CloudflareEnvironment, CloudflarePagesClient, CloudflareStageStatus,
+        CloudflareVersions,
     },
     config::{DeployAction, DeployTarget, LoadedPlan},
     journal::{DeployJournal, JournalEntry, JournalStatus, JournalStore, VersionId},
     layout::{DeployLayout, LayoutFrame, LayoutStore, SplitSurface},
     runner::{self, OutputStream, RunOperation, RunOutcome, RunSpec, RunTargetSpec},
-    state::{ActiveRegion, App, Phase, ProgressStatus, RunIntent, VersionsSource, VersionsState},
+    state::{
+        ActiveRegion, App, Modal, ModalResult, Phase, ProgressStatus, RunIntent, VersionsSource,
+        VersionsState,
+    },
 };
 use crate::tui::{
-    Direction, EventReader, NavigationMap, NavigationRegion, Session, SessionOptions,
+    render_split_divider, Direction, EventReader, NavigationMap, NavigationRegion, Session,
+    SessionOptions, SplitDividerStyle,
 };
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -44,17 +50,31 @@ const MUTED: Color = Color::Rgb(129, 139, 157);
 const BORDER: Color = Color::Rgb(76, 86, 106);
 const SELECTED: Color = Color::Rgb(59, 66, 82);
 
-pub async fn run(
-    loaded: LoadedPlan,
-    journal_store: JournalStore,
-    journal: DeployJournal,
-    layout_store: LayoutStore,
-    layout: DeployLayout,
-    layout_warning: Option<String>,
-) -> Result<Option<RunOutcome>> {
+pub struct Startup {
+    pub loaded: LoadedPlan,
+    pub journal_store: JournalStore,
+    pub journal: DeployJournal,
+    pub annotation_store: AnnotationStore,
+    pub annotations: DeployAnnotations,
+    pub layout_store: LayoutStore,
+    pub layout: DeployLayout,
+    pub layout_warning: Option<String>,
+}
+
+pub async fn run(startup: Startup) -> Result<Option<RunOutcome>> {
+    let Startup {
+        loaded,
+        journal_store,
+        journal,
+        annotation_store,
+        annotations,
+        layout_store,
+        layout,
+        layout_warning,
+    } = startup;
     let mut session = Session::open(SessionOptions { mouse_capture: true })?;
     let mut events = EventReader::start();
-    let mut app = App::new(loaded, journal, layout);
+    let mut app = App::new(loaded, journal, annotations, layout);
     app.notice = layout_warning;
     let (_idle_tx, mut run_events) = tokio::sync::mpsc::channel(1);
     let (backend_tx, mut backend_events) = mpsc::channel(8);
@@ -104,8 +124,26 @@ pub async fn run(
                 }
             }
             event = backend_events.recv() => {
-                if let Some(BackendEvent::VersionsLoaded { target_id, result }) = event {
-                    app.set_cloudflare_versions(target_id, result);
+                match event {
+                    Some(BackendEvent::VersionsLoaded { target_id, result }) => {
+                        app.set_cloudflare_versions(target_id, result);
+                    }
+                    Some(BackendEvent::Deleted { short_id, result }) => match result {
+                        Ok(()) => {
+                            app.notice = Some(format!("Deleted deployment {short_id}. Refreshing…"));
+                            if let Some(handle) = versions_handle.take() {
+                                handle.abort();
+                            }
+                            match spawn_versions_load(&app, backend_tx.clone()) {
+                                Ok(handle) => versions_handle = Some(handle),
+                                Err(error) => app.notice = Some(format!("{error:#}")),
+                            }
+                        }
+                        Err(error) => {
+                            app.notice = Some(format!("Could not delete {short_id}: {error}"));
+                        }
+                    },
+                    None => {}
                 }
             }
             event = events.recv() => {
@@ -152,6 +190,22 @@ pub async fn run(
                         layout_dirty = true;
                         persist_layout(&mut app, &layout_store, &mut layout_dirty);
                     }
+                    UiAction::PersistAnnotations => {
+                        if let Err(error) = annotation_store.save(&app.annotations) {
+                            app.notice = Some(format!("Could not save annotations: {error:#}"));
+                        }
+                    }
+                    UiAction::DeleteDeployment { deployment_id, short_id } => {
+                        app.notice = Some(format!("Deleting deployment {short_id}…"));
+                        match spawn_delete(&app, deployment_id, short_id, backend_tx.clone()) {
+                            Ok(handle) => {
+                                if let Some(previous) = versions_handle.replace(handle) {
+                                    previous.abort();
+                                }
+                            }
+                            Err(error) => app.notice = Some(format!("{error:#}")),
+                        }
+                    }
                     UiAction::Start => {
                         match app.intent.clone() {
                             Some(RunIntent::CloudflarePagesRollback {
@@ -180,7 +234,11 @@ pub async fn run(
                                 run_handle = Some(handle);
                                 run_active = true;
                             }
-                            Some(RunIntent::Deploy | RunIntent::Rollback { .. }) => {
+                            Some(
+                                RunIntent::Deploy
+                                | RunIntent::DeployPreview { .. }
+                                | RunIntent::Rollback { .. },
+                            ) => {
                                 let spec = prepare_run(&app, &journal_store).await?;
                                 app.begin_run(&spec);
                                 let (receiver, cancel_tx, handle) = runner::spawn(spec);
@@ -235,6 +293,8 @@ enum UiAction {
     Cancel,
     LoadVersions,
     PersistLayout,
+    PersistAnnotations,
+    DeleteDeployment { deployment_id: String, short_id: String },
 }
 
 fn handle_event(event: Event, app: &mut App) -> UiAction {
@@ -294,6 +354,10 @@ fn handle_key(key: KeyEvent, app: &mut App) -> UiAction {
         return if app.phase == Phase::Running { UiAction::Cancel } else { UiAction::Quit };
     }
 
+    if app.modal.is_some() {
+        return handle_modal_key(key, app);
+    }
+
     if app.layout_drag.is_some() {
         if key.code == KeyCode::Esc {
             app.cancel_layout_drag();
@@ -336,6 +400,15 @@ fn handle_key(key: KeyEvent, app: &mut App) -> UiAction {
                 VersionsSource::Journal => UiAction::None,
                 VersionsSource::CloudflarePages => UiAction::LoadVersions,
             },
+            KeyCode::Char('p') => {
+                let default_branch = app
+                    .focused_target()
+                    .map(|target| target_working_dir(&app.loaded.base_dir, target))
+                    .and_then(|dir| current_git_branch(&dir))
+                    .unwrap_or_default();
+                app.open_branch_input(default_branch);
+                UiAction::None
+            }
             KeyCode::Enter => {
                 app.review_deploy();
                 UiAction::None
@@ -364,6 +437,18 @@ fn handle_key(key: KeyEvent, app: &mut App) -> UiAction {
                 app.review_rollback();
                 UiAction::None
             }
+            KeyCode::Char('d') => {
+                app.open_confirm_delete();
+                UiAction::None
+            }
+            KeyCode::Char('e') => match app.toggle_selected_annotation_error() {
+                Some(_) => UiAction::PersistAnnotations,
+                None => UiAction::None,
+            },
+            KeyCode::Char('n') => {
+                app.open_note_input();
+                UiAction::None
+            }
             _ => UiAction::None,
         },
         Phase::Review => match key.code {
@@ -390,11 +475,51 @@ fn handle_key(key: KeyEvent, app: &mut App) -> UiAction {
     }
 }
 
+fn handle_modal_key(key: KeyEvent, app: &mut App) -> UiAction {
+    let confirming_delete = matches!(app.modal, Some(Modal::ConfirmDelete { .. }));
+    match key.code {
+        KeyCode::Esc => {
+            app.modal_cancel();
+            UiAction::None
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') if confirming_delete => {
+            app.modal_cancel();
+            UiAction::None
+        }
+        KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') if confirming_delete => {
+            match app.modal_confirm() {
+                ModalResult::DeleteDeployment { deployment_id, short_id } => {
+                    UiAction::DeleteDeployment { deployment_id, short_id }
+                }
+                ModalResult::None | ModalResult::ReviewPreview | ModalResult::SaveAnnotations => {
+                    UiAction::None
+                }
+            }
+        }
+        KeyCode::Enter => match app.modal_confirm() {
+            ModalResult::SaveAnnotations => UiAction::PersistAnnotations,
+            ModalResult::DeleteDeployment { deployment_id, short_id } => {
+                UiAction::DeleteDeployment { deployment_id, short_id }
+            }
+            ModalResult::None | ModalResult::ReviewPreview => UiAction::None,
+        },
+        KeyCode::Backspace if !confirming_delete => {
+            app.modal_backspace();
+            UiAction::None
+        }
+        KeyCode::Char(ch) if !confirming_delete => {
+            app.modal_push(ch);
+            UiAction::None
+        }
+        _ => UiAction::None,
+    }
+}
+
 fn navigation(app: &App) -> NavigationMap<ActiveRegion> {
     let regions = app.layout_frame.surface.into_iter().flat_map(|_| {
         [
-            NavigationRegion::new(ActiveRegion::Primary, app.layout_frame.first),
-            NavigationRegion::new(ActiveRegion::Secondary, app.layout_frame.second),
+            NavigationRegion::new(ActiveRegion::Primary, app.layout_frame.split.first),
+            NavigationRegion::new(ActiveRegion::Secondary, app.layout_frame.split.second),
         ]
     });
     NavigationMap::new(regions)
@@ -449,9 +574,16 @@ fn scroll_limit(app: &App, region: ActiveRegion) -> u16 {
             VersionsState::Journal => {
                 app.selected_history_entry().map_or(0, |entry| version_detail(entry).len())
             }
-            VersionsState::CloudflareReady { .. } => app
-                .selected_cloudflare_deployment()
-                .map_or(0, |deployment| cloudflare_version_detail(deployment).len()),
+            VersionsState::CloudflareReady { .. } => {
+                app.selected_cloudflare_deployment().map_or(0, |deployment| {
+                    cloudflare_version_detail(
+                        deployment,
+                        app.deployment_is_live(deployment),
+                        app.annotation(deployment),
+                    )
+                    .len()
+                })
+            }
             VersionsState::CloudflareLoading | VersionsState::CloudflareError { .. } => 0,
         },
         (Phase::Running, ActiveRegion::Primary) => {
@@ -463,8 +595,8 @@ fn scroll_limit(app: &App, region: ActiveRegion) -> u16 {
         _ => 0,
     };
     let area = match region {
-        ActiveRegion::Primary => app.layout_frame.first,
-        ActiveRegion::Secondary => app.layout_frame.second,
+        ActiveRegion::Primary => app.layout_frame.split.first,
+        ActiveRegion::Secondary => app.layout_frame.split.second,
     };
     let visible = usize::from(area.height.saturating_sub(2));
     u16::try_from(total.saturating_sub(visible)).unwrap_or(u16::MAX)
@@ -501,12 +633,42 @@ async fn prepare_run(app: &App, journal_store: &JournalStore) -> Result<RunSpec>
                     app.loaded.environments.get(&target.id).cloned().ok_or_else(|| {
                         anyhow!("Target '{}' has no loaded environment", target.id)
                     })?;
-                targets.push(RunTargetSpec { target, version, environment });
+                let branch = cloudflare_production_branch(&target, &environment).await?;
+                targets.push(RunTargetSpec { target, version, branch, environment });
             }
             Ok(RunSpec {
                 base_dir: app.loaded.base_dir.clone(),
                 operation: RunOperation::Deploy,
                 targets,
+            })
+        }
+        RunIntent::DeployPreview { branch, .. } => {
+            let target = app
+                .review_targets()
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow!("selected preview Target no longer exists"))?;
+            let working_dir = target_working_dir(&app.loaded.base_dir, &target);
+            let version = journal_store.current_version(&target.id, &working_dir).await?;
+            let environment = app
+                .loaded
+                .environments
+                .get(&target.id)
+                .cloned()
+                .ok_or_else(|| anyhow!("Target '{}' has no loaded environment", target.id))?;
+            let production = cloudflare_production_branch(&target, &environment)
+                .await?
+                .ok_or_else(|| anyhow!("selected Target has no Cloudflare Pages backend"))?;
+            ensure_preview_branch(branch, &production)?;
+            Ok(RunSpec {
+                base_dir: app.loaded.base_dir.clone(),
+                operation: RunOperation::Deploy,
+                targets: vec![RunTargetSpec {
+                    target,
+                    version,
+                    branch: Some(branch.clone()),
+                    environment,
+                }],
             })
         }
         RunIntent::Rollback { version, .. } => {
@@ -524,7 +686,12 @@ async fn prepare_run(app: &App, journal_store: &JournalStore) -> Result<RunSpec>
             Ok(RunSpec {
                 base_dir: app.loaded.base_dir.clone(),
                 operation: RunOperation::Rollback { selected_version: version.clone() },
-                targets: vec![RunTargetSpec { target, version: version.clone(), environment }],
+                targets: vec![RunTargetSpec {
+                    target,
+                    version: version.clone(),
+                    branch: None,
+                    environment,
+                }],
             })
         }
         RunIntent::CloudflarePagesRollback { .. } => {
@@ -533,8 +700,26 @@ async fn prepare_run(app: &App, journal_store: &JournalStore) -> Result<RunSpec>
     }
 }
 
+async fn cloudflare_production_branch(
+    target: &DeployTarget,
+    environment: &super::environment::TargetEnvironment,
+) -> Result<Option<String>> {
+    let Some(client) = CloudflarePagesClient::for_target(target, environment)? else {
+        return Ok(None);
+    };
+    Ok(Some(client.get_project().await?.production_branch))
+}
+
+fn ensure_preview_branch(branch: &str, production: &str) -> Result<()> {
+    if branch == production {
+        bail!("'{branch}' is Cloudflare's production branch; use a normal deploy instead")
+    }
+    Ok(())
+}
+
 enum BackendEvent {
-    VersionsLoaded { target_id: String, result: Result<Vec<CloudflareDeployment>, String> },
+    VersionsLoaded { target_id: String, result: Result<CloudflareVersions, String> },
+    Deleted { short_id: String, result: Result<(), String> },
 }
 
 fn spawn_versions_load(app: &App, sender: mpsc::Sender<BackendEvent>) -> Result<JoinHandle<()>> {
@@ -548,8 +733,29 @@ fn spawn_versions_load(app: &App, sender: mpsc::Sender<BackendEvent>) -> Result<
     let client = CloudflarePagesClient::for_target(target, environment)?
         .ok_or_else(|| anyhow!("selected Target has no Cloudflare Pages backend"))?;
     Ok(tokio::spawn(async move {
-        let result = client.list_deployments().await.map_err(|error| error.to_string());
+        let result = client.load_versions().await.map_err(|error| error.to_string());
         let _ = sender.send(BackendEvent::VersionsLoaded { target_id, result }).await;
+    }))
+}
+
+fn spawn_delete(
+    app: &App,
+    deployment_id: String,
+    short_id: String,
+    sender: mpsc::Sender<BackendEvent>,
+) -> Result<JoinHandle<()>> {
+    let target = app.focused_target().ok_or_else(|| anyhow!("no Target is selected"))?;
+    let environment = app
+        .loaded
+        .environments
+        .get(&target.id)
+        .ok_or_else(|| anyhow!("Target '{}' has no loaded environment", target.id))?;
+    let client = CloudflarePagesClient::for_target(target, environment)?
+        .ok_or_else(|| anyhow!("selected Target has no Cloudflare Pages backend"))?;
+    Ok(tokio::spawn(async move {
+        let result =
+            client.delete_deployment(&deployment_id).await.map_err(|error| error.to_string());
+        let _ = sender.send(BackendEvent::Deleted { short_id, result }).await;
     }))
 }
 
@@ -632,6 +838,20 @@ fn spawn_cloudflare_rollback(
     (event_rx, cancel_tx, handle)
 }
 
+fn current_git_branch(working_dir: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .current_dir(working_dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (!branch.is_empty() && branch != "HEAD").then_some(branch)
+}
+
 fn target_working_dir(base_dir: &Path, target: &DeployTarget) -> std::path::PathBuf {
     match target.working_dir.as_deref() {
         Some(path) if path.is_absolute() => path.to_path_buf(),
@@ -671,6 +891,87 @@ fn render(frame: &mut Frame<'_>, app: &mut App, journal_path: &Path) {
         Phase::Summary => render_summary(frame, areas[1], app, journal_path),
     }
     render_footer(frame, areas[2], app);
+    if app.modal.is_some() {
+        render_modal(frame, app);
+    }
+}
+
+fn render_modal(frame: &mut Frame<'_>, app: &App) {
+    let Some(modal) = &app.modal else {
+        return;
+    };
+    let (title, body) = match modal {
+        Modal::BranchInput { buffer, .. } => (
+            " Preview deploy · branch ",
+            vec![
+                Line::styled(
+                    "Deploy a preview to a Cloudflare Pages branch alias.",
+                    Style::default().fg(MUTED),
+                ),
+                Line::raw(""),
+                input_line(buffer),
+                Line::raw(""),
+                Line::styled("Enter deploy  ·  Esc cancel", Style::default().fg(MUTED)),
+            ],
+        ),
+        Modal::NoteInput { buffer, .. } => (
+            " Annotate deployment · note ",
+            vec![
+                Line::styled("Attach a short note to this deployment.", Style::default().fg(MUTED)),
+                Line::raw(""),
+                input_line(buffer),
+                Line::raw(""),
+                Line::styled("Enter save  ·  Esc cancel", Style::default().fg(MUTED)),
+            ],
+        ),
+        Modal::ConfirmDelete { label, .. } => (
+            " Delete deployment ",
+            vec![
+                Line::from(vec![
+                    Span::styled("Permanently delete ", Style::default().fg(TEXT)),
+                    Span::styled(
+                        label.clone(),
+                        Style::default().fg(RED).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" from Cloudflare Pages?", Style::default().fg(TEXT)),
+                ]),
+                Line::raw(""),
+                Line::styled("y delete  ·  n / Esc cancel", Style::default().fg(MUTED)),
+            ],
+        ),
+    };
+    let area = centered_rect(frame.area(), 62, body.len() as u16 + 2);
+    frame.render_widget(ratatui::widgets::Clear, area);
+    frame.render_widget(
+        Paragraph::new(body).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(CYAN))
+                .padding(Padding::horizontal(1))
+                .title(Span::styled(title, Style::default().fg(CYAN).add_modifier(Modifier::BOLD))),
+        ),
+        area,
+    );
+}
+
+fn input_line(buffer: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("› ", Style::default().fg(CYAN)),
+        Span::styled(buffer.to_owned(), Style::default().fg(TEXT).add_modifier(Modifier::BOLD)),
+        Span::styled("▌", Style::default().fg(CYAN)),
+    ])
+}
+
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    }
 }
 
 fn install_split_frame(app: &mut App, surface: SplitSurface, area: Rect) -> LayoutFrame {
@@ -683,25 +984,19 @@ fn install_split_frame(app: &mut App, surface: SplitSurface, area: Rect) -> Layo
     layout_frame
 }
 
-fn render_split_divider(frame: &mut Frame<'_>, layout_frame: LayoutFrame, dragging: bool) {
-    if layout_frame.separator.width == 0 || layout_frame.separator.height == 0 {
-        return;
-    }
-    let color = if dragging { CYAN } else { MUTED };
-    let midpoint = layout_frame.separator.height / 2;
-    let lines = (0..layout_frame.separator.height)
-        .map(|row| {
-            let symbol = if dragging {
-                "┃"
-            } else if row.abs_diff(midpoint) <= 1 {
-                "┋"
-            } else {
-                " "
-            };
-            Line::styled(symbol, Style::default().fg(color))
-        })
-        .collect::<Vec<_>>();
-    frame.render_widget(Paragraph::new(lines), layout_frame.separator);
+fn render_layout_divider(frame: &mut Frame<'_>, layout_frame: LayoutFrame, dragging: bool) {
+    render_split_divider(
+        frame,
+        layout_frame.split,
+        dragging,
+        SplitDividerStyle {
+            idle_color: MUTED,
+            active_color: CYAN,
+            idle_line: " ",
+            idle_grip: "┋",
+            active_line: "┃",
+        },
+    );
 }
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -768,16 +1063,16 @@ fn render_browse(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         ))
         .highlight_style(Style::default().bg(SELECTED))
         .highlight_symbol("▌");
-    frame.render_stateful_widget(list, layout_frame.first, &mut state);
+    frame.render_stateful_widget(list, layout_frame.split.first, &mut state);
 
     render_target_detail(
         frame,
-        layout_frame.second,
+        layout_frame.split.second,
         app.focused_target(),
         app.secondary_scroll,
         app.active_region == ActiveRegion::Secondary,
     );
-    render_split_divider(frame, layout_frame, app.layout_drag.is_some());
+    render_layout_divider(frame, layout_frame, app.layout_drag.is_some());
 }
 
 fn render_target_detail(
@@ -844,7 +1139,7 @@ fn render_versions(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         .map(|target| target.name.clone())
         .unwrap_or_else(|| "Target".to_owned());
     let has_split = match &app.versions {
-        VersionsState::CloudflareReady { deployments } => !deployments.is_empty(),
+        VersionsState::CloudflareReady { deployments, .. } => !deployments.is_empty(),
         VersionsState::Journal => !app.history().is_empty(),
         VersionsState::CloudflareLoading | VersionsState::CloudflareError { .. } => false,
     };
@@ -887,8 +1182,8 @@ fn render_versions(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             );
             return;
         }
-        VersionsState::CloudflareReady { deployments } => {
-            render_cloudflare_versions(frame, area, &target_name, deployments, app);
+        VersionsState::CloudflareReady { .. } => {
+            render_cloudflare_versions(frame, area, &target_name, app);
             return;
         }
         VersionsState::Journal => {}
@@ -927,7 +1222,7 @@ fn render_versions(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         ))
         .highlight_style(Style::default().bg(SELECTED))
         .highlight_symbol("▌");
-    frame.render_stateful_widget(list, layout_frame.first, &mut state);
+    frame.render_stateful_widget(list, layout_frame.split.first, &mut state);
 
     let detail = app
         .selected_history_entry()
@@ -937,18 +1232,20 @@ fn render_versions(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         Paragraph::new(detail)
             .scroll((detail_scroll, 0))
             .block(active_panel(" Recorded Run ", active_region == ActiveRegion::Secondary)),
-        layout_frame.second,
+        layout_frame.split.second,
     );
-    render_split_divider(frame, layout_frame, app.layout_drag.is_some());
+    render_layout_divider(frame, layout_frame, app.layout_drag.is_some());
 }
 
-fn render_cloudflare_versions(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    target_name: &str,
-    deployments: &[CloudflareDeployment],
-    app: &App,
-) {
+fn render_cloudflare_versions(frame: &mut Frame<'_>, area: Rect, target_name: &str, app: &App) {
+    let (deployments, live_id, production_branch) = match &app.versions {
+        VersionsState::CloudflareReady { deployments, live_id, production_branch } => {
+            (deployments.as_slice(), live_id.as_deref(), production_branch.as_str())
+        }
+        VersionsState::Journal
+        | VersionsState::CloudflareLoading
+        | VersionsState::CloudflareError { .. } => return,
+    };
     if deployments.is_empty() {
         frame.render_widget(
             Paragraph::new(vec![
@@ -973,38 +1270,52 @@ fn render_cloudflare_versions(
     else {
         return;
     };
-    let items =
-        deployments.iter().map(cloudflare_version_line).map(ListItem::new).collect::<Vec<_>>();
+    let items = deployments
+        .iter()
+        .map(|deployment| {
+            let live = live_id == Some(deployment.id.as_str());
+            ListItem::new(cloudflare_version_line(deployment, live, app.annotation(deployment)))
+        })
+        .collect::<Vec<_>>();
     let mut state = ListState::default().with_selected(Some(app.history_cursor));
     frame.render_stateful_widget(
         List::new(items)
             .block(active_panel(
-                format!(" {target_name} · Cloudflare Pages "),
+                format!(" {target_name} · Cloudflare Pages · prod: {production_branch} "),
                 app.active_region == ActiveRegion::Primary,
             ))
             .highlight_style(Style::default().bg(SELECTED))
             .highlight_symbol("▌"),
-        layout_frame.first,
+        layout_frame.split.first,
         &mut state,
     );
-    let detail =
-        deployments.get(app.history_cursor).map(cloudflare_version_detail).unwrap_or_else(|| {
+    let detail = deployments
+        .get(app.history_cursor)
+        .map(|deployment| {
+            let live = live_id == Some(deployment.id.as_str());
+            cloudflare_version_detail(deployment, live, app.annotation(deployment))
+        })
+        .unwrap_or_else(|| {
             vec![Line::styled("No deployment selected", Style::default().fg(MUTED))]
         });
     frame.render_widget(
         Paragraph::new(detail).wrap(Wrap { trim: false }).scroll((app.secondary_scroll, 0)).block(
             active_panel(" Platform deployment ", app.active_region == ActiveRegion::Secondary),
         ),
-        layout_frame.second,
+        layout_frame.split.second,
     );
-    render_split_divider(frame, layout_frame, app.layout_drag.is_some());
+    render_layout_divider(frame, layout_frame, app.layout_drag.is_some());
 }
 
-fn cloudflare_version_line(deployment: &CloudflareDeployment) -> Line<'static> {
+fn cloudflare_version_line(
+    deployment: &CloudflareDeployment,
+    live: bool,
+    annotation: Option<&Annotation>,
+) -> Line<'static> {
     let status = deployment.latest_stage.as_ref().map(|stage| stage.status);
     let (symbol, color) = cloudflare_status(status);
     let commit = deployment.commit_hash().map(short_text).unwrap_or_else(|| "no commit".to_owned());
-    Line::from(vec![
+    let mut spans = vec![
         Span::styled(format!("{symbol} "), Style::default().fg(color).add_modifier(Modifier::BOLD)),
         Span::styled(
             deployment.short_id.clone(),
@@ -1018,40 +1329,76 @@ fn cloudflare_version_line(deployment: &CloudflareDeployment) -> Line<'static> {
             ),
             Style::default().fg(MUTED),
         ),
-    ])
+    ];
+    if live {
+        spans.push(Span::styled(
+            "  ● LIVE",
+            Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+        ));
+    }
+    if annotation.is_some_and(|annotation| annotation.error) {
+        spans
+            .push(Span::styled("  ⚠ ERROR", Style::default().fg(RED).add_modifier(Modifier::BOLD)));
+    }
+    if annotation.and_then(|annotation| annotation.note.as_deref()).is_some() {
+        spans.push(Span::styled("  ✎", Style::default().fg(YELLOW)));
+    }
+    Line::from(spans)
 }
 
-fn cloudflare_version_detail(deployment: &CloudflareDeployment) -> Vec<Line<'static>> {
+fn cloudflare_version_detail(
+    deployment: &CloudflareDeployment,
+    live: bool,
+    annotation: Option<&Annotation>,
+) -> Vec<Line<'static>> {
     let status = deployment.latest_stage.as_ref().map(|stage| stage.status);
     let (symbol, color) = cloudflare_status(status);
-    vec![
-        Line::from(vec![
-            Span::styled(
-                format!("{symbol} "),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                deployment.short_id.clone(),
-                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-            ),
-        ]),
+    let mut header = vec![
+        Span::styled(format!("{symbol} "), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            deployment.short_id.clone(),
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if live {
+        header.push(Span::styled(
+            "  ● LIVE",
+            Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+        ));
+    }
+    let mut lines = vec![
+        Line::from(header),
         Line::raw(""),
         detail_line("Commit", deployment.commit_hash().unwrap_or("—")),
+        detail_line("Branch", deployment.branch().unwrap_or("—")),
         detail_line("Created", &deployment.created_on),
         detail_line("Environment", cloudflare_environment(deployment.environment)),
         detail_line("Status", cloudflare_status_label(status)),
-        Line::raw(""),
-        Line::styled(deployment.url.clone(), Style::default().fg(CYAN)),
-        Line::raw(""),
-        Line::styled(
-            if deployment.rollback_eligible() {
-                "Enter  roll back to this production deployment"
-            } else {
-                "Rollback requires a successful production deployment"
-            },
-            Style::default().fg(if deployment.rollback_eligible() { MAGENTA } else { MUTED }),
-        ),
-    ]
+    ];
+    if let Some(annotation) = annotation {
+        lines.push(Line::raw(""));
+        if annotation.error {
+            lines.push(Line::styled(
+                "⚠ Marked as an error",
+                Style::default().fg(RED).add_modifier(Modifier::BOLD),
+            ));
+        }
+        if let Some(note) = annotation.note.as_deref() {
+            lines.push(detail_line("Note", note));
+        }
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(deployment.url.clone(), Style::default().fg(CYAN)));
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        if deployment.rollback_eligible() {
+            "Enter roll back  ·  e error  ·  n note  ·  d delete"
+        } else {
+            "e error  ·  n note  ·  d delete  ·  rollback needs a successful production deploy"
+        },
+        Style::default().fg(if deployment.rollback_eligible() { MAGENTA } else { MUTED }),
+    ));
+    lines
 }
 
 fn detail_line(label: &'static str, value: &str) -> Line<'static> {
@@ -1230,10 +1577,10 @@ fn render_running(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         Paragraph::new(progress)
             .scroll((app.primary_scroll, 0))
             .block(active_panel(" Progress ", app.active_region == ActiveRegion::Primary)),
-        layout_frame.first,
+        layout_frame.split.first,
     );
 
-    let inner_height = layout_frame.second.height.saturating_sub(2) as usize;
+    let inner_height = layout_frame.split.second.height.saturating_sub(2) as usize;
     let output_end = app.output.len().saturating_sub(app.secondary_scroll as usize);
     let output_start = output_end.saturating_sub(inner_height);
     let output = app
@@ -1247,7 +1594,7 @@ fn render_running(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 OutputStream::Stderr => Style::default().fg(YELLOW),
             };
             Line::styled(
-                truncate(&line.text, layout_frame.second.width.saturating_sub(4) as usize),
+                truncate(&line.text, layout_frame.split.second.width.saturating_sub(4) as usize),
                 style,
             )
         })
@@ -1255,9 +1602,9 @@ fn render_running(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     frame.render_widget(
         Paragraph::new(output)
             .block(active_panel(" Live output ", app.active_region == ActiveRegion::Secondary)),
-        layout_frame.second,
+        layout_frame.split.second,
     );
-    render_split_divider(frame, layout_frame, app.layout_drag.is_some());
+    render_layout_divider(frame, layout_frame, app.layout_drag.is_some());
 }
 
 fn render_summary(frame: &mut Frame<'_>, area: Rect, app: &App, journal_path: &Path) {
@@ -1339,33 +1686,12 @@ fn render_summary(frame: &mut Frame<'_>, area: Rect, app: &App, journal_path: &P
 }
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let controls = match app.phase {
-        Phase::Browse if app.active_region == ActiveRegion::Secondary => {
-            "↑↓ scroll plan   ←→/Tab region   Space select   v versions   drag resize   = reset   Enter review   q quit"
+    let controls = match app.modal {
+        Some(Modal::ConfirmDelete { .. }) => "y delete   n / Esc cancel",
+        Some(Modal::BranchInput { .. } | Modal::NoteInput { .. }) => {
+            "type to edit   Enter confirm   Esc cancel"
         }
-        Phase::Browse => {
-            "↑↓ targets   ←→/Tab region   Space select   a all   v versions   drag resize   = reset   Enter review   q quit"
-        }
-        Phase::Versions => {
-            if app.layout_frame.surface.is_none() {
-                if app.versions_source() == VersionsSource::CloudflarePages {
-                    "r refresh   Esc targets   q quit"
-                } else {
-                    "Esc targets   q quit"
-                }
-            } else if app.active_region == ActiveRegion::Secondary {
-                "↑↓ scroll details   ←→/Tab region   Enter rollback   drag resize   = reset   Esc targets   q quit"
-            } else if app.versions_source() == VersionsSource::CloudflarePages {
-                "↑↓ versions   ←→/Tab region   Enter rollback   r refresh   drag resize   = reset   Esc targets   q quit"
-            } else {
-                "↑↓ versions   ←→/Tab region   Enter rollback   drag resize   = reset   Esc targets   q quit"
-            }
-        }
-        Phase::Review => "Enter run   Esc back   q quit",
-        Phase::Running => {
-            "↑↓ scroll   ←→/Tab region   drag resize   = reset   Ctrl-C cancel safely"
-        }
-        Phase::Summary => "Enter close",
+        None => modal_free_controls(app),
     };
     if let Some(notice) = &app.notice {
         let lines = vec![
@@ -1378,6 +1704,37 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Paragraph::new(controls).style(Style::default().fg(MUTED)).alignment(Alignment::Center),
             area,
         );
+    }
+}
+
+fn modal_free_controls(app: &App) -> &'static str {
+    match app.phase {
+        Phase::Browse if app.active_region == ActiveRegion::Secondary => {
+            "↑↓ scroll plan   ←→/Tab region   Space select   v versions   p preview   Enter review   q quit"
+        }
+        Phase::Browse => {
+            "↑↓ targets   Space select   a all   v versions   p preview   Enter review   q quit"
+        }
+        Phase::Versions => {
+            if app.layout_frame.surface.is_none() {
+                if app.versions_source() == VersionsSource::CloudflarePages {
+                    "r refresh   Esc targets   q quit"
+                } else {
+                    "Esc targets   q quit"
+                }
+            } else if app.active_region == ActiveRegion::Secondary {
+                "↑↓ scroll details   Enter rollback   e error   n note   d delete   Esc targets   q quit"
+            } else if app.versions_source() == VersionsSource::CloudflarePages {
+                "↑↓ versions   Enter rollback   e error   n note   d delete   r refresh   Esc targets   q quit"
+            } else {
+                "↑↓ versions   ←→/Tab region   Enter rollback   drag resize   = reset   Esc targets   q quit"
+            }
+        }
+        Phase::Review => "Enter run   Esc back   q quit",
+        Phase::Running => {
+            "↑↓ scroll   ←→/Tab region   drag resize   = reset   Ctrl-C cancel safely"
+        }
+        Phase::Summary => "Enter close",
     }
 }
 
@@ -1525,6 +1882,13 @@ mod tests {
         environment::TargetEnvironment,
     };
 
+    #[test]
+    fn preview_branch_validation_uses_the_remote_production_branch() {
+        assert!(ensure_preview_branch("feature", "main").is_ok());
+        let error = ensure_preview_branch("main", "main").expect_err("production must fail");
+        assert!(error.to_string().contains("Cloudflare's production branch"));
+    }
+
     fn test_app() -> App {
         App::new(
             LoadedPlan {
@@ -1553,6 +1917,7 @@ mod tests {
                 environments: Default::default(),
             },
             DeployJournal::default(),
+            DeployAnnotations::default(),
             DeployLayout::default(),
         )
     }
@@ -1593,8 +1958,8 @@ mod tests {
         app.selected.push(false);
 
         terminal.draw(|frame| render(frame, &mut app, Path::new("journal.json")))?;
-        let primary = app.layout_frame.first;
-        let secondary = app.layout_frame.second;
+        let primary = app.layout_frame.split.first;
+        let secondary = app.layout_frame.split.second;
         assert_eq!(terminal.backend().buffer()[(primary.x, primary.y)].fg, CYAN);
 
         handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &mut app);
@@ -1643,6 +2008,7 @@ mod tests {
             targets: vec![RunTargetSpec {
                 target,
                 version: VersionId("version-placeholder".to_owned()),
+                branch: None,
                 environment: TargetEnvironment::default(),
             }],
         });
@@ -1671,7 +2037,7 @@ mod tests {
         let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend)?;
         let mut app = test_app();
-        app.layout.versions = crate::tools::deploy::layout::SplitRatio::new_unchecked(700);
+        app.layout.versions = crate::tools::deploy::layout::SplitRatio::new(700);
         app.phase = Phase::Versions;
         app.journal.targets.push(crate::tools::deploy::journal::TargetJournal {
             target_id: "preview".to_owned(),
@@ -1686,9 +2052,9 @@ mod tests {
         });
 
         terminal.draw(|frame| render(frame, &mut app, Path::new("journal.json")))?;
-        let journal_width = app.layout_frame.first.width;
-        let primary = app.layout_frame.first;
-        let secondary = app.layout_frame.second;
+        let journal_width = app.layout_frame.split.first.width;
+        let primary = app.layout_frame.split.first;
+        let secondary = app.layout_frame.split.second;
         handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &mut app);
         terminal.draw(|frame| render(frame, &mut app, Path::new("journal.json")))?;
         assert_eq!(terminal.backend().buffer()[(primary.x, primary.y)].fg, BORDER);
@@ -1706,11 +2072,13 @@ mod tests {
                 }),
                 deployment_trigger: None,
             }],
+            live_id: Some("deployment-placeholder".to_owned()),
+            production_branch: "main".to_owned(),
         };
         terminal.draw(|frame| render(frame, &mut app, Path::new("journal.json")))?;
 
-        assert_eq!(app.layout_frame.first.width, journal_width);
-        assert!(journal_width > app.layout_frame.second.width);
+        assert_eq!(app.layout_frame.split.first.width, journal_width);
+        assert!(journal_width > app.layout_frame.split.second.width);
         assert_eq!(terminal.backend().buffer()[(secondary.x, secondary.y)].fg, CYAN);
         Ok(())
     }

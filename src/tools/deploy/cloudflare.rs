@@ -61,6 +61,26 @@ pub struct CloudflareDeploymentTrigger {
 #[derive(Clone, Debug, Deserialize)]
 pub struct CloudflareDeploymentMetadata {
     pub commit_hash: Option<String>,
+    pub branch: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct CloudflareProject {
+    pub production_branch: String,
+    pub canonical_deployment: Option<CanonicalDeployment>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct CanonicalDeployment {
+    pub id: String,
+}
+
+/// The version history plus the pointers needed to render "which one is live".
+#[derive(Clone, Debug)]
+pub struct CloudflareVersions {
+    pub deployments: Vec<CloudflareDeployment>,
+    pub live_id: Option<String>,
+    pub production_branch: String,
 }
 
 #[derive(Debug, Error)]
@@ -113,7 +133,7 @@ impl CloudflarePagesClient {
         target: &DeployTarget,
         environment: &TargetEnvironment,
     ) -> Result<Option<Self>, CloudflareError> {
-        let Some(TargetBackend::CloudflarePages { account_id, project, token_env }) =
+        let Some(TargetBackend::CloudflarePages { account_id, project, token_env, .. }) =
             &target.backend
         else {
             return Ok(None);
@@ -178,6 +198,44 @@ impl CloudflarePagesClient {
         parsed.result.ok_or(CloudflareError::MissingResult)
     }
 
+    pub async fn load_versions(&self) -> Result<CloudflareVersions, CloudflareError> {
+        let (deployments, project) = tokio::try_join!(self.list_deployments(), self.get_project())?;
+        Ok(CloudflareVersions {
+            deployments,
+            live_id: project.canonical_deployment.map(|canonical| canonical.id),
+            production_branch: project.production_branch,
+        })
+    }
+
+    pub async fn get_project(&self) -> Result<CloudflareProject, CloudflareError> {
+        let token = self.token()?;
+        let response = self
+            .http
+            .get(self.project_url()?)
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(CloudflareError::Request)?;
+        let parsed: ApiResponse<CloudflareProject> = decode(response).await?;
+        parsed.result.ok_or(CloudflareError::MissingResult)
+    }
+
+    pub async fn delete_deployment(&self, deployment_id: &str) -> Result<(), CloudflareError> {
+        let token = self.token()?;
+        let mut url = self.deployments_url()?;
+        url.path_segments_mut().map_err(|()| CloudflareError::InvalidUrl)?.push(deployment_id);
+        url.query_pairs_mut().append_pair("force", "true");
+        let response = self
+            .http
+            .delete(url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(CloudflareError::Request)?;
+        let _: ApiResponse<serde_json::Value> = decode(response).await?;
+        Ok(())
+    }
+
     fn token(&self) -> Result<String, CloudflareError> {
         self.environment
             .resolve(&self.token_env)
@@ -193,6 +251,18 @@ impl CloudflarePagesClient {
             "projects",
             self.project.as_str(),
             "deployments",
+        ]);
+        Ok(url)
+    }
+
+    fn project_url(&self) -> Result<Url, CloudflareError> {
+        let mut url = Url::parse(API_ROOT).map_err(|_| CloudflareError::InvalidUrl)?;
+        url.path_segments_mut().map_err(|()| CloudflareError::InvalidUrl)?.extend([
+            "accounts",
+            self.account_id.as_str(),
+            "pages",
+            "projects",
+            self.project.as_str(),
         ]);
         Ok(url)
     }
@@ -214,12 +284,25 @@ impl CloudflareDeployment {
             .and_then(|metadata| metadata.commit_hash.as_deref())
     }
 
-    pub fn rollback_eligible(&self) -> bool {
+    pub fn branch(&self) -> Option<&str> {
+        self.deployment_trigger
+            .as_ref()
+            .and_then(|trigger| trigger.metadata.as_ref())
+            .and_then(|metadata| metadata.branch.as_deref())
+    }
+
+    pub fn is_production(&self) -> bool {
         self.environment == CloudflareEnvironment::Production
-            && self
-                .latest_stage
-                .as_ref()
-                .is_some_and(|stage| stage.status == CloudflareStageStatus::Success)
+    }
+
+    pub fn succeeded(&self) -> bool {
+        self.latest_stage
+            .as_ref()
+            .is_some_and(|stage| stage.status == CloudflareStageStatus::Success)
+    }
+
+    pub fn rollback_eligible(&self) -> bool {
+        self.is_production() && self.succeeded()
     }
 }
 

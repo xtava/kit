@@ -52,6 +52,8 @@ token_env = "CLOUDFLARE_API_TOKEN"
 name = "Build site"
 action = { type = "command", program = "<your-build-command>", args = ["<build-argument>"] }
 
+# A normal deploy fetches {{branch}} from Cloudflare; a preview deploy (p) substitutes
+# the branch you enter, publishing to that Pages branch alias.
 [[targets.steps]]
 name = "Publish site"
-action = { type = "command", program = "<your-pages-deploy-command>", args = ["<output-directory>", "--project-name=<pages-project>"] }
+action = { type = "command", program = "<your-pages-deploy-command>", args = ["<output-directory>", "--project-name=<pages-project>", "--branch={{branch}}"] }

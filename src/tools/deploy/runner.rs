@@ -63,6 +63,7 @@ pub struct RunSpec {
 pub struct RunTargetSpec {
     pub target: DeployTarget,
     pub version: VersionId,
+    pub branch: Option<String>,
     pub environment: TargetEnvironment,
 }
 
@@ -136,6 +137,7 @@ async fn run(
                 &step.action,
                 &working_dir,
                 &run_target.version,
+                run_target.branch.as_deref(),
                 &run_target.environment,
                 &event_tx,
                 &mut cancel_rx,
@@ -234,6 +236,7 @@ async fn execute(
     action: &DeployAction,
     working_dir: &std::path::Path,
     version: &VersionId,
+    branch: Option<&str>,
     environment: &TargetEnvironment,
     event_tx: &mpsc::Sender<RunEvent>,
     cancel_rx: &mut watch::Receiver<bool>,
@@ -245,16 +248,16 @@ async fn execute(
         ));
     }
 
-    let mut command = command_for(action, version);
+    let mut command = command_for(action, version, branch);
     command
         .current_dir(working_dir)
         .envs(environment.child_values())
         .env("KIT_DEPLOY_VERSION", &version.0)
-        .env("KIT_DEPLOY_REF", &version.0)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .env("KIT_DEPLOY_REF", &version.0);
+    if let Some(branch) = branch {
+        command.env("KIT_DEPLOY_BRANCH", branch);
+    }
+    command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
@@ -297,23 +300,27 @@ async fn execute(
     }
 }
 
-fn command_for(action: &DeployAction, version: &VersionId) -> Command {
+fn command_for(action: &DeployAction, version: &VersionId, branch: Option<&str>) -> Command {
     match action {
         DeployAction::Command { program, args } => {
             let mut command = Command::new(program);
-            command.args(args.iter().map(|arg| substitute_version(arg, version)));
+            command.args(args.iter().map(|arg| substitute(arg, version, branch)));
             command
         }
         DeployAction::Shell { script } => {
             let mut command = Command::new("sh");
-            command.arg("-c").arg(substitute_version(script, version));
+            command.arg("-c").arg(substitute(script, version, branch));
             command
         }
     }
 }
 
-fn substitute_version(value: &str, version: &VersionId) -> String {
-    value.replace("{{version}}", &version.0).replace("{{ref}}", &version.0)
+fn substitute(value: &str, version: &VersionId, branch: Option<&str>) -> String {
+    let substituted = value.replace("{{version}}", &version.0).replace("{{ref}}", &version.0);
+    match branch {
+        Some(branch) => substituted.replace("{{branch}}", branch),
+        None => substituted,
+    }
 }
 
 fn stream_lines<R>(
@@ -432,6 +439,7 @@ mod tests {
                     script: format!("printf '%s' \"${variable}\""),
                 }),
                 version: VersionId("abc123".to_owned()),
+                branch: None,
                 environment,
             }],
         };
@@ -460,6 +468,7 @@ mod tests {
                     args: vec!["-c".to_owned(), "printf ok".to_owned()],
                 }),
                 version: VersionId("abc123".to_owned()),
+                branch: None,
                 environment: TargetEnvironment::default(),
             }],
         };
@@ -475,6 +484,7 @@ mod tests {
             targets: vec![RunTargetSpec {
                 target: target(DeployAction::Shell { script: "exit 7".to_owned() }),
                 version: VersionId("abc123".to_owned()),
+                branch: None,
                 environment: TargetEnvironment::default(),
             }],
         };
@@ -490,6 +500,7 @@ mod tests {
             targets: vec![RunTargetSpec {
                 target: target(DeployAction::Shell { script: "sleep 30".to_owned() }),
                 version: VersionId("abc123".to_owned()),
+                branch: None,
                 environment: TargetEnvironment::default(),
             }],
         };
@@ -509,10 +520,15 @@ mod tests {
     }
 
     #[test]
-    fn substitutes_selected_version_in_arguments_and_scripts() {
+    fn substitutes_selected_version_and_branch_in_arguments_and_scripts() {
         let version = VersionId("release-42".to_owned());
-        assert_eq!(substitute_version("--ref={{ref}}", &version), "--ref=release-42");
-        assert_eq!(substitute_version("restore {{version}}", &version), "restore release-42");
+        assert_eq!(substitute("--ref={{ref}}", &version, None), "--ref=release-42");
+        assert_eq!(substitute("restore {{version}}", &version, None), "restore release-42");
+        assert_eq!(
+            substitute("--branch={{branch}}", &version, Some("worker-verify")),
+            "--branch=worker-verify"
+        );
+        assert_eq!(substitute("--branch={{branch}}", &version, None), "--branch={{branch}}");
     }
 
     #[tokio::test]
