@@ -75,7 +75,7 @@ pub async fn run(interval: Duration, mouse_capture: bool) -> Result<()> {
 mod tests {
     use std::time::Instant;
 
-    use super::super::app::{ActiveRegion, DetailIntent, InspectorTab};
+    use super::super::app::{ActiveRegion, DetailIntent, InspectorTab, SortBy};
     use super::super::host::ProcessAction;
     use super::super::model::{
         CpuSample, DetailCompleteness, DetailData, DetailOutcome, DetailRequest, DetailRequestKind,
@@ -339,6 +339,66 @@ mod tests {
         app.ingest(snapshot);
         assert_eq!(app.row_offset, 0);
         assert_eq!(app.selected, selected);
+    }
+
+    #[test]
+    fn process_headers_sort_their_exact_columns_and_return_to_the_top() {
+        let mut app = StatsApp::new(snapshot());
+        app.viewport_rows = 1;
+        app.move_selection(1);
+        assert_eq!(app.row_offset, 1);
+
+        let backend = ratatui::backend::TestBackend::new(140, 35);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let regions = draw_app(&mut terminal, &app);
+        assert_eq!(regions.headers.len(), 4);
+
+        let memory = regions
+            .headers
+            .iter()
+            .find(|(_, sort)| *sort == SortBy::Memory)
+            .expect("memory header")
+            .0;
+        app.on_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: memory.x,
+                row: memory.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            &regions,
+        );
+
+        assert_eq!(app.sort, SortBy::Memory);
+        assert!(app.descending);
+        assert_eq!(app.row_offset, 0);
+        assert_eq!(app.visible[0].pid, 3);
+
+        let first_row = regions.rows[0].0;
+        app.on_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: memory.x,
+                row: first_row.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            &regions,
+        );
+        assert_eq!(app.sort, SortBy::Memory, "row clicks must not activate a header");
+        assert!(app.descending, "row clicks must not reverse the active sort");
+    }
+
+    #[test]
+    fn home_selects_the_first_sorted_process_and_resets_scroll() {
+        let mut app = StatsApp::new(snapshot_with_processes(30));
+        app.viewport_rows = 5;
+        app.move_selection(12);
+        assert!(app.row_offset > 0);
+
+        app.on_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE), &UiRegions::default());
+
+        assert_eq!(app.row_offset, 0);
+        assert_eq!(app.selected, Some(app.visible[0].key));
     }
 
     #[test]

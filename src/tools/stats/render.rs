@@ -257,31 +257,19 @@ fn render_processes(
         ]);
         Row::new(cells).style(style)
     });
-    let mut headers = vec!["NAME / COMMAND"];
+    let mut headers = vec![sort_header(app, "NAME / COMMAND", SortBy::Name)];
     if wide {
-        headers.push("PID");
+        headers.push(sort_header(app, "PID", SortBy::Pid));
     }
-    headers.extend(["CPU", "FAMILY", "MEM"]);
-    let header =
-        Row::new(headers).style(Style::default().fg(MUTED).bg(PANEL).add_modifier(Modifier::BOLD));
-    let constraints = if wide {
-        vec![
-            Constraint::Min(24),
-            Constraint::Length(8),
-            Constraint::Length(8),
-            Constraint::Length(9),
-            Constraint::Length(9),
-        ]
-    } else {
-        vec![
-            Constraint::Min(24),
-            Constraint::Length(8),
-            Constraint::Length(9),
-            Constraint::Length(9),
-        ]
-    };
+    headers.extend([
+        sort_header(app, "CPU", SortBy::Cpu),
+        Cell::from("FAMILY").style(Style::default().fg(MUTED)),
+        sort_header(app, "MEM", SortBy::Memory),
+    ]);
+    let header = Row::new(headers).style(Style::default().bg(PANEL).add_modifier(Modifier::BOLD));
+    let constraints = process_column_constraints(wide);
     let table =
-        Table::new(rows, constraints)
+        Table::new(rows, constraints.clone())
             .header(header)
             .style(Style::default().fg(TEXT).bg(PANEL))
             .block(
@@ -298,7 +286,21 @@ fn render_processes(
     if inner.height < 3 {
         return;
     }
-    regions.headers.push((Rect::new(inner.x, inner.y, inner.width / 2, 1), SortBy::Name));
+    let columns = Layout::horizontal(constraints).spacing(1).split(inner);
+    let header_area = |column: Rect| Rect::new(column.x, inner.y, column.width, 1);
+    regions.headers.push((header_area(columns[0]), SortBy::Name));
+    if wide {
+        regions.headers.extend([
+            (header_area(columns[1]), SortBy::Pid),
+            (header_area(columns[2]), SortBy::Cpu),
+            (header_area(columns[4]), SortBy::Memory),
+        ]);
+    } else {
+        regions.headers.extend([
+            (header_area(columns[1]), SortBy::Cpu),
+            (header_area(columns[3]), SortBy::Memory),
+        ]);
+    }
     let row_top = inner.y + 1;
     for (screen_index, index) in
         (app.row_offset..app.visible.len()).take(visible_height).enumerate()
@@ -307,6 +309,34 @@ fn render_processes(
         regions.rows.push((Rect::new(inner.x, y, inner.width, 1), index));
         let disclosure_x = inner.x + app.visible[index].depth.saturating_mul(2);
         regions.disclosures.push((Rect::new(disclosure_x, y, 2, 1), app.visible[index].key));
+    }
+}
+
+fn process_column_constraints(wide: bool) -> Vec<Constraint> {
+    if wide {
+        vec![
+            Constraint::Min(24),
+            Constraint::Length(8),
+            Constraint::Length(8),
+            Constraint::Length(9),
+            Constraint::Length(9),
+        ]
+    } else {
+        vec![
+            Constraint::Min(24),
+            Constraint::Length(8),
+            Constraint::Length(9),
+            Constraint::Length(9),
+        ]
+    }
+}
+
+fn sort_header(app: &StatsApp, label: &'static str, sort: SortBy) -> Cell<'static> {
+    if app.sort == sort {
+        let arrow = if app.descending { "▼" } else { "▲" };
+        Cell::from(format!("{label} {arrow}")).style(Style::default().fg(ACCENT))
+    } else {
+        Cell::from(label).style(Style::default().fg(MUTED))
     }
 }
 
@@ -859,6 +889,8 @@ fn render_footer(frame: &mut Frame<'_>, app: &StatsApp, area: Rect) {
             ActiveRegion::Processes => Line::from(vec![
                 Span::styled(" ↑↓ ", key),
                 Span::styled("select   ", Style::default().fg(MUTED)),
+                Span::styled("home ", key),
+                Span::styled("top   ", Style::default().fg(MUTED)),
                 Span::styled("←→ ", key),
                 Span::styled("tree / inspect   ", Style::default().fg(MUTED)),
                 Span::styled("tab ", key),

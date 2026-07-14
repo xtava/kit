@@ -1,0 +1,31 @@
+name: macOS
+
+on:
+  pull_request:
+    paths:
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
+      - "src/**"
+      - "tests/**"
+      - ".github/workflows/macos.yml"
+  push:
+    branches: [master]
+    paths:
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
+      - "src/**"
+      - "tests/**"
+      - ".github/workflows/macos.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  stats:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test Stats on macOS
+        run: cargo test -j 2 tools::stats::

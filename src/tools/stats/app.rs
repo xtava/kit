@@ -561,7 +561,13 @@ impl StatsApp {
             self.sort = sort;
             self.descending = !matches!(sort, SortBy::Name | SortBy::Pid);
         }
+        self.row_offset = 0;
         self.reproject();
+    }
+
+    fn jump_to_top(&mut self) {
+        self.row_offset = 0;
+        self.select_index(0);
     }
 
     pub(super) fn on_event(&mut self, event: Event, regions: &UiRegions) -> Action {
@@ -634,6 +640,12 @@ impl StatsApp {
             KeyCode::PageDown => {
                 if self.active_region == ActiveRegion::Processes {
                     self.move_selection(10);
+                }
+                Action::None
+            }
+            KeyCode::Home => {
+                if self.active_region == ActiveRegion::Processes {
+                    self.jump_to_top();
                 }
                 Action::None
             }

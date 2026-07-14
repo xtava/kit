@@ -17,6 +17,7 @@ kit stats --interval 500
 | Action | Keyboard | Mouse |
 | --- | --- | --- |
 | Select process | `↑`/`↓`, `j`/`k`, `PageUp`/`PageDown` | click row or scroll |
+| Jump to the hottest/top row | `Home` | click a sort header to reorder from the top |
 | Expand/collapse a process family | `Space`, `←`/`→` | click the disclosure marker |
 | Move between processes and inspector | `Tab`/`Shift-Tab`, `←`/`→` at a tree boundary | click either region |
 | Open the inspector | `Enter` | click an inspector tab |
@@ -25,7 +26,7 @@ kit stats --interval 500
 | Focus a logical CPU | `[`/`]` cycle cores | click a CPU tile; click again to clear |
 | Return from CPU focus | `Esc` or `c` | click the active CPU tile |
 | Search name, command, PID, or user | `/`, type, `Enter` | — |
-| Sort CPU, RAM, PID, name | `1`, `2`, `3`, `4` | click a column header |
+| Sort CPU, RAM, PID, name | `1`, `2`, `3`, `4` | click CPU, MEM, PID, or NAME; click again to reverse |
 | Open the full observed command | `v` from Overview | click **View full command** |
 | Open Profile | `p` | click **Profile** |
 | Gracefully end a process | `x` or `Delete`, then confirm | click **End process**, then confirm |

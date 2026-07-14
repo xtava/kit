@@ -15,6 +15,7 @@ const PROC_PIDLISTTHREADS: libc::c_int = 6;
 const PROC_PIDLISTFDS: libc::c_int = 1;
 const PATH_CAPACITY: usize = 4_096;
 const THREAD_LIST_SLACK: usize = 16;
+const THREAD_LIST_RETRIES: usize = 3;
 
 #[repr(C)]
 struct ProcBsdInfo {
@@ -142,17 +143,10 @@ pub fn read_process_observation(pid: u32) -> io::Result<ProcessObservation> {
 
 pub fn read_process_tasks(pid: u32) -> io::Result<TaskBatch> {
     let pid = native_pid(pid)?;
-    let requested = call_pidinfo(pid, PROC_PIDLISTTHREADS, 0, std::ptr::null_mut(), 0)?;
-    let capacity = (requested as usize / size_of::<u64>()).saturating_add(THREAD_LIST_SLACK);
-    let mut thread_ids = vec![0_u64; capacity];
-    let written = call_pidinfo(
-        pid,
-        PROC_PIDLISTTHREADS,
-        0,
-        thread_ids.as_mut_ptr().cast(),
-        byte_len(&thread_ids)?,
-    )?;
-    thread_ids.truncate(written as usize / size_of::<u64>());
+    let task_info = read_task_info(pid)?;
+    let thread_count = usize::try_from(task_info.thread_count)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "negative thread count"))?;
+    let thread_ids = read_thread_ids(pid, thread_count.saturating_add(THREAD_LIST_SLACK))?;
 
     let mut tasks = Vec::with_capacity(thread_ids.len());
     let mut failures = Vec::new();
@@ -164,6 +158,32 @@ pub fn read_process_tasks(pid: u32) -> io::Result<TaskBatch> {
         }
     }
     Ok(TaskBatch { tasks, failures })
+}
+
+fn read_thread_ids(pid: libc::c_int, mut capacity: usize) -> io::Result<Vec<u64>> {
+    capacity = capacity.max(THREAD_LIST_SLACK);
+    for _ in 0..THREAD_LIST_RETRIES {
+        let mut thread_ids = vec![0_u64; capacity];
+        let written = call_pidinfo(
+            pid,
+            PROC_PIDLISTTHREADS,
+            0,
+            thread_ids.as_mut_ptr().cast(),
+            byte_len(&thread_ids)?,
+        )? as usize;
+        if written % size_of::<u64>() != 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "unaligned thread list"));
+        }
+        let count = written / size_of::<u64>();
+        if count < capacity {
+            thread_ids.truncate(count);
+            return Ok(thread_ids);
+        }
+        capacity = capacity.checked_mul(2).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "thread list is too large")
+        })?;
+    }
+    Err(io::Error::other("thread list changed during every collection attempt"))
 }
 
 fn read_thread(pid: libc::c_int, thread_id: u64) -> io::Result<TaskStat> {
@@ -298,4 +318,31 @@ fn detail_unavailable(error: &io::Error) -> DetailUnavailable {
 
 pub fn send_action(_key: ProcessKey, _action: ProcessAction) -> Result<(), ActionError> {
     Err(ActionError::Unsupported { reason: "macOS process actions are read-only" })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_layout_matches_the_xnu_contract() {
+        assert_eq!(size_of::<ProcBsdInfo>(), 136);
+        assert_eq!(size_of::<ProcTaskInfo>(), 96);
+        assert_eq!(size_of::<ProcThreadInfo>(), 112);
+        assert_eq!(size_of::<ProcFdInfo>(), 8);
+    }
+
+    #[test]
+    fn current_process_exposes_identity_threads_and_resources() {
+        let pid = std::process::id();
+        assert!(read_process_observation(pid).unwrap().start_token > 0);
+
+        let tasks = read_process_tasks(pid).unwrap();
+        assert!(!tasks.tasks.is_empty());
+
+        let resources = read_process_resources(pid).unwrap();
+        assert!(matches!(resources.executable, Observed::Value(_)));
+        assert!(matches!(resources.virtual_bytes, Observed::Value(bytes) if bytes > 0));
+        assert!(matches!(resources.open_resources, Observed::Value(_)));
+    }
 }
