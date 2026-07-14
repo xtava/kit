@@ -19,7 +19,7 @@ pub fn print(snapshot: &StatsSnapshot) {
         let core = process.last_cpu.map(|core| core.to_string()).unwrap_or_else(|| "-".into());
         println!(
             "{:>7} {:>7.1}% {:>9} {:>6}  {}",
-            process.key.pid,
+            process.identity.pid(),
             process.cpu_percent,
             bytes(process.rss_bytes),
             core,

@@ -1,10 +1,13 @@
 //! stats — an interactive, process-aware system monitor.
 
-mod linux;
+mod app;
+mod history;
+mod host;
 mod model;
+mod render;
 mod report;
 mod sampler;
-mod signal;
+mod tree;
 mod tui;
 
 use std::time::Duration;
@@ -15,7 +18,6 @@ use clap::{ArgMatches, Command, CommandFactory, FromArgMatches, Parser};
 
 use crate::framework::{Context, Tool, ToolMeta};
 
-use model::DetailScope;
 use sampler::Sampler;
 
 pub fn tool() -> StatsTool {
@@ -62,9 +64,9 @@ impl Tool for StatsTool {
         }
 
         let mut sampler = Sampler::new(interval)?;
-        let _ = sampler.sample(DetailScope::None)?;
+        let _ = sampler.sample_overview()?;
         tokio::time::sleep(interval.max(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL)).await;
-        let snapshot = sampler.sample(DetailScope::None)?;
+        let snapshot = sampler.sample_overview()?;
         if cx.out.is_json() {
             cx.out.json(&snapshot)?;
         } else {

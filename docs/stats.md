@@ -17,12 +17,16 @@ kit stats --interval 500
 | Action | Keyboard | Mouse |
 | --- | --- | --- |
 | Select process | `↑`/`↓`, `j`/`k`, `PageUp`/`PageDown` | click row or scroll |
-| Expand process threads | `Enter`, `Space`, or `→` | click an already selected row |
+| Expand/collapse a process family | `Space`, `←`/`→` | click the disclosure marker |
+| Move between processes and inspector | `Tab`/`Shift-Tab`, `←`/`→` at a tree boundary | click either region |
+| Open the inspector | `Enter` | click an inspector tab |
+| Change inspector tab | `←`/`→` while the inspector is active | click Overview, Family, Threads, Resources, or Profile |
+| Focus the selected family | `f` | — |
 | Focus a logical CPU | `[`/`]` cycle cores | click a CPU tile; click again to clear |
 | Return from CPU focus | `Esc` or `c` | click the active CPU tile |
 | Search name, command, PID, or user | `/`, type, `Enter` | — |
-| Toggle process hierarchy | `t` | — |
 | Sort CPU, RAM, PID, name | `1`, `2`, `3`, `4` | click a column header |
+| Open Profile | `p` | click **Profile** |
 | Gracefully end a process | `x` or `Delete`, then confirm | click **End process**, then confirm |
 | Force kill | `X`, or `f` in confirmation | choose force in confirmation |
 | Quit | `q` or `Ctrl-C` | — |
@@ -32,23 +36,26 @@ logical CPUs. A focused core view is explicitly approximate. Linux exposes the C
 thread was last observed, not exact historical scheduler attribution, so the table is labeled
 “threads last seen on Core N · approx CPU.”
 
-The process viewport always begins at the hottest sorted row. Selecting a process updates the
-inspector without letting later CPU re-sorts drag the table down to that process's new position.
-The dashboard uses the exact Nord roles from the active btop theme on this machine, including its
-transparent terminal background, quiet gray borders, blue CPU gradient, and selected-row colors.
-The CPU surface follows btop's dense composition: one global history followed by compact logical
-core readings, while the process table keeps the full terminal width and the inspector stays in a
-fixed strip below it.
+The process viewport always begins at the hottest sorted row. Explicit navigation scrolls the table,
+while the next sample returns the viewport to the top without transferring the selected stable
+process identity. Filtering may hide a selection without replacing it; PID reuse never transfers a
+selection to the replacement generation.
+
+At 120 columns or wider, the process tree and inspector render side by side. Compact terminals show
+one active region at a time, with the same Tab and arrow navigation. The cyan border identifies the
+active region. The inspector exposes Overview, Family, Threads, Resources, and Profile as explicit
+capability-aware surfaces rather than expanding expensive detail inline in the process table.
 
 ## Safety and performance
 
 The overview keeps one persistent `sysinfo::System`, publishes only the latest snapshot, and does
-not scan every thread or collect unused per-process disk I/O. Expanding a process samples only its
-tasks. Selecting a core warms its task deltas after two seconds, then refreshes the expensive
-all-task attribution pass every four seconds. The default dashboard cadence is two seconds, matching
-the active btop configuration; `--interval` remains available for an explicit faster cadence.
+not scan every thread or collect unused per-process resources. Threads, Resources, and focused-core
+attribution are separate typed requests with bounded cadences and explicit warming, unavailable, and
+error states. Late detail responses cannot overwrite a newer request. The default overview cadence
+is two seconds; `--interval` remains available for an explicit faster cadence.
 
-Process control has no PID-only fallback. Kit opens a Linux pidfd, rechecks the process start token,
-and sends through that descriptor. It refuses PID 1, itself, an exited or replaced process, and any
-target that cannot be addressed safely. `SIGTERM` is the default and `SIGKILL` is a separate force
-action.
+Process control has no PID-only fallback. Host adapters expose their capabilities explicitly and
+revalidate stable process identity before acting. On Linux, Kit opens a pidfd, rechecks the process
+start token, and sends through that descriptor. It refuses PID 1, itself, an exited or replaced
+process, and any target that cannot be addressed safely. Graceful termination is the default and
+force termination is a separate confirmation path.
