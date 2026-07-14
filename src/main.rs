@@ -1,6 +1,6 @@
 use anyhow::Result;
 use kit::framework::Registry;
-use kit::tools::{cdp, deploy, diff, domain, record, render, scout, stats, update};
+use kit::tools::{cdp, deploy, diff, domain, record, render, scout, settings, stats, update};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -18,6 +18,7 @@ async fn main() -> Result<()> {
         .register(render::tool())
         .register(stats::tool())
         .register(update::tool())
+        .register_settings(settings::tool)
         .dispatch()
         .await
 }

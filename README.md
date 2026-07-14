@@ -25,6 +25,7 @@ does not pull or modify Git state.
 | `kit deploy` | Run typed deployment plans, inspect version history, and execute configured rollbacks. |
 | `kit record` | Start, stop, inspect, save, and replay Modular Playwright recorder runs. |
 | `kit render` | Read Markdown in the terminal and fuzzy-search Markdown files in the current workspace. |
+| `kit settings` | Edit tool-owned operator preferences in a shared TUI. |
 | `kit update` | Rebuild and reinstall Kit from its source checkout. |
 
 Use built-in help for the current command surface:

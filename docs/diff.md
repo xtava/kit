@@ -12,6 +12,7 @@ kit diff --mode split
 kit diff --context 10
 kit diff --context all
 kit diff --theme terminal
+kit settings
 ```
 
 `--mode auto` is the default. Modified files use side-by-side mode when the content pane is at least
@@ -55,8 +56,10 @@ Uninterrupted single-child directory chains are compacted into one row while pre
 directory as the expansion identity; mixed and branching directories remain separate rows.
 
 Code rows use narrow colored bars and muted row backgrounds instead of literal patch `+` / `-`
-prefixes. Inline mode omits line numbers to maximize code width; split mode retains one number per
-pane for side alignment. Omitted context is labeled as “N unmodified lines” rather than displaying
+prefixes. The `line_numbers` choice in the Diff Settings section is `auto` by default: inline mode
+omits line numbers to maximize code width, while split mode retains one number per pane for side
+alignment. Choose `always` or `never` in `kit settings`; the value is persisted in the XDG-scoped
+`diff.toml`. Omitted context is labeled as “N unmodified lines” rather than displaying
 raw `@@` hunk headers. These are presentation choices only: every staged, unstaged, and untracked
 path reported by Git remains visible in the viewer.
 

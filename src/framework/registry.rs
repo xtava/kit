@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{Arg, ArgAction, Command};
 
-use super::{ConfigStore, Context, Output, OutputFormat, Terminal, Tool};
+use super::{ConfigStore, Context, Output, OutputFormat, SettingsSection, Terminal, Tool};
 
 /// The set of registered tools, and the dispatcher that turns argv into one tool's `run`.
 pub struct Registry {
@@ -22,6 +22,15 @@ impl Registry {
     pub fn register(mut self, tool: impl Tool + 'static) -> Self {
         self.tools.push(Box::new(tool));
         self
+    }
+
+    /// Register the shared Settings tool from contributions already mounted in this registry.
+    pub fn register_settings<T: Tool + 'static>(
+        self,
+        build: impl FnOnce(Vec<SettingsSection>) -> T,
+    ) -> Self {
+        let sections = self.tools.iter().filter_map(|tool| tool.settings()).collect();
+        self.register(build(sections))
     }
 
     pub async fn dispatch(self) -> Result<()> {

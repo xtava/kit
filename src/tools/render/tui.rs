@@ -17,13 +17,13 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use super::config::Config;
+use super::config::{self, Config};
 use crate::tui::{
     fuzzy,
     markdown::MarkdownRenderer,
     theme::{self, TuiTheme},
     CommandSet, CommandSpec, EventReader, LineEditor, ParsedInput, Session, SessionOptions,
-    Suggestion, SuggestionMenu,
+    SettingsEditor, SettingsFlow, Suggestion, SuggestionMenu,
 };
 
 const SUGGESTION_ROWS: usize = 8;
@@ -87,10 +87,9 @@ enum Flow {
     Quit,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Surface {
     Viewer,
-    Configure,
+    Settings(SettingsEditor),
 }
 
 struct App {
@@ -148,8 +147,11 @@ impl App {
         {
             return Flow::Quit;
         }
-        if self.surface == Surface::Configure {
-            return self.on_configure_key(key);
+        if let Surface::Settings(editor) = &mut self.surface {
+            if editor.on_key(key) == SettingsFlow::Exit {
+                self.leave_settings();
+            }
+            return Flow::Continue;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('u') {
             self.clear_search();
@@ -197,7 +199,7 @@ impl App {
     }
 
     fn on_mouse(&mut self, mouse: MouseEvent) {
-        if self.surface == Surface::Configure {
+        if matches!(self.surface, Surface::Settings(_)) {
             return;
         }
         match mouse.kind {
@@ -205,19 +207,6 @@ impl App {
             MouseEventKind::ScrollDown => self.scroll_by(SCROLL_STEP),
             _ => {}
         }
-    }
-
-    fn on_configure_key(&mut self, key: KeyEvent) -> Flow {
-        match key.code {
-            KeyCode::Enter | KeyCode::Char(' ') => self.toggle_ignored_visibility(),
-            KeyCode::Char('t' | 'T') => {
-                let next = theme::next_built_in(&self.theme_spec);
-                self.apply_theme(next);
-            }
-            KeyCode::Esc => self.leave_configuration(),
-            _ => {}
-        }
-        Flow::Continue
     }
 
     fn submit_typed(&mut self) -> Flow {
@@ -294,7 +283,11 @@ impl App {
     fn dispatch_command(&mut self, name: &str, args: &str) -> Flow {
         match name {
             "configure" if args.trim().is_empty() => {
-                self.surface = Surface::Configure;
+                self.surface = Surface::Settings(SettingsEditor::open(
+                    self.config.store(),
+                    vec![config::settings()],
+                    self.theme,
+                ));
                 self.input.clear();
                 self.suggestions = None;
                 Flow::Continue
@@ -322,22 +315,6 @@ impl App {
             }
             "quit" => Flow::Quit,
             _ => Flow::Continue,
-        }
-    }
-
-    fn toggle_ignored_visibility(&mut self) {
-        let show = !self.config.show_git_ignored();
-        match self.config.set_show_git_ignored(show) {
-            Ok(()) => {
-                let state = if show { "shown" } else { "hidden" };
-                self.notice = Notice::info(format!(
-                    "Git-ignored Markdown {state} · saved {}",
-                    self.config.path().display()
-                ));
-            }
-            Err(error) => {
-                self.notice = Notice::error(format!("save render configuration: {error:#}"));
-            }
         }
     }
 
@@ -411,7 +388,27 @@ impl App {
         ranked.into_iter().map(|(_, suggestion)| suggestion).collect()
     }
 
-    fn leave_configuration(&mut self) {
+    fn leave_settings(&mut self) {
+        let store = self.config.store();
+        match Config::load(store) {
+            Ok(config) => {
+                let requested_theme = config.theme().to_owned();
+                self.config = config;
+                match theme::resolve(&requested_theme) {
+                    Ok((spec, theme)) => {
+                        self.theme_spec = spec;
+                        self.theme = theme;
+                        self.notice = Notice::info("Settings updated".to_owned());
+                    }
+                    Err(error) => {
+                        self.notice = Notice::error(format!("reload Render theme: {error:#}"));
+                    }
+                }
+            }
+            Err(error) => {
+                self.notice = Notice::error(format!("reload Render Settings: {error:#}"));
+            }
+        }
         self.surface = Surface::Viewer;
         self.input.clear();
         self.refresh_suggestions();
@@ -594,10 +591,6 @@ impl Catalog {
         Self { entries }
     }
 
-    fn ignored_count(&self) -> usize {
-        self.entries.iter().filter(|entry| entry.ignored).count()
-    }
-
     fn suggestions(
         &self,
         query: &str,
@@ -714,6 +707,10 @@ impl Notice {
 fn render(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
     frame.render_widget(Block::new().style(Style::default().bg(app.theme.background)), area);
+    if let Surface::Settings(editor) = &mut app.surface {
+        editor.render(frame, area);
+        return;
+    }
     let shown =
         app.suggestions.as_ref().map_or(0, |menu| menu.visible_rows(area, SUGGESTION_ROWS, 8));
     let menu_height = if shown == 0 { 0 } else { shown as u16 + 1 };
@@ -732,11 +729,6 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
 }
 
 fn render_document(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
-    if app.surface == Surface::Configure {
-        render_configuration(frame, area, app);
-        return;
-    }
-
     let Some(document) = &app.document else {
         let body = vec![
             Line::from(""),
@@ -775,81 +767,7 @@ fn render_document(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     frame.render_widget(paragraph.block(panel(title, app.theme)).scroll((scroll, 0)), area);
 }
 
-fn render_configuration(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
-    let show = app.config.show_git_ignored();
-    let state = if show { "shown" } else { "hidden" };
-    let state_style = if show {
-        Style::default().fg(app.theme.accent).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(app.theme.text_muted).add_modifier(Modifier::BOLD)
-    };
-    let ignored = app.catalog.ignored_count();
-    let body = vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            "Render settings",
-            Style::default().fg(app.theme.text_strong).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("▌ ", Style::default().fg(app.theme.accent)),
-            Span::raw("Git-ignored Markdown  "),
-            Span::styled(format!("[{state}]"), state_style),
-        ]),
-        Line::from(Span::styled(
-            format!("  {ignored} ignored Markdown file(s) found under {}", app.root.display()),
-            Style::default().fg(app.theme.text),
-        )),
-        Line::from(Span::styled(
-            "  Shown files remain marked as ignored in fuzzy results.",
-            Style::default().fg(app.theme.text_muted),
-        )),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("▌ ", Style::default().fg(app.theme.accent_alt)),
-            Span::raw("Theme                "),
-            Span::styled(
-                format!("[{}]", app.theme_spec),
-                Style::default().fg(app.theme.accent_alt).add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(Span::styled(
-            "  T cycles built-ins · /theme <name|path> loads and persists a custom theme.",
-            Style::default().fg(app.theme.text_muted),
-        )),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("Config  ", Style::default().fg(app.theme.text_muted)),
-            Span::raw(app.config.path().display().to_string()),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Enter/Space toggles ignored files · T changes theme · Esc returns",
-            Style::default().fg(app.theme.text_muted),
-        )),
-    ];
-    app.set_geometry(body.len(), area.height.saturating_sub(2) as usize);
-    frame.render_widget(Paragraph::new(body).block(panel(" configuration ", app.theme)), area);
-}
-
 fn render_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    if app.surface == Surface::Configure {
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    "configure› ",
-                    Style::default().fg(app.theme.accent).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    "‹Enter/Space ignored · T theme · Esc close›",
-                    Style::default().fg(app.theme.text_muted),
-                ),
-            ]))
-            .style(Style::default().fg(app.theme.text).bg(app.theme.background)),
-            area,
-        );
-        return;
-    }
     let prompt = "file› ";
     let mut spans = vec![
         Span::styled(prompt, Style::default().fg(app.theme.accent).add_modifier(Modifier::BOLD)),
@@ -1098,12 +1016,16 @@ mod tests {
 
         app.input.set("/configure".to_owned());
         assert_eq!(app.submit_typed(), Flow::Continue);
-        assert_eq!(app.surface, Surface::Configure);
+        assert!(matches!(app.surface, Surface::Settings(_)));
         assert!(app.config.show_git_ignored());
 
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
         assert!(!app.config.show_git_ignored());
-        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
         assert_eq!(app.theme_spec, "terminal");
         let reloaded =
             Config::load(crate::framework::ConfigStore::rooted(temp.0.join("config"))).unwrap();

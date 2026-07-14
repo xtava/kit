@@ -13,6 +13,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use super::config::LineNumbers;
 use super::git::{load_repository, stage_document, unstage_document};
 use super::model::{
     ChangeGroup, ChangeKind, DiffBody, DiffContext, DiffDocument, LineCell, RowKind, SpecialState,
@@ -76,8 +77,9 @@ pub async fn run(
     mouse_capture: bool,
     mode: ViewMode,
     context: DiffContext,
+    line_numbers: LineNumbers,
 ) -> Result<()> {
-    let mut app = DiffApp::new(documents, theme, mode);
+    let mut app = DiffApp::with_line_numbers(documents, theme, mode, line_numbers);
     let mut session = Session::open(SessionOptions { mouse_capture })?;
     let mut events = EventReader::start();
     let mut repository_task = None;
@@ -256,6 +258,7 @@ struct ProjectionKey {
     old_horizontal_scroll: usize,
     new_horizontal_scroll: usize,
     divider_percent: u16,
+    line_numbers: LineNumbers,
 }
 
 struct DocumentProjection {
@@ -283,11 +286,22 @@ struct DiffApp {
     hovered_file: Option<usize>,
     repository_status: Option<RepositoryStatus>,
     theme: TuiTheme,
+    line_numbers: LineNumbers,
     regions: UiRegions,
 }
 
 impl DiffApp {
+    #[cfg(test)]
     fn new(documents: Vec<DiffDocument>, theme: TuiTheme, mode: ViewMode) -> Self {
+        Self::with_line_numbers(documents, theme, mode, LineNumbers::Auto)
+    }
+
+    fn with_line_numbers(
+        documents: Vec<DiffDocument>,
+        theme: TuiTheme,
+        mode: ViewMode,
+        line_numbers: LineNumbers,
+    ) -> Self {
         let expanded = directory_keys(&documents).into_iter().collect();
         Self {
             selected: (!documents.is_empty()).then_some(0),
@@ -309,6 +323,7 @@ impl DiffApp {
             hovered_file: None,
             repository_status: None,
             theme,
+            line_numbers,
             regions: UiRegions::default(),
         }
     }
@@ -948,6 +963,7 @@ fn render_document(frame: &mut Frame<'_>, area: Rect, app: &mut DiffApp) {
         old_horizontal_scroll: app.old_horizontal_scroll,
         new_horizontal_scroll: app.new_horizontal_scroll,
         divider_percent: app.divider_percent,
+        line_numbers: app.line_numbers,
     };
     if app.document_projection.as_ref().is_none_or(|projection| projection.key != key) {
         let document = &app.documents[document_index];
@@ -971,7 +987,8 @@ fn render_document(frame: &mut Frame<'_>, area: Rect, app: &mut DiffApp) {
     let max_scroll = projection.lines.len().saturating_sub(inner.height as usize);
     app.content_scroll = app.content_scroll.min(max_scroll);
     if effective == EffectiveMode::Split {
-        let left_width = split_widths(inner.width as usize, app.divider_percent).0;
+        let left_width =
+            split_widths(inner.width as usize, app.divider_percent, app.line_numbers.show(true)).0;
         app.regions.divider =
             Some(Rect::new(inner.x + left_width as u16, inner.y, 1, inner.height));
     }
@@ -1098,6 +1115,7 @@ fn inline_text_lines(text: &TextDiffDocument, app: &DiffApp, width: usize) -> Ve
                         theme,
                         app.new_horizontal_scroll,
                         width,
+                        app.line_numbers.show(false),
                     );
                 }
                 RowKind::Changed => {
@@ -1111,6 +1129,7 @@ fn inline_text_lines(text: &TextDiffDocument, app: &DiffApp, width: usize) -> Ve
                             theme,
                             app.old_horizontal_scroll,
                             width,
+                            app.line_numbers.show(false),
                         );
                     }
                     if let Some(new) = &row.new {
@@ -1123,6 +1142,7 @@ fn inline_text_lines(text: &TextDiffDocument, app: &DiffApp, width: usize) -> Ve
                             theme,
                             app.new_horizontal_scroll,
                             width,
+                            app.line_numbers.show(false),
                         );
                     }
                 }
@@ -1144,7 +1164,8 @@ fn inline_text_lines(text: &TextDiffDocument, app: &DiffApp, width: usize) -> Ve
 
 fn split_text_lines(text: &TextDiffDocument, app: &DiffApp, width: usize) -> Vec<RenderedLine> {
     let theme = app.theme;
-    let (left_width, right_width) = split_widths(width, app.divider_percent);
+    let show_line_numbers = app.line_numbers.show(true);
+    let (left_width, right_width) = split_widths(width, app.divider_percent, show_line_numbers);
     let mut lines = Vec::new();
     for (hunk_index, hunk) in text.hunks.iter().enumerate() {
         push_hunk_separator(&mut lines, text, hunk_index, width, theme);
@@ -1157,6 +1178,7 @@ fn split_text_lines(text: &TextDiffDocument, app: &DiffApp, width: usize) -> Vec
                 theme,
                 app.old_horizontal_scroll,
                 left_width,
+                show_line_numbers,
             );
             spans.push(Span::styled("│", Style::default().fg(theme.border)));
             spans.extend(split_side(
@@ -1166,6 +1188,7 @@ fn split_text_lines(text: &TextDiffDocument, app: &DiffApp, width: usize) -> Vec
                 theme,
                 app.new_horizontal_scroll,
                 right_width,
+                show_line_numbers,
             ));
             lines.push(RenderedLine { line: Line::from(spans), anchor });
         }
@@ -1191,6 +1214,7 @@ fn split_side(
     theme: TuiTheme,
     horizontal_scroll: usize,
     width: usize,
+    show_line_numbers: bool,
 ) -> Vec<Span<'static>> {
     let background = change.map(|side| change_background(theme, side));
     let base = background
@@ -1199,14 +1223,18 @@ fn split_side(
     let Some(cell) = cell else {
         return vec![Span::styled(" ".repeat(width), base)];
     };
-    let gutter = format!("{:>5} ", cell.line_index + 1);
     let source = snapshot.display_line(cell.line_index);
     let styled = apply_emphasis(source, &cell.emphasis, base);
     let newline_marker = cell.missing_newline.then_some(" ⏎");
     let marker_width = newline_marker.map(UnicodeWidthStr::width).unwrap_or(0);
-    let available = width.saturating_sub(SPLIT_GUTTER_WIDTH + marker_width);
+    let gutter_width = if show_line_numbers { SPLIT_GUTTER_WIDTH } else { CHANGE_INDICATOR_WIDTH };
+    let available = width.saturating_sub(gutter_width + marker_width);
     let gutter_foreground = readable_foreground(theme.text_muted, background, theme);
-    let mut spans = vec![Span::styled(gutter, base.fg(gutter_foreground))];
+    let mut spans = Vec::new();
+    if show_line_numbers {
+        spans
+            .push(Span::styled(format!("{:>5} ", cell.line_index + 1), base.fg(gutter_foreground)));
+    }
     spans.push(change_indicator(change, base, theme));
     spans.extend(crop_spans(styled, horizontal_scroll, available));
     if let Some(marker) = newline_marker {
@@ -1276,9 +1304,9 @@ fn push_context_separator(
     });
 }
 
-fn split_widths(width: usize, percent: u16) -> (usize, usize) {
+fn split_widths(width: usize, percent: u16, show_line_numbers: bool) -> (usize, usize) {
     let content = width.saturating_sub(1);
-    let minimum = SPLIT_GUTTER_WIDTH + 1;
+    let minimum = if show_line_numbers { SPLIT_GUTTER_WIDTH + 1 } else { 3 };
     let left = ((content * percent as usize) / 100).clamp(minimum, content.saturating_sub(minimum));
     (left, content.saturating_sub(left))
 }
@@ -1301,6 +1329,7 @@ fn push_source_line(
     theme: TuiTheme,
     horizontal_scroll: usize,
     width: usize,
+    show_line_numbers: bool,
 ) {
     let background = change.map(|side| change_background(theme, side));
     let base = background
@@ -1310,8 +1339,16 @@ fn push_source_line(
     let styled = apply_emphasis(source, &cell.emphasis, base);
     let newline_marker = cell.missing_newline.then_some("  ⏎ no newline");
     let marker_width = newline_marker.map(UnicodeWidthStr::width).unwrap_or(0);
-    let available = width.saturating_sub(CHANGE_INDICATOR_WIDTH + marker_width);
-    let mut spans = vec![change_indicator(change, base, theme)];
+    let gutter_width = if show_line_numbers { 6 } else { 0 };
+    let available = width.saturating_sub(gutter_width + CHANGE_INDICATOR_WIDTH + marker_width);
+    let mut spans = Vec::new();
+    if show_line_numbers {
+        spans.push(Span::styled(
+            format!("{:>5} ", cell.line_index + 1),
+            base.fg(readable_foreground(theme.text_muted, background, theme)),
+        ));
+    }
+    spans.push(change_indicator(change, base, theme));
     spans.extend(crop_spans(styled, horizontal_scroll, available));
     if let Some(marker) = newline_marker {
         spans.push(Span::styled(marker, base.fg(theme.warning).add_modifier(Modifier::ITALIC)));
@@ -2256,6 +2293,37 @@ mod tests {
                 .first()
                 .is_some_and(|indicator| UnicodeWidthStr::width(indicator.content.as_ref()) == 2)
         }));
+    }
+
+    #[test]
+    fn line_number_setting_controls_every_text_projection() {
+        let document = document(ChangeGroup::Changes, "src/lib.rs", "same\nold\n", "same\nnew\n");
+        let DiffBody::Text(text) = &document.body else {
+            panic!("text fixture");
+        };
+        let always = DiffApp::with_line_numbers(
+            vec![document.clone()],
+            NORD,
+            ViewMode::Inline,
+            LineNumbers::Always,
+        );
+        let inline = inline_text_lines(text, &always, 100);
+        assert!(inline
+            .iter()
+            .filter(|line| line.anchor.row.is_some())
+            .all(|line| line_text(&line.line).starts_with("    ")));
+
+        let never = DiffApp::with_line_numbers(
+            vec![document.clone()],
+            NORD,
+            ViewMode::Split,
+            LineNumbers::Never,
+        );
+        let split = split_text_lines(text, &never, 100);
+        assert!(split
+            .iter()
+            .filter(|line| line.anchor.row.is_some())
+            .all(|line| !line_text(&line.line).starts_with("    ")));
     }
 
     #[test]

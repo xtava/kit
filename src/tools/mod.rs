@@ -8,5 +8,6 @@ pub mod domain;
 pub mod record;
 pub mod render;
 pub mod scout;
+pub mod settings;
 pub mod stats;
 pub mod update;

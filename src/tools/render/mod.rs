@@ -9,7 +9,7 @@ use anyhow::{bail, Context as AnyhowContext, Result};
 use async_trait::async_trait;
 use clap::{ArgMatches, Command, CommandFactory, FromArgMatches, Parser};
 
-use crate::framework::{Context, Tool, ToolMeta};
+use crate::framework::{Context, SettingsSection, Tool, ToolMeta};
 use config::Config;
 
 pub fn tool() -> RenderTool {
@@ -46,6 +46,10 @@ impl Tool for RenderTool {
 
     fn command(&self) -> Command {
         RenderArgs::command()
+    }
+
+    fn settings(&self) -> Option<SettingsSection> {
+        Some(config::settings())
     }
 
     async fn run(&self, cx: &Context, matches: &ArgMatches) -> Result<()> {

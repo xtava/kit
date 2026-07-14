@@ -2,7 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use clap::{ArgMatches, Command};
 
-use super::Context;
+use super::{Context, SettingsSection};
 
 /// A tool's identity — drives dispatch (`name`), the tool list, and help text.
 pub struct ToolMeta {
@@ -20,6 +20,11 @@ pub struct ToolMeta {
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn meta(&self) -> ToolMeta;
+
+    /// Operator Settings contributed by this tool, when it has editable preferences.
+    fn settings(&self) -> Option<SettingsSection> {
+        None
+    }
 
     /// The tool's clap subcommand, mounted under `kit <name>`. Build it from a derived
     /// `Args` struct via `Args::command().name(self.meta().name)` to keep derive ergonomics.

@@ -1,5 +1,6 @@
 //! `diff` — Git working-tree comparison and index review.
 
+mod config;
 mod git;
 mod model;
 mod tui;
@@ -10,7 +11,8 @@ use anyhow::{bail, Context as _, Result};
 use async_trait::async_trait;
 use clap::{ArgMatches, Command, CommandFactory, FromArgMatches, Parser, ValueEnum};
 
-use crate::framework::{Context, Tool, ToolMeta};
+use crate::framework::{Context, SettingsSection, Tool, ToolMeta};
+use config::Config;
 
 pub use git::load_repository;
 pub use model::{ChangeGroup, ChangeKind, DiffContext, DiffDocument, DiffInput, SpecialState};
@@ -66,12 +68,17 @@ impl Tool for DiffTool {
         DiffArgs::command()
     }
 
+    fn settings(&self) -> Option<SettingsSection> {
+        Some(config::settings())
+    }
+
     async fn run(&self, cx: &Context, matches: &ArgMatches) -> Result<()> {
         let args = DiffArgs::from_arg_matches(matches)?;
         if !cx.term.interactive() {
             bail!("kit diff requires an interactive terminal");
         }
         let cwd = env::current_dir().context("resolve current directory")?;
+        let config = Config::load(cx.config.clone())?;
         let documents = load_repository(&cwd, args.context)?;
         let (_, theme) = crate::tui::theme::resolve(&args.theme)
             .with_context(|| format!("load diff theme {:?}", args.theme))?;
@@ -80,7 +87,8 @@ impl Tool for DiffTool {
             ModeArg::Inline => tui::ViewMode::Inline,
             ModeArg::Split => tui::ViewMode::Split,
         };
-        tui::run(cwd, documents, theme, !args.no_mouse, mode, args.context).await
+        tui::run(cwd, documents, theme, !args.no_mouse, mode, args.context, config.line_numbers())
+            .await
     }
 }
 
