@@ -11,12 +11,15 @@ mod editor;
 mod events;
 pub mod fuzzy;
 pub mod markdown;
+mod navigation;
 mod session;
 mod suggestions;
+pub mod syntax;
 pub mod theme;
 
 pub use commandline::{CommandSet, CommandSpec, ParsedInput};
 pub use editor::LineEditor;
 pub use events::EventReader;
+pub use navigation::{Direction, NavigationMap, NavigationRegion};
 pub use session::{Session, SessionOptions};
 pub use suggestions::{Suggestion, SuggestionMenu};

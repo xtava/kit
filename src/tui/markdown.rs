@@ -3,8 +3,6 @@
 //! The renderer owns Markdown semantics and width-aware terminal layout. It performs no I/O and
 //! deliberately emits presentation text rather than Markdown source delimiters.
 
-use std::sync::LazyLock;
-
 use pulldown_cmark::{
     Alignment as MarkdownAlignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Options,
     Parser, Tag, TagEnd,
@@ -13,23 +11,10 @@ use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span, Text},
 };
-use syntect::{
-    easy::HighlightLines,
-    highlighting::{FontStyle, Theme, ThemeSet},
-    parsing::SyntaxSet,
-};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use super::syntax;
 use super::theme::{TuiTheme, NORD};
-
-static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
-static CODE_THEME: LazyLock<Theme> = LazyLock::new(|| {
-    ThemeSet::load_defaults()
-        .themes
-        .get("base16-ocean.dark")
-        .cloned()
-        .expect("syntect ships the base16-ocean.dark theme")
-});
 
 #[derive(Clone, Debug)]
 struct MarkdownTheme {
@@ -670,51 +655,7 @@ fn highlight_code(
     fallback: Style,
     palette: TuiTheme,
 ) -> Vec<Vec<Span<'static>>> {
-    let syntax = SYNTAXES
-        .find_syntax_by_token(language)
-        .or_else(|| SYNTAXES.find_syntax_by_extension(language));
-    let Some(syntax) = syntax else {
-        return lines
-            .into_iter()
-            .map(|line| vec![Span::styled(line.to_owned(), fallback)])
-            .collect();
-    };
-
-    let mut highlighter = HighlightLines::new(syntax, &CODE_THEME);
-    lines
-        .into_iter()
-        .map(|line| {
-            highlighter
-                .highlight_line(line, &SYNTAXES)
-                .map(|ranges| {
-                    ranges
-                        .into_iter()
-                        .map(|(style, text)| {
-                            Span::styled(text.to_owned(), syntect_style(style, palette))
-                        })
-                        .collect()
-                })
-                .unwrap_or_else(|_| vec![Span::styled(line.to_owned(), fallback)])
-        })
-        .collect()
-}
-
-fn syntect_style(style: syntect::highlighting::Style, palette: TuiTheme) -> Style {
-    let mut output = Style::default().fg(palette.nearest_syntax_color(
-        style.foreground.r,
-        style.foreground.g,
-        style.foreground.b,
-    ));
-    if style.font_style.contains(FontStyle::BOLD) {
-        output = output.add_modifier(Modifier::BOLD);
-    }
-    if style.font_style.contains(FontStyle::ITALIC) {
-        output = output.add_modifier(Modifier::ITALIC);
-    }
-    if style.font_style.contains(FontStyle::UNDERLINE) {
-        output = output.add_modifier(Modifier::UNDERLINED);
-    }
-    output
+    syntax::highlight_lines(lines, language, fallback, palette)
 }
 
 fn render_table(
