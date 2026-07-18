@@ -67,10 +67,10 @@ impl Session {
     /// draws on (which is itself a `Write`), so it's ordered with frames and never races a redraw.
     pub fn copy(&mut self, text: &str) -> Result<()> {
         let backend = self.terminal.backend_mut();
-        backend
-            .write_all(super::clipboard::osc52(text).as_bytes())
-            .context("write clipboard escape")?;
+        let escape = super::clipboard::osc52(text);
+        backend.write_all(escape.as_bytes()).context("write clipboard escape")?;
         backend.flush().context("flush clipboard escape")?;
+        drop(escape);
         // The escape bytes desync ratatui's diff buffer; force the next draw to repaint in full.
         self.terminal.clear().context("repaint after clipboard write")
     }

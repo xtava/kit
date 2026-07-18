@@ -5,16 +5,22 @@
 //! This module only *builds* the escape sequence. Writing it is [`crate::tui::Session::copy`]'s job,
 //! so the bytes go through the same terminal handle ratatui draws on and never race a redraw.
 
+use zeroize::Zeroizing;
+
 /// The OSC 52 sequence that asks the terminal to set the clipboard to `text`:
 /// `ESC ] 52 ; c ; <base64> BEL`.
-pub fn osc52(text: &str) -> String {
-    format!("\x1b]52;c;{}\x07", base64(text.as_bytes()))
+pub fn osc52(text: &str) -> Zeroizing<String> {
+    let encoded_len = text.len().div_ceil(3) * 4;
+    let mut out = Zeroizing::new(String::with_capacity(8 + encoded_len));
+    out.push_str("\x1b]52;c;");
+    append_base64(&mut out, text.as_bytes());
+    out.push('\x07');
+    out
 }
 
 const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-fn base64(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+fn append_base64(out: &mut String, bytes: &[u8]) {
     for chunk in bytes.chunks(3) {
         let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
         let triple = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
@@ -27,12 +33,17 @@ fn base64(bytes: &[u8]) -> String {
             });
         }
     }
-    out
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{base64, osc52};
+    use super::{append_base64, osc52};
+
+    fn base64(bytes: &[u8]) -> String {
+        let mut out = String::new();
+        append_base64(&mut out, bytes);
+        out
+    }
 
     #[test]
     fn base64_matches_known_vectors() {
@@ -45,6 +56,6 @@ mod tests {
 
     #[test]
     fn osc52_wraps_base64_in_the_escape() {
-        assert_eq!(osc52("foo"), "\x1b]52;c;Zm9v\x07");
+        assert_eq!(osc52("foo").as_str(), "\x1b]52;c;Zm9v\x07");
     }
 }
