@@ -13,6 +13,10 @@
 
 The dependency direction is architectural: `tools/* -> framework | tui | cdp`; never `tools/a -> tools/b`.
 
+Read [CONTRIBUTING.md](./CONTRIBUTING.md) before non-trivial changes. It defines the reuse-first
+workflow: tools own domain policy and presentation, shared modules own reusable mechanics, and
+cross-tool behavior must have one canonical owner rather than copied per-tool implementations.
+
 ## Build, Test, and Development Commands
 
 - `cargo watch -x check`: fast edit loop for type and borrow-checking.
@@ -59,6 +63,11 @@ Keep engines pure and testable: parsing, probing, grouping, and protocol logic s
 ## Testing Guidelines
 
 Put focused unit tests near pure engine code and broader behavior tests in `tests/`. Name tests by behavior, for example `errors_view_collapses_real_duplicate_errors`. CDP integration tests may skip when no Chrome binary is present; still run `cargo test` before handing off changes. For `kit cdp` daemon changes, also exercise a live command and detach stale daemons with `kit cdp detach --all`.
+
+For `kit stats`, agents must use the canonical headless verification path in
+[`docs/canonical/stats-headless-verification.md`](./docs/canonical/stats-headless-verification.md).
+Do not launch a terminal window, PTY verifier, or interactive Stats session unless the user
+explicitly requests interactive validation.
 
 ## Commit & Pull Request Guidelines
 
