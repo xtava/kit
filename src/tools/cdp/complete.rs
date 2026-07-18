@@ -335,22 +335,23 @@ fn value_flag<'a>(node: &'a clap::Command, long: &str) -> Option<&'a clap::Arg> 
 /// narrows to the `@ref` inserts alone.
 fn rank(pool: Vec<Suggestion>, needle: &str) -> Vec<Suggestion> {
     let by_name = needle.trim_start_matches('@');
-    let mut ranked: Vec<(u32, Suggestion)> = pool
+    let mut insert_matcher = fuzzy::Matcher::case_insensitive(needle);
+    let mut hint_matcher = fuzzy::Matcher::case_insensitive(by_name);
+    let mut ranked: Vec<((u8, u64), Suggestion)> = pool
         .into_iter()
         .filter_map(|candidate| {
             if needle.is_empty() {
-                return Some((0, candidate));
+                return Some(((0, 0), candidate));
             }
-            match fuzzy::score_ci(&candidate.insert, needle) {
-                Some(score) => Some((u32::from(score), candidate)),
+            match insert_matcher.score(&candidate.insert) {
+                Some(score) => Some(((0, score), candidate)),
                 None if by_name.is_empty() => None,
-                None => fuzzy::score_ci(&candidate.hint, by_name)
-                    .map(|score| (10_000 + u32::from(score), candidate)),
+                None => hint_matcher.score(&candidate.hint).map(|score| ((1, score), candidate)),
             }
         })
         .collect();
     if !needle.is_empty() {
-        ranked.sort_by_key(|(score, _)| *score);
+        ranked.sort_by_key(|(rank, _)| *rank);
     }
     ranked.into_iter().map(|(_, candidate)| candidate).collect()
 }

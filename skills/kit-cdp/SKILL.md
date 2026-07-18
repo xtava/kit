@@ -6,8 +6,9 @@ description: >-
   against a running app, CDP clicks/fills/presses, screenshots, accessibility
   snapshots, console or network error diagnosis, live logpoints, function traces,
   source-map stack resolution, websocket inspection, value watches, or evidence
-  bundles. Handles multiple app instances with `--app <selector>` and every
-  command supports `--json`.
+  bundles. Resolves the app owned by the current Git worktree automatically,
+  supports intentional cross-instance selection with `--app <selector>`, and
+  every command supports `--json`.
 license: MIT
 metadata:
   source: https://github.com/xtava/kit
@@ -24,24 +25,26 @@ happened, in as few round trips as possible.
 
 **Expect several instances at once.** Multiple worktrees, dev ports, or launched
 sessions run side by side, each its own attachment and its own Timeline — they never
-merge. Almost every command therefore takes `--app <selector>` to pick which one. See
-*Pick the instance* below; in scripts always pass it.
+merge. Normal commands select the instance owned by the current Git worktree. Use
+`--app <selector>` only as an intentional cross-instance or launched-session override.
 
 Requires the `kit` binary on PATH (`cargo install --path .` from the kit repo).
 
-## Orient first
+## Start with the operation
 
 ```bash
-kit cdp                     # instances available + live attachments — run this first
-kit cdp ready --app dev     # is the app up? which target won, and why
-kit cdp state --app dev     # readiness, recent failures, focus; --visual adds a screenshot
-kit cdp targets --app dev   # every target, with the selector that addresses it
+kit cdp screenshot          # current worktree, lazy attachment
+kit cdp state --visual      # readiness, recent failures, focus, screenshot
+kit cdp ready               # is the app up? which target won, and why
 ```
 
-### Pick the instance
+There is no orientation or attach prerequisite. Use bare `kit cdp` only when you
+actually need the fleet overview.
 
-Bare `kit cdp` lists every instance it can see. Pick one with `--app <selector>`,
-matched against the app name, worktree, instance id, or port:
+### Override the instance
+
+`--app <selector>` overrides worktree selection. It matches the internal attachment
+name, app name, worktree label/path, instance id, or exact port:
 
 ```bash
 kit cdp --app my-feature-worktree eval 'location.href'   # by worktree
@@ -49,9 +52,13 @@ kit cdp --app instance-8 ready                            # by instance id
 kit cdp --app 9333 ready                                  # by debug port
 ```
 
-- **Omit `--app` only when exactly one instance is running.** With several up, a bare
-  command is ambiguous — it errors and lists the candidates rather than guessing. In
-  scripts, always pass `--app`.
+- **Inside a Git worktree, omit `--app` for the normal case.** Kit considers only
+  processes owned by that exact worktree; it never falls back to the main checkout.
+- If that worktree has zero or multiple CDP endpoints, Kit errors with the scoped
+  candidates rather than guessing. Outside Git, omission is allowed only when exactly
+  one instance exists.
+- Pass `--app` in scripts only when the script intentionally targets another worktree
+  or a named launched session.
 - **Avoid bare digits as a name** — `--app 8` is too loose (it can collide with a port
   or an id fragment). Use the worktree name, `instance-8`, or the full port.
 - `--target <selector>` picks a target *within* the chosen instance (a specific window
@@ -65,8 +72,8 @@ drives the wrong window of the right app.
 ## Three ways in
 
 ```bash
-# 1. The app is already running with a debug port → just use any command (lazy attach):
-kit cdp eval 'location.href' --app dev
+# 1. The current worktree's app is already running → just use a command (lazy attach):
+kit cdp eval 'location.href'
 
 # 2. You control the browser → launch isolated Chrome, attached before navigation:
 kit cdp launch http://localhost:3000 --name checkout --headless

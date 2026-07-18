@@ -361,7 +361,7 @@ struct CdpArgs {
     #[arg(short, long)]
     interactive: bool,
 
-    /// Instance selector — app name, worktree, instance id, or port. Picks which Attachment to use.
+    /// Cross-instance override. By default Kit selects the app owned by the current Git worktree.
     #[arg(long, global = true)]
     app: Option<String>,
 }
@@ -771,6 +771,8 @@ enum CdpCommand {
         port: u16,
         #[arg(long, default_value_t = 0)]
         root_pid: u32,
+        #[arg(long)]
+        worktree_root: Option<PathBuf>,
         /// Internal: controlled plain-Chrome launches have no Electron main inspector to probe.
         #[arg(long)]
         skip_main_probe: bool,
@@ -1057,15 +1059,25 @@ impl Tool for CdpTool {
         let args = CdpArgs::from_arg_matches(matches)?;
         let json = cx.out.is_json();
         let app = args.app.as_deref();
+        let runtime = client::Runtime::new(&cx.processes, &cx.repositories);
 
         match args.command {
-            None if args.interactive => interactive::run(app).await,
-            None => client::overview(json).await,
+            None if args.interactive => interactive::run(runtime, app).await,
+            None => client::overview(runtime, json).await,
 
-            Some(CdpCommand::Serve { name, selector, port, root_pid, skip_main_probe, track }) => {
+            Some(CdpCommand::Serve {
+                name,
+                selector,
+                port,
+                root_pid,
+                worktree_root,
+                skip_main_probe,
+                track,
+            }) => {
                 daemon::serve(
                     name,
                     selector,
+                    worktree_root,
                     port,
                     root_pid,
                     !skip_main_probe,
@@ -1093,6 +1105,7 @@ impl Tool for CdpTool {
                 throttle,
             }) => {
                 client::launch(
+                    runtime,
                     client::LaunchOptions {
                         url,
                         name,
@@ -1129,6 +1142,7 @@ impl Tool for CdpTool {
                 replace,
             }) => {
                 client::launch_electron(
+                    runtime,
                     client::ElectronLaunchOptions {
                         command,
                         name,
@@ -1146,16 +1160,16 @@ impl Tool for CdpTool {
                 )
                 .await
             }
-            Some(CdpCommand::Launched) => client::launched(json).await,
+            Some(CdpCommand::Launched) => client::launched(runtime, json).await,
             Some(CdpCommand::Close { name, all }) => {
-                client::close_launched(name.as_deref(), all).await
+                client::close_launched(runtime, name.as_deref(), all).await
             }
             Some(CdpCommand::Attach { track }) => {
-                client::attach(app, tracks_or_all(track.as_deref()), json).await
+                client::attach(runtime, app, tracks_or_all(track.as_deref()), json).await
             }
-            Some(CdpCommand::Detach { all }) => client::detach(app, all).await,
-            Some(CdpCommand::Ls) => client::ls(json),
-            Some(CdpCommand::Gc) => client::gc(json),
+            Some(CdpCommand::Detach { all }) => client::detach(runtime, app, all).await,
+            Some(CdpCommand::Ls) => client::ls(runtime, json).await,
+            Some(CdpCommand::Gc) => client::gc(runtime, json).await,
             Some(CdpCommand::Lens { list: true, .. }) => {
                 println!("{}", render_lens_list(json));
                 Ok(())
@@ -1172,6 +1186,7 @@ impl Tool for CdpTool {
             Some(CdpCommand::Profile { command }) => client::profile(profile_op(command), json),
             Some(CdpCommand::Bundle { name, since, include, include_secrets }) => finish(
                 client::query(
+                    runtime,
                     name.as_deref().or(app),
                     json,
                     Command::Bundle { since, include, include_secrets },
@@ -1179,7 +1194,9 @@ impl Tool for CdpTool {
                 .await?,
             ),
 
-            Some(session) => finish(client::query(app, json, session_command(session)?).await?),
+            Some(session) => {
+                finish(client::query(runtime, app, json, session_command(session)?).await?)
+            }
         }
     }
 }

@@ -2,13 +2,13 @@
 //! Instance selector — lazily spawning the daemon if none is live (`docs/adr/0003`) — sends one
 //! [`Query`] over the unix socket, and prints the rendered [`Reply`]. No CDP, no state of its own.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{bail, Context, Error, Result};
-use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::time::sleep;
@@ -16,12 +16,16 @@ use tokio::time::sleep;
 use tokio::sync::mpsc::{self, Receiver};
 
 use crate::cdp::{self, TrackKind};
+use crate::framework::process::{
+    CommandSpec, DetachedControlError, DetachedLaunchTransaction, DetachedLifetimeRequirement,
+    DetachedOutputPolicy, DetachedProcessReceipt, DetachedProcessSpec, DetachedProcessStatus,
+    DetachedRecordPolicy, DetachedUnavailable, EnvironmentBase, ProcessEnvironment,
+    ProcessFailureReport, ProcessLabel, ProcessSupervisor, TerminationPolicy,
+};
+use crate::framework::RepositoryLocator;
 
 use super::protocol::{Command, Frame, LaunchSettings, Query, Reply};
-use super::registry::{
-    self, GpuMode, LaunchKind, LaunchOwnership, LaunchPhase, LaunchRecord, ProcessIdentity, Record,
-    RenderMode,
-};
+use super::registry::{self, GpuMode, LaunchKind, LaunchPhase, LaunchRecord, Record, RenderMode};
 
 const READY_TRIES: u32 = 60;
 const READY_INTERVAL: Duration = Duration::from_millis(100);
@@ -30,101 +34,47 @@ const DEVTOOLS_INTERVAL: Duration = Duration::from_millis(100);
 const ELECTRON_TRIES: u32 = 300;
 const ELECTRON_INTERVAL: Duration = Duration::from_millis(100);
 const LIVE_FRAME_CAPACITY: usize = 1_024;
-const CLOSE_GRACE: Duration = Duration::from_millis(750);
-const CLOSE_TERM_GRACE: Duration = Duration::from_secs(2);
-const CLOSE_KILL_GRACE: Duration = Duration::from_secs(1);
-const CLOSE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const DETACHED_TERMINATION_GRACE: Duration = Duration::from_secs(2);
+const DETACHED_RECORD_POLICY: DetachedRecordPolicy = match DetachedRecordPolicy::new(
+    NonZeroU64::new(64 * 1024 * 1024).expect("detached record limit is nonzero"),
+) {
+    Ok(policy) => policy,
+    Err(_) => panic!("CDP record limit exceeds the framework maximum"),
+};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct VerifiedLaunchProcess {
-    session_id: u32,
-    known: HashMap<u32, ProcessIdentity>,
+#[derive(Clone, Copy)]
+pub struct Runtime<'a> {
+    processes: &'a ProcessSupervisor,
+    repositories: &'a RepositoryLocator,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ProcessObservation {
-    Verified(VerifiedLaunchProcess),
-    Dead,
-    Mismatch(String),
-    Unverified { process_may_be_live: bool },
+impl<'a> Runtime<'a> {
+    pub const fn new(
+        processes: &'a ProcessSupervisor,
+        repositories: &'a RepositoryLocator,
+    ) -> Self {
+        Self { processes, repositories }
+    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum EndpointObservation {
-    Current,
-    Unreachable,
-    Mismatch(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum LaunchState {
-    Current(VerifiedLaunchProcess),
-    Unreachable(VerifiedLaunchProcess),
-    EndpointMismatch { process: VerifiedLaunchProcess, reason: String },
-    Dead,
-    OwnershipMismatch(String),
-    Unverified { process_may_be_live: bool },
+    Running,
+    Stopping,
+    Completed,
+    InfrastructureFailure(ProcessFailureReport),
+    AuthorityUnavailable(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CloseAction {
-    TerminateWithCdp,
-    TerminateOwnedSession,
-    CleanupDead,
-    RetainRecoveryState,
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DetachedState {
+    Running,
+    Stopping,
+    Completed,
+    InfrastructureFailure(ProcessFailureReport),
 }
 
-fn close_action(state: &LaunchState) -> CloseAction {
-    match state {
-        LaunchState::Current(_) => CloseAction::TerminateWithCdp,
-        LaunchState::Unreachable(_) | LaunchState::EndpointMismatch { .. } => {
-            CloseAction::TerminateOwnedSession
-        }
-        LaunchState::Dead => CloseAction::CleanupDead,
-        LaunchState::OwnershipMismatch(_) | LaunchState::Unverified { .. } => {
-            CloseAction::RetainRecoveryState
-        }
-    }
-}
-
-impl LaunchState {
-    fn description(&self) -> String {
-        match self {
-            Self::Current(_) => "current".to_owned(),
-            Self::Unreachable(_) => "process verified, CDP endpoint unreachable".to_owned(),
-            Self::EndpointMismatch { reason, .. } => {
-                format!("process verified, endpoint mismatch: {reason}")
-            }
-            Self::Dead => "stopped".to_owned(),
-            Self::OwnershipMismatch(reason) => format!("ownership mismatch: {reason}"),
-            Self::Unverified { process_may_be_live: true } => {
-                "live process may remain but launch ownership is unverified".to_owned()
-            }
-            Self::Unverified { process_may_be_live: false } => {
-                "launch ownership is unverified and no owned process can be proven".to_owned()
-            }
-        }
-    }
-}
-
-fn classify_launch(process: ProcessObservation, endpoint: EndpointObservation) -> LaunchState {
-    match process {
-        ProcessObservation::Verified(process) => match endpoint {
-            EndpointObservation::Current => LaunchState::Current(process),
-            EndpointObservation::Unreachable => LaunchState::Unreachable(process),
-            EndpointObservation::Mismatch(reason) => {
-                LaunchState::EndpointMismatch { process, reason }
-            }
-        },
-        ProcessObservation::Dead => LaunchState::Dead,
-        ProcessObservation::Mismatch(reason) => LaunchState::OwnershipMismatch(reason),
-        ProcessObservation::Unverified { process_may_be_live } => {
-            LaunchState::Unverified { process_may_be_live }
-        }
-    }
-}
-
-async fn existing_launch(name: &str) -> Result<Option<LaunchRecord>> {
+async fn existing_launch(runtime: Runtime<'_>, name: &str) -> Result<Option<LaunchRecord>> {
     let Some(record) = registry::read_launch(name) else {
         return Ok(None);
     };
@@ -138,22 +88,27 @@ async fn existing_launch(name: &str) -> Result<Option<LaunchRecord>> {
         ),
         LaunchPhase::Ready => {}
     }
-    match inspect_launch(&record).await {
-        LaunchState::Dead => {
+    match inspect_launch(runtime, &record).await {
+        LaunchState::Completed => {
+            close_launch_runtime(runtime, &record).await.map_err(Error::msg)?;
             registry::remove(&record.name);
             registry::remove_launch_profile(&record);
             registry::remove_launch(&record.name);
             Ok(None)
         }
-        LaunchState::OwnershipMismatch(reason) => bail!(
-            "launched session '{name}' has an ownership mismatch ({reason}); recovery state was retained at {}",
+        LaunchState::InfrastructureFailure(report) => {
+            let failure = detached_failure_message(&report);
+            close_launch_runtime(runtime, &record).await.map_err(Error::msg)?;
+            registry::remove(&record.name);
+            registry::remove_launch_profile(&record);
+            registry::remove_launch(&record.name);
+            bail!("launched session '{name}' ended with {failure}; terminal state was cleaned")
+        }
+        LaunchState::AuthorityUnavailable(reason) => bail!(
+            "launched session '{name}' cannot prove detached authority ({reason}); recovery state retained at {}",
             registry::dir().display()
         ),
-        LaunchState::Unverified { process_may_be_live } => bail!(
-            "launched session '{name}' has no verifiable process ownership (process may be live: {process_may_be_live}); recovery state was retained at {}",
-            registry::dir().display()
-        ),
-        _ => Ok(Some(record)),
+        LaunchState::Running | LaunchState::Stopping => Ok(Some(record)),
     }
 }
 
@@ -209,8 +164,13 @@ pub enum ProfileOp {
 
 /// Run one command against the warm Attachment for `app`, attaching first if needed. Returns whether
 /// the result was a success (drives the process exit code).
-pub async fn query(app: Option<&str>, json: bool, command: Command) -> Result<bool> {
-    let record = ensure(app, &TrackKind::ALL).await?;
+pub async fn query(
+    runtime: Runtime<'_>,
+    app: Option<&str>,
+    json: bool,
+    command: Command,
+) -> Result<bool> {
+    let record = ensure(runtime, app, &TrackKind::ALL).await?;
     let reply = send(&record, &Query { command, json }).await?;
     println!("{}", reply.output);
     Ok(reply.ok)
@@ -218,8 +178,8 @@ pub async fn query(app: Option<&str>, json: bool, command: Command) -> Result<bo
 
 /// Resolve the warm Attachment for `app`, lazily attaching with all tracks if none is live. The
 /// entry point for the interactive session, which then reuses the returned record for every command.
-pub async fn ensure_attached(app: Option<&str>) -> Result<Record> {
-    ensure(app, &TrackKind::ALL).await
+pub async fn ensure_attached(runtime: Runtime<'_>, app: Option<&str>) -> Result<Record> {
+    ensure(runtime, app, &TrackKind::ALL).await
 }
 
 /// Run one command against a known Attachment and return its `Reply` verbatim (no printing) — the
@@ -273,24 +233,38 @@ fn decode_frame(line: &str) -> Option<Frame> {
 }
 
 /// `kit cdp attach` — pre-warm an Attachment with a chosen Track set (idempotent).
-pub async fn attach(app: Option<&str>, tracks: Vec<TrackKind>, json: bool) -> Result<()> {
-    let record = ensure(app, &tracks).await?;
+pub async fn attach(
+    runtime: Runtime<'_>,
+    app: Option<&str>,
+    tracks: Vec<TrackKind>,
+    json: bool,
+) -> Result<()> {
+    let record = ensure(runtime, app, &tracks).await?;
     let reply = send(&record, &Query { command: Command::Status, json }).await?;
     println!("{}", reply.output);
     Ok(())
 }
 
 /// `kit cdp detach` — dispose one or all Attachments.
-pub async fn detach(app: Option<&str>, all: bool) -> Result<()> {
-    let live = registry::reconcile();
+pub async fn detach(runtime: Runtime<'_>, app: Option<&str>, all: bool) -> Result<()> {
+    let live = reconcile_attachments(runtime).await?;
     let targets: Vec<Record> = if all {
         live
     } else if let Some(selector) = app {
-        live.into_iter().filter(|record| matches(record, selector)).collect()
-    } else if live.len() <= 1 {
-        live
+        select_record(
+            live.into_iter().filter(|record| matches(record, selector)).collect(),
+            Some(selector),
+        )?
+        .into_iter()
+        .collect()
     } else {
-        bail!("multiple attachments — pass --app <selector> or --all");
+        let cwd = std::env::current_dir().context("resolve working directory")?;
+        let root = runtime.repositories.nearest_worktree_root(&cwd)?;
+        let candidates = live
+            .into_iter()
+            .filter(|record| record.worktree_root.as_deref() == Some(root.as_path()))
+            .collect();
+        select_record(candidates, None)?.into_iter().collect()
     };
 
     if targets.is_empty() {
@@ -299,7 +273,7 @@ pub async fn detach(app: Option<&str>, all: bool) -> Result<()> {
     }
     let mut failures = Vec::new();
     for record in targets {
-        match stop_attachment_record(&record).await {
+        match stop_attachment_record(runtime, &record).await {
             Ok(()) => println!("detached {}", record.name),
             Err(reason) => failures.push(format!("{}: {reason}", record.name)),
         }
@@ -312,8 +286,8 @@ pub async fn detach(app: Option<&str>, all: bool) -> Result<()> {
 }
 
 /// `kit cdp ls` — live Attachments and their health.
-pub fn ls(json: bool) -> Result<()> {
-    let live = registry::reconcile();
+pub async fn ls(runtime: Runtime<'_>, json: bool) -> Result<()> {
+    let live = reconcile_attachments(runtime).await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&live)?);
         return Ok(());
@@ -324,11 +298,10 @@ pub fn ls(json: bool) -> Result<()> {
     }
     for record in &live {
         println!(
-            "{:<16} {:<12} :{:<6} pid {:<8} up {:<6} tracks {}",
+            "{:<16} {:<12} :{:<6} up {:<6} tracks {}",
             record.name,
             record.app,
             record.port,
-            record.pid,
             human_ms(now_unix_ms().saturating_sub(record.started_at_ms)),
             record.tracks.join(",")
         );
@@ -337,9 +310,10 @@ pub fn ls(json: bool) -> Result<()> {
 }
 
 /// `kit cdp gc` — sweep dead Attachments.
-pub fn gc(json: bool) -> Result<()> {
+pub async fn gc(runtime: Runtime<'_>, json: bool) -> Result<()> {
     let before: Vec<String> = registry::all().into_iter().map(|record| record.name).collect();
-    let after: Vec<String> = registry::reconcile().into_iter().map(|record| record.name).collect();
+    let after: Vec<String> =
+        reconcile_attachments(runtime).await?.into_iter().map(|record| record.name).collect();
     let swept: Vec<&String> = before.iter().filter(|name| !after.contains(name)).collect();
     if json {
         println!("{}", serde_json::json!({ "swept": swept, "live": after }));
@@ -352,21 +326,22 @@ pub fn gc(json: bool) -> Result<()> {
 }
 
 /// `kit cdp` (bare) — one-call orientation: instances available + live attachments.
-pub async fn overview(json: bool) -> Result<()> {
-    let live = registry::reconcile();
-    let launches = active_launches().await;
-    let instances = cdp::discover().await;
+pub async fn overview(runtime: Runtime<'_>, json: bool) -> Result<()> {
+    let live = reconcile_attachments(runtime).await?;
+    let launches = active_launches(runtime).await?;
+    let instances = cdp::discover(runtime.repositories).await;
 
     if json {
         let instances: Vec<_> = instances
             .iter()
             .map(|instance| {
                 serde_json::json!({
-                    "name": instance.name(),
+                    "name": instance.display_name(),
+                    "attachmentName": instance.name(),
                     "app": instance.endpoint.app,
                     "port": instance.endpoint.port,
                     "pid": instance.pid,
-                    "worktree": instance.worktree,
+                    "worktreeRoot": instance.worktree_root,
                 })
             })
             .collect();
@@ -384,7 +359,7 @@ pub async fn overview(json: bool) -> Result<()> {
     for instance in &instances {
         println!(
             "  {:<16} {:<12} :{}",
-            instance.name(),
+            instance.display_name(),
             instance.endpoint.app,
             instance.endpoint.port
         );
@@ -394,38 +369,39 @@ pub async fn overview(json: bool) -> Result<()> {
         println!("  (none — a command will attach lazily)");
     }
     for record in &live {
-        println!("  {:<16} {:<12} :{:<6} pid {}", record.name, record.app, record.port, record.pid);
+        println!("  {:<16} {:<12} :{}", record.name, record.app, record.port);
     }
     println!("\nlaunched:");
     if launches.is_empty() {
         println!("  (none)");
     }
     for launch in &launches {
-        println!(
-            "  {:<16} :{:<6} pid {:<8} {:<8?} {}",
-            launch.name, launch.port, launch.browser_pid, launch.phase, launch.url
-        );
+        println!("  {:<16} :{:<6} {:<8?} {}", launch.name, launch.port, launch.phase, launch.url);
     }
     Ok(())
 }
 
-pub async fn launch(options: LaunchOptions, json: bool) -> Result<()> {
+pub async fn launch(runtime: Runtime<'_>, options: LaunchOptions, json: bool) -> Result<()> {
     if options.reuse && options.replace {
         bail!("choose only one of --reuse or --replace");
     }
 
     let name = session_name(options.name.as_deref(), &options.url)?;
-    let existing = existing_launch(&name).await?;
+    let existing = existing_launch(runtime, &name).await?;
     if let Some(existing) = existing {
         if options.replace {
-            close_records([existing].into_iter(), false).await?;
+            close_records(runtime, [existing].into_iter(), false).await?;
         } else if options.reuse {
-            let record = ensure_launch_attached(&existing, &TrackKind::ALL).await?;
-            let _ = send(
-                &record,
-                &Query { command: Command::Configure(settings_from(&options)), json: false },
-            )
-            .await;
+            let record = ensure_launch_attached(runtime, &existing, &TrackKind::ALL).await?;
+            require_reply(
+                send(
+                    &record,
+                    &Query { command: Command::Configure(settings_from(&options)), json: false },
+                )
+                .await
+                .context("configure reused controlled browser session")?,
+                "configure reused controlled browser session",
+            )?;
             let reply = send(
                 &record,
                 &Query {
@@ -442,7 +418,8 @@ pub async fn launch(options: LaunchOptions, json: bool) -> Result<()> {
             updated.dark = options.dark;
             updated.offline = options.offline;
             updated.throttle = options.throttle.clone();
-            let _ = registry::write_launch(&updated);
+            registry::write_launch(&updated)
+                .context("persist reused controlled browser session metadata")?;
             println!("{}", reply.output);
             return Ok(());
         } else {
@@ -458,106 +435,56 @@ pub async fn launch(options: LaunchOptions, json: bool) -> Result<()> {
     let artifact_dir = registry::artifact_dir(&name);
     std::fs::create_dir_all(&artifact_dir)
         .with_context(|| format!("create {}", artifact_dir.display()))?;
-    let browser_log = std::fs::File::create(artifact_dir.join("browser.log"))
-        .with_context(|| format!("create {}", artifact_dir.join("browser.log").display()))?;
-
-    let mut command = std::process::Command::new(&browser);
-    command
-        .arg("--remote-debugging-address=127.0.0.1")
-        .arg("--remote-debugging-port=0")
-        .arg(format!("--user-data-dir={}", profile_dir.display()))
-        .arg("--no-first-run")
-        .arg("--no-default-browser-check")
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(browser_log.try_clone()?))
-        .stderr(Stdio::from(browser_log));
+    let mut arguments = vec![
+        OsString::from("--remote-debugging-address=127.0.0.1"),
+        OsString::from("--remote-debugging-port=0"),
+        OsString::from(format!("--user-data-dir={}", profile_dir.display())),
+        OsString::from("--no-first-run"),
+        OsString::from("--no-default-browser-check"),
+    ];
     if options.headless {
-        command.arg("--headless=new");
+        arguments.push(OsString::from("--headless=new"));
     }
     if let Some(viewport) = &options.viewport {
         if let Some((width, height)) = parse_viewport(viewport) {
-            command.arg(format!("--window-size={width},{height}"));
+            arguments.push(OsString::from(format!("--window-size={width},{height}")));
         }
     }
     if options.startup_capture {
-        command.arg("about:blank");
+        arguments.push(OsString::from("about:blank"));
     } else {
-        command.arg(&options.url);
+        arguments.push(OsString::from(&options.url));
     }
-    // Keep launched browsers alive after the short-lived CLI process exits. The daemon is detached
-    // the same way; without this, headless Chrome can disappear before the next `kit cdp` command.
-    unsafe {
-        use std::os::unix::process::CommandExt;
-        command.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
-
     let started_after = SystemTime::now();
-    let mut child =
-        command.spawn().with_context(|| format!("launch browser {}", browser.display()))?;
-    let browser_pid = child.id();
-    let leader_identity = match registry::process_identity(browser_pid) {
-        Some(identity) => identity,
-        None => {
-            let _ = child.kill();
-            remove_temp_profile_dir(&profile_dir, temp_profile, options.keep_profile);
-            bail!("read controlled browser process identity for pid {browser_pid}");
-        }
-    };
-    let port = match wait_devtools_port(&profile_dir, started_after).await {
-        Ok(port) => port,
+    let transaction = match runtime
+        .processes
+        .launch_detached(detached_spec(
+            browser.clone(),
+            arguments,
+            profile_dir.clone(),
+            BTreeMap::new(),
+            "cdp browser",
+        )?)
+        .await
+    {
+        Ok(transaction) => transaction,
         Err(error) => {
-            if let Err(cleanup) = abort_spawned_session(leader_identity).await {
-                return Err(error.context(format!(
-                    "controlled browser cleanup failed ({cleanup}); profile retained at {}",
-                    profile_dir.display()
-                )));
-            }
             remove_temp_profile_dir(&profile_dir, temp_profile, options.keep_profile);
-            return Err(error);
+            return Err(error).with_context(|| format!("launch browser {}", browser.display()));
         }
     };
-    let endpoint = match cdp::browser_endpoint(port).await {
-        Some(endpoint) => endpoint,
-        None => {
-            if let Err(cleanup) = abort_spawned_session(leader_identity).await {
-                bail!(
-                    "browser did not expose a valid Chrome DevTools endpoint on port {port}; controlled browser cleanup failed ({cleanup}); profile retained at {}",
-                    profile_dir.display()
-                );
-            }
-            remove_temp_profile_dir(&profile_dir, temp_profile, options.keep_profile);
-            bail!("browser did not expose a valid Chrome DevTools endpoint on port {port}");
-        }
-    };
-    let ownership = match capture_launch_ownership(leader_identity, port) {
-        Ok(ownership) => ownership,
-        Err(error) => {
-            if let Err(cleanup) = abort_spawned_session(leader_identity).await {
-                return Err(error.context(format!(
-                    "verify controlled browser ownership; cleanup failed ({cleanup}); profile retained at {}",
-                    profile_dir.display()
-                )));
-            }
-            remove_temp_profile_dir(&profile_dir, temp_profile, options.keep_profile);
-            return Err(error.context("verify controlled browser ownership"));
-        }
-    };
-
     let mut launch = LaunchRecord {
         name: name.clone(),
         phase: LaunchPhase::Starting,
         url: options.url.clone(),
         browser: browser.display().to_string(),
-        browser_pid,
-        ownership: Some(ownership),
+        process_receipt: transaction.receipt().encode(),
+        root_pid: 0,
         launch_kind: Some(LaunchKind::Chrome),
         render_mode: if options.headless { RenderMode::HeadlessNew } else { RenderMode::Windowed },
         gpu_mode: GpuMode::BrowserDefault,
-        port,
-        devtools_ws_url: Some(endpoint.ws_url),
+        port: 0,
+        devtools_ws_url: None,
         profile_dir,
         profile_name,
         temp_profile,
@@ -574,21 +501,79 @@ pub async fn launch(options: LaunchOptions, json: bool) -> Result<()> {
         throttle: options.throttle.clone(),
     };
     if let Err(error) = registry::write_launch(&launch) {
-        return fail_after_launch_ownership(
+        return Err(rollback_unpublished_detached(
+            transaction,
+            error.context("persist controlled browser launch receipt before attachment startup"),
+            || {
+                registry::remove_launch(&name);
+                remove_temp_profile_dir(
+                    &launch.profile_dir,
+                    launch.temp_profile,
+                    launch.keep_profile,
+                );
+            },
+        )
+        .await);
+    }
+    if let Err(error) = transaction.commit() {
+        let message = error.to_string();
+        return Err(rollback_unpublished_detached(
+            error.into_transaction(),
+            Error::msg(message),
+            || {
+                registry::remove_launch(&name);
+                remove_temp_profile_dir(
+                    &launch.profile_dir,
+                    launch.temp_profile,
+                    launch.keep_profile,
+                );
+            },
+        )
+        .await);
+    }
+
+    let startup = async {
+        let port = wait_devtools_port(&launch.profile_dir, started_after).await?;
+        let endpoint = cdp::browser_endpoint(port).await.ok_or_else(|| {
+            Error::msg(format!(
+                "browser did not expose a valid Chrome DevTools endpoint on port {port}"
+            ))
+        })?;
+        let root_pid = cdp::owner_pid(port)
+            .with_context(|| format!("resolve browser process serving CDP port {port}"))?;
+        Ok::<_, Error>((port, endpoint, root_pid))
+    }
+    .await;
+    let (port, endpoint, root_pid) = match startup {
+        Ok(startup) => startup,
+        Err(error) => return fail_after_launch(runtime, &launch, error).await,
+    };
+    launch.port = port;
+    launch.root_pid = root_pid;
+    launch.devtools_ws_url = Some(endpoint.ws_url);
+    if let Err(error) = registry::write_launch(&launch) {
+        return fail_after_launch(
+            runtime,
             &launch,
-            None,
-            error.context("persist controlled browser ownership before attachment startup"),
-            false,
+            error.context("persist controlled browser endpoint after detached launch commit"),
         )
         .await;
     }
 
-    let mut spawned_attachment = None;
     let completion: Result<()> = async {
-        let identity = spawn_daemon(&name, &name, port, browser_pid, false, &TrackKind::ALL)?;
-        spawned_attachment = Some(identity);
-        let record = wait_ready(&name).await?;
-        verify_spawned_attachment_record(&record, identity)?;
+        let record = spawn_daemon(
+            runtime,
+            SpawnDaemonOptions {
+                name: &name,
+                selector: &name,
+                worktree_root: None,
+                port,
+                root_pid,
+                probe_main: false,
+                tracks: &TrackKind::ALL,
+            },
+        )
+        .await?;
 
         require_reply(
             send(
@@ -630,14 +615,18 @@ pub async fn launch(options: LaunchOptions, json: bool) -> Result<()> {
 
     match completion {
         Ok(()) => Ok(()),
-        Err(error) => fail_after_launch_ownership(&launch, spawned_attachment, error, true).await,
+        Err(error) => fail_after_launch(runtime, &launch, error).await,
     }
 }
 
 /// `kit cdp launch-electron` — spawn an Electron app, wait for the renderer CDP endpoint it exposes,
 /// and attach to it. The app owns its own page, so there is no navigation step: capture runs from
 /// daemon-attach onward and the renderer target is selected by `--renderer-target`.
-pub async fn launch_electron(options: ElectronLaunchOptions, json: bool) -> Result<()> {
+pub async fn launch_electron(
+    runtime: Runtime<'_>,
+    options: ElectronLaunchOptions,
+    json: bool,
+) -> Result<()> {
     if options.reuse && options.replace {
         bail!("choose only one of --reuse or --replace");
     }
@@ -646,12 +635,12 @@ pub async fn launch_electron(options: ElectronLaunchOptions, json: bool) -> Resu
     };
 
     let name = electron_session_name(options.name.as_deref(), &program)?;
-    let existing = existing_launch(&name).await?;
+    let existing = existing_launch(runtime, &name).await?;
     if let Some(existing) = existing {
         if options.replace {
-            close_records([existing].into_iter(), false).await?;
+            close_records(runtime, [existing].into_iter(), false).await?;
         } else if options.reuse {
-            let record = ensure_launch_attached(&existing, &TrackKind::ALL).await?;
+            let record = ensure_launch_attached(runtime, &existing, &TrackKind::ALL).await?;
             let reply = send(&record, &Query { command: Command::Status, json }).await?;
             println!("{}", reply.output);
             return Ok(());
@@ -675,82 +664,46 @@ pub async fn launch_electron(options: ElectronLaunchOptions, json: bool) -> Resu
     let artifact_dir = registry::artifact_dir(&name);
     std::fs::create_dir_all(&artifact_dir)
         .with_context(|| format!("create {}", artifact_dir.display()))?;
-    let app_log = std::fs::File::create(artifact_dir.join("app.log"))
-        .with_context(|| format!("create {}", artifact_dir.join("app.log").display()))?;
-
-    let mut command = std::process::Command::new(&program);
-    command
-        .args(&options.command[1..])
-        .args(options.electron_args.iter().map(|arg| arg.replace("{cdp_port}", &port.to_string())))
-        .current_dir(&cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(app_log.try_clone()?))
-        .stderr(Stdio::from(app_log));
+    let mut arguments = options.command[1..].iter().map(OsString::from).collect::<Vec<_>>();
+    arguments.extend(
+        options
+            .electron_args
+            .iter()
+            .map(|arg| OsString::from(arg.replace("{cdp_port}", &port.to_string()))),
+    );
+    let mut environment = BTreeMap::new();
     if let Some(var) = &options.cdp_env {
-        command.env(var, port.to_string());
+        environment.insert(OsString::from(var), OsString::from(port.to_string()));
     }
     for entry in &options.env {
         let (key, value) = entry
             .split_once('=')
             .with_context(|| format!("invalid --env '{entry}' — expected KEY=VALUE"))?;
-        command.env(key, value);
+        environment.insert(OsString::from(key), OsString::from(value));
     }
-    // Detach into its own session so the app outlives this short-lived CLI process, exactly like a
-    // browser launch — without this the app can die before the next `kit cdp` command runs.
-    unsafe {
-        use std::os::unix::process::CommandExt;
-        command.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
-
-    let mut child = command.spawn().with_context(|| format!("launch {program}"))?;
-    let app_pid = child.id();
-    let leader_identity = match registry::process_identity(app_pid) {
-        Some(identity) => identity,
-        None => {
-            let _ = child.kill();
-            bail!("read controlled app process identity for pid {app_pid}");
-        }
-    };
-    let endpoint = match wait_electron_endpoint(port).await {
-        Ok(endpoint) => endpoint,
-        Err(error) => {
-            if let Err(cleanup) = abort_spawned_session(leader_identity).await {
-                return Err(error.context(format!(
-                    "controlled Electron cleanup failed ({cleanup}); artifacts retained at {}",
-                    artifact_dir.display()
-                )));
-            }
-            return Err(error);
-        }
-    };
-    let ownership = match capture_launch_ownership(leader_identity, port) {
-        Ok(ownership) => ownership,
-        Err(error) => {
-            if let Err(cleanup) = abort_spawned_session(leader_identity).await {
-                return Err(error.context(format!(
-                    "verify controlled Electron ownership; cleanup failed ({cleanup}); artifacts retained at {}",
-                    artifact_dir.display()
-                )));
-            }
-            return Err(error.context("verify controlled Electron ownership"));
-        }
-    };
-
+    let transaction = runtime
+        .processes
+        .launch_detached(detached_spec(
+            PathBuf::from(&program),
+            arguments,
+            cwd.clone(),
+            environment,
+            "cdp Electron",
+        )?)
+        .await
+        .with_context(|| format!("launch {program}"))?;
     let mut launch = LaunchRecord {
         name: name.clone(),
         phase: LaunchPhase::Starting,
         url: format!("electron://{}", display_command(&options.command)),
         browser: program,
-        browser_pid: app_pid,
-        ownership: Some(ownership),
+        process_receipt: transaction.receipt().encode(),
+        root_pid: 0,
         launch_kind: Some(LaunchKind::Electron),
         render_mode: RenderMode::ApplicationManaged,
         gpu_mode: GpuMode::ApplicationManaged,
         port,
-        devtools_ws_url: Some(endpoint.ws_url),
+        devtools_ws_url: None,
         profile_dir: cwd,
         profile_name: None,
         temp_profile: false,
@@ -767,21 +720,59 @@ pub async fn launch_electron(options: ElectronLaunchOptions, json: bool) -> Resu
         throttle: None,
     };
     if let Err(error) = registry::write_launch(&launch) {
-        return fail_after_launch_ownership(
+        return Err(rollback_unpublished_detached(
+            transaction,
+            error.context("persist controlled Electron launch receipt before attachment startup"),
+            || registry::remove_launch(&name),
+        )
+        .await);
+    }
+    if let Err(error) = transaction.commit() {
+        let message = error.to_string();
+        return Err(rollback_unpublished_detached(
+            error.into_transaction(),
+            Error::msg(message),
+            || registry::remove_launch(&name),
+        )
+        .await);
+    }
+
+    let startup = async {
+        let endpoint = wait_electron_endpoint(port).await?;
+        let root_pid = cdp::owner_pid(port)
+            .with_context(|| format!("resolve Electron process serving CDP port {port}"))?;
+        Ok::<_, Error>((endpoint, root_pid))
+    }
+    .await;
+    let (endpoint, root_pid) = match startup {
+        Ok(startup) => startup,
+        Err(error) => return fail_after_launch(runtime, &launch, error).await,
+    };
+    launch.root_pid = root_pid;
+    launch.devtools_ws_url = Some(endpoint.ws_url);
+    if let Err(error) = registry::write_launch(&launch) {
+        return fail_after_launch(
+            runtime,
             &launch,
-            None,
-            error.context("persist controlled Electron ownership before attachment startup"),
-            false,
+            error.context("persist controlled Electron endpoint after detached launch commit"),
         )
         .await;
     }
 
-    let mut spawned_attachment = None;
     let completion: Result<()> = async {
-        let identity = spawn_daemon(&name, &name, port, app_pid, true, &TrackKind::ALL)?;
-        spawned_attachment = Some(identity);
-        let record = wait_ready(&name).await?;
-        verify_spawned_attachment_record(&record, identity)?;
+        let record = spawn_daemon(
+            runtime,
+            SpawnDaemonOptions {
+                name: &name,
+                selector: &name,
+                worktree_root: None,
+                port,
+                root_pid,
+                probe_main: true,
+                tracks: &TrackKind::ALL,
+            },
+        )
+        .await?;
 
         require_reply(
             send(
@@ -817,12 +808,12 @@ pub async fn launch_electron(options: ElectronLaunchOptions, json: bool) -> Resu
 
     match completion {
         Ok(()) => Ok(()),
-        Err(error) => fail_after_launch_ownership(&launch, spawned_attachment, error, true).await,
+        Err(error) => fail_after_launch(runtime, &launch, error).await,
     }
 }
 
-pub async fn launched(json: bool) -> Result<()> {
-    let launches = active_launches().await;
+pub async fn launched(runtime: Runtime<'_>, json: bool) -> Result<()> {
+    let launches = active_launches(runtime).await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&launches)?);
         return Ok(());
@@ -833,10 +824,9 @@ pub async fn launched(json: bool) -> Result<()> {
     }
     for launch in &launches {
         println!(
-            "{:<16} :{:<6} pid {:<8} {:<8?} profile {}  {}",
+            "{:<16} :{:<6} {:<8?} profile {}  {}",
             launch.name,
             launch.port,
-            launch.browser_pid,
             launch.phase,
             launch.profile_name.as_deref().unwrap_or(if launch.temp_profile {
                 "temp"
@@ -849,7 +839,7 @@ pub async fn launched(json: bool) -> Result<()> {
     Ok(())
 }
 
-pub async fn close_launched(name: Option<&str>, all: bool) -> Result<()> {
+pub async fn close_launched(runtime: Runtime<'_>, name: Option<&str>, all: bool) -> Result<()> {
     let launches = registry::all_launches();
     let targets: Vec<LaunchRecord> = if all {
         launches
@@ -864,154 +854,33 @@ pub async fn close_launched(name: Option<&str>, all: bool) -> Result<()> {
         println!("no matching launched session");
         return Ok(());
     }
-    close_records(targets.into_iter(), true).await
+    close_records(runtime, targets.into_iter(), true).await
 }
 
-fn capture_launch_ownership(leader: ProcessIdentity, port: u16) -> Result<LaunchOwnership> {
-    if leader.session_id != leader.pid || leader.process_group_id != leader.pid {
-        bail!("controlled launch pid {} did not enter its own process session/group", leader.pid);
-    }
-    let endpoint_pid =
-        cdp::owner_pid(port).with_context(|| format!("resolve process owning CDP port {port}"))?;
-    let endpoint = registry::process_identity(endpoint_pid)
-        .with_context(|| format!("read CDP endpoint process identity for pid {endpoint_pid}"))?;
-    if endpoint.session_id != leader.session_id {
-        bail!(
-            "CDP endpoint pid {} belongs to session {}, expected controlled session {}",
-            endpoint.pid,
-            endpoint.session_id,
-            leader.session_id
-        );
-    }
-    Ok(LaunchOwnership { leader, endpoint })
-}
-
-fn observe_launch_process(launch: &LaunchRecord) -> ProcessObservation {
-    let Some(ownership) = launch.ownership.as_ref() else {
-        return ProcessObservation::Unverified {
-            process_may_be_live: registry::is_alive(launch.browser_pid)
-                || cdp::owner_pid(launch.port).is_some(),
-        };
+async fn inspect_launch(runtime: Runtime<'_>, launch: &LaunchRecord) -> LaunchState {
+    let receipt = match decode_receipt(&launch.process_receipt) {
+        Ok(receipt) => receipt,
+        Err(error) => return LaunchState::AuthorityUnavailable(error.to_string()),
     };
-
-    let stored = owned_identity_records(ownership);
-    let current: Vec<ProcessIdentity> =
-        stored.iter().filter_map(|expected| registry::process_identity(expected.pid)).collect();
-    classify_owned_processes(
-        ownership,
-        &current,
-        registry::processes_in_session(ownership.leader.session_id),
-    )
-}
-
-fn owned_identity_records(ownership: &LaunchOwnership) -> Vec<ProcessIdentity> {
-    let mut stored = vec![ownership.leader];
-    if ownership.endpoint.pid != ownership.leader.pid {
-        stored.push(ownership.endpoint);
-    }
-    stored
-}
-
-fn classify_owned_processes(
-    ownership: &LaunchOwnership,
-    current: &[ProcessIdentity],
-    members: Vec<ProcessIdentity>,
-) -> ProcessObservation {
-    let stored = owned_identity_records(ownership);
-    let mut exact = false;
-    let mut mismatches = Vec::new();
-    for expected in &stored {
-        if let Some(current) = current.iter().find(|current| current.pid == expected.pid) {
-            if current == expected {
-                exact = true;
-            } else {
-                mismatches.push(format!(
-                    "pid {} was reused (recorded start {}, current start {})",
-                    expected.pid, expected.start_ticks, current.start_ticks
-                ));
-            }
+    match reconcile_detached(runtime, &receipt).await {
+        Ok(DetachedState::Running) => LaunchState::Running,
+        Ok(DetachedState::Stopping) => LaunchState::Stopping,
+        Ok(DetachedState::Completed) => LaunchState::Completed,
+        Ok(DetachedState::InfrastructureFailure(report)) => {
+            LaunchState::InfrastructureFailure(report)
         }
-    }
-
-    if exact {
-        return ProcessObservation::Verified(VerifiedLaunchProcess {
-            session_id: ownership.leader.session_id,
-            known: members.into_iter().map(|identity| (identity.pid, identity)).collect(),
-        });
-    }
-    if members.is_empty() && mismatches.is_empty() {
-        ProcessObservation::Dead
-    } else {
-        let reason = if mismatches.is_empty() {
-            format!(
-                "recorded leader/endpoint are gone but session {} still has processes",
-                ownership.leader.session_id
-            )
-        } else {
-            mismatches.join("; ")
-        };
-        ProcessObservation::Mismatch(reason)
+        Err(reason) => LaunchState::AuthorityUnavailable(reason),
     }
 }
 
-async fn inspect_launch(launch: &LaunchRecord) -> LaunchState {
-    let process = observe_launch_process(launch);
-    let ProcessObservation::Verified(mut verified) = process else {
-        return classify_launch(process, EndpointObservation::Unreachable);
-    };
-    let Some(expected_ws_url) = launch.devtools_ws_url.as_ref() else {
-        return classify_launch(
-            ProcessObservation::Verified(verified),
-            EndpointObservation::Mismatch("launch record has no websocket identity".to_owned()),
-        );
-    };
-    let Some(endpoint) = cdp::browser_endpoint(launch.port).await else {
-        return classify_launch(
-            ProcessObservation::Verified(verified),
-            EndpointObservation::Unreachable,
-        );
-    };
-    if &endpoint.ws_url != expected_ws_url {
-        return classify_launch(
-            ProcessObservation::Verified(verified),
-            EndpointObservation::Mismatch(format!(
-                "port {} now exposes a different browser websocket",
-                launch.port
-            )),
-        );
-    }
-    let Some(endpoint_pid) = cdp::owner_pid(launch.port) else {
-        return classify_launch(
-            ProcessObservation::Verified(verified),
-            EndpointObservation::Mismatch("CDP port owner could not be resolved".to_owned()),
-        );
-    };
-    let Some(identity) = registry::process_identity(endpoint_pid) else {
-        return classify_launch(
-            ProcessObservation::Verified(verified),
-            EndpointObservation::Mismatch(format!(
-                "CDP port owner pid {endpoint_pid} disappeared during inspection"
-            )),
-        );
-    };
-    if identity.session_id != verified.session_id {
-        let expected_session = verified.session_id;
-        return classify_launch(
-            ProcessObservation::Verified(verified),
-            EndpointObservation::Mismatch(format!(
-                "CDP port owner pid {} belongs to session {}, expected {}",
-                identity.pid, identity.session_id, expected_session
-            )),
-        );
-    }
-    verified.known.insert(identity.pid, identity);
-    classify_launch(ProcessObservation::Verified(verified), EndpointObservation::Current)
-}
-
-async fn close_records(records: impl Iterator<Item = LaunchRecord>, print: bool) -> Result<()> {
+async fn close_records(
+    runtime: Runtime<'_>,
+    records: impl Iterator<Item = LaunchRecord>,
+    print: bool,
+) -> Result<()> {
     let mut failures = Vec::new();
     for launch in records {
-        let outcome = close_launch_runtime(&launch).await;
+        let outcome = close_launch_runtime(runtime, &launch).await;
         match outcome {
             Ok(()) => {
                 registry::remove_launch_profile(&launch);
@@ -1034,309 +903,75 @@ async fn close_records(records: impl Iterator<Item = LaunchRecord>, print: bool)
     }
 }
 
-async fn close_launch_runtime(launch: &LaunchRecord) -> Result<(), String> {
-    let state = inspect_launch(launch).await;
-    let action = close_action(&state);
-    match (action, state) {
-        (CloseAction::TerminateWithCdp, LaunchState::Current(process)) => {
-            terminate_verified_launch(launch, process, true).await
+async fn close_launch_runtime(runtime: Runtime<'_>, launch: &LaunchRecord) -> Result<(), String> {
+    match inspect_launch(runtime, launch).await {
+        LaunchState::Completed | LaunchState::InfrastructureFailure(_) => {
+            stop_launch_attachment(runtime, launch).await?;
+            let receipt =
+                decode_receipt(&launch.process_receipt).map_err(|error| error.to_string())?;
+            forget_detached(runtime, &receipt).await
         }
-        (CloseAction::TerminateOwnedSession, LaunchState::Unreachable(process))
-        | (
-            CloseAction::TerminateOwnedSession,
-            LaunchState::EndpointMismatch { process, .. },
-        ) => terminate_verified_launch(launch, process, false).await,
-        (CloseAction::CleanupDead, LaunchState::Dead) => stop_launch_attachment(launch).await,
-        (CloseAction::RetainRecoveryState, LaunchState::OwnershipMismatch(reason)) => Err(format!(
-            "ownership mismatch ({reason}); refusing to signal a possibly reused process"
-        )),
-        (CloseAction::RetainRecoveryState, LaunchState::Unverified { process_may_be_live }) => {
-            Err(format!(
-                "process ownership is unverified (process may be live: {process_may_be_live}); refusing to signal by pid alone"
-            ))
-        }
-        _ => unreachable!("close action and launch state are derived together"),
-    }
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct LaunchRecoveryEvidence<'a> {
-    failure: &'a str,
-    launch: &'a LaunchRecord,
-}
-
-fn write_launch_recovery_evidence(launch: &LaunchRecord, failure: &str) -> Result<PathBuf> {
-    let path = launch.artifact_dir.join("launch-recovery.json");
-    let evidence = LaunchRecoveryEvidence { failure, launch };
-    let json = serde_json::to_string_pretty(&evidence)?;
-    std::fs::write(&path, json).with_context(|| format!("write {}", path.display()))?;
-    Ok(path)
-}
-
-fn combine_cleanup_results(
-    browser: Result<(), String>,
-    attachment: Result<(), String>,
-) -> Result<(), String> {
-    match (browser, attachment) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(browser), Ok(())) => Err(format!("controlled session: {browser}")),
-        (Ok(()), Err(attachment)) => Err(format!("attachment: {attachment}")),
-        (Err(browser), Err(attachment)) => {
-            Err(format!("controlled session: {browser}; attachment: {attachment}"))
+        LaunchState::AuthorityUnavailable(reason) => Err(reason),
+        LaunchState::Running | LaunchState::Stopping => {
+            if let Some(record) = registry::read(&launch.name) {
+                let _ = send(&record, &Query { command: Command::CloseBrowser, json: false }).await;
+            } else {
+                let _ = close_browser_direct(launch).await;
+            }
+            let receipt =
+                decode_receipt(&launch.process_receipt).map_err(|error| error.to_string())?;
+            stop_detached(runtime, &receipt).await?;
+            stop_launch_attachment(runtime, launch).await?;
+            forget_detached(runtime, &receipt).await
         }
     }
 }
 
-async fn stop_spawned_attachment(
-    name: &str,
-    identity: Option<ProcessIdentity>,
-) -> Result<(), String> {
-    let Some(identity) = identity else {
-        return Ok(());
-    };
-    let stopped = abort_spawned_session(identity).await;
-    if stopped.is_ok()
-        && registry::read(name).is_some_and(|record| {
-            record.pid == identity.pid && record.process_start_ticks == Some(identity.start_ticks)
-        })
-    {
-        registry::remove(name);
-    }
-    stopped
-}
-
-async fn fail_after_launch_ownership<T>(
+async fn fail_after_launch<T>(
+    runtime: Runtime<'_>,
     launch: &LaunchRecord,
-    spawned_attachment: Option<ProcessIdentity>,
     failure: Error,
-    launch_record_persisted: bool,
 ) -> Result<T> {
-    let failure_text = failure.to_string();
-    let evidence = if launch_record_persisted {
-        Ok(None)
-    } else {
-        write_launch_recovery_evidence(launch, &failure_text).map(Some)
-    };
-    let cleanup = combine_cleanup_results(
-        close_launch_runtime(launch).await,
-        stop_spawned_attachment(&launch.name, spawned_attachment).await,
-    );
-
-    match cleanup {
+    match close_launch_runtime(runtime, launch).await {
         Ok(()) => {
             registry::remove_launch_profile(launch);
             registry::remove_launch(&launch.name);
-            if let Ok(Some(path)) = evidence {
-                let _ = std::fs::remove_file(path);
-            }
             Err(failure)
         }
-        Err(cleanup) => {
-            let ownership = launch
-                .ownership
-                .as_ref()
-                .expect("post-ownership cleanup requires launch ownership");
-            let recovery = match evidence {
-                Ok(Some(path)) => format!("recovery evidence retained at {}", path.display()),
-                Ok(None) => format!(
-                    "launch/profile recovery state retained under {}",
-                    registry::dir().display()
-                ),
-                Err(error) => format!(
-                    "recovery evidence write also failed ({error}); artifacts retained at {}; owned session {} leader pid {} endpoint pid {}",
-                    launch.artifact_dir.display(),
-                    ownership.leader.session_id,
-                    ownership.leader.pid,
-                    ownership.endpoint.pid,
-                ),
-            };
-            Err(failure.context(format!("post-ownership cleanup failed ({cleanup}); {recovery}")))
-        }
+        Err(cleanup) => Err(failure.context(format!(
+            "post-launch cleanup failed ({cleanup}); recovery state retained under {}",
+            registry::dir().display()
+        ))),
     }
 }
 
-async fn terminate_verified_launch(
-    launch: &LaunchRecord,
-    mut process: VerifiedLaunchProcess,
-    endpoint_current: bool,
-) -> Result<(), String> {
-    if endpoint_current {
-        let daemon_closed = match registry::read(&launch.name).filter(|record| {
-            record.port == launch.port
-                && record.root_pid == launch.browser_pid
-                && registry::record_process_is_current(record)
-        }) {
-            Some(record) => send(&record, &Query { command: Command::CloseBrowser, json: false })
-                .await
-                .is_ok_and(|reply| reply.ok),
-            None => false,
-        };
-        if !daemon_closed {
-            let _ = close_browser_direct(launch).await;
-        }
-    }
-
-    if wait_for_session_shutdown(&mut process, CLOSE_GRACE).await? {
-        return stop_launch_attachment(launch).await;
-    }
-    signal_verified_session(&mut process, libc::SIGTERM)?;
-    if wait_for_session_shutdown(&mut process, CLOSE_TERM_GRACE).await? {
-        return stop_launch_attachment(launch).await;
-    }
-    signal_verified_session(&mut process, libc::SIGKILL)?;
-    if wait_for_session_shutdown(&mut process, CLOSE_KILL_GRACE).await? {
-        return stop_launch_attachment(launch).await;
-    }
-
-    let remaining = verified_session_members(&mut process)?
-        .into_iter()
-        .map(|identity| identity.pid.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    Err(format!(
-        "verified process session {} did not stop; remaining pid(s): {remaining}",
-        process.session_id
-    ))
-}
-
-/// Tear down a just-spawned controlled session from its exact `setsid` leader identity. This is
-/// used for both pre-record launch failure and spawned Attachment cleanup, so descendants are not
-/// orphaned by killing only a wrapper pid.
-async fn abort_spawned_session(leader: ProcessIdentity) -> Result<(), String> {
-    let members = registry::processes_in_session(leader.session_id);
-    if members.is_empty() {
-        return Ok(());
-    }
-    if !members.contains(&leader) {
-        return Err(format!(
-            "session {} remains but its leader identity no longer matches",
-            leader.session_id
-        ));
-    }
-    let mut process = VerifiedLaunchProcess {
-        session_id: leader.session_id,
-        known: members.into_iter().map(|identity| (identity.pid, identity)).collect(),
-    };
-    signal_verified_session(&mut process, libc::SIGTERM)?;
-    if wait_for_session_shutdown(&mut process, CLOSE_TERM_GRACE).await? {
-        return Ok(());
-    }
-    signal_verified_session(&mut process, libc::SIGKILL)?;
-    if wait_for_session_shutdown(&mut process, CLOSE_KILL_GRACE).await? {
-        Ok(())
-    } else {
-        Err(format!("controlled session {} did not stop", process.session_id))
-    }
-}
-
-fn verified_session_members(
-    process: &mut VerifiedLaunchProcess,
-) -> Result<Vec<ProcessIdentity>, String> {
-    let current = registry::processes_in_session(process.session_id);
-    if current.is_empty() {
-        return Ok(current);
-    }
-    let anchored = current
-        .iter()
-        .any(|identity| process.known.get(&identity.pid).is_some_and(|known| known == identity));
-    if !anchored {
-        return Err(format!(
-            "session {} still has processes but none match a recorded identity; refusing further signals",
-            process.session_id
-        ));
-    }
-    for identity in &current {
-        process.known.insert(identity.pid, *identity);
-    }
-    Ok(current)
-}
-
-fn signal_verified_session(
-    process: &mut VerifiedLaunchProcess,
-    signal: libc::c_int,
-) -> Result<(), String> {
-    let members = verified_session_members(process)?;
-    let groups: HashSet<u32> = members
-        .into_iter()
-        .map(|identity| identity.process_group_id)
-        .filter(|group| *group > 0)
-        .collect();
-    for group in groups {
-        let result = unsafe { libc::kill(-(group as i32), signal) };
-        if result != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
-            return Err(format!(
-                "signal {signal} to verified process group {group}: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-    }
-    Ok(())
-}
-
-async fn wait_for_session_shutdown(
-    process: &mut VerifiedLaunchProcess,
-    budget: Duration,
-) -> Result<bool, String> {
-    let deadline = tokio::time::Instant::now() + budget;
-    loop {
-        if verified_session_members(process)?.is_empty() {
-            return Ok(true);
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Ok(false);
-        }
-        sleep(CLOSE_POLL_INTERVAL).await;
-    }
-}
-
-async fn stop_launch_attachment(launch: &LaunchRecord) -> Result<(), String> {
+async fn stop_launch_attachment(runtime: Runtime<'_>, launch: &LaunchRecord) -> Result<(), String> {
     let Some(record) = registry::read(&launch.name) else {
         return Ok(());
     };
-    if record.port != launch.port || record.root_pid != launch.browser_pid {
+    if record.port != launch.port || record.root_pid != launch.root_pid {
         return Err(format!(
-            "attachment record ownership mismatch (port/root {}:{}, expected {}:{})",
-            record.port, record.root_pid, launch.port, launch.browser_pid
+            "attachment endpoint mismatch (port/root {}:{}, expected {}:{})",
+            record.port, record.root_pid, launch.port, launch.root_pid
         ));
     }
-    stop_attachment_record(&record).await
+    stop_attachment_record(runtime, &record).await
 }
 
-async fn stop_attachment_record(record: &Record) -> Result<(), String> {
+async fn stop_attachment_record(runtime: Runtime<'_>, record: &Record) -> Result<(), String> {
     let _ = send(record, &Query { command: Command::Detach, json: false }).await;
-    let deadline = tokio::time::Instant::now() + CLOSE_GRACE;
-    while registry::record_process_is_current(record) && tokio::time::Instant::now() < deadline {
-        sleep(CLOSE_POLL_INTERVAL).await;
-    }
-    if registry::record_process_is_current(record) {
-        let Some(start_ticks) = record.process_start_ticks else {
-            return Err(
-                "attachment did not stop and its process identity is not verified".to_owned()
-            );
-        };
-        let Some(identity) = registry::process_identity(record.pid) else {
-            registry::remove(&record.name);
-            return Ok(());
-        };
-        if identity.start_ticks != start_ticks {
-            return Err(format!("attachment pid {} was reused; refusing to signal it", record.pid));
-        }
-        unsafe { libc::kill(record.pid as i32, libc::SIGTERM) };
-        let deadline = tokio::time::Instant::now() + CLOSE_GRACE;
-        while registry::record_process_is_current(record) && tokio::time::Instant::now() < deadline
-        {
-            sleep(CLOSE_POLL_INTERVAL).await;
-        }
-    }
-    if registry::record_process_is_current(record) {
-        return Err(format!("attachment pid {} did not stop", record.pid));
-    }
+    let receipt = decode_receipt(&record.daemon_receipt).map_err(|error| error.to_string())?;
+    stop_detached(runtime, &receipt).await?;
+    forget_detached(runtime, &receipt).await?;
     registry::remove(&record.name);
     Ok(())
 }
 
-async fn ensure_launch_attached(launch: &LaunchRecord, tracks: &[TrackKind]) -> Result<Record> {
+async fn ensure_launch_attached(
+    runtime: Runtime<'_>,
+    launch: &LaunchRecord,
+    tracks: &[TrackKind],
+) -> Result<Record> {
     if launch.phase != LaunchPhase::Ready {
         bail!(
             "launched session '{}' is {:?}, not ready; recovery state was retained",
@@ -1344,35 +979,54 @@ async fn ensure_launch_attached(launch: &LaunchRecord, tracks: &[TrackKind]) -> 
             launch.phase
         );
     }
-    let state = inspect_launch(launch).await;
-    if !matches!(&state, LaunchState::Current(_)) {
-        if matches!(&state, LaunchState::Dead) {
+    match inspect_launch(runtime, launch).await {
+        LaunchState::Running | LaunchState::Stopping => {}
+        LaunchState::Completed => {
+            close_launch_runtime(runtime, launch).await.map_err(Error::msg)?;
             registry::remove(&launch.name);
             registry::remove_launch_profile(launch);
             registry::remove_launch(&launch.name);
+            bail!(
+                "launched session '{}' completed before it could be attached; terminal state was cleaned",
+                launch.name
+            );
         }
-        bail!(
-            "launched session '{}' cannot be attached: {}; recovery state {}",
+        LaunchState::InfrastructureFailure(report) => {
+            let failure = detached_failure_message(&report);
+            close_launch_runtime(runtime, launch).await.map_err(Error::msg)?;
+            registry::remove(&launch.name);
+            registry::remove_launch_profile(launch);
+            registry::remove_launch(&launch.name);
+            bail!(
+                "launched session '{}' cannot be attached because {failure}; terminal state was cleaned",
+                launch.name
+            );
+        }
+        LaunchState::AuthorityUnavailable(reason) => bail!(
+            "launched session '{}' cannot prove detached authority ({reason}); recovery state was retained at {}",
             launch.name,
-            state.description(),
-            if matches!(&state, LaunchState::Dead) { "was cleaned" } else { "was retained" }
-        );
+            registry::dir().display()
+        ),
     }
     if let Some(record) = registry::read(&launch.name) {
         if send(&record, &Query { command: Command::Ping, json: false }).await.is_ok() {
             return Ok(record);
         }
-        registry::remove(&record.name);
+        stop_attachment_record(runtime, &record).await.map_err(Error::msg)?;
     }
-    let spawned = spawn_daemon(
-        &launch.name,
-        &launch.name,
-        launch.port,
-        launch.browser_pid,
-        launch.launch_kind != Some(LaunchKind::Chrome),
-        tracks,
-    )?;
-    wait_for_spawned_attachment(&launch.name, spawned).await
+    spawn_daemon(
+        runtime,
+        SpawnDaemonOptions {
+            name: &launch.name,
+            selector: &launch.name,
+            worktree_root: None,
+            port: launch.port,
+            root_pid: launch.root_pid,
+            probe_main: launch.launch_kind != Some(LaunchKind::Chrome),
+            tracks,
+        },
+    )
+    .await
 }
 
 async fn close_browser_direct(launch: &LaunchRecord) -> bool {
@@ -1391,19 +1045,174 @@ async fn close_browser_direct(launch: &LaunchRecord) -> bool {
     conn.call(None, "Browser.close", serde_json::json!({})).await.is_ok()
 }
 
-async fn active_launches() -> Vec<LaunchRecord> {
+async fn active_launches(runtime: Runtime<'_>) -> Result<Vec<LaunchRecord>> {
     let mut live = Vec::new();
     for launch in registry::all_launches() {
-        match inspect_launch(&launch).await {
-            LaunchState::Dead => {
+        match inspect_launch(runtime, &launch).await {
+            LaunchState::Completed => {
+                close_launch_runtime(runtime, &launch).await.map_err(Error::msg)?;
                 registry::remove(&launch.name);
                 registry::remove_launch_profile(&launch);
                 registry::remove_launch(&launch.name);
             }
-            _ => live.push(launch),
+            LaunchState::InfrastructureFailure(report) => {
+                let failure = detached_failure_message(&report);
+                close_launch_runtime(runtime, &launch).await.map_err(Error::msg)?;
+                registry::remove(&launch.name);
+                registry::remove_launch_profile(&launch);
+                registry::remove_launch(&launch.name);
+                bail!(
+                    "launched session '{}' ended with {failure}; terminal state was cleaned",
+                    launch.name
+                );
+            }
+            LaunchState::Running | LaunchState::Stopping => live.push(launch),
+            LaunchState::AuthorityUnavailable(reason) => bail!(
+                "launched session '{}' cannot prove detached authority ({reason}); recovery state retained at {}",
+                launch.name,
+                registry::dir().display()
+            ),
         }
     }
-    live
+    Ok(live)
+}
+
+fn detached_spec(
+    program: PathBuf,
+    arguments: Vec<OsString>,
+    working_directory: PathBuf,
+    values: BTreeMap<OsString, OsString>,
+    label: &str,
+) -> Result<DetachedProcessSpec> {
+    let environment = ProcessEnvironment::new(EnvironmentBase::Inherit, values, BTreeSet::new())?;
+    let command = CommandSpec::new(
+        program.into_os_string(),
+        arguments,
+        working_directory,
+        environment,
+        ProcessLabel::new(label.to_owned())?,
+    )?;
+    Ok(DetachedProcessSpec::new(
+        command,
+        DetachedOutputPolicy::Record(DETACHED_RECORD_POLICY),
+        DetachedOutputPolicy::Record(DETACHED_RECORD_POLICY),
+        DetachedLifetimeRequirement::InvocationIndependent,
+        TerminationPolicy::new(DETACHED_TERMINATION_GRACE),
+    ))
+}
+
+fn decode_receipt(encoded: &str) -> Result<DetachedProcessReceipt> {
+    DetachedProcessReceipt::decode(encoded).context("decode persisted detached-process receipt")
+}
+
+fn detached_control_message(error: DetachedControlError) -> String {
+    format!("detached process control unavailable: {error}")
+}
+
+async fn stop_detached(
+    runtime: Runtime<'_>,
+    receipt: &DetachedProcessReceipt,
+) -> Result<(), String> {
+    runtime.processes.stop_detached(receipt).await.map(|_| ()).map_err(detached_control_message)
+}
+
+async fn forget_detached(
+    runtime: Runtime<'_>,
+    receipt: &DetachedProcessReceipt,
+) -> Result<(), String> {
+    runtime.processes.forget_detached(receipt).await.map_err(detached_control_message)
+}
+
+async fn reconcile_detached(
+    runtime: Runtime<'_>,
+    receipt: &DetachedProcessReceipt,
+) -> Result<DetachedState, String> {
+    match runtime.processes.inspect_detached(receipt).await {
+        Ok(DetachedProcessStatus::Running) => Ok(DetachedState::Running),
+        Ok(DetachedProcessStatus::Stopping) => Ok(DetachedState::Stopping),
+        Ok(DetachedProcessStatus::Completed(_)) => {
+            forget_detached(runtime, receipt).await?;
+            Ok(DetachedState::Completed)
+        }
+        Ok(DetachedProcessStatus::Failed(report)) => {
+            Ok(DetachedState::InfrastructureFailure(report))
+        }
+        Err(DetachedControlError::Unavailable(DetachedUnavailable::DurableStorageUnavailable)) => {
+            // A prior reconciliation may have released framework storage before its CDP registry
+            // removal became durable. Prove both the run directory and exact systemd authority are
+            // gone through the idempotent release transition before calling that state completed.
+            runtime
+                .processes
+                .forget_detached(receipt)
+                .await
+                .map(|()| DetachedState::Completed)
+                .map_err(detached_control_message)
+        }
+        Err(error) => Err(detached_control_message(error)),
+    }
+}
+
+fn detached_failure_message(report: &ProcessFailureReport) -> String {
+    format!(
+        "detached run {} had infrastructure failure {:?} (leader {:?}, termination {:?}, stdout {:?}, stderr {:?})",
+        report.run_id,
+        report.failure,
+        report.leader_exit,
+        report.termination,
+        report.stdout,
+        report.stderr
+    )
+}
+
+async fn rollback_unpublished_detached(
+    transaction: DetachedLaunchTransaction,
+    cause: Error,
+    on_confirmed: impl FnOnce(),
+) -> Error {
+    match transaction.rollback(cause).await {
+        Ok(cause) => {
+            on_confirmed();
+            cause
+        }
+        Err(error) => {
+            let (cause, receipt, rollback_error) = error.into_parts();
+            cause.context(format!(
+                "detached launch rollback could not prove termination ({rollback_error}); recovery receipt: {}",
+                receipt.encode()
+            ))
+        }
+    }
+}
+
+async fn reconcile_attachments(runtime: Runtime<'_>) -> Result<Vec<Record>> {
+    let mut live = Vec::new();
+    for record in registry::all() {
+        let receipt = decode_receipt(&record.daemon_receipt).with_context(|| {
+            format!("attachment '{}' has an invalid detached-process receipt", record.name)
+        })?;
+        match reconcile_detached(runtime, &receipt).await {
+            Ok(DetachedState::Running | DetachedState::Stopping) => live.push(record),
+            Ok(DetachedState::Completed) => {
+                registry::remove(&record.name);
+            }
+            Ok(DetachedState::InfrastructureFailure(report)) => {
+                let failure = detached_failure_message(&report);
+                forget_detached(runtime, &receipt).await.map_err(Error::msg)?;
+                registry::remove(&record.name);
+                bail!(
+                    "attachment '{}' ended with {failure}; terminal state was cleaned",
+                    record.name
+                );
+            }
+            Err(reason) => bail!(
+                "attachment '{}' cannot prove detached authority ({}); recovery state retained at {}",
+                record.name,
+                reason,
+                registry::dir().display()
+            ),
+        }
+    }
+    Ok(live)
 }
 
 pub fn profile(op: ProfileOp, json: bool) -> Result<()> {
@@ -1666,164 +1475,289 @@ fn sanitize(raw: &str) -> String {
         .collect()
 }
 
-async fn ensure(app: Option<&str>, tracks: &[TrackKind]) -> Result<Record> {
-    if let Some(record) = find(app) {
+async fn ensure(runtime: Runtime<'_>, app: Option<&str>, tracks: &[TrackKind]) -> Result<Record> {
+    if let Some(record) = find(runtime, app).await? {
         return Ok(record);
     }
     if let Some(selector) = app.and_then(registry::read_launch) {
-        return ensure_launch_attached(&selector, tracks).await;
+        return ensure_launch_attached(runtime, &selector, tracks).await;
     }
-    attach_new(app, tracks).await
+    attach_new(runtime, app, tracks).await
 }
 
-fn find(app: Option<&str>) -> Option<Record> {
-    let live = registry::reconcile();
-    match app {
-        Some(selector) => live.into_iter().find(|record| matches(record, selector)),
-        None if live.len() <= 1 => live.into_iter().next(),
-        None => live
-            .iter()
-            .find(|record| record.app.contains("dev"))
-            .cloned()
-            .or_else(|| live.into_iter().next()),
-    }
+async fn find(runtime: Runtime<'_>, app: Option<&str>) -> Result<Option<Record>> {
+    let live = reconcile_attachments(runtime).await?;
+    let candidates = match app {
+        Some(selector) => {
+            live.into_iter().filter(|record| matches(record, selector)).collect::<Vec<_>>()
+        }
+        None => match runtime.repositories.nearest_worktree_root(&std::env::current_dir()?).ok() {
+            Some(root) => live
+                .into_iter()
+                .filter(|record| record.worktree_root.as_deref() == Some(root.as_path()))
+                .collect(),
+            None => live,
+        },
+    };
+    select_record(candidates, app)
 }
 
-async fn attach_new(app: Option<&str>, tracks: &[TrackKind]) -> Result<Record> {
-    let instances = cdp::discover().await;
-    if instances.is_empty() {
-        bail!("no running CDP instance found — is the app launched with a remote debugging port?");
-    }
-    let instance = pick(instances, app)?;
+async fn attach_new(
+    runtime: Runtime<'_>,
+    app: Option<&str>,
+    tracks: &[TrackKind],
+) -> Result<Record> {
+    let current_worktree = if app.is_none() {
+        runtime.repositories.nearest_worktree_root(&std::env::current_dir()?).ok()
+    } else {
+        None
+    };
+    let current_worktree_path = current_worktree.as_ref().map(|root| root.as_path());
+    let instances = match (app, current_worktree_path) {
+        (Some(selector), _) => match selector.parse::<u16>() {
+            Ok(port) => match cdp::discover_port(runtime.repositories, port).await {
+                Some(instance) => vec![instance],
+                None => cdp::discover(runtime.repositories)
+                    .await
+                    .into_iter()
+                    .filter(|instance| instance.matches(selector))
+                    .collect(),
+            },
+            Err(_) => cdp::discover(runtime.repositories)
+                .await
+                .into_iter()
+                .filter(|instance| instance.matches(selector))
+                .collect(),
+        },
+        (None, Some(worktree_root)) => {
+            cdp::discover_in_worktree(runtime.repositories, worktree_root).await
+        }
+        (None, None) => cdp::discover(runtime.repositories).await,
+    };
+    let instance = select_instance(instances, app, current_worktree_path)?;
     let name = instance.name();
     let selector = app.map(str::to_owned).unwrap_or_else(|| name.clone());
 
-    let spawned =
-        spawn_daemon(&name, &selector, instance.endpoint.port, instance.pid, true, tracks)?;
-    wait_for_spawned_attachment(&name, spawned).await
+    replace_conflicting_attachment(runtime, &instance).await?;
+    spawn_daemon(
+        runtime,
+        SpawnDaemonOptions {
+            name: &name,
+            selector: &selector,
+            worktree_root: instance.worktree_root.as_deref(),
+            port: instance.endpoint.port,
+            root_pid: instance.pid,
+            probe_main: true,
+            tracks,
+        },
+    )
+    .await
 }
 
-fn pick(instances: Vec<cdp::Instance>, app: Option<&str>) -> Result<cdp::Instance> {
-    match app {
-        Some(selector) => instances
-            .into_iter()
-            .find(|instance| instance.matches(selector))
-            .with_context(|| format!("no instance matches '{selector}'")),
-        None if instances.len() == 1 => Ok(instances.into_iter().next().unwrap()),
-        None => {
-            if let Some(dev) =
-                instances.iter().find(|instance| instance.endpoint.app.contains("dev")).cloned()
-            {
-                Ok(dev)
-            } else {
-                instances.into_iter().next().context("no instance")
-            }
-        }
+fn select_record(candidates: Vec<Record>, selector: Option<&str>) -> Result<Option<Record>> {
+    match candidates.len() {
+        0 => Ok(None),
+        1 => Ok(candidates.into_iter().next()),
+        _ => bail!(
+            "multiple live attachments match {}:\n{}",
+            selector.map_or("the default instance scope".to_owned(), |value| format!("'{value}'")),
+            format_records(&candidates)
+        ),
     }
 }
 
-fn spawn_daemon(
-    name: &str,
-    selector: &str,
+fn select_instance(
+    instances: Vec<cdp::Instance>,
+    selector: Option<&str>,
+    worktree_root: Option<&Path>,
+) -> Result<cdp::Instance> {
+    match instances.len() {
+        0 => match (selector, worktree_root) {
+            (Some(selector), _) => bail!("no running CDP instance matches '{selector}'"),
+            (None, Some(root)) => bail!(
+                "no running CDP instance belongs to the current Git worktree {}",
+                root.display()
+            ),
+            (None, None) => {
+                bail!("no running CDP instance found — is the app using a remote debugging port?")
+            }
+        },
+        1 => Ok(instances.into_iter().next().unwrap()),
+        _ => bail!(
+            "multiple running CDP instances match {}:\n{}",
+            selector
+                .map(|value| format!("'{value}'"))
+                .or_else(|| worktree_root.map(|root| root.display().to_string()))
+                .unwrap_or_else(|| "this command".to_owned()),
+            format_instances(&instances)
+        ),
+    }
+}
+
+fn format_records(records: &[Record]) -> String {
+    records
+        .iter()
+        .map(|record| format!("  {} ({}, port {})", record.name, record.app, record.port))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_instances(instances: &[cdp::Instance]) -> String {
+    instances
+        .iter()
+        .map(|instance| {
+            format!(
+                "  {} ({}, port {})",
+                instance.display_name(),
+                instance.endpoint.app,
+                instance.endpoint.port
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+async fn replace_conflicting_attachment(
+    runtime: Runtime<'_>,
+    instance: &cdp::Instance,
+) -> Result<()> {
+    let conflicting = reconcile_attachments(runtime).await?.into_iter().find(|record| {
+        record.port == instance.endpoint.port
+            && record.root_pid == instance.pid
+            && record.worktree_root.as_deref() != instance.worktree_root.as_deref()
+    });
+    if let Some(record) = conflicting {
+        stop_attachment_record(runtime, &record)
+            .await
+            .map_err(Error::msg)
+            .context("replace conflicting attachment for CDP endpoint")?;
+    }
+    Ok(())
+}
+
+struct SpawnDaemonOptions<'a> {
+    name: &'a str,
+    selector: &'a str,
+    worktree_root: Option<&'a Path>,
     port: u16,
     root_pid: u32,
     probe_main: bool,
-    tracks: &[TrackKind],
-) -> Result<ProcessIdentity> {
+    tracks: &'a [TrackKind],
+}
+
+async fn spawn_daemon(runtime: Runtime<'_>, options: SpawnDaemonOptions<'_>) -> Result<Record> {
+    let SpawnDaemonOptions { name, selector, worktree_root, port, root_pid, probe_main, tracks } =
+        options;
     std::fs::create_dir_all(registry::dir()).context("create runtime dir")?;
     let exe = std::env::current_exe().context("resolve own path")?;
-    let log = std::fs::File::create(registry::log_path(name)).context("open daemon log")?;
-
-    let mut command = std::process::Command::new(exe);
-    command
-        .arg("cdp")
-        .arg("__serve")
-        .arg("--name")
-        .arg(name)
-        .arg("--selector")
-        .arg(selector)
-        .arg("--port")
-        .arg(port.to_string())
-        .arg("--root-pid")
-        .arg(root_pid.to_string());
+    let mut arguments = vec![
+        OsString::from("cdp"),
+        OsString::from("__serve"),
+        OsString::from("--name"),
+        OsString::from(name),
+        OsString::from("--selector"),
+        OsString::from(selector),
+        OsString::from("--port"),
+        OsString::from(port.to_string()),
+        OsString::from("--root-pid"),
+        OsString::from(root_pid.to_string()),
+    ];
+    if let Some(worktree_root) = worktree_root {
+        arguments.extend([OsString::from("--worktree-root"), worktree_root.as_os_str().to_owned()]);
+    }
     if !probe_main {
-        command.arg("--skip-main-probe");
+        arguments.push(OsString::from("--skip-main-probe"));
     }
     if !tracks.is_empty() {
         let csv = tracks.iter().map(|track| track.as_str()).collect::<Vec<_>>().join(",");
-        command.arg("--track").arg(csv);
+        arguments.extend([OsString::from("--track"), OsString::from(csv)]);
     }
-    command.stdin(Stdio::null()).stdout(Stdio::from(log.try_clone()?)).stderr(Stdio::from(log));
-
-    // Detach into its own session so the daemon outlives this CLI process and its terminal.
-    unsafe {
-        use std::os::unix::process::CommandExt;
-        command.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
-    let mut child = command.spawn().context("spawn cdp daemon")?;
-    let pid = child.id();
-    let identity = match registry::process_identity(pid) {
-        Some(identity) => identity,
+    let working_directory =
+        std::env::current_dir().context("resolve cdp daemon working directory")?;
+    let transaction = runtime
+        .processes
+        .launch_detached(detached_spec(
+            exe,
+            arguments,
+            working_directory,
+            BTreeMap::new(),
+            "cdp attachment daemon",
+        )?)
+        .await
+        .context("spawn cdp attachment daemon")?;
+    let endpoint = match cdp::browser_endpoint(port).await {
+        Some(endpoint) => endpoint,
         None => {
-            let _ = child.kill();
-            bail!("read spawned attachment process identity for pid {pid}");
+            return Err(rollback_unpublished_detached(
+                transaction,
+                Error::msg(format!(
+                    "CDP endpoint on port {port} disappeared before attachment startup"
+                )),
+                || {},
+            )
+            .await);
         }
     };
-    if identity.session_id != pid || identity.process_group_id != pid {
-        let _ = child.kill();
-        bail!("spawned attachment pid {pid} did not enter its own process session/group");
+    let record = Record {
+        name: name.to_owned(),
+        selector: selector.to_owned(),
+        app: endpoint.app,
+        worktree_root: worktree_root.map(Path::to_path_buf),
+        port,
+        daemon_receipt: transaction.receipt().encode(),
+        root_pid,
+        started_at_ms: now_unix_ms(),
+        tracks: tracks.iter().map(|track| track.as_str().to_owned()).collect(),
+    };
+    if let Err(error) = registry::write(&record) {
+        return Err(rollback_unpublished_detached(
+            transaction,
+            error.context("persist attachment detached receipt before waiting for readiness"),
+            || {},
+        )
+        .await);
     }
-    Ok(identity)
-}
-
-async fn wait_ready(name: &str) -> Result<Record> {
-    for _ in 0..READY_TRIES {
-        if let Some(record) = registry::read(name) {
-            if send(&record, &Query { command: Command::Ping, json: false }).await.is_ok() {
-                return Ok(record);
-            }
+    let receipt = match transaction.commit() {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            let message = error.to_string();
+            return Err(rollback_unpublished_detached(
+                error.into_transaction(),
+                Error::msg(message),
+                || registry::remove(name),
+            )
+            .await);
         }
-        sleep(READY_INTERVAL).await;
-    }
-    bail!("attachment '{name}' did not come up — see {}", registry::log_path(name).display())
-}
-
-async fn wait_for_spawned_attachment(name: &str, identity: ProcessIdentity) -> Result<Record> {
-    match wait_ready(name).await {
-        Ok(record) => match verify_spawned_attachment_record(&record, identity) {
-            Ok(()) => Ok(record),
-            Err(error) => match stop_spawned_attachment(name, Some(identity)).await {
-                Ok(()) => Err(error),
+    };
+    match wait_ready(&record).await {
+        Ok(()) => Ok(record),
+        Err(error) => match stop_detached(runtime, &receipt).await {
+            Ok(()) => match forget_detached(runtime, &receipt).await {
+                Ok(()) => {
+                    registry::remove(name);
+                    Err(error)
+                }
                 Err(cleanup) => Err(error.context(format!(
-                    "spawned attachment cleanup failed ({cleanup}); pid {} session {}",
-                    identity.pid, identity.session_id
+                    "attachment cleanup failed ({cleanup}); recovery state retained at {}",
+                    registry::dir().display()
                 ))),
             },
-        },
-        Err(error) => match stop_spawned_attachment(name, Some(identity)).await {
-            Ok(()) => Err(error),
             Err(cleanup) => Err(error.context(format!(
-                "spawned attachment cleanup failed ({cleanup}); pid {} session {}",
-                identity.pid, identity.session_id
+                "attachment cleanup failed ({cleanup}); recovery state retained at {}",
+                registry::dir().display()
             ))),
         },
     }
 }
 
-fn verify_spawned_attachment_record(record: &Record, identity: ProcessIdentity) -> Result<()> {
-    if record.pid != identity.pid || record.process_start_ticks != Some(identity.start_ticks) {
-        bail!(
-            "attachment registry identity mismatch: spawned pid {} start {}, recorded pid {} start {:?}",
-            identity.pid,
-            identity.start_ticks,
-            record.pid,
-            record.process_start_ticks
-        );
+async fn wait_ready(record: &Record) -> Result<()> {
+    for _ in 0..READY_TRIES {
+        if send(record, &Query { command: Command::Ping, json: false }).await.is_ok() {
+            return Ok(());
+        }
+        sleep(READY_INTERVAL).await;
     }
-    Ok(())
+    bail!("attachment '{}' did not come up", record.name)
 }
 
 async fn send(record: &Record, query: &Query) -> Result<Reply> {
@@ -1878,28 +1812,6 @@ fn human_ms(ms: u64) -> String {
 mod tests {
     use super::*;
 
-    fn verified() -> VerifiedLaunchProcess {
-        VerifiedLaunchProcess { session_id: 42, known: HashMap::new() }
-    }
-
-    fn process_identity() -> ProcessIdentity {
-        ProcessIdentity { pid: 42, start_ticks: 7, process_group_id: 42, session_id: 42 }
-    }
-
-    fn attachment_record() -> Record {
-        Record {
-            name: "test".to_owned(),
-            app: "test".to_owned(),
-            selector: "test".to_owned(),
-            port: 9222,
-            pid: 42,
-            process_start_ticks: Some(7),
-            root_pid: 100,
-            started_at_ms: 0,
-            tracks: Vec::new(),
-        }
-    }
-
     /// The reader's contract: a valid frame decodes, anything malformed becomes `None` so the loop
     /// skips it instead of killing the stream. (Wire-shape coverage lives in `protocol`/`timeline`.)
     #[test]
@@ -1913,88 +1825,7 @@ mod tests {
     }
 
     #[test]
-    fn launch_state_distinguishes_current_unreachable_mismatch_and_dead() {
-        assert!(matches!(
-            classify_launch(ProcessObservation::Verified(verified()), EndpointObservation::Current,),
-            LaunchState::Current(_)
-        ));
-        assert!(matches!(
-            classify_launch(
-                ProcessObservation::Verified(verified()),
-                EndpointObservation::Unreachable,
-            ),
-            LaunchState::Unreachable(_)
-        ));
-        assert!(matches!(
-            classify_launch(
-                ProcessObservation::Verified(verified()),
-                EndpointObservation::Mismatch("different websocket".to_owned()),
-            ),
-            LaunchState::EndpointMismatch { .. }
-        ));
-        assert_eq!(
-            classify_launch(ProcessObservation::Dead, EndpointObservation::Current),
-            LaunchState::Dead
-        );
-    }
-
-    #[test]
-    fn cleanup_decision_retains_ambiguous_ownership_and_terminates_verified_unreachable() {
-        assert_eq!(
-            close_action(&LaunchState::Unreachable(verified())),
-            CloseAction::TerminateOwnedSession
-        );
-        assert_eq!(close_action(&LaunchState::Dead), CloseAction::CleanupDead);
-        assert_eq!(
-            close_action(&LaunchState::OwnershipMismatch("pid reused".to_owned())),
-            CloseAction::RetainRecoveryState
-        );
-        assert_eq!(
-            close_action(&LaunchState::Unverified { process_may_be_live: true }),
-            CloseAction::RetainRecoveryState
-        );
-    }
-
-    #[test]
-    fn post_ownership_cleanup_succeeds_only_when_session_and_attachment_both_stop() {
-        assert_eq!(combine_cleanup_results(Ok(()), Ok(())), Ok(()));
-        assert_eq!(
-            combine_cleanup_results(Err("browser live".to_owned()), Ok(())).unwrap_err(),
-            "controlled session: browser live"
-        );
-        let both =
-            combine_cleanup_results(Err("browser live".to_owned()), Err("daemon live".to_owned()))
-                .unwrap_err();
-        assert!(both.contains("browser live") && both.contains("daemon live"), "{both}");
-    }
-
-    #[test]
-    fn spawned_attachment_record_must_match_pid_and_start_ticks() {
-        let identity = process_identity();
-        assert!(verify_spawned_attachment_record(&attachment_record(), identity).is_ok());
-
-        let mut reused = attachment_record();
-        reused.process_start_ticks = Some(8);
-        assert!(verify_spawned_attachment_record(&reused, identity).is_err());
-
-        let mut legacy = attachment_record();
-        legacy.process_start_ticks = None;
-        assert!(verify_spawned_attachment_record(&legacy, identity).is_err());
-    }
-
-    #[test]
-    fn endpoint_identity_keeps_launch_owned_after_wrapper_leader_exits() {
-        let leader =
-            ProcessIdentity { pid: 41, start_ticks: 6, process_group_id: 41, session_id: 41 };
-        let endpoint =
-            ProcessIdentity { pid: 42, start_ticks: 7, process_group_id: 41, session_id: 41 };
-        let ownership = LaunchOwnership { leader, endpoint };
-
-        let observation = classify_owned_processes(&ownership, &[endpoint], vec![endpoint]);
-
-        assert!(matches!(
-            observation,
-            ProcessObservation::Verified(VerifiedLaunchProcess { session_id: 41, .. })
-        ));
+    fn persisted_receipts_reject_legacy_pid_authority() {
+        assert!(decode_receipt(r#"{"pid":42,"startTicks":7}"#).is_err());
     }
 }

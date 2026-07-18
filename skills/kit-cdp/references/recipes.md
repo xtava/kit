@@ -1,7 +1,8 @@
 # kit cdp — worked recipes
 
-Each recipe is a complete sequence you can adapt. `--app` is shown explicitly;
-drop it when only one instance exists.
+Each recipe is a complete sequence you can adapt. The examples show `--app`
+explicitly because many use named launched sessions. For an app owned by the current
+Git worktree, omit it even when other worktrees are running.
 
 ## Verify a feature you just built
 

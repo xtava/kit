@@ -1,8 +1,9 @@
 //! The Attachment registry — the single source of truth for which Attachments are live. One JSON
 //! record + one socket per Attachment under the user's runtime dir, keyed by Instance name.
 //!
-//! Reconciliation is the disposal backstop (`docs/adr/0003`): a record whose daemon pid is dead is
-//! swept, so a crashed daemon never lingers as a phantom entry.
+//! Reconciliation is the disposal backstop (`docs/adr/0003`): the caller asks the framework
+//! supervisor to inspect each durable receipt, so a completed daemon never lingers as a phantom
+//! entry and a lost authority is never guessed from a PID.
 
 use std::path::{Path, PathBuf};
 
@@ -16,13 +17,14 @@ pub struct Record {
     pub app: String,
     /// The Instance selector the Attachment was created with — used to re-discover on reconnect.
     pub selector: String,
-    pub port: u16,
-    /// The daemon process pid (the Attachment itself).
-    pub pid: u32,
-    /// Linux process start ticks for `pid`. Paired with the pid so reconciliation never treats a
-    /// reused pid as the original Attachment process.
+    /// Git worktree root for attachments discovered from a running process. Controlled launches
+    /// use their explicit session identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub process_start_ticks: Option<u64>,
+    pub worktree_root: Option<PathBuf>,
+    pub port: u16,
+    /// Opaque receipt for the detached daemon authority. It must be decoded and controlled only
+    /// by `ProcessSupervisor`.
+    pub daemon_receipt: String,
     /// The Instance's browser pid at attach time.
     pub root_pid: u32,
     pub started_at_ms: u64,
@@ -40,11 +42,12 @@ pub struct LaunchRecord {
     pub phase: LaunchPhase,
     pub url: String,
     pub browser: String,
-    pub browser_pid: u32,
-    /// Controlled-launch ownership proof. Legacy records without this proof are retained but never
-    /// signalled automatically: a pid alone is not a safe process identity.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ownership: Option<LaunchOwnership>,
+    /// Opaque receipt for the detached browser/Electron authority. It must be decoded and
+    /// controlled only by `ProcessSupervisor`.
+    pub process_receipt: String,
+    /// The process currently serving the browser-level CDP endpoint. This is CDP routing metadata,
+    /// never a lifecycle authority.
+    pub root_pid: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_kind: Option<LaunchKind>,
     #[serde(default)]
@@ -135,27 +138,6 @@ impl GpuMode {
     }
 }
 
-/// Stable identity for one Linux process. Pids are reusable; `start_ticks` makes a match specific to
-/// one process lifetime, while process-group/session ids establish the owned termination boundary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProcessIdentity {
-    pub pid: u32,
-    pub start_ticks: u64,
-    pub process_group_id: u32,
-    pub session_id: u32,
-}
-
-/// Ownership recorded after the controlled process and its CDP endpoint are both live. The endpoint
-/// may be a descendant of a launcher wrapper (notably `pnpm` -> Electron), but it must live in the
-/// same newly-created session.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LaunchOwnership {
-    pub leader: ProcessIdentity,
-    pub endpoint: ProcessIdentity,
-}
-
 pub fn dir() -> PathBuf {
     directories::ProjectDirs::from("", "", "kit")
         .and_then(|dirs| dirs.runtime_dir().map(|dir| dir.join("cdp")))
@@ -167,10 +149,6 @@ pub fn dir() -> PathBuf {
 
 pub fn socket_path(name: &str) -> PathBuf {
     dir().join(format!("{name}.sock"))
-}
-
-pub fn log_path(name: &str) -> PathBuf {
-    dir().join(format!("{name}.log"))
 }
 
 pub fn profiles_dir() -> PathBuf {
@@ -265,33 +243,6 @@ pub fn all_launches() -> Vec<LaunchRecord> {
         .collect()
 }
 
-/// Drop records whose daemon is gone (and their stray sockets); return the survivors.
-pub fn reconcile() -> Vec<Record> {
-    all()
-        .into_iter()
-        .filter(|record| {
-            if record_process_is_current(record) {
-                true
-            } else {
-                remove(&record.name);
-                false
-            }
-        })
-        .collect()
-}
-
-/// Whether an Attachment record still names the exact process that wrote it. Old records without
-/// start ticks keep the previous liveness check so `gc` can still recover them, but newly written
-/// records cannot be kept alive by pid reuse.
-pub fn record_process_is_current(record: &Record) -> bool {
-    match record.process_start_ticks {
-        Some(start_ticks) => {
-            process_identity(record.pid).is_some_and(|identity| identity.start_ticks == start_ticks)
-        }
-        None => is_alive(record.pid),
-    }
-}
-
 pub fn remove(name: &str) {
     let _ = std::fs::remove_file(record_path(name));
     let _ = std::fs::remove_file(socket_path(name));
@@ -314,68 +265,5 @@ fn is_under(path: &Path, root: &Path) -> bool {
     match (path.canonicalize(), root.canonicalize()) {
         (Ok(path), Ok(root)) => path.starts_with(root),
         _ => path.starts_with(root),
-    }
-}
-
-/// Whether a pid is a live process.
-pub fn is_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    if unsafe { libc::kill(pid as i32, 0) == 0 } {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-/// Read one process's identity from `/proc/<pid>/stat`. The command name is parenthesized and may
-/// contain spaces or parentheses, so fields are parsed only after its final `)`.
-pub fn process_identity(pid: u32) -> Option<ProcessIdentity> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    parse_process_stat(pid, &stat)
-}
-
-/// Enumerate every live process currently in a Linux session. Callers must first verify a recorded
-/// process identity in that session before treating this as an owned termination boundary.
-pub fn processes_in_session(session_id: u32) -> Vec<ProcessIdentity> {
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .filter_map(|entry| entry.file_name().to_string_lossy().parse::<u32>().ok())
-        .filter_map(process_identity)
-        .filter(|identity| identity.session_id == session_id)
-        .collect()
-}
-
-fn parse_process_stat(pid: u32, stat: &str) -> Option<ProcessIdentity> {
-    let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
-    Some(ProcessIdentity {
-        pid,
-        process_group_id: fields.get(2)?.parse().ok()?,
-        session_id: fields.get(3)?.parse().ok()?,
-        start_ticks: fields.get(19)?.parse().ok()?,
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn process_stat_parser_handles_spaces_and_parentheses_in_command_name() {
-        let mut fields = vec!["0"; 20];
-        fields[0] = "S";
-        fields[1] = "1";
-        fields[2] = "42";
-        fields[3] = "42";
-        fields[19] = "987654";
-        let stat = format!("42 (chrome (renderer)) {}", fields.join(" "));
-        let identity = parse_process_stat(42, &stat).unwrap();
-        assert_eq!(
-            identity,
-            ProcessIdentity { pid: 42, process_group_id: 42, session_id: 42, start_ticks: 987654 }
-        );
     }
 }

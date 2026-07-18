@@ -10,8 +10,8 @@ the *why* of the shape see [`docs/adr/`](./adr).
 Every command talks to a warm **Attachment** — a background daemon bound to one
 Instance's browser endpoint that holds the live connection and accumulates a
 **Timeline**. The first command lazily spawns it; the rest are warm. It survives
-HMR reloads (browser endpoint is stable) and app restarts (re-discovers by
-selector), addresses **Targets** by stable **selector** (never a volatile id), and
+HMR reloads (browser endpoint is stable) and app restarts (re-discovers by the
+persisted canonical Git worktree), addresses **Targets** by stable **selector** (never a volatile id), and
 disposes itself through idle timeout, bounded reconnect, signals, and registry
 reconciliation; controlled close verifies ownership and retains recovery state when
 shutdown cannot be proven.
@@ -19,10 +19,10 @@ shutdown cannot be proven.
 ## The agent contract
 
 ```
-kit cdp                       # orient: instances available + live attachments
 kit cdp launch http://localhost:3000 --name app
                               # launch isolated Chrome, attach before navigation
-kit cdp eval 'location.href'  # just works — lazy-attaches, stays warm
+kit cdp screenshot            # current worktree — lazy-attaches, stays warm
+kit cdp eval 'location.href'  # same exact worktree attachment
 kit cdp tail --since 3s       # all tracks on one clock — "what just happened"
 kit cdp brief --since 30s     # agent-safe compact timeline with omission counts
 kit cdp ls                    # health + the kill switch
@@ -237,9 +237,13 @@ A value change reads as a remove/add pair; reordering alone is not a change (ref
 renumber and layout shifts — identity is the line, not the position). Every explicit
 `snap` resets the baseline.
 
-Selectors: `--app <instance>` picks the Attachment (app name / worktree / instance
-id / port); `--target <selector>` picks the Target (defaults to the main app
-window). Timeline slices accept `--source main|renderer`, `--target <selector>`,
+Instance selection is worktree-bound by default: Kit finds the nearest Git root for
+the caller and considers only CDP processes owned by that exact root. It never falls
+back to the main checkout, and zero or multiple endpoints are explicit errors. Outside
+Git, omission requires exactly one instance. `--app <instance>` is the cross-instance
+override (internal attachment name / app name / worktree label or path / instance id /
+exact port); `--target <selector>` picks the Target (defaults to the main app window).
+Timeline slices accept `--source main|renderer`, `--target <selector>`,
 `--grep <text>`, `--extension <id>`, and `--limit <n>`. `--since` takes `500ms`
 / `2s` / `5m`.
 

@@ -41,8 +41,8 @@ const HISTORY_CAP: usize = 1_000;
 /// Columns panned per Shift+Left/Right.
 const PAN_STEP: u16 = 12;
 
-pub async fn run(app: Option<&str>) -> Result<()> {
-    let record = client::ensure_attached(app).await?;
+pub async fn run(runtime: client::Runtime<'_>, app: Option<&str>) -> Result<()> {
+    let record = client::ensure_attached(runtime, app).await?;
     let mut frames = client::subscribe(&record, BACKFILL_MS).await?;
     let (async_tx, mut async_rx) = mpsc::unbounded_channel::<Async>();
 
@@ -774,7 +774,7 @@ impl TargetEntry {
         self.events > 0
     }
 
-    fn score(&self, needle: &str) -> Option<u16> {
+    fn score(&self, matcher: &mut fuzzy::Matcher) -> Option<u64> {
         [
             Some(self.label.as_str()),
             Some(self.url.as_str()),
@@ -784,7 +784,7 @@ impl TargetEntry {
         ]
         .into_iter()
         .flatten()
-        .filter_map(|field| fuzzy::score_ci(field, needle))
+        .filter_map(|field| matcher.score(field))
         .min()
     }
 }
@@ -844,14 +844,15 @@ impl Picker {
                 .collect();
         } else {
             // Searching reaches every target, active or not, so any view is findable by name.
-            let mut scored: Vec<(u16, usize)> = self
+            let mut matcher = fuzzy::Matcher::case_insensitive(&needle);
+            let mut scored: Vec<(u64, usize)> = self
                 .entries
                 .iter()
                 .enumerate()
                 .filter_map(|(index, entry)| {
                     entry
                         .as_ref()
-                        .and_then(|entry| entry.score(&needle))
+                        .and_then(|entry| entry.score(&mut matcher))
                         .map(|score| (score, index))
                 })
                 .collect();

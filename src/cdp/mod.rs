@@ -19,8 +19,8 @@ pub use client::{
     EventDropCounts, EventIngressSnapshot, EventIngressStats, ImageFormat, NoFrame, TargetMetrics,
 };
 pub use discovery::{
-    browser_endpoint, discover, is_cdp, node_endpoint, targets, BrowserEndpoint, Instance,
-    NodeEndpoint,
+    browser_endpoint, discover, discover_in_worktree, discover_port, is_cdp, node_endpoint,
+    targets, BrowserEndpoint, Instance, NodeEndpoint,
 };
 pub use ports::{listening_ports, owner_pid};
 pub use sourcemap::{inline_map, resolve_map_url, SourceMap, SourceMatch};

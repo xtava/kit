@@ -1,8 +1,8 @@
 //! The Attachment daemon — the warm process behind every `kit cdp` command. It binds to the
 //! Instance's browser endpoint, flatten-auto-attaches every Target, captures their events into one
 //! Timeline, and answers client queries over a unix socket. It survives reloads (browser endpoint
-//! is stable) and restarts (re-discovers by selector), and disposes itself cleanly (`docs/adr/0002`,
-//! `docs/adr/0003`).
+//! is stable) and restarts (re-discovers by canonical worktree or explicit launched-session
+//! selector), and disposes itself cleanly (`docs/adr/0002`, `docs/adr/0003`).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -18,19 +18,19 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 use tokio::time::{interval, sleep};
 
-use crate::cdp::{
-    self, CdpConnection, CdpEvent, CdpEventStream, EventIngressSnapshot, EventIngressStats,
-    ImageFormat, LogEntry, Source, Target, Timeline, TimelineEvent, Track, TrackKind,
-};
-
 use super::protocol::{
     Command, Expectation, Frame, IgnoreOp, LaunchSettings, Locator, NetCommand, Query, Reply,
     ScreenshotRequest, Settle, SubscriptionOverload, TargetActivity, TimelineQuery,
     DEFAULT_CAPTURE_TIMEOUT_MS,
 };
 use super::readiness::{self, DocState, Readiness};
-use super::registry::{self, Record};
+use super::registry;
 use super::{checks, format, snapshot};
+use crate::cdp::{
+    self, CdpConnection, CdpEvent, CdpEventStream, EventIngressSnapshot, EventIngressStats,
+    ImageFormat, LogEntry, Source, Target, Timeline, TimelineEvent, Track, TrackKind,
+};
+use crate::framework::RepositoryLocator;
 
 mod console_capture;
 mod redaction;
@@ -151,6 +151,7 @@ struct State {
     name: String,
     app: String,
     selector: String,
+    worktree_root: Option<PathBuf>,
     port: u16,
     root_pid: u32,
     conn: CdpConnection,
@@ -268,21 +269,6 @@ impl State {
             .unwrap_or_else(|| "browser".to_owned())
     }
 
-    fn record(&self) -> Record {
-        Record {
-            name: self.name.clone(),
-            app: self.app.clone(),
-            selector: self.selector.clone(),
-            port: self.port,
-            pid: std::process::id(),
-            process_start_ticks: registry::process_identity(std::process::id())
-                .map(|identity| identity.start_ticks),
-            root_pid: self.root_pid,
-            started_at_ms: now_unix_ms(),
-            tracks: self.tracks.iter().map(|track| track.as_str().to_owned()).collect(),
-        }
-    }
-
     fn ingress_snapshot(&self) -> EventIngressSnapshot {
         let renderer =
             self.renderer_ingress_history.saturating_add(self.renderer_ingress.snapshot());
@@ -296,6 +282,7 @@ impl State {
 pub async fn serve(
     name: String,
     selector: String,
+    worktree_root: Option<PathBuf>,
     port: u16,
     root_pid: u32,
     probe_main: bool,
@@ -310,6 +297,7 @@ pub async fn serve(
         name: name.clone(),
         app: endpoint.app.clone(),
         selector,
+        worktree_root,
         port,
         root_pid,
         conn: conn.clone(),
@@ -340,8 +328,6 @@ pub async fn serve(
     }));
 
     setup_capture(&conn).await.context("enable target discovery")?;
-    registry::write(&state.lock().unwrap().record())?;
-
     if probe_main {
         tokio::spawn(main_process_pump(state.clone()));
     }
@@ -371,19 +357,13 @@ pub async fn serve(
             _ = shutdown_rx.recv() => break,
             _ = watchdog.tick() => {
                 let idle = state.lock().unwrap().last_activity.elapsed() > IDLE_TIMEOUT;
-                let registry_owned = registry::read(&name)
-                    .is_some_and(|record| {
-                        record.pid == std::process::id()
-                            && registry::record_process_is_current(&record)
-                    });
-                if idle || !registry_owned {
+                if idle {
                     break;
                 }
             }
         }
     }
 
-    registry::remove(&name);
     Ok(())
 }
 
@@ -737,7 +717,10 @@ async fn connect_main(root_pid: u32) -> Option<(CdpConnection, CdpEventStream)> 
 }
 
 async fn reconnect(state: &Shared) -> Option<CdpEventStream> {
-    let selector = state.lock().unwrap().selector.clone();
+    let (selector, worktree_root) = {
+        let state = state.lock().unwrap();
+        (state.selector.clone(), state.worktree_root.clone())
+    };
     let deadline = Instant::now() + RECONNECT_WINDOW;
     let mut delay = RECONNECT_MIN;
 
@@ -745,7 +728,7 @@ async fn reconnect(state: &Shared) -> Option<CdpEventStream> {
         sleep(delay).await;
         delay = (delay * 2).min(RECONNECT_MAX);
 
-        let Some(instance) = discover_matching(&selector).await else {
+        let Some(instance) = discover_matching(&selector, worktree_root.as_deref()).await else {
             continue;
         };
         let Ok((conn, events)) = CdpConnection::connect(&instance.endpoint.ws_url).await else {
@@ -756,7 +739,7 @@ async fn reconnect(state: &Shared) -> Option<CdpEventStream> {
             continue;
         }
 
-        let record = {
+        {
             let mut state = state.lock().unwrap();
             state.renderer_ingress_history =
                 state.renderer_ingress_history.saturating_add(state.renderer_ingress.snapshot());
@@ -772,20 +755,26 @@ async fn reconnect(state: &Shared) -> Option<CdpEventStream> {
             state.debugger_enabled.clear();
             state.scripts.clear();
             state.source_maps.clear();
-            state.record()
         };
-        let _ = registry::write(&record);
         return Some(events);
     }
     None
 }
 
-async fn discover_matching(selector: &str) -> Option<cdp::Instance> {
-    cdp::discover()
-        .await
-        .into_iter()
-        .filter(|instance| instance.matches(selector))
-        .min_by_key(|instance| instance.endpoint.port)
+async fn discover_matching(selector: &str, worktree_root: Option<&Path>) -> Option<cdp::Instance> {
+    let repositories = RepositoryLocator::new();
+    let instances = match worktree_root {
+        Some(root) => cdp::discover_in_worktree(&repositories, root).await,
+        None => cdp::discover(&repositories)
+            .await
+            .into_iter()
+            .filter(|instance| instance.matches(selector))
+            .collect(),
+    };
+    if instances.len() != 1 {
+        return None;
+    }
+    instances.into_iter().next()
 }
 
 async fn handle_client(stream: UnixStream, state: Shared, shutdown: mpsc::Sender<()>) {

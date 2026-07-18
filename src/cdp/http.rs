@@ -12,7 +12,11 @@ use tokio::time::timeout;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub async fn get(port: u16, path: &str) -> Result<String> {
-    timeout(HTTP_TIMEOUT, get_inner(port, path)).await.context("http get timed out")?
+    get_with_timeout(port, path, HTTP_TIMEOUT).await
+}
+
+pub async fn get_with_timeout(port: u16, path: &str, duration: Duration) -> Result<String> {
+    timeout(duration, get_inner(port, path)).await.context("http get timed out")?
 }
 
 async fn get_inner(port: u16, path: &str) -> Result<String> {

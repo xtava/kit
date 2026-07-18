@@ -1,15 +1,17 @@
 # kit cdp — full command surface
 
-Every command accepts `--json` (structured output) and `--app <selector>` (which
-attachment: app name, worktree, instance id, or port). Failed assertions and failed
-steps exit non-zero. Text output pipes cleanly to `grep`/`head`.
+Every command accepts `--json` (structured output) and `--app <selector>` (an
+intentional cross-instance override by attachment name, app name, worktree, instance
+id, or port). Failed assertions and failed steps exit non-zero. Text output pipes
+cleanly to `grep`/`head`.
 
 **Multiple instances.** The daemon holds one attachment and one Timeline **per
 instance** — worktrees, dev ports, and launched sessions all coexist and never merge.
-`--app` selects which one; omit it only with a single instance running (otherwise the
-command errors and lists candidates rather than guessing). Avoid a bare digit as the
-selector (`--app 8` is too loose) — use the worktree name, `instance-8`, or the full
-port. `--target <selector>` then picks a specific window *within* that instance
+Without `--app`, Kit selects only the instance owned by the current Git worktree. It
+never falls back to another checkout and errors if that scope contains zero or multiple
+endpoints. Outside Git, omission requires exactly one instance. Avoid a bare digit as
+the selector (`--app 8` is too loose) — use the worktree name, internal attachment
+name, `instance-8`, or the full port. `--target <selector>` then picks a specific window *within* that instance
 (defaults to the main window). Per-instance state — marks, the `snap --diff` baseline,
 watches, traces, ignore filters — lives on the instance you set it on; reuse the same
 `--app` across a loop or continuity breaks.
