@@ -104,6 +104,11 @@ impl MarkdownRenderer {
     }
 
     pub fn render(&self, source: &str, width: u16) -> Text<'static> {
+        self.render_with_outline(source, width).text
+    }
+
+    /// Renders Markdown and returns semantic headings mapped to their rendered line positions.
+    pub fn render_with_outline(&self, source: &str, width: u16) -> RenderedMarkdown {
         let mut options = Options::empty();
         options.insert(Options::ENABLE_TABLES);
         options.insert(Options::ENABLE_FOOTNOTES);
@@ -126,6 +131,46 @@ impl MarkdownRenderer {
         }
         writer.finish()
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarkdownHeading {
+    pub level: u8,
+    pub title: String,
+    pub line: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct RenderedMarkdown {
+    pub text: Text<'static>,
+    pub headings: Vec<MarkdownHeading>,
+    pub links: Vec<MarkdownLink>,
+    pub search_lines: Vec<MarkdownSearchLine>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarkdownLink {
+    pub destination: String,
+    pub line: usize,
+    pub start: u16,
+    pub end: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarkdownSearchLine {
+    pub text: String,
+    pub start_line: usize,
+    pub end_line: usize,
+}
+
+/// Returns whether the document contains a semantic heading at or above `max_level`.
+pub fn has_heading(source: &str, max_level: u8) -> bool {
+    Parser::new_ext(source, Options::ENABLE_GFM).any(|event| {
+        matches!(
+            event,
+            Event::Start(Tag::Heading { level, .. }) if heading_level(level) <= max_level
+        )
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -163,6 +208,18 @@ struct ImageState {
     alt: String,
 }
 
+struct PendingHeading {
+    level: HeadingLevel,
+    title: String,
+    logical_line: usize,
+}
+
+struct LogicalHeading {
+    level: HeadingLevel,
+    title: String,
+    logical_line: usize,
+}
+
 struct TableState {
     alignments: Vec<MarkdownAlignment>,
     rows: Vec<Vec<Vec<Span<'static>>>>,
@@ -184,10 +241,13 @@ struct Writer {
     code: Option<CodeBlock>,
     image: Option<ImageState>,
     links: Vec<String>,
+    rendered_links: Vec<String>,
     table: Option<TableState>,
     footnote_depth: usize,
     needs_gap: bool,
     last_item_marker: Option<usize>,
+    heading: Option<PendingHeading>,
+    headings: Vec<LogicalHeading>,
 }
 
 impl Writer {
@@ -205,10 +265,13 @@ impl Writer {
             code: None,
             image: None,
             links: Vec::new(),
+            rendered_links: Vec::new(),
             table: None,
             footnote_depth: 0,
             needs_gap: false,
             last_item_marker: None,
+            heading: None,
+            headings: Vec::new(),
         }
     }
 
@@ -216,19 +279,36 @@ impl Writer {
         match event {
             Event::Start(tag) => self.start(tag),
             Event::End(tag) => self.end(tag),
-            Event::Text(text) => self.text(text.as_ref()),
-            Event::Code(code) => self.push_span(code.to_string(), self.theme.inline_code),
+            Event::Text(text) => {
+                self.capture_heading_text(text.as_ref());
+                self.text(text.as_ref());
+            }
+            Event::Code(code) => {
+                self.capture_heading_text(code.as_ref());
+                self.push_span(code.to_string(), self.theme.inline_code);
+            }
             Event::Html(html) | Event::InlineHtml(html) => {
+                self.capture_heading_text(html.as_ref());
                 self.push_span(html.to_string(), self.theme.html)
             }
             Event::FootnoteReference(label) => {
+                self.capture_heading_text(label.as_ref());
                 self.push_span(superscript_reference(label.as_ref()), self.theme.footnote)
             }
-            Event::SoftBreak => self.push_span(" ".to_owned(), Style::default()),
-            Event::HardBreak => self.finish_line(),
+            Event::SoftBreak => {
+                self.capture_heading_text(" ");
+                self.push_span(" ".to_owned(), Style::default());
+            }
+            Event::HardBreak => {
+                self.capture_heading_text(" ");
+                self.finish_line();
+            }
             Event::Rule => self.rule(),
             Event::TaskListMarker(checked) => self.task_marker(checked),
-            Event::InlineMath(math) => self.push_span(math.to_string(), self.theme.math),
+            Event::InlineMath(math) => {
+                self.capture_heading_text(math.as_ref());
+                self.push_span(math.to_string(), self.theme.math);
+            }
             Event::DisplayMath(math) => {
                 self.separate_block();
                 self.push_span(math.to_string(), self.theme.math);
@@ -248,6 +328,11 @@ impl Writer {
             Tag::Heading { level, .. } => {
                 self.separate_block();
                 self.block_styles.push(self.theme.headings[heading_index(level)]);
+                self.heading = Some(PendingHeading {
+                    level,
+                    title: String::new(),
+                    logical_line: self.lines.len(),
+                });
             }
             Tag::BlockQuote(kind) => {
                 if self.quotes.is_empty() {
@@ -332,6 +417,16 @@ impl Writer {
             TagEnd::Heading(_) => {
                 self.finish_line();
                 self.block_styles.pop();
+                if let Some(heading) = self.heading.take() {
+                    let title = heading.title.split_whitespace().collect::<Vec<_>>().join(" ");
+                    if !title.is_empty() {
+                        self.headings.push(LogicalHeading {
+                            level: heading.level,
+                            title,
+                            logical_line: heading.logical_line,
+                        });
+                    }
+                }
                 self.needs_gap = true;
             }
             TagEnd::BlockQuote(_) => {
@@ -387,6 +482,7 @@ impl Writer {
             TagEnd::Link => {
                 self.inline_styles.pop();
                 if let Some(destination) = self.links.pop() {
+                    self.rendered_links.push(destination.clone());
                     self.push_span(format!(" ‹{destination}›"), self.theme.link);
                 }
             }
@@ -431,6 +527,12 @@ impl Writer {
             .iter()
             .chain(&self.inline_styles)
             .fold(self.theme.text, |style, next| style.patch(*next))
+    }
+
+    fn capture_heading_text(&mut self, text: &str) {
+        if let Some(heading) = &mut self.heading {
+            heading.title.push_str(text);
+        }
     }
 
     fn start_item(&mut self) {
@@ -594,15 +696,147 @@ impl Writer {
         self.needs_gap = false;
     }
 
-    fn finish(mut self) -> Text<'static> {
+    fn finish(mut self) -> RenderedMarkdown {
         self.finish_line();
         while self.lines.last().is_some_and(|line| line.spans.is_empty()) {
             self.lines.pop();
         }
-        Text::from(
-            self.lines.into_iter().flat_map(|line| wrap_line(line, self.width)).collect::<Vec<_>>(),
-        )
+        let search_text = self
+            .lines
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect::<String>())
+            .collect::<Vec<_>>();
+        let mut rendered_lines = Vec::new();
+        let mut line_offsets = Vec::with_capacity(self.lines.len());
+        for line in self.lines {
+            line_offsets.push(rendered_lines.len());
+            rendered_lines.extend(wrap_line(line, self.width));
+        }
+        let headings = self
+            .headings
+            .into_iter()
+            .filter_map(|heading| {
+                Some(MarkdownHeading {
+                    level: heading_level(heading.level),
+                    title: heading.title,
+                    line: *line_offsets.get(heading.logical_line)?,
+                })
+            })
+            .collect();
+        let search_lines = search_text
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, text)| {
+                let start_line = *line_offsets.get(index)?;
+                let end_line = line_offsets.get(index + 1).copied().unwrap_or(rendered_lines.len());
+                Some(MarkdownSearchLine { text, start_line, end_line })
+            })
+            .collect();
+        let text = Text::from(rendered_lines);
+        let links = locate_rendered_links(&text, &self.rendered_links, self.theme.link);
+        RenderedMarkdown { text, headings, links, search_lines }
     }
+}
+
+fn locate_rendered_links(
+    text: &Text<'_>,
+    destinations: &[String],
+    link_style: Style,
+) -> Vec<MarkdownLink> {
+    let mut flat = String::new();
+    let mut lines = Vec::with_capacity(text.lines.len());
+    let mut styled_ranges = Vec::new();
+    for (line_index, line) in text.lines.iter().enumerate() {
+        let line_start = flat.len();
+        for span in &line.spans {
+            let start = flat.len();
+            flat.push_str(span.content.as_ref());
+            if span.style.fg == link_style.fg
+                && span.style.add_modifier.contains(Modifier::UNDERLINED)
+            {
+                styled_ranges.push(start..flat.len());
+            }
+        }
+        lines.push((line_index, line_start, flat.len()));
+    }
+
+    let mut output = Vec::new();
+    let mut cursor = 0;
+    for destination in destinations {
+        let link_start_bound = cursor;
+        let marker = format!("‹{destination}›");
+        let mut search_from = cursor;
+        let range = loop {
+            let Some(offset) = flat.get(search_from..).and_then(|tail| tail.find(&marker)) else {
+                break None;
+            };
+            let start = search_from + offset;
+            let end = start + marker.len();
+            if range_is_styled(start, end, &styled_ranges) {
+                break Some(start..end);
+            }
+            search_from = end;
+        };
+        let Some(range) = range else {
+            continue;
+        };
+        let component = styled_component(range.start, range.end, &styled_ranges);
+        let clickable = component.start.max(link_start_bound)..range.end;
+        cursor = range.end;
+        for (line, line_start, line_end) in &lines {
+            let start = clickable.start.max(*line_start);
+            let end = clickable.end.min(*line_end);
+            if start >= end {
+                continue;
+            }
+            let line_text = &flat[*line_start..*line_end];
+            let local_start = start - *line_start;
+            let local_end = end - *line_start;
+            output.push(MarkdownLink {
+                destination: destination.clone(),
+                line: *line,
+                start: line_text[..local_start].width().min(u16::MAX as usize) as u16,
+                end: line_text[..local_end].width().min(u16::MAX as usize) as u16,
+            });
+        }
+    }
+    output
+}
+
+fn styled_component(
+    start: usize,
+    end: usize,
+    ranges: &[std::ops::Range<usize>],
+) -> std::ops::Range<usize> {
+    let mut output = start..end;
+    for range in ranges.iter().rev() {
+        if range.start > output.end {
+            continue;
+        }
+        if range.end < output.start {
+            break;
+        }
+        output.start = output.start.min(range.start);
+        output.end = output.end.max(range.end);
+    }
+    output
+}
+
+fn range_is_styled(start: usize, end: usize, ranges: &[std::ops::Range<usize>]) -> bool {
+    let mut covered = start;
+    for range in ranges {
+        if range.end <= covered {
+            continue;
+        }
+        if range.start > covered {
+            return false;
+        }
+        covered = covered.max(range.end);
+        if covered >= end {
+            return true;
+        }
+    }
+    false
 }
 
 fn heading_index(level: HeadingLevel) -> usize {
@@ -614,6 +848,10 @@ fn heading_index(level: HeadingLevel) -> usize {
         HeadingLevel::H5 => 4,
         HeadingLevel::H6 => 5,
     }
+}
+
+fn heading_level(level: HeadingLevel) -> u8 {
+    heading_index(level) as u8 + 1
 }
 
 fn alert_name(kind: BlockQuoteKind) -> &'static str {
@@ -909,6 +1147,88 @@ mod tests {
         assert!(text.lines[0].spans.iter().any(|span| {
             span.style.add_modifier.contains(Modifier::BOLD) && span.content.contains("Heading")
         }));
+    }
+
+    #[test]
+    fn outline_uses_semantic_headings_and_rendered_line_positions() {
+        let source = concat!(
+            "Intro text that wraps over several rendered lines before the outline.\n\n",
+            "# First *section*\n\n",
+            "```markdown\n# Not a heading\n```\n\n",
+            "Second section\n--------------\n"
+        );
+        let rendered = MarkdownRenderer::default().render_with_outline(source, 24);
+        let lines = rendered
+            .text
+            .lines
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect::<String>())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            rendered.headings,
+            vec![
+                MarkdownHeading {
+                    level: 1,
+                    title: "First section".to_owned(),
+                    line: lines.iter().position(|line| line == "First section").unwrap(),
+                },
+                MarkdownHeading {
+                    level: 2,
+                    title: "Second section".to_owned(),
+                    line: lines.iter().position(|line| line == "Second section").unwrap(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn links_report_clickable_ranges_after_wrapping() {
+        let long = "docs/a-very-long-guide-name.md";
+        let source = format!("Literal `‹fake.md›` then [the guide]({long}) and [notes](notes.md).");
+        let rendered = MarkdownRenderer::default().render_with_outline(&source, 18);
+        let long_hits =
+            rendered.links.iter().filter(|link| link.destination == long).collect::<Vec<_>>();
+
+        assert!(long_hits.len() > 1, "long destination should span rendered lines");
+        assert!(long_hits.iter().all(|link| link.end > link.start));
+        assert!(rendered.links.iter().any(|link| link.destination == "notes.md"));
+        assert!(!rendered.links.iter().any(|link| link.destination == "fake.md"));
+
+        let simple = MarkdownRenderer::default().render_with_outline("[the guide](guide.md)", 80);
+        assert_eq!(
+            simple.links,
+            vec![MarkdownLink {
+                destination: "guide.md".to_owned(),
+                line: 0,
+                start: 0,
+                end: "the guide ‹guide.md›".width() as u16,
+            }]
+        );
+    }
+
+    #[test]
+    fn adjacent_links_keep_distinct_click_targets() {
+        let rendered = MarkdownRenderer::default()
+            .render_with_outline("[first](first.md)[second](second.md)", 80);
+        let first = rendered.links.iter().find(|link| link.destination == "first.md").unwrap();
+        let second = rendered.links.iter().find(|link| link.destination == "second.md").unwrap();
+
+        assert_eq!(first.line, second.line);
+        assert!(first.end <= second.start, "{first:?} overlaps {second:?}");
+    }
+
+    #[test]
+    fn semantic_search_lines_do_not_change_when_text_wraps() {
+        let source = "A deliberately long visible line with a needle phrase near the end.";
+        let narrow = MarkdownRenderer::default().render_with_outline(source, 16);
+        let wide = MarkdownRenderer::default().render_with_outline(source, 80);
+
+        assert_eq!(
+            narrow.search_lines.iter().map(|line| &line.text).collect::<Vec<_>>(),
+            wide.search_lines.iter().map(|line| &line.text).collect::<Vec<_>>()
+        );
+        assert!(narrow.search_lines[0].end_line > wide.search_lines[0].end_line);
     }
 
     #[test]

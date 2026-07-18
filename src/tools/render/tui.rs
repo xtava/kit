@@ -1,50 +1,69 @@
 use std::{
-    collections::HashSet,
     fs, future,
     path::{Path, PathBuf},
-    process::Command,
+    sync::Arc,
     time::Duration,
 };
 
 use anyhow::{anyhow, Context, Result};
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
-use ignore::WalkBuilder;
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Modifier, Style},
-    text::{Line, Span},
+    text::{Line, Span, Text},
     widgets::{Block, BorderType, Borders, Padding, Paragraph},
     Frame,
 };
-use tokio::sync::mpsc::{self, UnboundedReceiver};
+use tokio::sync::{
+    mpsc::{self, UnboundedReceiver},
+    Notify,
+};
 use tokio::time::{self, Instant};
 use unicode_width::UnicodeWidthStr;
+use url::Url;
 
-use super::config::{self, Config};
+use super::{
+    config::{self, Config},
+    search::SearchIndex,
+};
 use crate::tui::{
     fuzzy,
-    markdown::MarkdownRenderer,
+    markdown::{has_heading, MarkdownHeading, MarkdownLink, MarkdownRenderer, MarkdownSearchLine},
+    render_split_divider,
     theme::{self, TuiTheme},
-    CommandSet, CommandSpec, EventReader, LineEditor, ParsedInput, Session, SessionOptions,
-    SettingsEditor, SettingsFlow, Suggestion, SuggestionMenu,
+    CommandSet, CommandSpec, EventReader, Frecency, FrecencyStore, LineEditor, ParsedInput,
+    Session, SessionOptions, SettingsEditor, SettingsFlow, SplitDividerStyle, SplitDrag,
+    SplitFrame, SplitMinimums, SplitRatio, Suggestion, SuggestionMenu,
 };
 
 const SUGGESTION_ROWS: usize = 8;
 const SCROLL_STEP: isize = 3;
 const WATCH_SETTLE_TIME: Duration = Duration::from_millis(60);
+const TOC_MIN_DOCUMENT_WIDTH: u16 = 48;
+const TOC_MIN_WIDTH: u16 = 24;
+const TOC_MIN_LAYOUT_WIDTH: u16 = TOC_MIN_DOCUMENT_WIDTH + TOC_MIN_WIDTH + 1;
+const DEFAULT_TOC_SPLIT_RATIO: SplitRatio = SplitRatio::new(700);
 const COMMANDS: CommandSet = CommandSet::new(&[
     CommandSpec {
         name: "configure",
         aliases: &["config"],
         usage: "/configure",
-        description: "configure Markdown discovery",
+        description: "configure the Markdown viewer",
     },
     CommandSpec {
         name: "theme",
         aliases: &[],
         usage: "/theme <nord|terminal|path>",
         description: "change and persist the render theme",
+    },
+    CommandSpec {
+        name: "find",
+        aliases: &["search"],
+        usage: "/find <text>",
+        description: "search inside the open document",
     },
     CommandSpec {
         name: "help",
@@ -63,8 +82,12 @@ pub async fn run(
     theme: TuiTheme,
 ) -> Result<()> {
     let root = root.canonicalize().context("resolve Markdown search root")?;
-    let catalog = Catalog::discover(&root);
-    let mut app = App::new(root, catalog, initial, config, theme_spec, theme)?;
+    let search_wake = Arc::new(Notify::new());
+    let index = SearchIndex::discover(&root, Arc::clone(&search_wake));
+    let frecency_store =
+        FrecencyStore::bootstrap("render").context("open Render frecency store")?;
+    let frecency = frecency_store.load().context("load Render frecency")?;
+    let mut app = App::new(root, index, frecency, initial, config, theme_spec, theme)?;
     let mut session = Session::open(SessionOptions { mouse_capture: true })?;
     let mut events = EventReader::start();
     let mut document_watch = DocumentWatch::start()?;
@@ -87,8 +110,19 @@ pub async fn run(
                         app.notice = Notice::error(format!("watch document: {error:#}"));
                     }
                 }
-                Some(Event::Mouse(mouse)) => app.on_mouse(mouse),
-                Some(Event::Resize(_, _)) => {}
+                Some(Event::Mouse(mouse)) => {
+                    let previous_document = app.document_path().map(Path::to_path_buf);
+                    app.on_mouse(mouse);
+                    if app.document_path() != previous_document.as_deref() {
+                        reload_at = None;
+                    }
+                    if let Err(error) = document_watch.follow(app.document_path()) {
+                        app.notice = Notice::error(format!("watch document: {error:#}"));
+                    }
+                }
+                Some(Event::Resize(_, _)) => {
+                    app.cancel_toc_drag();
+                }
                 None => break,
                 _ => {}
             },
@@ -106,9 +140,15 @@ pub async fn run(
                 reload_at = None;
                 app.reload_document(false);
             },
+            () = search_wake.notified() => {
+                app.refresh_search_results();
+            },
         }
     }
 
+    if app.frecency.is_dirty() {
+        frecency_store.save(&mut app.frecency).context("save Render frecency")?;
+    }
     Ok(())
 }
 
@@ -173,7 +213,8 @@ enum Surface {
 
 struct App {
     root: PathBuf,
-    catalog: Catalog,
+    index: SearchIndex,
+    frecency: Frecency<PathBuf>,
     config: Config,
     theme_spec: String,
     theme: TuiTheme,
@@ -184,13 +225,84 @@ struct App {
     viewport_height: usize,
     input: LineEditor,
     suggestions: Option<SuggestionMenu>,
+    search: Option<DocumentSearch>,
+    toc_hits: Vec<TocHit>,
+    link_hits: Vec<LinkHit>,
+    toc_split_ratio: SplitRatio,
+    toc_split_frame: SplitFrame,
+    toc_drag: Option<SplitDrag<()>>,
+    history: NavigationHistory,
     notice: Notice,
+}
+
+struct DocumentSearch {
+    query: String,
+    matches: Vec<usize>,
+    selected: usize,
+}
+
+#[derive(Clone, Copy)]
+struct TocHit {
+    area: Rect,
+    line: usize,
+}
+
+struct LinkHit {
+    area: Rect,
+    destination: String,
+}
+
+#[derive(Default)]
+struct NavigationHistory {
+    entries: Vec<PathBuf>,
+    cursor: Option<usize>,
+}
+
+impl NavigationHistory {
+    fn visit(&mut self, path: PathBuf) {
+        if self.current() == Some(path.as_path()) {
+            return;
+        }
+        let keep = self.cursor.map_or(0, |cursor| cursor + 1);
+        self.entries.truncate(keep);
+        self.entries.push(path);
+        self.cursor = Some(self.entries.len() - 1);
+    }
+
+    fn current(&self) -> Option<&Path> {
+        self.cursor.and_then(|cursor| self.entries.get(cursor)).map(PathBuf::as_path)
+    }
+
+    fn target(&self, delta: isize) -> Option<(usize, &Path)> {
+        let cursor = self.cursor?;
+        let target = cursor.checked_add_signed(delta)?;
+        self.entries.get(target).map(|path| (target, path.as_path()))
+    }
+
+    fn select(&mut self, cursor: usize) {
+        debug_assert!(cursor < self.entries.len());
+        self.cursor = Some(cursor);
+    }
+}
+
+fn document_search_notice(search: &DocumentSearch) -> String {
+    if search.matches.is_empty() {
+        format!("no matches for {:?} · Esc clears", search.query)
+    } else {
+        format!(
+            "match {}/{} for {:?} · n/N navigates · Esc clears",
+            search.selected + 1,
+            search.matches.len(),
+            search.query
+        )
+    }
 }
 
 impl App {
     fn new(
         root: PathBuf,
-        catalog: Catalog,
+        index: SearchIndex,
+        frecency: Frecency<PathBuf>,
         initial: Option<PathBuf>,
         config: Config,
         theme_spec: String,
@@ -198,7 +310,8 @@ impl App {
     ) -> Result<Self> {
         let mut app = Self {
             root,
-            catalog,
+            index,
+            frecency,
             config,
             theme_spec,
             theme,
@@ -209,6 +322,13 @@ impl App {
             viewport_height: 0,
             input: LineEditor::default(),
             suggestions: None,
+            search: None,
+            toc_hits: Vec::new(),
+            link_hits: Vec::new(),
+            toc_split_ratio: DEFAULT_TOC_SPLIT_RATIO,
+            toc_split_frame: SplitFrame::default(),
+            toc_drag: None,
+            history: NavigationHistory::default(),
             notice: Notice::info(String::new()),
         };
 
@@ -232,22 +352,81 @@ impl App {
             }
             return Flow::Continue;
         }
+        if self.toc_drag.is_some() {
+            if key.code == KeyCode::Esc {
+                self.cancel_toc_drag();
+            }
+            return Flow::Continue;
+        }
+        if self.input.value().is_empty() && self.toc_split_frame.separator.width > 0 {
+            match key.code {
+                KeyCode::Char('<') => {
+                    self.resize_toc_split(-5);
+                    return Flow::Continue;
+                }
+                KeyCode::Char('>') => {
+                    self.resize_toc_split(5);
+                    return Flow::Continue;
+                }
+                KeyCode::Char('=') if key.modifiers.is_empty() => {
+                    self.reset_toc_split();
+                    self.notice = Notice::info("reset contents panel width".to_owned());
+                    return Flow::Continue;
+                }
+                _ => {}
+            }
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('u') {
             self.clear_search();
+            return Flow::Continue;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('f') {
+            self.open_document_search();
             return Flow::Continue;
         }
         if key.modifiers.is_empty()
             && key.code == KeyCode::Char('r')
             && self.input.value().is_empty()
-            && self.document.is_some()
         {
-            self.reload_document(true);
+            self.refresh_index();
             return Flow::Continue;
         }
 
         let menu = self.suggestions.is_some();
         let engaged = self.suggestions.as_ref().is_some_and(SuggestionMenu::is_engaged);
         match key.code {
+            KeyCode::Up
+                if key.modifiers == KeyModifiers::SHIFT && self.input.value().is_empty() =>
+            {
+                self.scroll_top = 0;
+            }
+            KeyCode::Down
+                if key.modifiers == KeyModifiers::SHIFT && self.input.value().is_empty() =>
+            {
+                self.scroll_top = self.max_scroll();
+            }
+            KeyCode::Char('n')
+                if key.modifiers.is_empty()
+                    && self.input.value().is_empty()
+                    && self.search.is_some() =>
+            {
+                self.move_search(1);
+            }
+            KeyCode::Char('N')
+                if (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+                    && self.input.value().is_empty()
+                    && self.search.is_some() =>
+            {
+                self.move_search(-1);
+            }
+            KeyCode::Left if key.modifiers.is_empty() && self.input.value().is_empty() && !menu => {
+                self.move_history(-1);
+            }
+            KeyCode::Right
+                if key.modifiers.is_empty() && self.input.value().is_empty() && !menu =>
+            {
+                self.move_history(1);
+            }
             KeyCode::Enter if engaged => return self.submit_selected(),
             KeyCode::Enter => return self.submit_typed(),
             KeyCode::Tab if menu => self.cycle_selection(1),
@@ -276,6 +455,7 @@ impl App {
                 }
             }
             KeyCode::Esc if !self.input.value().is_empty() => self.clear_search(),
+            KeyCode::Esc if self.search.is_some() => self.clear_document_search(),
             KeyCode::Esc => return Flow::Quit,
             _ => {
                 self.input.apply_key(key);
@@ -290,9 +470,87 @@ impl App {
             return;
         }
         match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if self.begin_toc_drag(mouse.column, mouse.row) {
+                    return;
+                }
+                if let Some(destination) = self
+                    .link_hits
+                    .iter()
+                    .find(|hit| rect_contains(hit.area, mouse.column, mouse.row))
+                    .map(|hit| hit.destination.clone())
+                {
+                    self.open_link(&destination);
+                    return;
+                }
+                if let Some(line) = self
+                    .toc_hits
+                    .iter()
+                    .find(|hit| rect_contains(hit.area, mouse.column, mouse.row))
+                    .map(|hit| hit.line)
+                {
+                    self.scroll_top = line.min(self.max_scroll());
+                    self.notice = Notice::info("jumped to heading".to_owned());
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                self.update_toc_drag(mouse.column);
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.finish_toc_drag();
+            }
             MouseEventKind::ScrollUp => self.scroll_by(-SCROLL_STEP),
             MouseEventKind::ScrollDown => self.scroll_by(SCROLL_STEP),
             _ => {}
+        }
+    }
+
+    fn begin_toc_drag(&mut self, column: u16, row: u16) -> bool {
+        self.toc_drag =
+            SplitDrag::begin((), self.toc_split_frame, self.toc_split_ratio, column, row);
+        self.toc_drag.is_some()
+    }
+
+    fn update_toc_drag(&mut self, column: u16) -> bool {
+        let Some(drag) = self.toc_drag else {
+            return false;
+        };
+        let Some(ratio) = drag.ratio_for_column((), self.toc_split_frame, column) else {
+            self.cancel_toc_drag();
+            return false;
+        };
+        let changed = self.toc_split_ratio != ratio;
+        self.toc_split_ratio = ratio;
+        changed
+    }
+
+    fn finish_toc_drag(&mut self) -> bool {
+        let Some(drag) = self.toc_drag.take() else {
+            return false;
+        };
+        drag.changed(self.toc_split_ratio)
+    }
+
+    fn cancel_toc_drag(&mut self) -> bool {
+        let Some(drag) = self.toc_drag.take() else {
+            return false;
+        };
+        let (_, start_ratio) = drag.cancel();
+        let changed = self.toc_split_ratio != start_ratio;
+        self.toc_split_ratio = start_ratio;
+        changed
+    }
+
+    fn reset_toc_split(&mut self) {
+        self.toc_split_ratio = DEFAULT_TOC_SPLIT_RATIO;
+    }
+
+    fn resize_toc_split(&mut self, cells: i16) {
+        let column = self.toc_split_frame.separator.x.saturating_add_signed(cells);
+        if let Some(ratio) = self.toc_split_frame.ratio_for_column(column) {
+            self.toc_split_ratio = ratio;
+            let action = if cells.is_negative() { "narrowed" } else { "widened" };
+            self.notice = Notice::info(format!("{action} document panel"));
         }
     }
 
@@ -391,11 +649,19 @@ impl App {
                 self.open_theme_picker();
                 Flow::Continue
             }
+            "find" if args.trim().is_empty() => {
+                self.open_document_search();
+                Flow::Continue
+            }
+            "find" => {
+                self.start_document_search(args.trim());
+                Flow::Continue
+            }
             "help" => {
                 self.input.clear();
                 self.suggestions = None;
                 self.notice = Notice::info(
-                    "/configure changes settings · /theme changes appearance · /quit exits"
+                    "/find searches · n/N moves · drag or </> resizes · = resets · /quit exits"
                         .to_owned(),
                 );
                 Flow::Continue
@@ -434,6 +700,61 @@ impl App {
         self.notice = Notice::info("select a theme with Tab or ↑/↓, then press Enter".to_owned());
     }
 
+    fn open_document_search(&mut self) {
+        if self.document.is_none() {
+            self.notice = Notice::error("open a Markdown file before searching".to_owned());
+            return;
+        }
+        self.input.set("/find ".to_owned());
+        self.suggestions = None;
+        self.notice = Notice::info("type text to find, then press Enter".to_owned());
+    }
+
+    fn start_document_search(&mut self, query: &str) {
+        if self.document.is_none() {
+            self.notice = Notice::error("open a Markdown file before searching".to_owned());
+            return;
+        }
+        self.search =
+            Some(DocumentSearch { query: query.to_owned(), matches: Vec::new(), selected: 0 });
+        self.input.clear();
+        self.suggestions = None;
+        self.notice = Notice::info(String::new());
+    }
+
+    fn sync_document_search(&mut self, matches: Vec<usize>) {
+        let Some(search) = &mut self.search else {
+            return;
+        };
+        let jump_to_first = search.matches.is_empty() && !matches.is_empty();
+        search.matches = matches;
+        search.selected = search.selected.min(search.matches.len().saturating_sub(1));
+        let line = search.matches.get(search.selected).copied();
+        if jump_to_first {
+            if let Some(line) = line {
+                self.scroll_top = line.min(self.max_scroll());
+            }
+        }
+    }
+
+    fn move_search(&mut self, delta: isize) {
+        let Some(search) = &mut self.search else {
+            return;
+        };
+        if search.matches.is_empty() {
+            return;
+        }
+        search.selected =
+            (search.selected as isize + delta).rem_euclid(search.matches.len() as isize) as usize;
+        let line = search.matches[search.selected];
+        self.scroll_top = line.min(self.max_scroll());
+    }
+
+    fn clear_document_search(&mut self) {
+        self.search = None;
+        self.notice = Notice::info("document search cleared".to_owned());
+    }
+
     fn theme_suggestions(&self, query: &str) -> Vec<Suggestion> {
         let mut choices = vec![
             ("nord".to_owned(), "built-in Nord palette".to_owned()),
@@ -461,10 +782,11 @@ impl App {
         }
         choices.sort_by(|left, right| left.0.cmp(&right.0));
 
+        let mut matcher = fuzzy::Matcher::case_insensitive(query);
         let mut ranked = choices
             .into_iter()
             .filter_map(|(spec, hint)| {
-                let score = if query.is_empty() { 0 } else { fuzzy::score_ci(&spec, query)? };
+                let score = if query.is_empty() { 0 } else { matcher.score(&spec)? };
                 let active = if spec == self.theme_spec { " · active" } else { "" };
                 Some((score, Suggestion::new(format!("/theme {spec}"), format!("{hint}{active}"))))
             })
@@ -523,9 +845,9 @@ impl App {
         event.paths.iter().any(|changed| changed == path)
     }
 
-    fn reload_document(&mut self, announce_unchanged: bool) {
+    fn reload_document(&mut self, announce_unchanged: bool) -> bool {
         let Some(path) = self.document_path().map(Path::to_path_buf) else {
-            return;
+            return true;
         };
         match Document::load(&self.root, path) {
             Ok(document)
@@ -537,26 +859,90 @@ impl App {
                 if announce_unchanged {
                     self.notice = Notice::info(format!("refreshed {}", document.display));
                 }
+                true
             }
             Ok(document) => {
                 self.notice = Notice::info(format!("reloaded {}", document.display));
                 self.document = Some(document);
+                true
             }
             Err(error) => {
                 self.notice = Notice::error(format!("reload document: {error:#}"));
+                false
             }
         }
+    }
+
+    fn refresh_index(&mut self) {
+        let had_suggestions = self.suggestions.is_some();
+        let indexed = self.index.refresh(&self.root);
+        if had_suggestions || !self.input.value().trim().is_empty() {
+            self.refresh_suggestions();
+        }
+
+        let display = self.document.as_ref().map(|document| document.display.clone());
+        if !self.reload_document(false) {
+            return;
+        }
+        let noun = if indexed == 1 { "file" } else { "files" };
+        self.notice = Notice::info(match display {
+            Some(display) => format!("refreshed {display} · indexed {indexed} Markdown {noun}"),
+            None => format!("indexed {indexed} Markdown {noun}"),
+        });
     }
 
     fn open(&mut self, path: PathBuf) -> Result<()> {
         let path = if path.is_absolute() { path } else { self.root.join(path) };
         let document = Document::load(&self.root, path)?;
-        self.notice = Notice::info(format!("opened {} · r refreshes", document.display));
+        self.history.visit(document.path.clone());
+        self.frecency.record(document.path.clone());
+        self.show_document(document);
+        Ok(())
+    }
+
+    fn show_document(&mut self, document: Document) {
+        self.notice = Notice::info(format!(
+            "opened {} · ←/→ history · Ctrl-F finds · ⇧↑/⇧↓ jumps",
+            document.display
+        ));
         self.document = Some(document);
+        self.search = None;
         self.scroll_top = 0;
         self.input.clear();
         self.suggestions = None;
-        Ok(())
+    }
+
+    fn move_history(&mut self, delta: isize) {
+        let Some((cursor, path)) =
+            self.history.target(delta).map(|(cursor, path)| (cursor, path.to_path_buf()))
+        else {
+            let direction = if delta.is_negative() { "back" } else { "forward" };
+            self.notice = Notice::info(format!("no {direction} history"));
+            return;
+        };
+        match Document::load(&self.root, path) {
+            Ok(document) => {
+                self.history.select(cursor);
+                let display = document.display.clone();
+                self.show_document(document);
+                self.notice = Notice::info(format!("history · {display}"));
+            }
+            Err(error) => {
+                self.notice = Notice::error(format!("open history entry: {error:#}"));
+            }
+        }
+    }
+
+    fn open_link(&mut self, destination: &str) {
+        let Some(current) = self.document_path().map(Path::to_path_buf) else {
+            return;
+        };
+        match resolve_document_link(&current, destination).and_then(|path| self.open(path)) {
+            Ok(()) => {}
+            Err(error) => {
+                self.notice = Notice::error(format!("open link {destination:?}: {error:#}"));
+            }
+        }
     }
 
     fn clear_search(&mut self) {
@@ -573,6 +959,10 @@ impl App {
         }
         let query = raw.trim().to_owned();
         if query.starts_with('/') {
+            if query.chars().any(char::is_whitespace) {
+                self.suggestions = None;
+                return;
+            }
             let candidates = COMMANDS
                 .suggestions(&query)
                 .into_iter()
@@ -581,14 +971,23 @@ impl App {
             self.set_suggestions(&query, candidates);
             return;
         }
-        if query.is_empty() && self.document.is_some() {
-            self.suggestions = None;
-            return;
-        }
+        self.refresh_file_suggestions(&query);
+    }
 
+    fn refresh_search_results(&mut self) {
+        let query = self.input.value().trim().to_owned();
+        if !query.is_empty() && !query.starts_with('/') {
+            self.refresh_file_suggestions(&query);
+        }
+    }
+
+    fn refresh_file_suggestions(&mut self, query: &str) {
         let current = self.document.as_ref().map(|document| document.path.as_path());
-        let candidates = self.catalog.suggestions(&query, current, self.config.show_git_ignored());
-        self.set_suggestions(&query, candidates);
+        match self.index.suggestions(query, current, self.config.show_git_ignored(), &self.frecency)
+        {
+            Some(candidates) => self.set_suggestions(query, candidates),
+            None => self.suggestions = None,
+        }
     }
 
     fn set_suggestions(&mut self, query: &str, candidates: Vec<Suggestion>) {
@@ -681,141 +1080,6 @@ impl Document {
     }
 }
 
-struct Catalog {
-    entries: Vec<FileEntry>,
-}
-
-impl Catalog {
-    fn discover(root: &Path) -> Self {
-        let mut entries = WalkBuilder::new(root)
-            .follow_links(false)
-            .standard_filters(true)
-            .build()
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
-            .filter(|entry| is_markdown(entry.path()))
-            .map(|entry| FileEntry::new(root, entry.into_path(), false))
-            .collect::<Vec<_>>();
-
-        let mut known = entries.iter().map(|entry| entry.path.clone()).collect::<HashSet<_>>();
-        for relative in git_ignored_markdown(root) {
-            let path = root.join(relative);
-            let Ok(path) = path.canonicalize() else {
-                continue;
-            };
-            if !path.starts_with(root)
-                || !path.is_file()
-                || !is_markdown(&path)
-                || !known.insert(path.clone())
-            {
-                continue;
-            }
-            entries.push(FileEntry::new(root, path, true));
-        }
-
-        entries
-            .sort_by(|left, right| left.display.to_lowercase().cmp(&right.display.to_lowercase()));
-        Self { entries }
-    }
-
-    fn suggestions(
-        &self,
-        query: &str,
-        current: Option<&Path>,
-        show_git_ignored: bool,
-    ) -> Vec<Suggestion> {
-        let needle = query.strip_prefix("./").unwrap_or(query);
-        let mut ranked = self
-            .entries
-            .iter()
-            .filter(|entry| show_git_ignored || !entry.ignored)
-            .filter_map(|entry| {
-                let rank = if needle.is_empty() {
-                    (3, 0)
-                } else if entry.display.eq_ignore_ascii_case(needle) {
-                    (0, 0)
-                } else if let Some(score) = fuzzy::score_ci(&entry.basename, needle) {
-                    (1, score)
-                } else {
-                    (2, fuzzy::score_ci(&entry.display, needle)?)
-                };
-                Some((rank, entry))
-            })
-            .collect::<Vec<_>>();
-        ranked.sort_by(|(left_rank, left), (right_rank, right)| {
-            left_rank.cmp(right_rank).then_with(|| left.display.cmp(&right.display))
-        });
-        ranked
-            .into_iter()
-            .map(|(_, entry)| {
-                let mut hint = Vec::with_capacity(3);
-                if entry.ignored {
-                    hint.push("ignored".to_owned());
-                }
-                if current == Some(entry.path.as_path()) {
-                    hint.push("open".to_owned());
-                }
-                hint.push(format_bytes(entry.bytes));
-                Suggestion::new(entry.display.clone(), hint.join(" · "))
-            })
-            .collect()
-    }
-}
-
-struct FileEntry {
-    path: PathBuf,
-    display: String,
-    basename: String,
-    bytes: u64,
-    ignored: bool,
-}
-
-impl FileEntry {
-    fn new(root: &Path, path: PathBuf, ignored: bool) -> Self {
-        let display = display_path(root, &path);
-        let basename = path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| display.clone());
-        let bytes = path.metadata().map(|metadata| metadata.len()).unwrap_or(0);
-        Self { path, display, basename, bytes, ignored }
-    }
-}
-
-fn git_ignored_markdown(root: &Path) -> Vec<PathBuf> {
-    let output = Command::new("git")
-        .args([
-            "ls-files",
-            "-z",
-            "--cached",
-            "--others",
-            "--ignored",
-            "--exclude-standard",
-            "--",
-            ":(icase)*.md",
-            ":(icase)*.markdown",
-            ":(icase)*.mdown",
-            ":(icase)*.mkd",
-            ":(icase)*.mdx",
-        ])
-        .current_dir(root)
-        .output();
-    let Ok(output) = output else {
-        return Vec::new();
-    };
-    if !output.status.success() {
-        return Vec::new();
-    }
-
-    output
-        .stdout
-        .split(|byte| *byte == 0)
-        .filter(|raw| !raw.is_empty())
-        .filter_map(|raw| std::str::from_utf8(raw).ok())
-        .map(PathBuf::from)
-        .collect()
-}
-
 struct Notice {
     text: String,
     error: bool,
@@ -856,6 +1120,9 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
 }
 
 fn render_document(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    app.toc_hits.clear();
+    app.link_hits.clear();
+    app.toc_split_frame = SplitFrame::default();
     let Some(document) = &app.document else {
         let body = vec![
             Line::from(""),
@@ -864,7 +1131,7 @@ fn render_document(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 Style::default().fg(app.theme.text_strong).add_modifier(Modifier::BOLD),
             )),
             Line::from("Use fuzzy fragments from any part of the path, then Tab or ↑/↓ to select."),
-            Line::from("Type /configure to control whether Git-ignored Markdown is shown."),
+            Line::from("Type /configure to change viewer settings."),
             Line::from(""),
             Line::from(Span::styled(
                 "Enter opens a selected or exact path · Esc clears or quits",
@@ -876,22 +1143,205 @@ fn render_document(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         return;
     };
 
-    let inner_width = area.width.saturating_sub(4).max(1);
-    let text = MarkdownRenderer::new(app.theme).render(&document.markdown, inner_width);
+    let renderer = MarkdownRenderer::new(app.theme);
+    let toc_heading_depth = app.config.toc_heading_depth();
+    let supports_toc = area.width >= TOC_MIN_LAYOUT_WIDTH;
+    let mut document_area = area;
+    let mut toc_area = None;
+    let rendered = if supports_toc && has_heading(&document.markdown, toc_heading_depth) {
+        let split = SplitFrame::horizontal(
+            area,
+            app.toc_split_ratio,
+            SplitMinimums::new(TOC_MIN_DOCUMENT_WIDTH, TOC_MIN_WIDTH),
+        );
+        app.toc_split_frame = split;
+        document_area = split.first;
+        toc_area = Some(split.second);
+        renderer.render_with_outline(&document.markdown, split.first.width.saturating_sub(4).max(1))
+    } else {
+        renderer.render_with_outline(&document.markdown, area.width.saturating_sub(4).max(1))
+    };
+    if toc_area.is_none() {
+        app.cancel_toc_drag();
+    }
+    let mut text = rendered.text;
+    let mut headings = rendered.headings;
+    headings.retain(|heading| heading.level <= toc_heading_depth);
+    let links = rendered.links;
+    let search_lines = rendered.search_lines;
     let content_height = text.lines.len();
-    let paragraph = Paragraph::new(text);
-    let viewport_height = area.height.saturating_sub(2) as usize;
+    let viewport_height = document_area.height.saturating_sub(2) as usize;
     app.content_height = content_height;
     app.viewport_height = viewport_height;
     let max_scroll = content_height.saturating_sub(viewport_height).min(u16::MAX as usize);
     app.scroll_top = app.scroll_top.min(max_scroll);
+    if let Some(query) = app.search.as_ref().map(|search| search.query.clone()) {
+        app.sync_document_search(matching_document_lines(&text, &search_lines, &query));
+    }
+    if let Some(search) = &app.search {
+        highlight_document_matches(&mut text, search, app.theme);
+    }
+    app.link_hits = rendered_link_hits(document_area, app.scroll_top, viewport_height, &links);
     let title = if max_scroll == 0 {
         " markdown ".to_owned()
     } else {
         format!(" markdown ─ {}/{} ", app.scroll_top + 1, max_scroll + 1)
     };
     let scroll = app.scroll_top.min(u16::MAX as usize) as u16;
-    frame.render_widget(paragraph.block(panel(title, app.theme)).scroll((scroll, 0)), area);
+    frame.render_widget(
+        Paragraph::new(text).block(panel(title, app.theme)).scroll((scroll, 0)),
+        document_area,
+    );
+    if let Some(toc_area) = toc_area {
+        app.toc_hits = render_toc(frame, toc_area, &headings, app.scroll_top, app.theme);
+        render_split_divider(
+            frame,
+            app.toc_split_frame,
+            app.toc_drag.is_some(),
+            SplitDividerStyle {
+                idle_color: app.theme.text_muted,
+                active_color: app.theme.accent,
+                idle_line: " ",
+                idle_grip: "┋",
+                active_line: "┃",
+            },
+        );
+    }
+}
+
+fn rendered_link_hits(
+    area: Rect,
+    scroll_top: usize,
+    viewport_height: usize,
+    links: &[MarkdownLink],
+) -> Vec<LinkHit> {
+    let content_x = area.x.saturating_add(2);
+    let content_y = area.y.saturating_add(1);
+    let content_width = area.width.saturating_sub(4);
+    links
+        .iter()
+        .filter_map(|link| {
+            let row = link.line.checked_sub(scroll_top)?;
+            if row >= viewport_height {
+                return None;
+            }
+            let start = link.start.min(content_width);
+            let end = link.end.min(content_width);
+            (end > start).then(|| LinkHit {
+                area: Rect::new(
+                    content_x.saturating_add(start),
+                    content_y.saturating_add(row as u16),
+                    end - start,
+                    1,
+                ),
+                destination: link.destination.clone(),
+            })
+        })
+        .collect()
+}
+
+fn render_toc(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    headings: &[MarkdownHeading],
+    scroll_top: usize,
+    theme: TuiTheme,
+) -> Vec<TocHit> {
+    let active = headings.iter().rposition(|heading| heading.line <= scroll_top);
+    let visible_rows = area.height.saturating_sub(2) as usize;
+    let start = active
+        .unwrap_or_default()
+        .saturating_sub(visible_rows / 2)
+        .min(headings.len().saturating_sub(visible_rows));
+    let lines = headings
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible_rows)
+        .map(|(index, heading)| {
+            let selected = active == Some(index);
+            let prefix = if selected { "› " } else { "  " };
+            let indent = "  ".repeat(heading.level.saturating_sub(1).min(4) as usize);
+            let style = if selected {
+                Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.text_muted)
+            };
+            Line::styled(format!("{prefix}{indent}{}", heading.title), style)
+        })
+        .collect::<Vec<_>>();
+    let hits = headings
+        .iter()
+        .skip(start)
+        .take(visible_rows)
+        .enumerate()
+        .map(|(row, heading)| TocHit {
+            area: Rect::new(
+                area.x.saturating_add(1),
+                area.y.saturating_add(1).saturating_add(row as u16),
+                area.width.saturating_sub(2),
+                1,
+            ),
+            line: heading.line,
+        })
+        .collect();
+    let title = active.map_or_else(
+        || " contents ".to_owned(),
+        |index| format!(" contents ─ {}/{} ", index + 1, headings.len()),
+    );
+    frame.render_widget(Paragraph::new(lines).block(panel(title, theme)), area);
+    hits
+}
+
+fn matching_document_lines(
+    text: &Text<'_>,
+    search_lines: &[MarkdownSearchLine],
+    query: &str,
+) -> Vec<usize> {
+    let query = query.to_lowercase();
+    search_lines
+        .iter()
+        .filter_map(|search_line| {
+            if !search_line.text.to_lowercase().contains(&query) {
+                return None;
+            }
+            (search_line.start_line..search_line.end_line)
+                .find(|index| {
+                    text.lines.get(*index).is_some_and(|line| {
+                        line.spans
+                            .iter()
+                            .map(|span| span.content.as_ref())
+                            .collect::<String>()
+                            .to_lowercase()
+                            .contains(&query)
+                    })
+                })
+                .or(Some(search_line.start_line))
+        })
+        .collect()
+}
+
+fn highlight_document_matches(text: &mut Text<'_>, search: &DocumentSearch, theme: TuiTheme) {
+    for (index, line_index) in search.matches.iter().copied().enumerate() {
+        let Some(line) = text.lines.get_mut(line_index) else {
+            continue;
+        };
+        let style = if index == search.selected {
+            Style::default()
+                .fg(theme.code_background)
+                .bg(theme.warning)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().bg(theme.selection)
+        };
+        for span in &mut line.spans {
+            span.style = span.style.patch(style);
+        }
+    }
+}
+
+fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
+    column >= area.x && column < area.right() && row >= area.y && row < area.bottom()
 }
 
 fn render_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -903,7 +1353,12 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if let Some(ghost) = app.ghost() {
         spans.push(Span::styled(ghost, Style::default().fg(app.theme.text_muted)));
     } else if app.input.value().is_empty() {
-        let (hint, color) = if !app.notice.text.is_empty() {
+        let search_notice = app.search.as_ref().map(document_search_notice);
+        let (hint, color) = if app.notice.error {
+            (format!("‹{}›", app.notice.text), app.theme.danger)
+        } else if let Some(search_notice) = search_notice {
+            (format!("‹{search_notice}›"), app.theme.text_muted)
+        } else if !app.notice.text.is_empty() {
             let color = if app.notice.error { app.theme.danger } else { app.theme.text_muted };
             (format!("‹{}›", app.notice.text), color)
         } else {
@@ -942,25 +1397,20 @@ fn resolve_from(root: &Path, raw: &str) -> PathBuf {
     }
 }
 
+fn resolve_document_link(current: &Path, destination: &str) -> Result<PathBuf> {
+    let base = Url::from_file_path(current)
+        .map_err(|()| anyhow!("cannot convert {} to a file URL", current.display()))?;
+    let target = base
+        .join(destination)
+        .with_context(|| format!("resolve link from {}", current.display()))?;
+    if target.scheme() != "file" {
+        return Err(anyhow!("{} links do not open inside kit render", target.scheme()));
+    }
+    target.to_file_path().map_err(|()| anyhow!("link is not a local file path: {destination:?}"))
+}
+
 fn display_path(root: &Path, path: &Path) -> String {
     path.strip_prefix(root).unwrap_or(path).to_string_lossy().into_owned()
-}
-
-fn is_markdown(path: &Path) -> bool {
-    path.extension().and_then(|extension| extension.to_str()).is_some_and(|extension| {
-        matches!(
-            extension.to_ascii_lowercase().as_str(),
-            "md" | "markdown" | "mdown" | "mkd" | "mdx"
-        )
-    })
-}
-
-fn format_bytes(bytes: u64) -> String {
-    match bytes {
-        0..=999 => format!("{bytes} B"),
-        1_000..=999_999 => format!("{:.1} KB", bytes as f64 / 1_000.0),
-        _ => format!("{:.1} MB", bytes as f64 / 1_000_000.0),
-    }
 }
 
 #[cfg(test)]
@@ -999,56 +1449,19 @@ mod tests {
         Config::load(crate::framework::ConfigStore::rooted(temp.0.join("config"))).unwrap()
     }
 
-    #[test]
-    fn catalog_classifies_gitignored_markdown() {
-        let temp = TempDir::new();
-        let status = Command::new("git").args(["init", "--quiet"]).current_dir(&temp.0).status();
-        assert!(status.is_ok_and(|status| status.success()));
-        fs::create_dir_all(temp.0.join("docs")).unwrap();
-        fs::write(temp.0.join("README.md"), "# Read me").unwrap();
-        fs::write(temp.0.join("docs/guide.markdown"), "# Guide").unwrap();
-        fs::write(temp.0.join("ignored.md"), "# Ignore me").unwrap();
-        fs::write(temp.0.join("notes.txt"), "not Markdown").unwrap();
-        fs::write(temp.0.join(".gitignore"), "ignored.md\n").unwrap();
-
-        let catalog = Catalog::discover(&temp.0);
-        let paths = catalog.entries.iter().map(|entry| entry.display.as_str()).collect::<Vec<_>>();
-        assert_eq!(paths, vec!["docs/guide.markdown", "ignored.md", "README.md"]);
-        assert!(
-            catalog.entries.iter().find(|entry| entry.display == "ignored.md").unwrap().ignored
-        );
-
-        let hidden = catalog.suggestions("ignored", None, false);
-        assert!(hidden.is_empty());
-        let shown = catalog.suggestions("ignored", None, true);
-        assert_eq!(shown[0].insert, "ignored.md");
-        assert!(shown[0].hint.contains("ignored"));
+    fn test_index(root: &Path) -> SearchIndex {
+        SearchIndex::discover(root, Arc::new(Notify::new()))
     }
 
-    #[test]
-    fn fuzzy_search_prefers_basename_then_full_path() {
-        let catalog = Catalog {
-            entries: vec![
-                FileEntry {
-                    path: PathBuf::from("/repo/docs/setup.md"),
-                    display: "docs/setup.md".to_owned(),
-                    basename: "setup.md".to_owned(),
-                    bytes: 10,
-                    ignored: false,
-                },
-                FileEntry {
-                    path: PathBuf::from("/repo/setup/notes.md"),
-                    display: "setup/notes.md".to_owned(),
-                    basename: "notes.md".to_owned(),
-                    bytes: 20,
-                    ignored: false,
-                },
-            ],
-        };
-
-        let suggestions = catalog.suggestions("setup", None, true);
-        assert_eq!(suggestions[0].insert, "docs/setup.md");
-        assert_eq!(suggestions[1].insert, "setup/notes.md");
+    fn wait_for_search(app: &mut App) {
+        for _ in 0..100 {
+            app.refresh_search_results();
+            if app.suggestions.is_some() {
+                return;
+            }
+            std::thread::yield_now();
+        }
+        panic!("search index did not finish matching");
     }
 
     #[test]
@@ -1057,13 +1470,22 @@ mod tests {
         fs::create_dir_all(temp.0.join("docs")).unwrap();
         fs::write(temp.0.join("docs/guide.md"), "# Guide").unwrap();
         let root = temp.0.canonicalize().unwrap();
-        let catalog = Catalog::discover(&root);
+        let catalog = test_index(&root);
         let config = test_config(&temp);
-        let mut app =
-            App::new(root, catalog, None, config, "nord".to_owned(), theme::NORD).unwrap();
+        let mut app = App::new(
+            root,
+            catalog,
+            Frecency::default(),
+            None,
+            config,
+            "nord".to_owned(),
+            theme::NORD,
+        )
+        .unwrap();
 
         app.input.set("guide".to_owned());
         app.refresh_suggestions();
+        wait_for_search(&mut app);
         app.cycle_selection(1);
         assert_eq!(app.submit_selected(), Flow::Continue);
 
@@ -1085,7 +1507,8 @@ mod tests {
         let root = temp.0.canonicalize().unwrap();
         let mut app = App::new(
             root.clone(),
-            Catalog::discover(&root),
+            test_index(&root),
+            Frecency::default(),
             Some(open_path.clone()),
             test_config(&temp),
             "nord".to_owned(),
@@ -1116,7 +1539,8 @@ mod tests {
         let root = temp.0.canonicalize().unwrap();
         let mut app = App::new(
             root.clone(),
-            Catalog::discover(&root),
+            test_index(&root),
+            Frecency::default(),
             Some(path.clone()),
             test_config(&temp),
             "nord".to_owned(),
@@ -1126,6 +1550,7 @@ mod tests {
         app.set_geometry(100, 20);
         app.scroll_top = 12;
         fs::write(path, "# After").unwrap();
+        fs::write(temp.0.join("new.md"), "# Newly indexed").unwrap();
 
         assert_eq!(
             app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
@@ -1137,8 +1562,14 @@ mod tests {
             Some("# After")
         );
         assert_eq!(app.scroll_top, 12);
+        assert_eq!(app.index.len(), 2);
         assert!(app.input.value().is_empty());
-        assert_eq!(app.notice.text, "reloaded README.md");
+        assert_eq!(app.notice.text, "refreshed README.md · indexed 2 Markdown files");
+
+        app.input.set("new".to_owned());
+        app.refresh_suggestions();
+        wait_for_search(&mut app);
+        assert_eq!(app.suggestions.as_ref().unwrap().first().unwrap().insert, "new.md");
     }
 
     #[tokio::test]
@@ -1171,18 +1602,23 @@ mod tests {
 
     #[test]
     fn case_insensitive_match_stays_selectable_on_case_sensitive_filesystems() {
-        let catalog = Catalog {
-            entries: vec![FileEntry {
-                path: PathBuf::from("/repo/README.md"),
-                display: "README.md".to_owned(),
-                basename: "README.md".to_owned(),
-                bytes: 10,
-                ignored: false,
-            }],
-        };
-        let suggestions = catalog.suggestions("readme.md", None, true);
-        assert_eq!(suggestions.len(), 1);
-        assert_eq!(suggestions[0].insert, "README.md");
+        let temp = TempDir::new();
+        fs::write(temp.0.join("README.md"), "# Read me").unwrap();
+        let root = temp.0.canonicalize().unwrap();
+        let mut app = App::new(
+            root.clone(),
+            test_index(&root),
+            Frecency::default(),
+            None,
+            test_config(&temp),
+            "nord".to_owned(),
+            theme::NORD,
+        )
+        .unwrap();
+        app.input.set("readme.md".to_owned());
+        app.refresh_suggestions();
+        wait_for_search(&mut app);
+        assert_eq!(app.suggestions.as_ref().unwrap().first().unwrap().insert, "README.md");
     }
 
     #[test]
@@ -1190,11 +1626,12 @@ mod tests {
         let temp = TempDir::new();
         fs::write(temp.0.join("README.md"), "# Hello\n\nThis is **Markdown**.").unwrap();
         let root = temp.0.canonicalize().unwrap();
-        let catalog = Catalog::discover(&root);
+        let catalog = test_index(&root);
         let config = test_config(&temp);
         let mut app = App::new(
             root,
             catalog,
+            Frecency::default(),
             Some(PathBuf::from("README.md")),
             config,
             "nord".to_owned(),
@@ -1222,12 +1659,358 @@ mod tests {
     }
 
     #[test]
+    fn wide_viewer_renders_a_heading_toc_and_narrow_viewer_does_not() {
+        let temp = TempDir::new();
+        fs::write(
+            temp.0.join("README.md"),
+            "# Overview\n\nIntro.\n\n## Setup\n\nSteps.\n\n### Verify\n\nDone.",
+        )
+        .unwrap();
+        let root = temp.0.canonicalize().unwrap();
+        let config = test_config(&temp);
+        let mut app = App::new(
+            root.clone(),
+            test_index(&root),
+            Frecency::default(),
+            Some(PathBuf::from("README.md")),
+            config,
+            "nord".to_owned(),
+            theme::NORD,
+        )
+        .unwrap();
+
+        let wide_backend = TestBackend::new(100, 24);
+        let mut wide = Terminal::new(wide_backend).unwrap();
+        wide.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.toc_hits.len(), 1);
+
+        app.config.set_toc_heading_depth(3).unwrap();
+        wide.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.toc_hits.len(), 3);
+        let wide_screen = (0..wide.backend().buffer().area.height)
+            .map(|y| {
+                (0..wide.backend().buffer().area.width)
+                    .map(|x| wide.backend().buffer()[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(wide_screen.contains("contents"), "{wide_screen}");
+        assert!(wide_screen.contains("Overview"), "{wide_screen}");
+        assert!(wide_screen.contains("Setup"), "{wide_screen}");
+        assert!(wide_screen.contains("Verify"), "{wide_screen}");
+
+        let narrow_backend = TestBackend::new(70, 24);
+        let mut narrow = Terminal::new(narrow_backend).unwrap();
+        narrow.draw(|frame| render(frame, &mut app)).unwrap();
+        let narrow_screen = (0..narrow.backend().buffer().area.height)
+            .map(|y| {
+                (0..narrow.backend().buffer().area.width)
+                    .map(|x| narrow.backend().buffer()[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!narrow_screen.contains("contents"), "{narrow_screen}");
+        assert_eq!(app.toc_split_frame, SplitFrame::default());
+    }
+
+    #[test]
+    fn contents_divider_resizes_cancels_and_resets_through_shared_split_state() {
+        let temp = TempDir::new();
+        fs::write(temp.0.join("README.md"), "# Overview\n\nIntro.").unwrap();
+        let root = temp.0.canonicalize().unwrap();
+        let mut app = App::new(
+            root.clone(),
+            test_index(&root),
+            Frecency::default(),
+            Some(PathBuf::from("README.md")),
+            test_config(&temp),
+            "nord".to_owned(),
+            theme::NORD,
+        )
+        .unwrap();
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let original_ratio = app.toc_split_ratio;
+        let original_frame = app.toc_split_frame;
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: original_frame.first.x.saturating_add(2),
+            row: original_frame.first.y.saturating_add(2),
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.toc_drag.is_none());
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: original_frame.separator.x,
+            row: original_frame.separator.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.toc_drag.is_some());
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: original_frame.separator.x.saturating_sub(8),
+            row: original_frame.separator.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_ne!(app.toc_split_ratio, original_ratio);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(app.toc_split_frame.first.width < original_frame.first.width);
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: app.toc_split_frame.separator.x,
+            row: app.toc_split_frame.separator.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.toc_drag.is_none());
+        let resized_ratio = app.toc_split_ratio;
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: app.toc_split_frame.separator.x,
+            row: app.toc_split_frame.separator.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: app.toc_split_frame.separator.x.saturating_add(8),
+            row: app.toc_split_frame.separator.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_ne!(app.toc_split_ratio, resized_ratio);
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.toc_drag.is_none());
+        assert_eq!(app.toc_split_ratio, resized_ratio);
+
+        app.on_key(KeyEvent::new(KeyCode::Char('='), KeyModifiers::NONE));
+        assert_eq!(app.toc_split_ratio, DEFAULT_TOC_SPLIT_RATIO);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let narrower = app
+            .toc_split_frame
+            .ratio_for_column(app.toc_split_frame.separator.x.saturating_sub(5))
+            .unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Char('<'), KeyModifiers::NONE));
+        assert_eq!(app.toc_split_ratio, narrower);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let wider = app
+            .toc_split_frame
+            .ratio_for_column(app.toc_split_frame.separator.x.saturating_add(5))
+            .unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Char('>'), KeyModifiers::NONE));
+        assert_eq!(app.toc_split_ratio, wider);
+    }
+
+    #[test]
+    fn clicking_a_toc_heading_jumps_to_its_rendered_line() {
+        let temp = TempDir::new();
+        let mut source = String::from("# First section\n\n");
+        for index in 0..30 {
+            source.push_str(&format!("Body paragraph {index}.\n\n"));
+        }
+        source.push_str("## Last section\n\nDone.\n");
+        fs::write(temp.0.join("README.md"), source).unwrap();
+        let root = temp.0.canonicalize().unwrap();
+        let mut config = test_config(&temp);
+        config.set_toc_heading_depth(2).unwrap();
+        let mut app = App::new(
+            root.clone(),
+            test_index(&root),
+            Frecency::default(),
+            Some(PathBuf::from("README.md")),
+            config,
+            "nord".to_owned(),
+            theme::NORD,
+        )
+        .unwrap();
+        let backend = TestBackend::new(100, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let hit = *app.toc_hits.last().unwrap();
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: hit.area.x,
+            row: hit.area.y,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert_eq!(app.scroll_top, hit.line.min(app.max_scroll()));
+        assert!(app.scroll_top > 0);
+    }
+
+    #[test]
+    fn clicking_a_local_markdown_link_opens_it_and_arrow_keys_traverse_history() {
+        let temp = TempDir::new();
+        fs::create_dir_all(temp.0.join("docs")).unwrap();
+        fs::write(temp.0.join("README.md"), "Read the [guide](docs/guide.md).").unwrap();
+        fs::write(temp.0.join("docs/guide.md"), "# Guide").unwrap();
+        let root = temp.0.canonicalize().unwrap();
+        let readme = root.join("README.md").canonicalize().unwrap();
+        let guide = root.join("docs/guide.md").canonicalize().unwrap();
+        let mut app = App::new(
+            root.clone(),
+            test_index(&root),
+            Frecency::default(),
+            Some(readme.clone()),
+            test_config(&temp),
+            "nord".to_owned(),
+            theme::NORD,
+        )
+        .unwrap();
+        let backend = TestBackend::new(70, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let hit = &app.link_hits[0];
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: hit.area.x,
+            row: hit.area.y,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        app.on_mouse(click);
+        assert_eq!(app.document_path(), Some(guide.as_path()));
+        assert_eq!(app.history.entries, vec![readme.clone(), guide.clone()]);
+        assert_eq!(app.frecency.visits(&readme), 1);
+        assert_eq!(app.frecency.visits(&guide), 1);
+
+        app.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(app.document_path(), Some(readme.as_path()));
+        app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.document_path(), Some(guide.as_path()));
+        assert_eq!(app.history.entries, vec![readme.clone(), guide.clone()]);
+        assert_eq!(app.frecency.visits(&readme), 1);
+        assert_eq!(app.frecency.visits(&guide), 1);
+    }
+
+    #[test]
+    fn nested_history_truncates_the_forward_branch_after_new_navigation() {
+        let temp = TempDir::new();
+        for name in ["a.md", "b.md", "c.md", "d.md"] {
+            fs::write(temp.0.join(name), format!("# {name}")).unwrap();
+        }
+        let root = temp.0.canonicalize().unwrap();
+        let paths =
+            ["a.md", "b.md", "c.md", "d.md"].map(|name| root.join(name).canonicalize().unwrap());
+        let mut app = App::new(
+            root.clone(),
+            test_index(&root),
+            Frecency::default(),
+            Some(paths[0].clone()),
+            test_config(&temp),
+            "nord".to_owned(),
+            theme::NORD,
+        )
+        .unwrap();
+        app.open(paths[1].clone()).unwrap();
+        app.open(paths[2].clone()).unwrap();
+
+        app.move_history(-1);
+        assert_eq!(app.document_path(), Some(paths[1].as_path()));
+        app.open(paths[3].clone()).unwrap();
+
+        assert_eq!(app.history.entries, vec![paths[0].clone(), paths[1].clone(), paths[3].clone()]);
+        assert!(app.history.target(1).is_none());
+        app.move_history(-1);
+        assert_eq!(app.document_path(), Some(paths[1].as_path()));
+        app.move_history(-1);
+        assert_eq!(app.document_path(), Some(paths[0].as_path()));
+        app.move_history(1);
+        assert_eq!(app.document_path(), Some(paths[1].as_path()));
+        app.move_history(1);
+        assert_eq!(app.document_path(), Some(paths[3].as_path()));
+    }
+
+    #[test]
+    fn document_links_resolve_relative_file_urls_and_reject_external_urls() {
+        let temp = TempDir::new();
+        fs::create_dir_all(temp.0.join("docs")).unwrap();
+        let current = temp.0.join("docs/index.md");
+        let target = temp.0.join("docs/guide one.md");
+        fs::write(&current, "# Index").unwrap();
+        fs::write(&target, "# Guide").unwrap();
+
+        assert_eq!(resolve_document_link(&current, "guide%20one.md#usage").unwrap(), target);
+        assert!(resolve_document_link(&current, "https://example.com/guide.md").is_err());
+    }
+
+    #[test]
+    fn document_search_finds_rendered_lines_and_navigates_results() {
+        let temp = TempDir::new();
+        let mut source = String::from("# Search demo\n\nFirst needle result.\n\n");
+        for index in 0..30 {
+            source.push_str(&format!("Paragraph {index} without the term.\n\n"));
+        }
+        source.push_str("Last NEEDLE result.\n");
+        fs::write(temp.0.join("README.md"), source).unwrap();
+        let root = temp.0.canonicalize().unwrap();
+        let mut app = App::new(
+            root.clone(),
+            test_index(&root),
+            Frecency::default(),
+            Some(PathBuf::from("README.md")),
+            test_config(&temp),
+            "nord".to_owned(),
+            theme::NORD,
+        )
+        .unwrap();
+        app.start_document_search("needle");
+        let backend = TestBackend::new(70, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let search = app.search.as_ref().unwrap();
+        assert_eq!(search.matches.len(), 2);
+        assert_eq!(search.selected, 0);
+        assert_eq!(app.scroll_top, search.matches[0]);
+
+        app.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        let search = app.search.as_ref().unwrap();
+        assert_eq!(search.selected, 1);
+        assert_eq!(app.scroll_top, search.matches[1].min(app.max_scroll()));
+
+        app.on_key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT));
+        assert_eq!(app.search.as_ref().unwrap().selected, 0);
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.search.is_none());
+    }
+
+    #[test]
+    fn control_f_opens_document_find_input() {
+        let temp = TempDir::new();
+        fs::write(temp.0.join("README.md"), "# Search demo").unwrap();
+        let root = temp.0.canonicalize().unwrap();
+        let mut app = App::new(
+            root.clone(),
+            test_index(&root),
+            Frecency::default(),
+            Some(PathBuf::from("README.md")),
+            test_config(&temp),
+            "nord".to_owned(),
+            theme::NORD,
+        )
+        .unwrap();
+
+        app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+
+        assert_eq!(app.input.value(), "/find ");
+        assert!(app.suggestions.is_none());
+    }
+
+    #[test]
     fn configure_command_toggles_and_persists_ignored_visibility() {
         let temp = TempDir::new();
         let config = test_config(&temp);
         let mut app = App::new(
             temp.0.clone(),
-            Catalog { entries: Vec::new() },
+            SearchIndex::empty(),
+            Frecency::default(),
             None,
             config,
             "nord".to_owned(),
@@ -1263,7 +2046,8 @@ mod tests {
         let config = test_config(&temp);
         let mut app = App::new(
             temp.0.clone(),
-            Catalog { entries: Vec::new() },
+            SearchIndex::empty(),
+            Frecency::default(),
             None,
             config,
             "nord".to_owned(),
@@ -1299,7 +2083,8 @@ mod tests {
         .unwrap();
         let mut app = App::new(
             temp.0.clone(),
-            Catalog { entries: Vec::new() },
+            SearchIndex::empty(),
+            Frecency::default(),
             None,
             config,
             "nord".to_owned(),
@@ -1336,7 +2121,8 @@ mod tests {
         let config = test_config(&temp);
         let mut app = App::new(
             temp.0.clone(),
-            Catalog { entries: Vec::new() },
+            SearchIndex::empty(),
+            Frecency::default(),
             None,
             config,
             "nord".to_owned(),
@@ -1348,5 +2134,10 @@ mod tests {
         assert_eq!(app.scroll_top, 80);
         app.page_by(-1);
         assert_eq!(app.scroll_top, 60);
+
+        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT));
+        assert_eq!(app.scroll_top, 0);
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
+        assert_eq!(app.scroll_top, 80);
     }
 }

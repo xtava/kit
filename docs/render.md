@@ -20,6 +20,12 @@ Or start without a path and fuzzy-search Markdown files under the current direct
 kit render
 ```
 
+To exercise all supported Markdown elements and syntax highlighting, render the included showcase:
+
+```bash
+kit render examples/markdown-showcase.md
+```
+
 The catalog includes `.md`, `.markdown`, `.mdown`, `.mkd`, and `.mdx` files. Git-ignored Markdown
 is shown by default and visibly labeled `ignored`, so private plans remain searchable without
 changing the repository's ignore rules. Use `/configure` to show or hide those results; the setting

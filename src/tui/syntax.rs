@@ -14,7 +14,7 @@ use syntect::{
 
 use super::theme::TuiTheme;
 
-static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
+static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(two_face::syntax::extra_newlines);
 static CODE_THEME: LazyLock<Theme> = LazyLock::new(|| {
     ThemeSet::load_defaults()
         .themes
@@ -95,5 +95,19 @@ mod tests {
         assert_ne!(comment_color, Some(Color::Reset));
         assert_eq!(highlighted[1][0].style.fg, comment_color);
         assert!(highlighted[2].iter().any(|span| span.style.fg != comment_color));
+    }
+
+    #[test]
+    fn highlights_typescript_and_tsx_fence_labels() {
+        let source = ["const greeting: string = \"hello\"; // typed\n"];
+        for language in ["typescript", "ts", "tsx"] {
+            let fallback = Style::default().fg(Color::Black);
+            let highlighted = highlight_lines(source, language, fallback, NORD);
+            let spans = &highlighted[0];
+
+            assert!(spans.len() > 1, "{language} should produce syntax spans");
+            assert!(spans.iter().all(|span| span.style.fg != Some(Color::Black)));
+            assert!(spans.iter().all(|span| span.style.bg.is_none()));
+        }
     }
 }
