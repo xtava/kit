@@ -4,6 +4,7 @@
 //! and the spine modules never reach up into `tools`. `cdp` is the Chrome DevTools Protocol engine —
 //! a peer capability (like `tui`) that both `scout` and `cdp` build on (see `docs/adr/0001`).
 
+#[cfg(unix)]
 pub mod cdp;
 pub mod framework;
 pub mod tools;

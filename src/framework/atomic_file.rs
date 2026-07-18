@@ -1,10 +1,13 @@
 use std::{
-    fs::{File, OpenOptions},
+    fs::{File, OpenOptions, TryLockError},
     io::Write,
     path::{Path, PathBuf},
 };
 
 use thiserror::Error;
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 /// Shared lock and atomic-replacement mechanics for small Kit-owned state files.
 #[derive(Clone, Debug)]
@@ -12,6 +15,12 @@ pub struct AtomicFileWriter {
     dir: PathBuf,
     lock_name: String,
     temp_prefix: String,
+}
+
+#[derive(Debug)]
+pub enum AtomicFileTryLock {
+    Acquired(File),
+    Busy,
 }
 
 #[derive(Debug, Error)]
@@ -53,17 +62,19 @@ impl AtomicFileWriter {
 
     /// Acquire the writer lock. Keep the returned file alive across any read-modify-write cycle.
     pub fn lock(&self) -> Result<File, AtomicFileError> {
-        self.ensure_dir()?;
-        let path = self.dir.join(&self.lock_name);
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&path)
-            .map_err(|source| AtomicFileError::OpenLock { path: path.clone(), source })?;
+        let (path, file) = self.open_lock()?;
         file.lock().map_err(|source| AtomicFileError::Lock { path, source })?;
         Ok(file)
+    }
+
+    /// Try to acquire the writer lock without waiting for another writer.
+    pub fn try_lock(&self) -> Result<AtomicFileTryLock, AtomicFileError> {
+        let (path, file) = self.open_lock()?;
+        match file.try_lock() {
+            Ok(()) => Ok(AtomicFileTryLock::Acquired(file)),
+            Err(TryLockError::WouldBlock) => Ok(AtomicFileTryLock::Busy),
+            Err(TryLockError::Error(source)) => Err(AtomicFileError::Lock { path, source }),
+        }
     }
 
     /// Publish bytes by syncing a sibling temporary file and atomically replacing the destination.
@@ -71,14 +82,38 @@ impl AtomicFileWriter {
         self.ensure_dir()?;
         let pending = self.dir.join(format!("{}.{}.tmp", self.temp_prefix, std::process::id()));
         let result = (|| {
-            let mut file = File::create(&pending)
+            let mut options = OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            let mut file = options
+                .open(&pending)
+                .map_err(|source| AtomicFileError::Write { path: pending.clone(), source })?;
+            #[cfg(unix)]
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
                 .map_err(|source| AtomicFileError::Write { path: pending.clone(), source })?;
             file.write_all(bytes)
                 .map_err(|source| AtomicFileError::Write { path: pending.clone(), source })?;
             file.sync_all()
                 .map_err(|source| AtomicFileError::Write { path: pending.clone(), source })?;
             std::fs::rename(&pending, path)
-                .map_err(|source| AtomicFileError::Write { path: path.to_path_buf(), source })
+                .map_err(|source| AtomicFileError::Write { path: path.to_path_buf(), source })?;
+            #[cfg(unix)]
+            {
+                let parent = path
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+                let directory = File::open(parent).map_err(|source| AtomicFileError::Write {
+                    path: parent.to_path_buf(),
+                    source,
+                })?;
+                directory.sync_all().map_err(|source| AtomicFileError::Write {
+                    path: parent.to_path_buf(),
+                    source,
+                })?;
+            }
+            Ok(())
         })();
         if result.is_err() {
             let _ = std::fs::remove_file(pending);
@@ -89,6 +124,19 @@ impl AtomicFileWriter {
     fn ensure_dir(&self) -> Result<(), AtomicFileError> {
         std::fs::create_dir_all(&self.dir)
             .map_err(|source| AtomicFileError::CreateDirectory { path: self.dir.clone(), source })
+    }
+
+    fn open_lock(&self) -> Result<(PathBuf, File), AtomicFileError> {
+        self.ensure_dir()?;
+        let path = self.dir.join(&self.lock_name);
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|source| AtomicFileError::OpenLock { path: path.clone(), source })?;
+        Ok((path, file))
     }
 }
 

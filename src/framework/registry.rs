@@ -1,7 +1,10 @@
 use anyhow::Result;
 use clap::{Arg, ArgAction, Command};
 
-use super::{ConfigStore, Context, Output, OutputFormat, SettingsSection, Terminal, Tool};
+use super::{
+    process::ProcessSupervisor, ConfigStore, Context, Output, OutputFormat, RepositoryLocator,
+    SettingsSection, Terminal, Tool,
+};
 
 /// The set of registered tools, and the dispatcher that turns argv into one tool's `run`.
 pub struct Registry {
@@ -51,13 +54,15 @@ impl Registry {
         let matches = command.get_matches();
         let terminal = Terminal::detect();
         let config = ConfigStore::bootstrap()?;
+        let repositories = RepositoryLocator::new();
+        let processes = ProcessSupervisor::bootstrap()?;
 
         match matches.subcommand() {
             Some((name, sub)) => {
                 let json = matches.get_flag("json") || sub.get_flag("json");
                 let format = if json { OutputFormat::Json } else { OutputFormat::Text };
                 let out = Output::new(format, terminal.stdout_tty);
-                let cx = Context { config, out, term: terminal };
+                let cx = Context { config, out, term: terminal, repositories, processes };
                 let tool = self
                     .tools
                     .iter()
