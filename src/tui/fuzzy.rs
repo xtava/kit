@@ -1,44 +1,66 @@
-//! The shared fuzzy matcher: subsequence scoring with exact/prefix tiers. One implementation behind
-//! every "type to narrow a list" surface — the slash-command line and the cdp target picker.
+//! Shared Nucleo-backed fuzzy matching for bounded candidate sets.
 //!
-//! Lower is better, `None` means no match. Sort ascending and exact beats prefix beats a scattered
-//! subsequence; within a tier, earlier and tighter matches win.
+//! Construct one [`Matcher`] per query and reuse it across every candidate. Nucleo's matcher owns
+//! substantial scratch storage, so the old stateless helper API intentionally does not survive the
+//! cutover. Lower scores are better to preserve Kit's existing ranking convention.
 
-/// Score `candidate` against `needle`, case-sensitive. `None` if `needle` is not a subsequence of
-/// `candidate`. Exact = 0, a prefix scores in the tens, a scattered subsequence in the hundreds.
-pub fn score(candidate: &str, needle: &str) -> Option<u16> {
-    if candidate == needle {
-        return Some(0);
-    }
-    if candidate.starts_with(needle) {
-        return Some(10 + candidate.len().saturating_sub(needle.len()) as u16);
-    }
-    subsequence(candidate, needle).map(|score| 100 + score)
+use nucleo::{
+    pattern::{CaseMatching, Normalization, Pattern},
+    Config, Matcher as NucleoMatcher, Utf32Str,
+};
+
+pub struct Matcher {
+    needle: String,
+    case_sensitive: bool,
+    pattern: Pattern,
+    matcher: NucleoMatcher,
+    chars: Vec<char>,
 }
 
-/// Case-insensitive [`score`] — for human-facing text like target titles and urls.
-pub fn score_ci(candidate: &str, needle: &str) -> Option<u16> {
-    score(&candidate.to_lowercase(), &needle.to_lowercase())
-}
+impl Matcher {
+    pub fn new(needle: &str) -> Self {
+        Self::with_config(needle, CaseMatching::Respect, Config::DEFAULT)
+    }
 
-fn subsequence(candidate: &str, needle: &str) -> Option<u16> {
-    let mut score = 0_u16;
-    let mut last_match = None;
-    let mut chars = candidate.char_indices();
+    pub fn case_insensitive(needle: &str) -> Self {
+        Self::with_config(needle, CaseMatching::Ignore, Config::DEFAULT)
+    }
 
-    for needle_char in needle.chars() {
-        let (index, _) = chars.find(|(_, candidate_char)| *candidate_char == needle_char)?;
-        score = score.saturating_add(index as u16);
+    pub fn paths(needle: &str) -> Self {
+        Self::with_config(needle, CaseMatching::Ignore, Config::DEFAULT.match_paths())
+    }
 
-        if let Some(last_index) = last_match {
-            score = score.saturating_add(index.saturating_sub(last_index + 1) as u16);
+    pub fn score(&mut self, candidate: &str) -> Option<u64> {
+        self.chars.clear();
+        let comparable =
+            if self.case_sensitive { candidate.to_owned() } else { candidate.to_lowercase() };
+        let tier: u8 = if comparable == self.needle {
+            0
+        } else if comparable.starts_with(&self.needle) {
+            1
+        } else {
+            2
+        };
+        let candidate = Utf32Str::new(candidate, &mut self.chars);
+        self.pattern
+            .score(candidate, &mut self.matcher)
+            .map(|score| (u64::from(tier) << 32) | u64::from(u32::MAX - score))
+    }
+
+    fn with_config(needle: &str, case: CaseMatching, config: Config) -> Self {
+        let case_sensitive = case == CaseMatching::Respect;
+        Self {
+            needle: if case_sensitive { needle.to_owned() } else { needle.to_lowercase() },
+            case_sensitive,
+            pattern: Pattern::parse(needle, case, Normalization::Smart),
+            matcher: NucleoMatcher::new(config),
+            chars: Vec::new(),
         }
-
-        last_match = Some(index);
     }
+}
 
-    score = score.saturating_add(candidate.len().saturating_sub(needle.len()) as u16);
-    Some(score)
+pub const fn tier(score: u64) -> u8 {
+    (score >> 32) as u8
 }
 
 #[cfg(test)]
@@ -47,14 +69,27 @@ mod tests {
 
     #[test]
     fn tiers_rank_exact_then_prefix_then_subsequence() {
-        assert_eq!(score("eval", "eval"), Some(0));
-        assert!(score("evaluate", "eval").unwrap() < score("retrieval", "eval").unwrap());
-        assert_eq!(score("snap", "xyz"), None);
+        let mut matcher = Matcher::new("eval");
+        let exact = matcher.score("eval").unwrap();
+        let prefix = matcher.score("evaluate").unwrap();
+        let scattered = matcher.score("retrieval").unwrap();
+        assert!(exact < prefix);
+        assert!(prefix < scattered);
+        assert_eq!(matcher.score("snap"), None);
     }
 
     #[test]
     fn case_insensitive_matches_titles() {
-        assert!(score_ci("Workspace · ari", "work").is_some());
-        assert!(score_ci("WORKSPACE", "wsp").is_some());
+        let mut matcher = Matcher::case_insensitive("work");
+        assert!(matcher.score("Workspace · ari").is_some());
+        let mut matcher = Matcher::case_insensitive("wsp");
+        assert!(matcher.score("WORKSPACE").is_some());
+    }
+
+    #[test]
+    fn path_config_supports_multiword_fzf_queries() {
+        let mut matcher = Matcher::paths("render config");
+        assert!(matcher.score("src/tools/render/config.rs").is_some());
+        assert!(matcher.score("src/tools/search/index.rs").is_none());
     }
 }

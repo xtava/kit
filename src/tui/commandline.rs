@@ -70,14 +70,15 @@ impl CommandSet {
             return self.specs.iter().collect();
         }
 
+        let mut matcher = super::fuzzy::Matcher::new(&prefix);
         let mut matches = self
             .specs
             .iter()
-            .filter_map(|spec| fuzzy_match(spec, &prefix).map(|score| (score, spec)))
+            .filter_map(|spec| fuzzy_match(spec, &mut matcher).map(|score| (score, spec)))
             .collect::<Vec<_>>();
 
-        if matches.iter().any(|(score, _)| *score < 100) {
-            matches.retain(|(score, _)| *score < 100);
+        if let Some(best_tier) = matches.iter().map(|(score, _)| super::fuzzy::tier(*score)).min() {
+            matches.retain(|(score, _)| super::fuzzy::tier(*score) == best_tier);
         }
 
         matches.sort_by_key(|(score, spec)| (*score, spec.name));
@@ -118,10 +119,10 @@ fn split_command(command_text: &str) -> (&str, &str) {
     }
 }
 
-fn fuzzy_match(spec: &'static CommandSpec, needle: &str) -> Option<u16> {
+fn fuzzy_match(spec: &'static CommandSpec, matcher: &mut super::fuzzy::Matcher) -> Option<u64> {
     std::iter::once(spec.name)
         .chain(spec.aliases.iter().copied())
-        .filter_map(|candidate| super::fuzzy::score(candidate, needle))
+        .filter_map(|candidate| matcher.score(candidate))
         .min()
 }
 
