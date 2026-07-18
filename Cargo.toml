@@ -15,21 +15,30 @@ async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+schemars = "1"
 toml = "1.1"
 toml_edit = "0.25"
 directories = "6"
 unicode-width = "0.2"
+url = "2.5"
 thiserror = "2"
+zeroize = "1"
 shell-words = "1"
 ignore = "0.4"
 notify = "8.2"
+nucleo = "0.5"
+processkit = "2.2.5"
+uuid = { version = "1", features = ["v4", "serde"] }
+systemd-zbus = { version = "5.3.2", default-features = false }
+zbus = { version = "5.7", default-features = false, features = ["tokio"] }
 
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "process", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "fs", "time", "sync", "process", "signal"] }
 
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 crossterm = "0.29"
 pulldown-cmark = "0.13"
 syntect = "5"
+two-face = "0.5"
 similar = { version = "3", features = ["inline", "unicode"] }
 time = { version = "0.3", features = ["formatting"] }
 sysinfo = { version = "=0.37.2", default-features = false, features = ["system", "user"] }
