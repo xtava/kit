@@ -114,6 +114,10 @@ impl HistoryStore {
         self.series.get(&key)
     }
 
+    pub(super) fn recent_cpu_average(&self, key: ProcessKey, sample_count: usize) -> Option<f32> {
+        self.series.get(&key)?.recent_cpu_average(sample_count)
+    }
+
     fn prune_expired(&mut self) {
         let now = self.elapsed_ms;
         self.series.retain(|_, series| {
@@ -133,6 +137,14 @@ impl HistoryStore {
 impl HistorySeries {
     pub(super) fn points(&self) -> impl DoubleEndedIterator<Item = HistoryPoint> + '_ {
         self.points.iter().copied()
+    }
+
+    fn recent_cpu_average(&self, sample_count: usize) -> Option<f32> {
+        let mut points = self.points.iter().rev().take(sample_count).peekable();
+        points.peek()?;
+        let (total, count) = points
+            .fold((0.0, 0_u32), |(total, count), point| (total + point.cpu_percent, count + 1));
+        Some(total / count as f32)
     }
 }
 

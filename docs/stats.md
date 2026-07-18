@@ -12,6 +12,11 @@ kit --json stats --once
 kit stats --interval 500
 ```
 
+Agent acceptance for this TUI is headless: deterministic Ratatui frame/input tests prove the
+interactive projection, and `kit --json stats --once` proves installed live sampling. Agents do not
+open terminal windows or PTY sessions unless interactive validation is explicitly requested. See
+[Stats headless verification](./canonical/stats-headless-verification.md).
+
 ## Controls
 
 | Action | Keyboard | Mouse |
@@ -32,17 +37,69 @@ kit stats --interval 500
 | Open Profile | `p` | click **Profile** |
 | Gracefully end a process | `x` or `Delete`, then confirm | click **End process**, then confirm |
 | Force kill | `X`, or `f` in confirmation | choose force in confirmation |
+| Open process actions | use the action shortcuts above | right-click a process row or the process inspector |
 | Quit | `q` or `Ctrl-C` | — |
+
+## Process actions
+
+Right-clicking a concrete process row selects that exact row and opens its action menu at the
+pointer. Right-clicking the process inspector opens the same menu for the process currently shown
+there. Ordinary left-clicks in inspector content never open a menu; they activate only explicit
+tabs and visible inline actions.
+
+The menu order is:
+
+1. **View full command** — the same action as `v` from Overview and the Overview inline action.
+2. **Profile** — the same navigation action as `p` and the inspector inline action.
+3. **End process…** — the same graceful request as `x`/`Delete` and the inspector inline action.
+4. **Force end process…** — the same force request as `X`; it is intentionally menu- and
+   keyboard-only.
+
+Navigation and destructive actions are separated visually. Actions that require a live process,
+stable process generation, available host capability, or an idle process-action controller remain
+visible but disabled with the reason shown. A disabled action cannot invoke. Profile remains a
+navigation surface and explains unavailable profiling inside the tab rather than starting an
+unsupported collector.
+
+Use `↑`/`↓`, `j`/`k`, `Home`/`End`, and `Enter` inside the menu. The registered action shortcuts
+remain active while it is open. `Esc`, `q`, or a click outside closes it, and that dismissal click is
+consumed instead of activating the surface underneath. `Ctrl-C` always quits Stats, including while
+a menu, confirmation, or full-command viewer is open.
+
+With `--no-mouse`, Stats does not create pointer action regions and mouse input cannot open or invoke
+the menu. Inline labels and shortcut hints remain visible, and `v`, `p`, `x`/`Delete`, and `X`
+continue to use the same registered actions from the keyboard.
+
+Stats builds one typed action registry for each interactive run. Context-menu, inline, and keyboard
+projections resolve from that catalog, while one mutually exclusive overlay owner holds the menu,
+confirmation, or command viewer. This is an internal organization boundary for Rust contributions,
+not an installable or dynamically loaded plugin runtime.
+
+See [Action contributions and context menus](./canonical/action-contributions.md) for the canonical
+architecture and extension contract.
 
 The default process CPU value is aggregate CPU: a process using 250% is consuming about 2.5
 logical CPUs. A focused core view is explicitly approximate. Linux exposes the CPU where each
 thread was last observed, not exact historical scheduler attribution, so the table is labeled
 “threads last seen on Core N · approx CPU.”
 
-The process viewport always begins at the hottest sorted row. Explicit navigation scrolls the table,
-while the next sample returns the viewport to the top without transferring the selected stable
-process identity. Filtering may hide a selection without replacing it; PID reuse never transfers a
-selection to the replacement generation.
+The system band separates whole-machine `CPU AVG` history from `PEAK CORE` history. `TOP CORES
+NOW/RECENT` names the busiest logical CPUs and retains their recent peak for three admitted samples,
+so scheduler migration does not immediately erase the previous hot-core identity. The compact Core
+Map remains clickable and preserves the hottest member when several cores share a cell. Selecting a
+core focuses the process table on threads last observed there.
+
+`PRESSURE SOURCES NOW/RECENT` is a global process ranking independent of the process hierarchy. It
+shows exact current CPU beside a three-sample recent average, allowing a hot descendant to remain
+visible even when its parent branch is below the process viewport. The CPU column also displays exact
+current CPU; only CPU ordering uses the recent average to prevent rows from swapping on every raw
+sample.
+
+The viewport follows the current top row while it is already at the top. After explicit navigation
+scrolls the table, refreshes preserve the first visible stable process as the viewport anchor instead
+of returning to row zero. `Home` and explicit sort changes still return to the first sorted row.
+Filtering may hide a selection without replacing it; PID reuse never transfers a selection to the
+replacement generation.
 
 At 120 columns or wider, the process tree and inspector render side by side. Compact terminals show
 one active region at a time, with the same Tab and arrow navigation. The cyan border identifies the
@@ -84,6 +141,12 @@ revalidate stable process identity before acting. On Linux, Kit opens a pidfd, r
 start token, and sends through that descriptor. It refuses PID 1, itself, an exited or replaced
 process, and any target that cannot be addressed safely. Graceful termination is the default and
 force termination is a separate confirmation path.
+
+Each menu invocation carries the exact process generation captured when the menu opened. Opening a
+termination confirmation retains that generation, and confirmation revalidates it before emitting
+the process action. If the target exits or its PID is reused, an open menu or confirmation closes
+with an unavailable status; it never follows the current selection or the replacement process. A
+full-command viewer that already copied observed text remains open and frozen.
 
 History is admitted every two seconds and bounded to eight minutes (240 points) for at most 1,024
 stable process generations. Exited history expires; a replacement that reuses the same PID receives

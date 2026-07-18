@@ -2,6 +2,7 @@
 
 mod actions;
 mod app;
+mod contributions;
 mod history;
 mod host;
 mod model;

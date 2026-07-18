@@ -4,9 +4,12 @@ use std::sync::Arc;
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 
 use super::actions::{ActionRequest, ActionResult};
+use super::contributions::{
+    StatsActionContext, StatsActionRegistry, StatsCommand, PROCESS_CONTEXT_MENU,
+};
 use super::history::{HistorySeries, HistoryStore};
 use super::host::ProcessAction;
 use super::model::{
@@ -15,9 +18,13 @@ use super::model::{
 };
 use super::render::UiRegions;
 use super::tree::{FamilyView, ProcessForest, TreeQuery, TreeSort};
-use crate::tui::{Direction, LineEditor, SplitDrag, SplitRatio};
+use crate::tui::{
+    ActionInvocation, ContextMenu, ContextMenuOutcome, Direction, KeyChord, LineEditor, SplitDrag,
+    SplitRatio,
+};
 
 const HISTORY: usize = 120;
+const RECENT_CPU_SAMPLES: usize = 3;
 const DEFAULT_SPLIT_RATIO: SplitRatio = SplitRatio::new(640);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,7 +57,7 @@ impl ThreadSortBy {
 impl SortBy {
     pub(super) fn label(self) -> &'static str {
         match self {
-            Self::Cpu => "CPU",
+            Self::Cpu => "RECENT CPU",
             Self::Memory => "RAM",
             Self::Pid => "PID",
             Self::Name => "NAME",
@@ -155,11 +162,50 @@ pub(super) struct VisibleRow {
     pub(super) is_context: bool,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct ProcessPressure {
+    pub(super) identity: ProcessIdentity,
+    pub(super) name: String,
+    pub(super) pid: u32,
+    pub(super) now_percent: f32,
+    pub(super) recent_percent: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct CorePressure {
+    pub(super) logical_index: u16,
+    pub(super) now_percent: f32,
+    pub(super) recent_peak_percent: f32,
+}
+
 pub(super) struct Confirmation {
     pub(super) key: ProcessKey,
-    pub(super) action: ProcessAction,
+    pub(super) requested: ProcessAction,
     pub(super) name: String,
+    pub(super) choices: Vec<ConfirmationChoice>,
     pub(super) choice: ConfirmationChoice,
+}
+
+impl Confirmation {
+    fn move_choice(&mut self, delta: isize) {
+        if self.choices.is_empty() {
+            return;
+        }
+        let index = self
+            .choices
+            .iter()
+            .position(|choice| *choice == self.choice)
+            .unwrap_or(self.choices.len() - 1);
+        self.choice =
+            self.choices[(index as isize + delta).rem_euclid(self.choices.len() as isize) as usize];
+    }
+
+    fn select_action(&mut self, action: ProcessAction) {
+        let choice = ConfirmationChoice::Action(action);
+        if self.choices.contains(&choice) {
+            self.choice = choice;
+        }
+    }
 }
 
 pub(super) struct CommandViewer {
@@ -170,24 +216,32 @@ pub(super) struct CommandViewer {
     pub(super) column_offset: usize,
 }
 
+pub(super) enum StatsOverlay {
+    ContextMenu(ContextMenu<StatsActionContext>),
+    Confirmation(Confirmation),
+    CommandViewer(CommandViewer),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ConfirmationChoice {
-    Confirm,
-    Force,
+    Action(ProcessAction),
     Cancel,
 }
 
 impl ConfirmationChoice {
-    fn next(self, delta: isize) -> Self {
-        const ALL: [ConfirmationChoice; 3] =
-            [ConfirmationChoice::Confirm, ConfirmationChoice::Force, ConfirmationChoice::Cancel];
-        let index = ALL.iter().position(|choice| *choice == self).unwrap_or_default();
-        ALL[(index as isize + delta).rem_euclid(ALL.len() as isize) as usize]
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Action(ProcessAction::GracefulTerminate) => "End process",
+            Self::Action(ProcessAction::ForceTerminate) => "Force terminate",
+            Self::Cancel => "Cancel",
+        }
     }
 }
 
 pub(super) struct StatsApp {
     pub(super) snapshot: Arc<StatsSnapshot>,
+    pub(super) registry: StatsActionRegistry,
+    pub(super) pointer_enabled: bool,
     forest: ProcessForest,
     pub(super) detail: Option<Arc<DetailSnapshot>>,
     pub(super) expected_detail: Option<DetailRequest>,
@@ -216,14 +270,26 @@ pub(super) struct StatsApp {
     pub(super) viewport_rows: usize,
     pub(super) histories: Vec<VecDeque<u64>>,
     process_history: HistoryStore,
-    pub(super) confirm: Option<Confirmation>,
-    pub(super) command_viewer: Option<CommandViewer>,
+    pub(super) overlay: Option<StatsOverlay>,
     pub(super) action_lifecycle: ActionLifecycle,
     pub(super) status: Option<String>,
 }
 
 impl StatsApp {
+    #[cfg(test)]
     pub(super) fn new(snapshot: Arc<StatsSnapshot>) -> Self {
+        Self::new_validated(
+            snapshot,
+            super::contributions::registry().expect("Stats test contributions must validate"),
+            true,
+        )
+    }
+
+    pub(super) fn new_validated(
+        snapshot: Arc<StatsSnapshot>,
+        registry: StatsActionRegistry,
+        pointer_enabled: bool,
+    ) -> Self {
         let forest = ProcessForest::new(&snapshot.processes);
         let selected = snapshot
             .processes
@@ -235,6 +301,8 @@ impl StatsApp {
         });
         let mut app = Self {
             snapshot,
+            registry,
+            pointer_enabled,
             forest,
             detail: None,
             expected_detail: None,
@@ -263,8 +331,7 @@ impl StatsApp {
             viewport_rows: 0,
             histories: Vec::new(),
             process_history: HistoryStore::default(),
-            confirm: None,
-            command_viewer: None,
+            overlay: None,
             action_lifecycle: ActionLifecycle::Idle,
             status: None,
         };
@@ -274,6 +341,11 @@ impl StatsApp {
     }
 
     pub(super) fn ingest(&mut self, snapshot: Arc<StatsSnapshot>) {
+        let viewport_anchor = if self.row_offset > 0 {
+            self.visible.get(self.row_offset).map(|row| row.key)
+        } else {
+            None
+        };
         let previous_live = self.selected_process().cloned();
         self.forest = ProcessForest::new(&snapshot.processes);
         self.snapshot = snapshot;
@@ -282,14 +354,26 @@ impl StatsApp {
         } else if previous_live.is_some() {
             self.selected_summary = previous_live;
         }
-        if self.selected.is_some_and(|selected| {
-            !self.snapshot.processes.iter().any(|process| process.identity == selected)
-        }) {
-            self.confirm = None;
+        let unavailable_overlay_target = match self.overlay.as_ref() {
+            Some(StatsOverlay::ContextMenu(menu)) => Some(menu.context().identity),
+            Some(StatsOverlay::Confirmation(confirm)) => Some(ProcessIdentity::stable(confirm.key)),
+            Some(StatsOverlay::CommandViewer(_)) | None => None,
         }
-        self.row_offset = 0;
+        .filter(|identity| self.process(*identity).is_none());
+        if let Some(identity) = unavailable_overlay_target {
+            self.overlay = None;
+            self.status = Some(format!(
+                "Target unavailable: PID {} is no longer the same process",
+                identity.pid()
+            ));
+        }
         self.record_history();
         self.reproject();
+        if let Some(anchor) = viewport_anchor {
+            if let Some(index) = self.visible.iter().position(|row| row.key == anchor) {
+                self.row_offset = index;
+            }
+        }
     }
 
     pub(super) fn ingest_detail(&mut self, detail: Option<Arc<DetailSnapshot>>) {
@@ -368,8 +452,20 @@ impl StatsApp {
 
     pub(super) fn reproject(&mut self) {
         let core_cpu = self.core_process_cpu();
+        let ordering_processes =
+            (self.sort == SortBy::Cpu && self.focused_core.is_none()).then(|| {
+                self.snapshot
+                    .processes
+                    .iter()
+                    .cloned()
+                    .map(|mut process| {
+                        process.cpu_percent = self.recent_cpu_score(&process);
+                        process
+                    })
+                    .collect::<Vec<_>>()
+            });
         let projection = self.forest.project(
-            &self.snapshot.processes,
+            ordering_processes.as_deref().unwrap_or(&self.snapshot.processes),
             TreeQuery {
                 collapsed: &self.collapsed,
                 focus: self.focused_process,
@@ -470,6 +566,73 @@ impl StatsApp {
         self.selected
             .and_then(ProcessIdentity::stable_key)
             .and_then(|key| self.process_history.get(key))
+    }
+
+    pub(super) fn pressure_sources(&self, limit: usize) -> Vec<ProcessPressure> {
+        let mut sources = self
+            .snapshot
+            .processes
+            .iter()
+            .map(|process| ProcessPressure {
+                identity: process.identity,
+                name: process.name.clone(),
+                pid: process.identity.pid(),
+                now_percent: process.cpu_percent,
+                recent_percent: self.recent_cpu_score(process),
+            })
+            .collect::<Vec<_>>();
+        sources.sort_by(|left, right| {
+            right
+                .recent_percent
+                .total_cmp(&left.recent_percent)
+                .then_with(|| right.now_percent.total_cmp(&left.now_percent))
+                .then_with(|| left.identity.cmp(&right.identity))
+        });
+        sources.truncate(limit);
+        sources
+    }
+
+    pub(super) fn core_pressure(&self, limit: usize) -> Vec<CorePressure> {
+        let mut cores = self
+            .snapshot
+            .system
+            .cpus
+            .iter()
+            .enumerate()
+            .map(|(index, cpu)| {
+                let recent_peak_percent = self
+                    .histories
+                    .get(index)
+                    .into_iter()
+                    .flat_map(|history| history.iter().rev().take(RECENT_CPU_SAMPLES))
+                    .copied()
+                    .max()
+                    .map(|peak| peak as f32)
+                    .unwrap_or(cpu.usage_percent);
+                CorePressure {
+                    logical_index: cpu.logical_index,
+                    now_percent: cpu.usage_percent,
+                    recent_peak_percent,
+                }
+            })
+            .collect::<Vec<_>>();
+        cores.sort_by(|left, right| {
+            right
+                .recent_peak_percent
+                .total_cmp(&left.recent_peak_percent)
+                .then_with(|| right.now_percent.total_cmp(&left.now_percent))
+                .then_with(|| left.logical_index.cmp(&right.logical_index))
+        });
+        cores.truncate(limit);
+        cores
+    }
+
+    fn recent_cpu_score(&self, process: &ProcessSample) -> f32 {
+        process
+            .identity
+            .stable_key()
+            .and_then(|key| self.process_history.recent_cpu_average(key, RECENT_CPU_SAMPLES))
+            .unwrap_or(process.cpu_percent)
     }
 
     pub(super) fn selected_family(&self) -> Option<&FamilyView> {
@@ -576,6 +739,12 @@ impl StatsApp {
     }
 
     pub(super) fn on_event(&mut self, event: Event, regions: &UiRegions) -> Action {
+        if matches!(&event, Event::Key(key) if is_ctrl_c(*key)) {
+            return Action::Quit;
+        }
+        if self.overlay.is_some() {
+            return self.on_overlay_event(event, regions);
+        }
         match event {
             Event::Key(key) => self.on_key(key, regions),
             Event::Mouse(mouse) => self.on_mouse(mouse, regions),
@@ -587,16 +756,89 @@ impl StatsApp {
         }
     }
 
-    pub(super) fn on_key(&mut self, key: KeyEvent, regions: &UiRegions) -> Action {
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            return Action::Quit;
+    fn on_overlay_event(&mut self, event: Event, regions: &UiRegions) -> Action {
+        let handler: fn(&mut Self, Event, &UiRegions) -> Action = match self.overlay.as_ref() {
+            Some(StatsOverlay::ContextMenu(_)) => Self::on_context_menu_event,
+            Some(StatsOverlay::Confirmation(_)) => Self::on_confirmation_event,
+            Some(StatsOverlay::CommandViewer(_)) => Self::on_command_viewer_event,
+            None => unreachable!("overlay state checked before dispatch"),
+        };
+        handler(self, event, regions)
+    }
+
+    fn on_context_menu_event(&mut self, event: Event, regions: &UiRegions) -> Action {
+        self.split_drag = None;
+        let Some(layout) = regions.context_menu.as_ref() else {
+            return Action::None;
+        };
+        let outcome = match self.overlay.as_mut() {
+            Some(StatsOverlay::ContextMenu(menu)) => menu.on_event(event, layout),
+            _ => unreachable!("context-menu handler dispatched for another overlay"),
+        };
+        match outcome {
+            ContextMenuOutcome::Captured => Action::None,
+            ContextMenuOutcome::Dismissed => {
+                self.overlay = None;
+                Action::None
+            }
+            ContextMenuOutcome::Unavailable { reason, .. } => {
+                self.status = Some(format!("Action unavailable: {reason}"));
+                Action::None
+            }
+            ContextMenuOutcome::Invoke(invocation) => {
+                self.overlay = None;
+                self.invoke_action(invocation)
+            }
         }
-        if self.confirm.is_some() {
-            return self.on_confirmation_key(key);
+    }
+
+    fn on_confirmation_event(&mut self, event: Event, regions: &UiRegions) -> Action {
+        match event {
+            Event::Key(key) => self.on_confirmation_key(key),
+            Event::Mouse(mouse) => {
+                self.split_drag = None;
+                if !self.pointer_enabled || mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+                    return Action::None;
+                }
+                let point = (mouse.column, mouse.row);
+                if let Some((_, choice)) =
+                    regions.confirmation_choices.iter().find(|(area, _)| contains(*area, point))
+                {
+                    return self.activate_confirmation(*choice);
+                }
+                Action::None
+            }
+            Event::Resize(_, _) => {
+                self.split_drag = None;
+                Action::None
+            }
+            _ => Action::None,
         }
-        if self.command_viewer.is_some() {
-            return self.on_command_viewer_key(key, regions);
+    }
+
+    fn on_command_viewer_event(&mut self, event: Event, regions: &UiRegions) -> Action {
+        match event {
+            Event::Key(key) => self.on_command_viewer_key(key, regions),
+            Event::Mouse(mouse) => {
+                self.split_drag = None;
+                let point = (mouse.column, mouse.row);
+                if self.pointer_enabled
+                    && mouse.kind == MouseEventKind::Down(MouseButton::Left)
+                    && regions.command_close.is_some_and(|area| contains(area, point))
+                {
+                    self.overlay = None;
+                }
+                Action::None
+            }
+            Event::Resize(_, _) => {
+                self.split_drag = None;
+                Action::None
+            }
+            _ => Action::None,
         }
+    }
+
+    fn on_key(&mut self, key: KeyEvent, regions: &UiRegions) -> Action {
         if self.filtering {
             match key.code {
                 KeyCode::Enter => self.filtering = false,
@@ -614,6 +856,12 @@ impl StatsApp {
         }
         if let Some(action) = self.on_inspector_table_key(key, regions) {
             return action;
+        }
+        if let (Some(chord), Some(identity)) = (KeyChord::from_event(key), self.selected) {
+            let context = self.action_context(identity);
+            if let Some(invocation) = self.registry.resolve_keybinding(chord, context) {
+                return self.invoke_action(invocation);
+            }
         }
         match key.code {
             KeyCode::Char('q') => Action::Quit,
@@ -720,23 +968,6 @@ impl StatsApp {
                 self.focused_process =
                     if self.focused_process == self.selected { None } else { self.selected };
                 self.reproject();
-                Action::None
-            }
-            KeyCode::Char('p') => {
-                self.set_inspector_tab(InspectorTab::Profile);
-                self.active_region = ActiveRegion::Inspector;
-                Action::None
-            }
-            KeyCode::Char('v') if self.inspector_tab == InspectorTab::Overview => {
-                self.open_command_viewer();
-                Action::None
-            }
-            KeyCode::Char('x') | KeyCode::Delete => {
-                self.open_confirmation(ProcessAction::GracefulTerminate);
-                Action::None
-            }
-            KeyCode::Char('X') => {
-                self.open_confirmation(ProcessAction::ForceTerminate);
                 Action::None
             }
             KeyCode::Char('1') => {
@@ -974,56 +1205,87 @@ impl StatsApp {
     pub(super) fn on_confirmation_key(&mut self, key: KeyEvent) -> Action {
         match key.code {
             KeyCode::Esc | KeyCode::Char('n') => {
-                self.confirm = None;
+                self.overlay = None;
                 Action::None
             }
             KeyCode::Char('f') => {
-                if let Some(confirm) = &mut self.confirm {
-                    confirm.choice = ConfirmationChoice::Force;
+                if let Some(StatsOverlay::Confirmation(confirm)) = self.overlay.as_mut() {
+                    confirm.select_action(ProcessAction::ForceTerminate);
                 }
                 Action::None
             }
             KeyCode::Left | KeyCode::BackTab => {
-                if let Some(confirm) = &mut self.confirm {
-                    confirm.choice = confirm.choice.next(-1);
+                if let Some(StatsOverlay::Confirmation(confirm)) = self.overlay.as_mut() {
+                    confirm.move_choice(-1);
                 }
                 Action::None
             }
             KeyCode::Right | KeyCode::Tab => {
-                if let Some(confirm) = &mut self.confirm {
-                    confirm.choice = confirm.choice.next(1);
+                if let Some(StatsOverlay::Confirmation(confirm)) = self.overlay.as_mut() {
+                    confirm.move_choice(1);
                 }
                 Action::None
             }
-            KeyCode::Char('y') => self.confirm_action(ConfirmationChoice::Confirm),
+            KeyCode::Char('y') => {
+                let Some(StatsOverlay::Confirmation(confirm)) = self.overlay.as_ref() else {
+                    return Action::None;
+                };
+                self.activate_confirmation(ConfirmationChoice::Action(confirm.requested))
+            }
             KeyCode::Enter => {
-                let choice = self.confirm.as_ref().expect("confirmation checked above").choice;
-                self.confirm_action(choice)
+                let Some(StatsOverlay::Confirmation(confirm)) = self.overlay.as_ref() else {
+                    return Action::None;
+                };
+                let choice = confirm.choice;
+                self.activate_confirmation(choice)
             }
             _ => Action::None,
         }
     }
 
-    fn confirm_action(&mut self, choice: ConfirmationChoice) -> Action {
+    fn activate_confirmation(&mut self, choice: ConfirmationChoice) -> Action {
         if choice == ConfirmationChoice::Cancel {
-            self.confirm = None;
+            self.overlay = None;
             return Action::None;
         }
-        let confirm = self.confirm.take().expect("confirmation checked above");
-        let action = if choice == ConfirmationChoice::Force {
-            ProcessAction::ForceTerminate
-        } else {
-            confirm.action
+        let Some(StatsOverlay::Confirmation(confirm)) = self.overlay.take() else {
+            return Action::None;
         };
+        if !confirm.choices.contains(&choice) {
+            self.status =
+                Some("Action unavailable: confirmation choice is no longer offered".into());
+            return Action::None;
+        }
+        let ConfirmationChoice::Action(action) = choice else {
+            unreachable!("cancel handled before taking confirmation")
+        };
+        if self.process(ProcessIdentity::stable(confirm.key)).is_none() {
+            self.status = Some(format!(
+                "Target unavailable: PID {} is no longer the same process",
+                confirm.key.pid
+            ));
+            return Action::None;
+        }
+        if let ActionLifecycle::Running(request) = self.action_lifecycle {
+            self.status = Some(format!("Action already running for PID {}", request.key.pid));
+            return Action::None;
+        }
+        let capability = process_action_capability(self.snapshot.host, action);
+        if let Some(reason) = capability.reason() {
+            self.status = Some(format!("Action unavailable: {reason}"));
+            return Action::None;
+        }
         Action::Process(confirm.key, action)
     }
 
     fn on_command_viewer_key(&mut self, key: KeyEvent, regions: &UiRegions) -> Action {
         if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
-            self.command_viewer = None;
+            self.overlay = None;
             return Action::None;
         }
-        let Some(viewer) = &mut self.command_viewer else { return Action::None };
+        let Some(StatsOverlay::CommandViewer(viewer)) = self.overlay.as_mut() else {
+            return Action::None;
+        };
         let viewport = regions.command_content.unwrap_or_default();
         let height = viewport.height.max(1) as usize;
         let width = viewport.width.max(1) as usize;
@@ -1059,46 +1321,49 @@ impl StatsApp {
         Action::None
     }
 
-    fn open_command_viewer(&mut self) {
-        if let Some((process, _)) = self.selected_inspection() {
-            self.command_viewer = Some(CommandViewer {
-                name: process.name.clone(),
-                pid: process.identity.pid(),
-                command: process.command.clone(),
-                row_offset: 0,
-                column_offset: 0,
-            });
-        }
+    fn show_command(&mut self, identity: ProcessIdentity) {
+        let Some(process) = self.process(identity) else {
+            self.target_unavailable(identity);
+            return;
+        };
+        let viewer = CommandViewer {
+            name: process.name.clone(),
+            pid: process.identity.pid(),
+            command: process.command.clone(),
+            row_offset: 0,
+            column_offset: 0,
+        };
+        self.overlay = Some(StatsOverlay::CommandViewer(viewer));
     }
 
-    pub(super) fn on_mouse(&mut self, mouse: MouseEvent, regions: &UiRegions) -> Action {
+    fn on_mouse(&mut self, mouse: MouseEvent, regions: &UiRegions) -> Action {
         let point = (mouse.column, mouse.row);
-        if self.command_viewer.is_some() {
+        if !self.pointer_enabled {
             self.split_drag = None;
-            if mouse.kind == MouseEventKind::Down(MouseButton::Left)
-                && regions.command_close.is_some_and(|area| contains(area, point))
-            {
-                self.command_viewer = None;
-            }
-            return Action::None;
-        }
-        if self.confirm.is_some() {
-            self.split_drag = None;
-            if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
-                return Action::None;
-            }
-            if regions.confirm_yes.is_some_and(|area| contains(area, point)) {
-                return self.confirm_action(ConfirmationChoice::Confirm);
-            }
-            if regions.confirm_force.is_some_and(|area| contains(area, point)) {
-                return self.confirm_action(ConfirmationChoice::Force);
-            }
-            if regions.confirm_cancel.is_some_and(|area| contains(area, point)) {
-                self.confirm = None;
-            }
             return Action::None;
         }
         match mouse.kind {
+            MouseEventKind::Down(MouseButton::Right) => {
+                self.split_drag = None;
+                if let Some(row) = regions.rows.iter().find(|row| contains(row.area, point)) {
+                    self.active_region = ActiveRegion::Processes;
+                    self.select_identity(row.identity);
+                    self.open_context_menu(
+                        row.identity,
+                        Position { x: mouse.column, y: mouse.row },
+                    );
+                } else if regions.inspector.is_some_and(|area| contains(area, point)) {
+                    self.active_region = ActiveRegion::Inspector;
+                    if let Some((process, _)) = self.selected_inspection() {
+                        let identity = process.identity;
+                        self.open_context_menu(
+                            identity,
+                            Position { x: mouse.column, y: mouse.row },
+                        );
+                    }
+                }
+                return Action::None;
+            }
             MouseEventKind::Down(MouseButton::Left) => {
                 self.split_drag = regions.split.and_then(|split| {
                     SplitDrag::begin((), split, self.split_ratio, mouse.column, mouse.row)
@@ -1175,14 +1440,11 @@ impl StatsApp {
             self.thread_cursor = *index;
             return Action::None;
         }
-        if regions.profile.is_some_and(|area| contains(area, point)) {
-            self.set_inspector_tab(InspectorTab::Profile);
-            self.active_region = ActiveRegion::Inspector;
-            return Action::None;
-        }
-        if regions.command_open.is_some_and(|area| contains(area, point)) {
-            self.open_command_viewer();
-            return Action::None;
+        if let Some(action) =
+            regions.inline_actions.iter().find(|action| contains(action.area, point))
+        {
+            let context = self.action_context(action.identity);
+            return self.invoke_action(ActionInvocation::new(action.action, context));
         }
         if let Some((_, key)) = regions.disclosures.iter().find(|(area, _)| contains(*area, point))
         {
@@ -1199,41 +1461,101 @@ impl StatsApp {
             self.set_sort(*sort);
             return Action::None;
         }
-        if let Some((_, index)) = regions.rows.iter().find(|(area, _)| contains(*area, point)) {
-            self.select_index(*index);
+        if let Some(row) = regions.rows.iter().find(|row| contains(row.area, point)) {
+            self.select_identity(row.identity);
             return Action::None;
-        }
-        if regions.end_process.is_some_and(|area| contains(area, point)) {
-            self.open_confirmation(ProcessAction::GracefulTerminate);
         }
         Action::None
     }
 
-    pub(super) fn open_confirmation(&mut self, requested: ProcessAction) {
+    fn open_context_menu(&mut self, identity: ProcessIdentity, anchor: Position) {
+        let context = self.action_context(identity);
+        let items = self.registry.resolve_menu(PROCESS_CONTEXT_MENU, &context);
+        self.overlay = ContextMenu::open(anchor, context, items).map(StatsOverlay::ContextMenu);
+    }
+
+    pub(super) fn action_context(&self, identity: ProcessIdentity) -> StatsActionContext {
+        StatsActionContext {
+            identity,
+            is_live: self.process(identity).is_some(),
+            inspector_tab: self.inspector_tab,
+            host: self.snapshot.host,
+            action_running: matches!(self.action_lifecycle, ActionLifecycle::Running(_)),
+        }
+    }
+
+    pub(super) fn invoke_action(
+        &mut self,
+        invocation: ActionInvocation<StatsActionContext>,
+    ) -> Action {
+        let command = match self.registry.command_for(&invocation) {
+            Ok(command) => command,
+            Err(error) => {
+                self.status = Some(error.to_string());
+                return Action::None;
+            }
+        };
+        if matches!(self.overlay.as_ref(), Some(StatsOverlay::ContextMenu(_))) {
+            self.overlay = None;
+        }
+        let identity = invocation.context.identity;
+        match command {
+            StatsCommand::ViewCommand => self.show_command(identity),
+            StatsCommand::OpenProfile => self.show_profile(identity),
+            StatsCommand::RequestTerminate(requested) => {
+                self.request_confirmation(identity, requested)
+            }
+        }
+        Action::None
+    }
+
+    fn show_profile(&mut self, identity: ProcessIdentity) {
+        if self.selected != Some(identity) {
+            self.select_identity(identity);
+        }
+        self.set_inspector_tab(InspectorTab::Profile);
+        self.active_region = ActiveRegion::Inspector;
+        self.overlay = None;
+    }
+
+    pub(super) fn request_confirmation(
+        &mut self,
+        identity: ProcessIdentity,
+        requested: ProcessAction,
+    ) {
         if let ActionLifecycle::Running(request) = self.action_lifecycle {
             self.status = Some(format!("Action already running for PID {}", request.key.pid));
             return;
         }
-        let capability = match requested {
-            ProcessAction::GracefulTerminate => self.snapshot.host.graceful_terminate,
-            ProcessAction::ForceTerminate => self.snapshot.host.force_terminate,
-        };
+        let capability = process_action_capability(self.snapshot.host, requested);
         if let Some(reason) = capability.reason() {
             self.status = Some(format!("Action unavailable: {reason}"));
             return;
         }
-        if let Some(process) = self.selected_process() {
-            let Some(key) = process.identity.stable_key() else {
-                self.status = Some("Action unavailable: process identity is snapshot-only".into());
-                return;
-            };
-            self.confirm = Some(Confirmation {
-                key,
-                action: requested,
-                name: process.name.clone(),
-                choice: ConfirmationChoice::Cancel,
-            });
-        }
+        let Some(process) = self.process(identity) else {
+            self.target_unavailable(identity);
+            return;
+        };
+        let Some(key) = process.identity.stable_key() else {
+            self.status = Some("Action unavailable: process identity is snapshot-only".into());
+            return;
+        };
+        let confirmation = Confirmation {
+            key,
+            requested,
+            name: process.name.clone(),
+            choices: confirmation_choices(requested, self.snapshot.host),
+            choice: ConfirmationChoice::Cancel,
+        };
+        self.overlay = Some(StatsOverlay::Confirmation(confirmation));
+    }
+
+    fn target_unavailable(&mut self, identity: ProcessIdentity) {
+        self.overlay = None;
+        self.status = Some(format!(
+            "Target unavailable: PID {} is no longer the same process",
+            identity.pid()
+        ));
     }
 
     pub(super) fn action_started(&mut self, request: ActionRequest) {
@@ -1261,6 +1583,35 @@ fn observed_f64(value: &super::model::Observed<f64>) -> f64 {
 
 fn observed_name(value: &super::model::Observed<String>) -> &str {
     value.value().map(String::as_str).unwrap_or("")
+}
+
+fn confirmation_choices(
+    requested: ProcessAction,
+    host: super::model::HostCapabilities,
+) -> Vec<ConfirmationChoice> {
+    let mut choices = Vec::with_capacity(3);
+    if process_action_capability(host, requested).reason().is_none() {
+        choices.push(ConfirmationChoice::Action(requested));
+    }
+    if requested == ProcessAction::GracefulTerminate && host.force_terminate.reason().is_none() {
+        choices.push(ConfirmationChoice::Action(ProcessAction::ForceTerminate));
+    }
+    choices.push(ConfirmationChoice::Cancel);
+    choices
+}
+
+fn process_action_capability(
+    host: super::model::HostCapabilities,
+    action: ProcessAction,
+) -> super::model::CapabilityState {
+    match action {
+        ProcessAction::GracefulTerminate => host.graceful_terminate,
+        ProcessAction::ForceTerminate => host.force_terminate,
+    }
+}
+
+fn is_ctrl_c(key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c')
 }
 
 fn contains(area: Rect, (x, y): (u16, u16)) -> bool {

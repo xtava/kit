@@ -5,17 +5,19 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Cell, Clear, Paragraph, Row, Table, Wrap};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthStr;
 
-use super::app::{ActiveRegion, ConfirmationChoice, InspectorTab, SortBy, StatsApp};
+use super::app::{ActiveRegion, ConfirmationChoice, InspectorTab, SortBy, StatsApp, StatsOverlay};
+use super::contributions::{PROCESS_COMMAND_INLINE, PROCESS_INSPECTOR_INLINE};
 use super::host::ProcessAction;
 use super::model::{
-    CapabilityState, DetailCompleteness, DetailData, DetailOutcome, Observed, ResourceSample,
-    SampleReadiness,
+    CapabilityState, DetailCompleteness, DetailData, DetailOutcome, Observed, ProcessIdentity,
+    ResourceSample, SampleReadiness,
 };
 use super::report;
 use crate::tui::{
-    render_split_divider, theme::NORD, NavigationMap, NavigationRegion, SplitDividerStyle,
-    SplitFrame, SplitMinimums,
+    render_split_divider, theme::NORD, ActionId, ActionState, ContextMenuLayout, ContextMenuStyle,
+    NavigationMap, NavigationRegion, ResolvedAction, SplitDividerStyle, SplitFrame, SplitMinimums,
 };
 
 const BACKGROUND: Color = NORD.background;
@@ -30,8 +32,23 @@ const HIGHLIGHT: Color = NORD.focus;
 const GOOD: Color = NORD.info;
 const WARN: Color = NORD.warning;
 const SELECTED: Color = NORD.selection;
-const CORE_TILE_WIDTH: u16 = 5;
-const CORE_OVERFLOW_WIDTH: usize = 5;
+const CORE_MAP_LABEL: &str = "CORE MAP  ";
+const BUSY_CPU_PERCENT: f32 = 70.0;
+const CRITICAL_CPU_PERCENT: f32 = 90.0;
+const COMMAND_LABEL: &str = "COMMAND  ";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ProcessRowRegion {
+    pub(super) area: Rect,
+    pub(super) identity: ProcessIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct InlineActionRegion {
+    pub(super) area: Rect,
+    pub(super) action: ActionId,
+    pub(super) identity: ProcessIdentity,
+}
 
 #[derive(Default)]
 pub(super) struct UiRegions {
@@ -39,21 +56,18 @@ pub(super) struct UiRegions {
     pub(super) inspector: Option<Rect>,
     pub(super) split: Option<SplitFrame>,
     pub(super) cores: Vec<(Rect, u16)>,
-    pub(super) rows: Vec<(Rect, usize)>,
+    pub(super) rows: Vec<ProcessRowRegion>,
     pub(super) headers: Vec<(Rect, SortBy)>,
     pub(super) disclosures: Vec<(Rect, super::model::ProcessIdentity)>,
     pub(super) family_rows: Vec<(Rect, usize, super::model::ProcessIdentity)>,
     pub(super) thread_rows: Vec<(Rect, usize)>,
     pub(super) tabs: Vec<(Rect, InspectorTab)>,
-    pub(super) profile: Option<Rect>,
-    pub(super) command_open: Option<Rect>,
+    pub(super) inline_actions: Vec<InlineActionRegion>,
+    pub(super) context_menu: Option<ContextMenuLayout>,
     pub(super) command_content: Option<Rect>,
     pub(super) command_close: Option<Rect>,
     pub(super) back: Option<Rect>,
-    pub(super) end_process: Option<Rect>,
-    pub(super) confirm_yes: Option<Rect>,
-    pub(super) confirm_force: Option<Rect>,
-    pub(super) confirm_cancel: Option<Rect>,
+    pub(super) confirmation_choices: Vec<(Rect, ConfirmationChoice)>,
 }
 
 impl UiRegions {
@@ -106,10 +120,19 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &StatsApp) -> UiRegions {
         render_processes(frame, app, chunks[2], false, &mut regions);
     }
     render_footer(frame, app, chunks[3]);
-    if app.confirm.is_some() {
-        render_confirmation(frame, app, &mut regions);
-    } else if app.command_viewer.is_some() {
-        render_command_viewer(frame, app, &mut regions);
+    match app.overlay.as_ref() {
+        Some(StatsOverlay::Confirmation(confirm)) => {
+            render_confirmation(frame, confirm, &mut regions)
+        }
+        Some(StatsOverlay::CommandViewer(viewer)) => {
+            render_command_viewer(frame, viewer, &mut regions)
+        }
+        Some(StatsOverlay::ContextMenu(menu)) => {
+            let layout = menu.layout(frame.area());
+            menu.render(frame, &layout, ContextMenuStyle::from_theme(NORD));
+            regions.context_menu = Some(layout);
+        }
+        None => {}
     }
     regions
 }
@@ -152,30 +175,83 @@ fn render_header(frame: &mut Frame<'_>, app: &StatsApp, area: Rect) {
 fn render_system_band(frame: &mut Frame<'_>, app: &StatsApp, area: Rect, regions: &mut UiRegions) {
     let system = &app.snapshot.system;
     let inner = area.inner(Margin { horizontal: 1, vertical: 0 });
-    let graph_width = (inner.width / 3).max(12) as usize;
-    let total = Line::from(vec![
-        Span::styled("CPU HISTORY  ", Style::default().fg(MUTED)),
-        Span::styled(global_spark(&app.histories, graph_width), Style::default().fg(CPU_ACCENT)),
-        Span::styled("  ", Style::default()),
+    let graph_width = usize::from(inner.width.saturating_sub(48) / 2).min(24);
+    let busiest = system.cpus.iter().max_by(|left, right| {
+        left.usage_percent
+            .total_cmp(&right.usage_percent)
+            .then_with(|| right.logical_index.cmp(&left.logical_index))
+    });
+    let peak = busiest.map_or_else(
+        || "—".to_owned(),
+        |cpu| format!("C{:02} {:>5.1}%", cpu.logical_index, cpu.usage_percent),
+    );
+    let totals = Line::from(vec![
+        Span::styled("CPU AVG ", Style::default().fg(MUTED)),
         Span::styled(
-            format!("{:.1}% now", system.global_cpu_percent),
+            format!("{:>5.1}% ", system.global_cpu_percent),
             Style::default().fg(cpu_color(system.global_cpu_percent)).add_modifier(Modifier::BOLD),
         ),
+        Span::styled(average_cpu_spark(&app.histories, graph_width), Style::default().fg(GOOD)),
+        Span::styled("  PEAK CORE ", Style::default().fg(MUTED)),
+        Span::styled(
+            format!("{peak} "),
+            Style::default()
+                .fg(busiest.map_or(GOOD, |cpu| cpu_color(cpu.usage_percent)))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(peak_core_spark(&app.histories, graph_width), Style::default().fg(CPU_ACCENT)),
     ]);
-    frame.render_widget(Paragraph::new(total), Rect::new(inner.x, inner.y, inner.width, 1));
+    frame.render_widget(Paragraph::new(totals), Rect::new(inner.x, inner.y, inner.width, 1));
 
-    let mut spans = vec![Span::styled("CORES  ", Style::default().fg(MUTED))];
-    let available = inner.width.saturating_sub(7) as usize;
-    let capacity = available / usize::from(CORE_TILE_WIDTH);
-    let visible = if system.cpus.len() <= capacity {
-        system.cpus.len()
+    let core_limit = if inner.width >= 120 {
+        3
+    } else if inner.width >= 78 {
+        2
     } else {
-        available.saturating_sub(CORE_OVERFLOW_WIDTH) / usize::from(CORE_TILE_WIDTH)
+        1
     };
-    for (index, cpu) in system.cpus.iter().take(visible).enumerate() {
-        let graph = spark(app.histories.get(index)).chars().last().unwrap_or('▁');
-        spans.push(Span::styled(
-            format!("{:02}{graph}  ", cpu.logical_index),
+    let core_pressure = app.core_pressure(core_limit);
+    let mut busy_summary = String::from("TOP CORES NOW/RECENT ");
+    if core_pressure.is_empty() {
+        busy_summary.push('—');
+    } else {
+        for (index, core) in core_pressure.iter().enumerate() {
+            if index > 0 {
+                busy_summary.push_str(" · ");
+            }
+            busy_summary.push_str(&format!(
+                "C{:02} {:.0}/{:.0}%",
+                core.logical_index, core.now_percent, core.recent_peak_percent
+            ));
+        }
+    }
+    let summary_budget = usize::from(inner.width.saturating_mul(2) / 5);
+    let busy_summary = truncate(&busy_summary, summary_budget);
+    let summary_width = busy_summary.width().min(usize::from(u16::MAX)) as u16;
+    let map_width = inner
+        .width
+        .saturating_sub(CORE_MAP_LABEL.len() as u16)
+        .saturating_sub(summary_width)
+        .saturating_sub(2) as usize;
+    let cell_count = system.cpus.len().min(map_width);
+    let cells = (0..cell_count)
+        .filter_map(|cell| {
+            let start = cell * system.cpus.len() / cell_count;
+            let end = (cell + 1) * system.cpus.len() / cell_count;
+            let group = &system.cpus[start..end];
+            group.iter().find(|cpu| app.focused_core == Some(cpu.logical_index)).or_else(|| {
+                group.iter().max_by(|left, right| {
+                    left.usage_percent
+                        .total_cmp(&right.usage_percent)
+                        .then_with(|| right.logical_index.cmp(&left.logical_index))
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut core_spans = vec![Span::styled(CORE_MAP_LABEL, Style::default().fg(MUTED))];
+    for cpu in &cells {
+        core_spans.push(Span::styled(
+            usage_bar(cpu.usage_percent).to_string(),
             if app.focused_core == Some(cpu.logical_index) {
                 Style::default().fg(PAPER).bg(SELECTED).add_modifier(Modifier::BOLD)
             } else {
@@ -183,16 +259,59 @@ fn render_system_band(frame: &mut Frame<'_>, app: &StatsApp, area: Rect, regions
             },
         ));
     }
-    if visible < system.cpus.len() {
-        spans.push(Span::styled("more…", Style::default().fg(MUTED)));
-    }
+    core_spans.push(Span::raw("  "));
+    let summary_color = core_pressure
+        .first()
+        .map_or(MUTED, |core| cpu_color(core.now_percent.max(core.recent_peak_percent)));
+    core_spans.push(Span::styled(busy_summary, Style::default().fg(summary_color)));
     let core_line = Rect::new(inner.x, inner.y + 1, inner.width, 1);
-    frame.render_widget(Paragraph::new(Line::from(spans)), core_line);
-    let mut x = core_line.x + 7;
-    for cpu in system.cpus.iter().take(visible) {
-        regions.cores.push((Rect::new(x, core_line.y, CORE_TILE_WIDTH, 1), cpu.logical_index));
-        x += CORE_TILE_WIDTH;
+    frame.render_widget(Paragraph::new(Line::from(core_spans)), core_line);
+    let mut x = core_line.x + CORE_MAP_LABEL.len() as u16;
+    for cpu in cells {
+        regions.cores.push((Rect::new(x, core_line.y, 1, 1), cpu.logical_index));
+        x += 1;
     }
+
+    let source_limit = if inner.width >= 120 {
+        3
+    } else if inner.width >= 72 {
+        2
+    } else {
+        1
+    };
+    let sources = app.pressure_sources(source_limit);
+    let mut source_spans =
+        vec![Span::styled("PRESSURE SOURCES NOW/RECENT  ", Style::default().fg(MUTED))];
+    if sources.is_empty() {
+        source_spans.push(Span::styled("—", Style::default().fg(MUTED)));
+    } else {
+        let name_width = if inner.width >= 120 {
+            16
+        } else if inner.width >= 72 {
+            10
+        } else {
+            7
+        };
+        for (index, source) in sources.iter().enumerate() {
+            if index > 0 {
+                source_spans.push(Span::styled("  ·  ", Style::default().fg(MUTED)));
+            }
+            let name = truncate(&source.name, name_width);
+            source_spans.push(Span::styled(
+                format!(
+                    "{name}[{}] {:.0}/{:.0}%",
+                    source.pid, source.now_percent, source.recent_percent
+                ),
+                Style::default()
+                    .fg(cpu_color(source.now_percent.max(source.recent_percent)))
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(source_spans)),
+        Rect::new(inner.x, inner.y + 2, inner.width, 1),
+    );
 }
 
 fn render_processes(
@@ -313,7 +432,10 @@ fn render_processes(
         (app.row_offset..app.visible.len()).take(visible_height).enumerate()
     {
         let y = row_top + screen_index as u16;
-        regions.rows.push((Rect::new(inner.x, y, inner.width, 1), index));
+        regions.rows.push(ProcessRowRegion {
+            area: Rect::new(inner.x, y, inner.width, 1),
+            identity: app.visible[index].key,
+        });
         let disclosure_x = inner.x + app.visible[index].depth.saturating_mul(2);
         regions.disclosures.push((Rect::new(disclosure_x, y, 2, 1), app.visible[index].key));
     }
@@ -425,34 +547,37 @@ fn render_inspector(
     frame.render_widget(Paragraph::new(Line::from(tab_spans)), tab_area);
 
     let content = Rect::new(inner.x, inner.y + 2, inner.width, inner.height.saturating_sub(3));
-    let lines = match app.inspector_tab {
+    let (lines, command_actions) = match app.inspector_tab {
         InspectorTab::Overview => {
-            overview_lines(app, process, family_cpu, family_memory, content, regions)
+            let (lines, command_actions) =
+                overview_lines(app, process, family_cpu, family_memory, content);
+            (lines, Some(command_actions))
         }
         InspectorTab::Family => {
-            family_lines(app, process, family_cpu, family_memory, content, regions)
+            (family_lines(app, process, family_cpu, family_memory, content, regions), None)
         }
-        InspectorTab::Threads => thread_lines(app, content, regions),
-        InspectorTab::Resources => resources_lines(app),
-        InspectorTab::Profile => profile_lines(app),
+        InspectorTab::Threads => (thread_lines(app, content, regions), None),
+        InspectorTab::Resources => (resources_lines(app), None),
+        InspectorTab::Profile => (profile_lines(app), None),
     };
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), content);
-    if inner.height >= 5 && is_live {
-        let action_line = Rect::new(inner.x, inner.bottom() - 1, inner.width, 1);
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(" p ", Style::default().fg(HIGHLIGHT).add_modifier(Modifier::BOLD)),
-                Span::styled("Profile", Style::default().fg(MUTED)),
-                Span::styled(
-                    format!("{:>width$}", "End…", width = inner.width.saturating_sub(10) as usize),
-                    Style::default().fg(MUTED),
-                ),
-            ])),
-            action_line,
+    if let Some(command_actions) = command_actions {
+        let context = app.action_context(process.identity);
+        let actions = app.registry.resolve_menu(PROCESS_COMMAND_INLINE, &context);
+        render_inline_actions(
+            frame,
+            app,
+            command_actions,
+            actions.items(),
+            process.identity,
+            regions,
         );
-        regions.profile = Some(Rect::new(inner.x, action_line.y, 10.min(inner.width), 1));
-        regions.end_process =
-            Some(Rect::new(inner.right().saturating_sub(6), action_line.y, 6.min(inner.width), 1));
+    }
+    if inner.height >= 5 {
+        let action_line = Rect::new(inner.x, inner.bottom() - 1, inner.width, 1);
+        let context = app.action_context(process.identity);
+        let actions = app.registry.resolve_menu(PROCESS_INSPECTOR_INLINE, &context);
+        render_inline_actions(frame, app, action_line, actions.items(), process.identity, regions);
     }
 }
 
@@ -462,8 +587,7 @@ fn overview_lines(
     family_cpu: f32,
     family_memory: u64,
     area: Rect,
-    regions: &mut UiRegions,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, Rect) {
     let core = process.last_cpu.map_or_else(|| "—".into(), |core| format!("C{core}"));
     let mut lines = vec![
         Line::from(vec![
@@ -494,22 +618,77 @@ fn overview_lines(
             history_bars(history.points().map(|point| point.rss_bytes as f64), width)
         )));
     }
-    let command_line = area.y + lines.len() as u16 + 1;
-    regions.command_open = Some(Rect::new(
-        area.x,
-        command_line,
-        area.width,
-        area.bottom().saturating_sub(command_line),
-    ));
+    let command_line_y = area.y.saturating_add(lines.len() as u16).saturating_add(1);
+    let prefix_width = u16::try_from(COMMAND_LABEL.width()).unwrap_or(area.width).min(area.width);
+    let command_actions = Rect::new(
+        area.x.saturating_add(prefix_width),
+        command_line_y,
+        area.width.saturating_sub(prefix_width),
+        u16::from(command_line_y < area.bottom()),
+    );
     lines.extend([
         Line::from(""),
-        Line::from(vec![
-            Span::styled("COMMAND", Style::default().fg(MUTED)),
-            Span::styled("  v / click to inspect", Style::default().fg(ACCENT)),
-        ]),
+        Line::from(vec![Span::styled(COMMAND_LABEL, Style::default().fg(MUTED))]),
         Line::styled(process.command.clone(), Style::default().fg(TEXT)),
     ]);
-    lines
+    (lines, command_actions)
+}
+
+fn render_inline_actions(
+    frame: &mut Frame<'_>,
+    app: &StatsApp,
+    area: Rect,
+    actions: &[ResolvedAction],
+    identity: ProcessIdentity,
+    regions: &mut UiRegions,
+) {
+    if actions.is_empty() || area.height == 0 || area.width == 0 {
+        return;
+    }
+    let mut x = area.x;
+    for action in actions {
+        let remaining = area.right().saturating_sub(x);
+        if remaining == 0 {
+            break;
+        }
+        let desired_width = u16::try_from(inline_action_width(action)).unwrap_or(u16::MAX);
+        let width = desired_width.min(remaining);
+        let slot = Rect::new(x, area.y, width, 1);
+        frame.render_widget(Paragraph::new(Line::from(inline_action_spans(action))), slot);
+        if app.pointer_enabled && width > 0 {
+            regions.inline_actions.push(InlineActionRegion {
+                area: slot,
+                action: action.id,
+                identity,
+            });
+        }
+        x = x.saturating_add(width);
+    }
+}
+
+fn inline_action_width(action: &ResolvedAction) -> usize {
+    let keybinding = action
+        .primary_keybinding()
+        .map(|keybinding| keybinding.to_string().width().saturating_add(2))
+        .unwrap_or(1);
+    keybinding.saturating_add(action.title.width())
+}
+
+fn inline_action_spans(action: &ResolvedAction) -> Vec<Span<'static>> {
+    let (key_style, title_style) = match &action.state {
+        ActionState::Enabled => (
+            Style::default().fg(HIGHLIGHT).add_modifier(Modifier::BOLD),
+            Style::default().fg(MUTED),
+        ),
+        ActionState::Disabled { .. } => {
+            let disabled = Style::default().fg(MUTED).add_modifier(Modifier::DIM);
+            (disabled, disabled)
+        }
+    };
+    let keybinding = action
+        .primary_keybinding()
+        .map_or_else(|| " ".to_owned(), |keybinding| format!(" {keybinding} "));
+    vec![Span::styled(keybinding, key_style), Span::styled(action.title, title_style)]
 }
 
 fn thread_lines(app: &StatsApp, area: Rect, regions: &mut UiRegions) -> Vec<Line<'static>> {
@@ -918,8 +1097,6 @@ fn render_footer(frame: &mut Frame<'_>, app: &StatsApp, area: Rect) {
                 Span::styled("tabs / processes   ", Style::default().fg(MUTED)),
                 Span::styled("tab ", key),
                 Span::styled("region   ", Style::default().fg(MUTED)),
-                Span::styled("p ", key),
-                Span::styled("profile   ", Style::default().fg(MUTED)),
                 Span::styled("esc ", key),
                 Span::styled("back   ", Style::default().fg(MUTED)),
                 Span::styled("q ", key),
@@ -930,23 +1107,36 @@ fn render_footer(frame: &mut Frame<'_>, app: &StatsApp, area: Rect) {
     }
 }
 
-fn render_confirmation(frame: &mut Frame<'_>, app: &StatsApp, regions: &mut UiRegions) {
-    let confirm = app.confirm.as_ref().expect("called only with confirmation");
+fn render_confirmation(
+    frame: &mut Frame<'_>,
+    confirm: &super::app::Confirmation,
+    regions: &mut UiRegions,
+) {
     let area = centered(frame.area(), 58, 9);
     frame.render_widget(Clear, area);
     frame.render_widget(Block::new().style(Style::default().bg(PANEL)), area);
-    let warning = if confirm.action == ProcessAction::ForceTerminate
-        || confirm.choice == ConfirmationChoice::Force
-    {
+    let selected_action = match confirm.choice {
+        ConfirmationChoice::Action(action) => action,
+        ConfirmationChoice::Cancel => confirm.requested,
+    };
+    let warning = if selected_action == ProcessAction::ForceTerminate {
         "Force kill cannot be handled or cleaned up by the process."
     } else {
         "The process may save work and shut down cleanly."
     };
+    let prompt = match confirm.requested {
+        ProcessAction::GracefulTerminate => {
+            format!("End {} (PID {})?", confirm.name, confirm.key.pid)
+        }
+        ProcessAction::ForceTerminate => {
+            format!("Force terminate {} (PID {})?", confirm.name, confirm.key.pid)
+        }
+    };
     let text = vec![
-        Line::from(format!("End {} (PID {})?", confirm.name, confirm.key.pid)),
+        Line::from(prompt),
         Line::from(""),
         Line::styled(
-            confirm.action.label(),
+            selected_action.label(),
             Style::default().fg(WARN).add_modifier(Modifier::BOLD),
         ),
         Line::from(warning),
@@ -970,32 +1160,31 @@ fn render_confirmation(frame: &mut Frame<'_>, app: &StatsApp, regions: &mut UiRe
         area,
     );
     let inner = area.inner(Margin { horizontal: 1, vertical: 1 });
-    let buttons = Layout::horizontal([
-        Constraint::Length(16),
-        Constraint::Length(17),
-        Constraint::Length(13),
-        Constraint::Min(0),
-    ])
-    .split(Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1));
-    regions.confirm_yes = Some(buttons[0]);
-    regions.confirm_force = Some(buttons[1]);
-    regions.confirm_cancel = Some(buttons[2]);
-    for (area, label, choice) in [
-        (buttons[0], " End process ", ConfirmationChoice::Confirm),
-        (buttons[1], " Force terminate ", ConfirmationChoice::Force),
-        (buttons[2], " Cancel ", ConfirmationChoice::Cancel),
-    ] {
+    let constraints = confirm.choices.iter().map(|choice| {
+        Constraint::Length((UnicodeWidthStr::width(choice.label()) as u16).saturating_add(2))
+    });
+    let buttons = Layout::horizontal(constraints).split(Rect::new(
+        inner.x,
+        inner.bottom().saturating_sub(1),
+        inner.width,
+        1,
+    ));
+    for (area, choice) in buttons.iter().copied().zip(confirm.choices.iter().copied()) {
+        regions.confirmation_choices.push((area, choice));
         let style = if confirm.choice == choice {
             Style::default().fg(PANEL).bg(ACCENT).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(TEXT).bg(PANEL)
         };
-        frame.render_widget(Paragraph::new(label).style(style), area);
+        frame.render_widget(Paragraph::new(format!(" {} ", choice.label())).style(style), area);
     }
 }
 
-fn render_command_viewer(frame: &mut Frame<'_>, app: &StatsApp, regions: &mut UiRegions) {
-    let viewer = app.command_viewer.as_ref().expect("called only with command viewer");
+fn render_command_viewer(
+    frame: &mut Frame<'_>,
+    viewer: &super::app::CommandViewer,
+    regions: &mut UiRegions,
+) {
     let width = frame.area().width.saturating_sub(8).min(120);
     let height = frame.area().height.saturating_sub(6).min(36);
     let area = centered(frame.area(), width, height);
@@ -1041,34 +1230,42 @@ fn horizontal_slice(value: &str, start: usize, width: usize) -> String {
     value.chars().skip(start).take(width).collect()
 }
 
-fn spark(history: Option<&VecDeque<u64>>) -> String {
-    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    history
-        .into_iter()
-        .flat_map(|history| history.iter().rev().take(6).rev())
-        .map(|value| BARS[(*value).min(99) as usize * BARS.len() / 100])
-        .collect()
+fn average_cpu_spark(histories: &[VecDeque<u64>], width: usize) -> String {
+    history_spark(histories, width, |values| {
+        values.iter().copied().sum::<u64>() / values.len().max(1) as u64
+    })
 }
 
-fn global_spark(histories: &[VecDeque<u64>], width: usize) -> String {
-    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+fn peak_core_spark(histories: &[VecDeque<u64>], width: usize) -> String {
+    history_spark(histories, width, |values| values.iter().copied().max().unwrap_or_default())
+}
+
+fn history_spark(
+    histories: &[VecDeque<u64>],
+    width: usize,
+    aggregate: impl Fn(&[u64]) -> u64,
+) -> String {
     let sample_count = histories.iter().map(VecDeque::len).min().unwrap_or(0);
     let first = sample_count.saturating_sub(width);
     let values = (first..sample_count)
         .map(|index| {
-            let total = histories.iter().map(|history| history[index]).sum::<u64>();
-            let average = total / histories.len().max(1) as u64;
-            BARS[average.min(99) as usize * BARS.len() / 100]
+            let values = histories.iter().map(|history| history[index]).collect::<Vec<_>>();
+            usage_bar(aggregate(&values) as f32)
         })
         .collect::<String>();
     format!("{}{values}", " ".repeat(width.saturating_sub(values.chars().count())))
 }
 
+fn usage_bar(value: f32) -> char {
+    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    BARS[value.clamp(0.0, 99.0) as usize * BARS.len() / 100]
+}
+
 fn cpu_color(value: f32) -> Color {
-    if value >= 85.0 {
+    if value >= CRITICAL_CPU_PERCENT {
         PAPER
-    } else if value >= 60.0 {
-        CPU_ACCENT
+    } else if value >= BUSY_CPU_PERCENT {
+        WARN
     } else {
         GOOD
     }
