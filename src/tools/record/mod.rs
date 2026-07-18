@@ -4,21 +4,27 @@
 
 mod tui;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 
 use anyhow::{anyhow, Context as AnyhowContext, Result};
 use async_trait::async_trait;
 use clap::{ArgMatches, Command, CommandFactory, FromArgMatches, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
-use tokio::process::Command as TokioCommand;
 
+use crate::framework::process::{
+    CommandSpec, CompletionCause, ContainmentRequirement, EnvironmentBase, InputPolicy, LeaderExit,
+    LeaderExitObservation, OutputPolicy, ProcessDeadline, ProcessEnvironment, ProcessFailureKind,
+    ProcessFailureReport, ProcessLabel, ProcessReport, ProcessSpec, ProcessSupervisor,
+    TerminationPolicy,
+};
 use crate::framework::{Context, Tool, ToolMeta};
 
 const TOOL: &str = "record";
 const DEFAULT_SCENARIO: &str = "workspace-layout-dnd";
+const PROCESS_TERMINATION_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Persistent config for `kit record`, stored at the framework config path (`record.toml`).
 /// The repo has no built-in default — it is machine-specific — and an unset scenario falls back to
@@ -129,7 +135,7 @@ impl Tool for RecordTool {
         if args.interactive
             || (args.command.is_none() && cx.term.interactive() && !cx.out.is_json())
         {
-            return tui::run(repo, scenario).await;
+            return tui::run(cx.processes.clone(), repo, scenario).await;
         }
 
         let command = args.command.unwrap_or(RecordCommand::Status);
@@ -145,12 +151,14 @@ async fn dispatch_command(
 ) -> Result<()> {
     match command {
         RecordCommand::Start { out } => {
-            run_modular_command(repo, record_args(scenario, out.as_deref())).await
+            run_modular_command(&cx.processes, repo, record_args(scenario, out.as_deref())).await
         }
-        RecordCommand::Stop => run_modular_command(repo, stop_args(scenario)).await,
-        RecordCommand::Cancel => run_modular_command(repo, cancel_args(scenario)).await,
+        RecordCommand::Stop => run_modular_command(&cx.processes, repo, stop_args(scenario)).await,
+        RecordCommand::Cancel => {
+            run_modular_command(&cx.processes, repo, cancel_args(scenario)).await
+        }
         RecordCommand::Replay { dir } => {
-            run_modular_command(repo, replay_args(scenario, dir.as_deref())).await
+            run_modular_command(&cx.processes, repo, replay_args(scenario, dir.as_deref())).await
         }
         RecordCommand::Status => print_status(cx, repo, scenario),
         RecordCommand::Events => print_events(cx, repo, scenario),
@@ -167,22 +175,95 @@ async fn dispatch_command(
     }
 }
 
-async fn run_modular_command(repo: &Path, args: Vec<String>) -> Result<()> {
-    let status = TokioCommand::new("pnpm")
-        .current_dir(repo)
-        .args(args)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
+async fn run_modular_command(
+    processes: &ProcessSupervisor,
+    repo: &Path,
+    args: Vec<String>,
+) -> Result<()> {
+    let process = modular_process_spec(
+        repo,
+        args,
+        "record command",
+        InputPolicy::Closed,
+        OutputPolicy::Inherit,
+        OutputPolicy::Inherit,
+    )?;
+    let started = processes
+        .spawn(process)
         .await
         .with_context(|| format!("failed to run pnpm in {}", repo.display()))?;
+    let report = started.session.wait().await.map_err(supervision_error)?;
+    ensure_success(&report)
+}
 
-    if status.success() {
-        Ok(())
-    } else {
-        Err(anyhow!("pnpm command exited with {status}"))
+pub(super) fn modular_process_spec(
+    repo: &Path,
+    args: Vec<String>,
+    label: &str,
+    input: InputPolicy,
+    stdout: OutputPolicy,
+    stderr: OutputPolicy,
+) -> Result<ProcessSpec> {
+    let working_directory = repo
+        .canonicalize()
+        .with_context(|| format!("could not resolve repo path {}", repo.display()))?;
+    let environment =
+        ProcessEnvironment::new(EnvironmentBase::Inherit, BTreeMap::new(), BTreeSet::new())?;
+    let command = CommandSpec::new(
+        OsString::from("pnpm"),
+        args.into_iter().map(OsString::from).collect(),
+        working_directory,
+        environment,
+        ProcessLabel::new(label.to_owned())?,
+    )?;
+    Ok(ProcessSpec::new(
+        command,
+        input,
+        stdout,
+        stderr,
+        ContainmentRequirement::CompleteTree,
+        ProcessDeadline::Unlimited,
+        TerminationPolicy::new(PROCESS_TERMINATION_GRACE),
+    ))
+}
+
+pub(super) fn ensure_success(report: &ProcessReport) -> Result<()> {
+    if report.completion != CompletionCause::Natural {
+        return Err(anyhow!("pnpm command did not complete naturally: {:?}", report.completion));
     }
+    match report.leader_exit {
+        LeaderExitObservation::Observed(LeaderExit::Code(0)) => Ok(()),
+        LeaderExitObservation::Observed(LeaderExit::Code(code)) => {
+            Err(anyhow!("pnpm command exited with status {code}"))
+        }
+        LeaderExitObservation::Observed(LeaderExit::Signal(signal)) => {
+            Err(anyhow!("pnpm command terminated by signal {}", signal.get()))
+        }
+        LeaderExitObservation::NotObserved => {
+            Err(anyhow!("pnpm command completed without an observed process leader"))
+        }
+    }
+}
+
+pub(super) fn supervision_error(report: ProcessFailureReport) -> anyhow::Error {
+    let reason = match report.failure {
+        ProcessFailureKind::InputIo => "the pnpm input stream failed".to_owned(),
+        ProcessFailureKind::OutputIo { stream } => format!("the pnpm {stream:?} stream failed"),
+        ProcessFailureKind::OutputLimitExceeded { stream } => {
+            format!("the pnpm {stream:?} stream exceeded its output limit")
+        }
+        ProcessFailureKind::RequiredConsumerLost { stream } => {
+            format!("the pnpm {stream:?} output consumer stopped")
+        }
+        ProcessFailureKind::ContainmentLost => "the pnpm process-tree owner was lost".to_owned(),
+        ProcessFailureKind::TerminationUnconfirmed => {
+            "the pnpm process tree did not terminate conclusively".to_owned()
+        }
+        ProcessFailureKind::OwnerTaskFailed => {
+            "the pnpm supervisor stopped unexpectedly".to_owned()
+        }
+    };
+    anyhow!("pnpm command supervision failed: {reason}")
 }
 
 fn record_args(scenario: &str, out: Option<&Path>) -> Vec<String> {

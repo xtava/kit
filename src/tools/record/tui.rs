@@ -1,6 +1,6 @@
 use std::fs;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context as AnyhowContext, Result};
@@ -10,31 +10,36 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
 use ratatui::Frame;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
-use tokio::process::{ChildStdin, Command as TokioCommand};
-use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::sync::mpsc::{self, Sender};
 use tokio::time;
 use unicode_width::UnicodeWidthStr;
 
+use crate::framework::process::{
+    InputPolicy, LeaderExit, LeaderExitObservation, OutputPolicy, ProcessByteEvent, ProcessControl,
+    ProcessInputHandle, ProcessInputWriter, ProcessOutputHandle, ProcessRunId, ProcessSupervisor,
+    StartedProcess, StreamPolicy,
+};
 use crate::tui::{
     fuzzy, EventReader, LineEditor, Session, SessionOptions, Suggestion, SuggestionMenu,
 };
 
 use super::{
-    artifacts_report, cancel_args, current_recording_dir, events_summary, normalize_repo,
-    record_args, rename_current_recording, replay_args, saved_recording_root, status_report,
-    stop_args,
+    artifacts_report, cancel_args, current_recording_dir, ensure_success, events_summary,
+    modular_process_spec, normalize_repo, record_args, rename_current_recording, replay_args,
+    saved_recording_root, status_report, stop_args, supervision_error,
 };
 
 const REDRAW: Duration = Duration::from_secs(1);
 const FEED_CAP: usize = 5_000;
 const HISTORY_CAP: usize = 500;
+const OUTPUT_IN_FLIGHT_BYTES: NonZeroUsize = NonZeroUsize::new(256 * 1024).unwrap();
+const LINE_FRAGMENT_BYTES: usize = 64 * 1024;
 
-pub async fn run(repo: PathBuf, scenario: String) -> Result<()> {
+pub async fn run(processes: ProcessSupervisor, repo: PathBuf, scenario: String) -> Result<()> {
     let mut session = Session::open(SessionOptions::default())?;
     let mut events = EventReader::start();
-    let (tx, mut rx) = mpsc::unbounded_channel::<Async>();
-    let mut app = App::new(repo, scenario);
+    let (tx, mut rx) = mpsc::channel::<Async>(512);
+    let mut app = App::new(processes, repo, scenario);
     app.notice(
         "ready — start, stop, cancel, replay, status, events, artifacts, rename, help".to_owned(),
     );
@@ -51,7 +56,10 @@ pub async fn run(repo: PathBuf, scenario: String) -> Result<()> {
                     Flow::Quit => break,
                     Flow::Continue => {}
                 },
-                None => break,
+                None => {
+                    app.close_active_windows().await?;
+                    break;
+                }
                 _ => {}
             },
         }
@@ -66,8 +74,17 @@ enum Flow {
 }
 
 enum Async {
-    Output { label: String, stream: Stream, line: String },
-    Finished { label: String, kind: ProcessKind, result: Result<String, String> },
+    Output {
+        label: String,
+        stream: Stream,
+        line: String,
+    },
+    Finished {
+        run_id: ProcessRunId,
+        label: String,
+        kind: ProcessKind,
+        result: Result<String, String>,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -82,6 +99,11 @@ enum ProcessKind {
     Stop,
     Cancel,
     Replay,
+}
+
+struct ActiveProcess {
+    run_id: ProcessRunId,
+    control: ProcessControl,
 }
 
 enum FeedItem {
@@ -101,6 +123,7 @@ struct Ghost {
 }
 
 struct App {
+    processes: ProcessSupervisor,
     repo: PathBuf,
     scenario: String,
     feed: Vec<FeedItem>,
@@ -113,14 +136,16 @@ struct App {
     draft: String,
     help_open: bool,
     recording: bool,
-    replay_stdin: Option<ChildStdin>,
+    replay_stdin: Option<ProcessInputWriter>,
+    active_processes: Vec<ActiveProcess>,
     suggestions: Option<SuggestionMenu>,
     muted_at: Option<usize>,
 }
 
 impl App {
-    fn new(repo: PathBuf, scenario: String) -> Self {
+    fn new(processes: ProcessSupervisor, repo: PathBuf, scenario: String) -> Self {
         Self {
+            processes,
             repo,
             scenario,
             feed: Vec::new(),
@@ -134,12 +159,13 @@ impl App {
             help_open: false,
             recording: false,
             replay_stdin: None,
+            active_processes: Vec::new(),
             suggestions: None,
             muted_at: None,
         }
     }
 
-    async fn on_key(&mut self, key: KeyEvent, tx: &UnboundedSender<Async>) -> Result<Flow> {
+    async fn on_key(&mut self, key: KeyEvent, tx: &Sender<Async>) -> Result<Flow> {
         if self.help_open {
             self.help_open = false;
             return Ok(Flow::Continue);
@@ -156,7 +182,10 @@ impl App {
                     self.refresh_suggestions();
                     Ok(Flow::Continue)
                 }
-                KeyCode::Char('d') => Ok(Flow::Quit),
+                KeyCode::Char('d') => {
+                    self.close_active_windows().await?;
+                    Ok(Flow::Quit)
+                }
                 KeyCode::Char('l') => {
                     self.feed.clear();
                     self.view_top = None;
@@ -183,7 +212,7 @@ impl App {
             {
                 self.close_replay_window().await?;
             }
-            KeyCode::Enter => return self.submit(tx),
+            KeyCode::Enter => return self.submit(tx).await,
             KeyCode::Tab if self.suggestions.is_some() => self.cycle_selection(1),
             KeyCode::BackTab if self.suggestions.is_some() => self.cycle_selection(-1),
             KeyCode::Tab => {
@@ -212,7 +241,7 @@ impl App {
         Ok(Flow::Continue)
     }
 
-    fn submit(&mut self, tx: &UnboundedSender<Async>) -> Result<Flow> {
+    async fn submit(&mut self, tx: &Sender<Async>) -> Result<Flow> {
         let line = self.input.value().trim().to_owned();
         self.input.clear();
         self.suggestions = None;
@@ -241,12 +270,12 @@ impl App {
             }
             "repo" => self.set_repo(&tokens[1..], line),
             "scenario" => self.set_scenario(&tokens[1..], line),
-            "start" | "record" => self.start_recording(&tokens[1..], tx, line),
+            "start" | "record" => self.start_recording(&tokens[1..], tx, line).await,
             "stop" => {
-                self.spawn_command("stop", stop_args(&self.scenario), ProcessKind::Stop, false, tx)?
+                self.spawn_command("stop", stop_args(&self.scenario), ProcessKind::Stop, tx).await?
             }
-            "cancel" => self.cancel_recording(tx, line),
-            "replay" => self.start_replay(&tokens[1..], tx, line),
+            "cancel" => self.cancel_recording(tx, line).await,
+            "replay" => self.start_replay(&tokens[1..], tx, line).await,
             "status" => self.status(line),
             "events" => self.events(line),
             "artifacts" | "files" => self.artifacts(line),
@@ -261,14 +290,11 @@ impl App {
         Ok(Flow::Continue)
     }
 
-    fn cancel_recording(&mut self, tx: &UnboundedSender<Async>, label: String) {
-        match self.spawn_command(
-            "cancel",
-            cancel_args(&self.scenario),
-            ProcessKind::Cancel,
-            false,
-            tx,
-        ) {
+    async fn cancel_recording(&mut self, tx: &Sender<Async>, label: String) {
+        match self
+            .spawn_command("cancel", cancel_args(&self.scenario), ProcessKind::Cancel, tx)
+            .await
+        {
             Ok(()) => {}
             Err(error) => self.block(label, vec![error.to_string()], false),
         }
@@ -295,7 +321,7 @@ impl App {
         self.block(label, vec![format!("scenario: {}", self.scenario)], true);
     }
 
-    fn start_recording(&mut self, args: &[String], tx: &UnboundedSender<Async>, label: String) {
+    async fn start_recording(&mut self, args: &[String], tx: &Sender<Async>, label: String) {
         if self.recording {
             self.block(label, vec!["recording already running".to_owned()], false);
             return;
@@ -310,13 +336,13 @@ impl App {
         };
 
         let args = record_args(&self.scenario, out.as_deref());
-        match self.spawn_command("record", args, ProcessKind::Recording, false, tx) {
+        match self.spawn_command("record", args, ProcessKind::Recording, tx).await {
             Ok(()) => self.recording = true,
             Err(error) => self.block(label, vec![error.to_string()], false),
         }
     }
 
-    fn start_replay(&mut self, args: &[String], tx: &UnboundedSender<Async>, label: String) {
+    async fn start_replay(&mut self, args: &[String], tx: &Sender<Async>, label: String) {
         if self.replay_stdin.is_some() {
             self.block(label, vec!["replay already running".to_owned()], false);
             return;
@@ -331,7 +357,7 @@ impl App {
         };
 
         let args = replay_args(&self.scenario, dir.as_deref());
-        match self.spawn_command_with_stdin("replay", args, ProcessKind::Replay, tx) {
+        match self.spawn_command_with_stdin("replay", args, ProcessKind::Replay, tx).await {
             Ok(stdin) => {
                 self.replay_stdin = stdin;
                 self.notice(
@@ -425,55 +451,77 @@ impl App {
         }
     }
 
-    fn spawn_command(
+    async fn spawn_command(
         &mut self,
         label: &str,
         args: Vec<String>,
         kind: ProcessKind,
-        pipe_stdin: bool,
-        tx: &UnboundedSender<Async>,
+        tx: &Sender<Async>,
     ) -> Result<()> {
-        let stdin = self.spawn_command_with_stdin(label, args, kind, tx)?;
-        if pipe_stdin && stdin.is_none() {
-            return Err(anyhow!("failed to pipe stdin for {label}"));
-        }
+        self.spawn_command_with_stdin(label, args, kind, tx).await?;
         Ok(())
     }
 
-    fn spawn_command_with_stdin(
+    async fn spawn_command_with_stdin(
         &mut self,
         label: &str,
         args: Vec<String>,
         kind: ProcessKind,
-        tx: &UnboundedSender<Async>,
-    ) -> Result<Option<ChildStdin>> {
-        let mut child = TokioCommand::new("pnpm")
-            .current_dir(&self.repo)
-            .args(args)
-            .stdin(if kind == ProcessKind::Replay { Stdio::piped() } else { Stdio::null() })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
+        tx: &Sender<Async>,
+    ) -> Result<Option<ProcessInputWriter>> {
+        let input =
+            if kind == ProcessKind::Replay { InputPolicy::Writable } else { InputPolicy::Closed };
+        let stream = OutputPolicy::Stream(StreamPolicy::new(OUTPUT_IN_FLIGHT_BYTES));
+        let process = modular_process_spec(
+            &self.repo,
+            args,
+            &format!("record {label}"),
+            input,
+            stream,
+            stream,
+        )?;
+        let started = self
+            .processes
+            .spawn(process)
+            .await
             .with_context(|| format!("failed to start pnpm in {}", self.repo.display()))?;
-
-        let stdin = child.stdin.take();
-        if let Some(stdout) = child.stdout.take() {
-            spawn_reader(label.to_owned(), Stream::Stdout, stdout, tx.clone());
-        }
-        if let Some(stderr) = child.stderr.take() {
-            spawn_reader(label.to_owned(), Stream::Stderr, stderr, tx.clone());
-        }
+        let StartedProcess { session, input, stdout, stderr } = started;
+        let run_id = session.run_id();
+        self.active_processes.push(ActiveProcess { run_id, control: session.control() });
+        spawn_reader(label.to_owned(), Stream::Stdout, stdout, tx.clone());
+        spawn_reader(label.to_owned(), Stream::Stderr, stderr, tx.clone());
+        let stdin = match input {
+            ProcessInputHandle::Writable(writer) => Some(writer),
+            ProcessInputHandle::Closed => None,
+            ProcessInputHandle::Once(completion) => {
+                completion.wait().await.map_err(|error| anyhow!("write process input: {error}"))?;
+                None
+            }
+        };
 
         let tx = tx.clone();
         let label = label.to_owned();
         let notice_label = label.clone();
         tokio::spawn(async move {
-            let result = child
+            let result = session
                 .wait()
                 .await
-                .map(|status| status.to_string())
-                .map_err(|error| error.to_string());
-            let _ = tx.send(Async::Finished { label, kind, result });
+                .map_err(|report| supervision_error(report).to_string())
+                .and_then(|report| {
+                    let status = match report.leader_exit {
+                        LeaderExitObservation::Observed(LeaderExit::Code(code)) => {
+                            format!("status {code}")
+                        }
+                        LeaderExitObservation::Observed(LeaderExit::Signal(signal)) => {
+                            format!("signal {}", signal.get())
+                        }
+                        LeaderExitObservation::NotObserved => {
+                            "no process leader observed".to_owned()
+                        }
+                    };
+                    ensure_success(&report).map(|()| status).map_err(|error| error.to_string())
+                });
+            let _ = tx.send(Async::Finished { run_id, label, kind, result }).await;
         });
 
         self.notice(format!("{notice_label} started"));
@@ -484,7 +532,7 @@ impl App {
         let Some(stdin) = &mut self.replay_stdin else {
             return Ok(());
         };
-        stdin.write_all(b"\n").await?;
+        stdin.write(b"\n").await?;
         stdin.flush().await?;
         self.notice("sent Enter to replay process".to_owned());
         Ok(())
@@ -497,14 +545,29 @@ impl App {
             closed = true;
         }
         if self.recording {
-            run_modular_command_quiet(&self.repo, cancel_args(&self.scenario)).await?;
+            run_modular_command_quiet(&self.processes, &self.repo, cancel_args(&self.scenario))
+                .await?;
             self.notice("sent cancel request to recorder process".to_owned());
             closed = true;
         }
+        self.cancel_owned_processes().await?;
         if !closed {
             self.notice("no active recording or replay window".to_owned());
         }
         Ok(())
+    }
+
+    async fn cancel_owned_processes(&mut self) -> Result<()> {
+        let mut failures = Vec::new();
+        for process in &self.active_processes {
+            if let Err(error) = process.control.cancel().await {
+                failures.push(format!("{}: {error}", process.run_id));
+            }
+        }
+        if failures.is_empty() {
+            return Ok(());
+        }
+        Err(anyhow!("process cancellation was not acknowledged: {}", failures.join(", ")))
     }
 
     fn on_async(&mut self, message: Async) {
@@ -512,7 +575,8 @@ impl App {
             Async::Output { label, stream, line } => {
                 self.push(FeedItem::Output { label, stream, line })
             }
-            Async::Finished { label, kind, result } => {
+            Async::Finished { run_id, label, kind, result } => {
+                self.active_processes.retain(|process| process.run_id != run_id);
                 match kind {
                     ProcessKind::Recording => self.recording = false,
                     ProcessKind::Stop => {}
@@ -822,34 +886,100 @@ impl App {
     }
 }
 
-fn spawn_reader<R>(label: String, stream: Stream, reader: R, tx: UnboundedSender<Async>)
-where
-    R: AsyncRead + Unpin + Send + 'static,
-{
+fn spawn_reader(label: String, stream: Stream, output: ProcessOutputHandle, tx: Sender<Async>) {
     tokio::spawn(async move {
-        let mut lines = BufReader::new(reader).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let _ = tx.send(Async::Output { label: label.clone(), stream, line });
+        let ProcessOutputHandle::Stream(mut output) = output else {
+            let _ = tx
+                .send(Async::Output {
+                    label,
+                    stream: Stream::Stderr,
+                    line: "kit: process supervisor returned a non-stream output handle".to_owned(),
+                })
+                .await;
+            return;
+        };
+        let mut pending = Vec::new();
+        loop {
+            match output.next().await {
+                Ok(ProcessByteEvent::Chunk { bytes, .. }) => {
+                    pending.extend_from_slice(bytes.as_ref());
+                    if emit_complete_lines(&label, stream, &mut pending, &tx).await.is_err() {
+                        return;
+                    }
+                }
+                Ok(ProcessByteEvent::End) => {
+                    if !pending.is_empty() {
+                        let _ = tx
+                            .send(Async::Output {
+                                label: label.clone(),
+                                stream,
+                                line: decode_line(&pending),
+                            })
+                            .await;
+                    }
+                    return;
+                }
+                Err(error) => {
+                    let _ = tx
+                        .send(Async::Output {
+                            label,
+                            stream: Stream::Stderr,
+                            line: format!("kit: could not read process output: {error}"),
+                        })
+                        .await;
+                    return;
+                }
+            }
         }
     });
 }
 
-async fn run_modular_command_quiet(repo: &PathBuf, args: Vec<String>) -> Result<()> {
-    let status = TokioCommand::new("pnpm")
-        .current_dir(repo)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+async fn emit_complete_lines(
+    label: &str,
+    stream: Stream,
+    pending: &mut Vec<u8>,
+    tx: &Sender<Async>,
+) -> Result<(), ()> {
+    while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+        let mut line = pending.drain(..=newline).collect::<Vec<_>>();
+        line.pop();
+        tx.send(Async::Output { label: label.to_owned(), stream, line: decode_line(&line) })
+            .await
+            .map_err(|_| ())?;
+    }
+    while pending.len() >= LINE_FRAGMENT_BYTES {
+        let fragment = pending.drain(..LINE_FRAGMENT_BYTES).collect::<Vec<_>>();
+        tx.send(Async::Output { label: label.to_owned(), stream, line: decode_line(&fragment) })
+            .await
+            .map_err(|_| ())?;
+    }
+    Ok(())
+}
+
+fn decode_line(bytes: &[u8]) -> String {
+    let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+async fn run_modular_command_quiet(
+    processes: &ProcessSupervisor,
+    repo: &Path,
+    args: Vec<String>,
+) -> Result<()> {
+    let process = modular_process_spec(
+        repo,
+        args,
+        "record cancel",
+        InputPolicy::Closed,
+        OutputPolicy::Discard,
+        OutputPolicy::Discard,
+    )?;
+    let started = processes
+        .spawn(process)
         .await
         .with_context(|| format!("failed to start pnpm in {}", repo.display()))?;
-
-    if status.success() {
-        Ok(())
-    } else {
-        Err(anyhow!("pnpm command exited with {status}"))
-    }
+    let report = started.session.wait().await.map_err(supervision_error)?;
+    ensure_success(&report)
 }
 
 fn parse_out_arg(words: &[String]) -> Result<Option<PathBuf>> {
@@ -926,11 +1056,10 @@ fn rank_candidates(candidates: Vec<Suggestion>, needle: &str) -> Vec<Suggestion>
         return candidates;
     }
 
-    let mut scored: Vec<(u16, Suggestion)> = candidates
+    let mut matcher = fuzzy::Matcher::case_insensitive(needle);
+    let mut scored: Vec<(u64, Suggestion)> = candidates
         .into_iter()
-        .filter_map(|candidate| {
-            fuzzy::score_ci(&candidate.insert, needle).map(|score| (score, candidate))
-        })
+        .filter_map(|candidate| matcher.score(&candidate.insert).map(|score| (score, candidate)))
         .collect();
     scored.sort_by(|(left_score, left), (right_score, right)| {
         left_score.cmp(right_score).then_with(|| left.insert.cmp(&right.insert))
