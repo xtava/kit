@@ -17,6 +17,7 @@ does not pull or modify Git state.
 
 | Command | Purpose |
 | --- | --- |
+| `kit build` | Run repository-owned build workflows with supervised transcripts and a validated provider protocol. |
 | `kit cdp` | Attach to running Chrome or Electron instances, inspect CDP timelines, interact with targets, assert behavior, trace code, and capture diagnostic bundles. |
 | `kit scout` | Inspect Electron memory by instance and process role, with CDP target attribution and optional heap capture. |
 | `kit stats` | Monitor CPU, memory, process trees, threads, and resources; safely terminate a selected process. |
@@ -25,6 +26,8 @@ does not pull or modify Git state.
 | `kit deploy` | Run typed deployment plans, inspect version history, and execute configured rollbacks. |
 | `kit record` | Start, stop, inspect, save, and replay Modular Playwright recorder runs. |
 | `kit render` | Read Markdown in the terminal and fuzzy-search Markdown files in the current workspace. |
+| `kit secrets` | Browse, search, and manage 1Password through a local TUI backed by the official `op` CLI. |
+| `kit swarm` | Run deterministic multi-thread Codex councils and independently inspect them in a tree/detail TUI. |
 | `kit settings` | Edit tool-owned operator preferences in a shared TUI. |
 | `kit update` | Rebuild and reinstall Kit from its source checkout. |
 
@@ -69,21 +72,36 @@ kit domain --for-sale ink
 kit deploy --config examples/deploy.toml
 kit record -i
 kit render README.md
+
+# Run the nearest repository build provider
+kit build run check
+
+# Start a Codex swarm, then inspect all runs independently
+kit swarm run --detach "Review this architecture"
+kit swarm
 ```
 
 ## Documentation
 
+- [Contribution guide](./CONTRIBUTING.md)
+- [Build provider client](./docs/build.md)
 - [CDP debugger](./docs/cdp.md)
 - [CPU and process monitor](./docs/stats.md)
 - [Git diff viewer](./docs/diff.md)
 - [Deployment plans and rollback](./docs/deploy.md)
 - [Modular recorder integration](./docs/record.md)
 - [Markdown viewer](./docs/render.md)
+- [1Password secrets client](./docs/secrets.md)
+- [Codex swarm orchestrator](./docs/swarm.md)
 - [Development guide](./docs/dev-guide.md)
 - [CDP testbed](./testbed/README.md)
 - [Agent skill installation](./skills/README.md)
 
 ## Development
+
+Read the [contribution guide](./CONTRIBUTING.md) before adding a tool or shared capability. Reuse is
+an architectural requirement: tools own domain policy, while reusable mechanics belong in the
+shared `framework`, `tui`, or `cdp` owners.
 
 ```bash
 cargo check -j 2
