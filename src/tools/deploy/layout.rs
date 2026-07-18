@@ -1,8 +1,4 @@
-use std::{
-    fs::File,
-    io::Read,
-    path::PathBuf,
-};
+use std::{fs::File, io::Read, path::PathBuf};
 
 use directories::ProjectDirs;
 use ratatui::layout::Rect;

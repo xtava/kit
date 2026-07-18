@@ -82,6 +82,7 @@ impl Tool for DeployTool {
         };
 
         match tui::run(tui::Startup {
+            processes: cx.processes.clone(),
             loaded,
             journal_store,
             journal,

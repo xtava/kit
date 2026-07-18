@@ -1,11 +1,22 @@
-use std::{path::PathBuf, process::Stdio, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ffi::OsString,
+    num::NonZeroUsize,
+    path::PathBuf,
+    time::Duration,
+};
 
 use tokio::{
-    io::{AsyncBufReadExt, BufReader},
-    process::{Child, Command},
     sync::{mpsc, watch},
     task::JoinHandle,
     time,
+};
+
+use crate::framework::process::{
+    CommandSpec, CompletionCause, ContainmentRequirement, EnvironmentBase, InputPolicy, LeaderExit,
+    LeaderExitObservation, OutputPolicy, ProcessByteEvent, ProcessControl, ProcessEnvironment,
+    ProcessLabel, ProcessOutputHandle, ProcessReport, ProcessSpec, ProcessSupervisor,
+    StartedProcess, StreamPolicy, TerminationPolicy,
 };
 
 use super::config::{DeployAction, DeployTarget};
@@ -13,7 +24,8 @@ use super::environment::TargetEnvironment;
 use super::journal::VersionId;
 
 const CANCEL_GRACE: Duration = Duration::from_secs(2);
-const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+const OUTPUT_IN_FLIGHT_BYTES: NonZeroUsize = NonZeroUsize::new(256 * 1024).unwrap();
+const LINE_FRAGMENT_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OutputStream {
@@ -74,14 +86,37 @@ pub enum RunOperation {
     CloudflarePagesRollback { deployment_id: String },
 }
 
-pub fn spawn(spec: RunSpec) -> (mpsc::Receiver<RunEvent>, watch::Sender<bool>, JoinHandle<()>) {
+struct StepExecution<'a> {
+    processes: &'a ProcessSupervisor,
+    action: &'a DeployAction,
+    working_dir: &'a std::path::Path,
+    version: &'a VersionId,
+    branch: Option<&'a str>,
+    environment: &'a TargetEnvironment,
+    event_tx: &'a mpsc::Sender<RunEvent>,
+    cancel_rx: &'a mut watch::Receiver<bool>,
+}
+
+pub fn spawn_with_supervisor(
+    processes: ProcessSupervisor,
+    spec: RunSpec,
+) -> (mpsc::Receiver<RunEvent>, watch::Sender<bool>, JoinHandle<()>) {
     let (event_tx, event_rx) = mpsc::channel(256);
     let (cancel_tx, cancel_rx) = watch::channel(false);
-    let handle = tokio::spawn(run(spec, event_tx, cancel_rx));
+    let handle = tokio::spawn(run(processes, spec, event_tx, cancel_rx));
     (event_rx, cancel_tx, handle)
 }
 
+#[cfg(test)]
+fn spawn(spec: RunSpec) -> (mpsc::Receiver<RunEvent>, watch::Sender<bool>, JoinHandle<()>) {
+    spawn_with_supervisor(
+        ProcessSupervisor::bootstrap().expect("bootstrap process supervisor for deploy test"),
+        spec,
+    )
+}
+
 async fn run(
+    processes: ProcessSupervisor,
     spec: RunSpec,
     event_tx: mpsc::Sender<RunEvent>,
     mut cancel_rx: watch::Receiver<bool>,
@@ -133,15 +168,16 @@ async fn run(
 
             let step_start = time::Instant::now();
             let working_dir = resolve_working_dir(&spec.base_dir, target, step_index);
-            let outcome = execute(
-                &step.action,
-                &working_dir,
-                &run_target.version,
-                run_target.branch.as_deref(),
-                &run_target.environment,
-                &event_tx,
-                &mut cancel_rx,
-            )
+            let outcome = execute(StepExecution {
+                processes: &processes,
+                action: &step.action,
+                working_dir: &working_dir,
+                version: &run_target.version,
+                branch: run_target.branch.as_deref(),
+                environment: &run_target.environment,
+                event_tx: &event_tx,
+                cancel_rx: &mut cancel_rx,
+            })
             .await;
             let elapsed = step_start.elapsed();
             let terminal_outcome = outcome.clone();
@@ -232,15 +268,17 @@ fn resolve_working_dir(
     }
 }
 
-async fn execute(
-    action: &DeployAction,
-    working_dir: &std::path::Path,
-    version: &VersionId,
-    branch: Option<&str>,
-    environment: &TargetEnvironment,
-    event_tx: &mpsc::Sender<RunEvent>,
-    cancel_rx: &mut watch::Receiver<bool>,
-) -> StepOutcome {
+async fn execute(execution: StepExecution<'_>) -> StepOutcome {
+    let StepExecution {
+        processes,
+        action,
+        working_dir,
+        version,
+        branch,
+        environment,
+        event_tx,
+        cancel_rx,
+    } = execution;
     if !working_dir.is_dir() {
         return StepOutcome::Failed(format!(
             "working directory does not exist: {}",
@@ -248,70 +286,131 @@ async fn execute(
         ));
     }
 
-    let mut command = command_for(action, version, branch);
-    command
-        .current_dir(working_dir)
-        .envs(environment.child_values())
-        .env("KIT_DEPLOY_VERSION", &version.0)
-        .env("KIT_DEPLOY_REF", &version.0);
-    if let Some(branch) = branch {
-        command.env("KIT_DEPLOY_BRANCH", branch);
-    }
-    command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        command.as_std_mut().process_group(0);
-    }
-
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => return StepOutcome::Failed(format!("start action: {error}")),
-    };
-    let stdout_task = child
-        .stdout
-        .take()
-        .map(|stdout| stream_lines(stdout, OutputStream::Stdout, event_tx.clone()));
-    let stderr_task = child
-        .stderr
-        .take()
-        .map(|stderr| stream_lines(stderr, OutputStream::Stderr, event_tx.clone()));
-
-    let status = tokio::select! {
-        status = child.wait() => status.map_err(|error| format!("wait for action: {error}")),
-        changed = cancel_rx.changed() => {
-            if changed.is_ok() && *cancel_rx.borrow() {
-                terminate(&mut child).await;
-                join_output(stdout_task, stderr_task).await;
-                return StepOutcome::Cancelled;
-            }
-            child.wait().await.map_err(|error| format!("wait for action: {error}"))
+    let working_dir = match working_dir.canonicalize() {
+        Ok(working_dir) => working_dir,
+        Err(error) => {
+            return StepOutcome::Failed(format!(
+                "resolve working directory {}: {error}",
+                working_dir.display()
+            ));
         }
     };
-
-    join_output(stdout_task, stderr_task).await;
-    match status {
-        Ok(status) if status.success() => StepOutcome::Succeeded,
-        Ok(status) => StepOutcome::Failed(match status.code() {
-            Some(code) => format!("action exited with status {code}"),
-            None => "action terminated by signal".to_owned(),
-        }),
-        Err(error) => StepOutcome::Failed(error),
+    let (program, arguments) = command_for(action, version, branch);
+    let mut values = environment
+        .child_values()
+        .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+        .collect::<BTreeMap<_, _>>();
+    values.insert(OsString::from("KIT_DEPLOY_VERSION"), OsString::from(&version.0));
+    values.insert(OsString::from("KIT_DEPLOY_REF"), OsString::from(&version.0));
+    if let Some(branch) = branch {
+        values.insert(OsString::from("KIT_DEPLOY_BRANCH"), OsString::from(branch));
+    }
+    let process_environment =
+        match ProcessEnvironment::new(EnvironmentBase::Inherit, values, BTreeSet::new()) {
+            Ok(environment) => environment,
+            Err(error) => {
+                return StepOutcome::Failed(format!("prepare action environment: {error}"));
+            }
+        };
+    let label = ProcessLabel::new("deploy step".to_owned()).expect("static process label is valid");
+    let command =
+        match CommandSpec::new(program, arguments, working_dir, process_environment, label) {
+            Ok(command) => command,
+            Err(error) => return StepOutcome::Failed(format!("prepare action: {error}")),
+        };
+    let stream = OutputPolicy::Stream(StreamPolicy::new(OUTPUT_IN_FLIGHT_BYTES));
+    let process = ProcessSpec::new(
+        command,
+        InputPolicy::Closed,
+        stream,
+        stream,
+        ContainmentRequirement::CompleteTree,
+        crate::framework::process::ProcessDeadline::Unlimited,
+        TerminationPolicy::new(CANCEL_GRACE),
+    );
+    let started = match processes.spawn(process).await {
+        Ok(started) => started,
+        Err(error) => return StepOutcome::Failed(format!("start action: {error}")),
+    };
+    let StartedProcess { session, input: _, stdout, stderr } = started;
+    let stdout_task = stream_lines(stdout, OutputStream::Stdout, event_tx.clone());
+    let stderr_task = stream_lines(stderr, OutputStream::Stderr, event_tx.clone());
+    let control = session.control();
+    let wait = session.wait();
+    tokio::pin!(wait);
+    let cancellation = wait_for_cancellation(cancel_rx);
+    tokio::pin!(cancellation);
+    let report = tokio::select! {
+        report = &mut wait => report,
+        () = &mut cancellation => {
+            if let Err(message) = acknowledge_cancellation(&control).await {
+                let _ = event_tx.send(RunEvent::Output {
+                    stream: OutputStream::Stderr,
+                    line: format!("kit: {message}"),
+                }).await;
+            }
+            wait.await
+        }
+    };
+    let output_result = join_output(stdout_task, stderr_task).await;
+    if let Err(error) = output_result {
+        return StepOutcome::Failed(error);
+    }
+    match report {
+        Ok(report) => outcome_from_report(report),
+        Err(report) => StepOutcome::Failed(supervision_failure(report)),
     }
 }
 
-fn command_for(action: &DeployAction, version: &VersionId, branch: Option<&str>) -> Command {
+async fn acknowledge_cancellation(control: &ProcessControl) -> Result<(), String> {
+    control
+        .cancel()
+        .await
+        .map(|_| ())
+        .map_err(|error| format!("action cancellation was not acknowledged: {error}"))
+}
+
+fn supervision_failure(report: crate::framework::process::ProcessFailureReport) -> String {
+    let reason = match report.failure {
+        crate::framework::process::ProcessFailureKind::InputIo => {
+            "the action input stream failed".to_owned()
+        }
+        crate::framework::process::ProcessFailureKind::OutputIo { stream } => {
+            format!("the action {stream:?} stream failed")
+        }
+        crate::framework::process::ProcessFailureKind::OutputLimitExceeded { stream } => {
+            format!("the action {stream:?} stream exceeded its output limit")
+        }
+        crate::framework::process::ProcessFailureKind::RequiredConsumerLost { stream } => {
+            format!("the action {stream:?} output consumer stopped")
+        }
+        crate::framework::process::ProcessFailureKind::ContainmentLost => {
+            "the action process-tree owner was lost".to_owned()
+        }
+        crate::framework::process::ProcessFailureKind::TerminationUnconfirmed => {
+            "the action process tree did not terminate conclusively".to_owned()
+        }
+        crate::framework::process::ProcessFailureKind::OwnerTaskFailed => {
+            "the action supervisor stopped unexpectedly".to_owned()
+        }
+    };
+    format!("action supervision failed: {reason}")
+}
+
+fn command_for(
+    action: &DeployAction,
+    version: &VersionId,
+    branch: Option<&str>,
+) -> (OsString, Vec<OsString>) {
     match action {
-        DeployAction::Command { program, args } => {
-            let mut command = Command::new(program);
-            command.args(args.iter().map(|arg| substitute(arg, version, branch)));
-            command
-        }
-        DeployAction::Shell { script } => {
-            let mut command = Command::new("sh");
-            command.arg("-c").arg(substitute(script, version, branch));
-            command
-        }
+        DeployAction::Command { program, args } => (
+            OsString::from(program),
+            args.iter().map(|arg| OsString::from(substitute(arg, version, branch))).collect(),
+        ),
+        DeployAction::Shell { script } => (
+            OsString::from("sh"),
+            vec![OsString::from("-c"), OsString::from(substitute(script, version, branch))],
+        ),
     }
 }
 
@@ -323,81 +422,103 @@ fn substitute(value: &str, version: &VersionId, branch: Option<&str>) -> String 
     }
 }
 
-fn stream_lines<R>(
-    reader: R,
+fn stream_lines(
+    output: ProcessOutputHandle,
     stream: OutputStream,
     event_tx: mpsc::Sender<RunEvent>,
-) -> JoinHandle<()>
-where
-    R: tokio::io::AsyncRead + Unpin + Send + 'static,
-{
+) -> JoinHandle<Result<(), String>> {
     tokio::spawn(async move {
-        let mut lines = BufReader::new(reader).lines();
+        let ProcessOutputHandle::Stream(mut output) = output else {
+            return Err("process supervisor returned a non-stream output handle".to_owned());
+        };
+        let mut pending = Vec::new();
         loop {
-            match lines.next_line().await {
-                Ok(Some(line)) => {
-                    if event_tx.send(RunEvent::Output { stream, line }).await.is_err() {
-                        break;
-                    }
+            match output.next().await.map_err(|error| error.to_string())? {
+                ProcessByteEvent::Chunk { bytes, .. } => {
+                    pending.extend_from_slice(bytes.as_ref());
+                    emit_complete_lines(&mut pending, stream, &event_tx).await?;
                 }
-                Ok(None) => break,
-                Err(error) => {
-                    let _ = event_tx
-                        .send(RunEvent::Output {
-                            stream: OutputStream::Stderr,
-                            line: format!("kit: could not read action output: {error}"),
-                        })
-                        .await;
+                ProcessByteEvent::End => {
+                    if !pending.is_empty() {
+                        let line = decode_line(&pending);
+                        event_tx
+                            .send(RunEvent::Output { stream, line })
+                            .await
+                            .map_err(|_| "deploy output consumer closed".to_owned())?;
+                    }
                     break;
                 }
             }
         }
+        Ok(())
     })
 }
 
-async fn join_output(stdout: Option<JoinHandle<()>>, stderr: Option<JoinHandle<()>>) {
-    if let Some(stdout) = stdout {
-        finish_output(stdout).await;
+async fn emit_complete_lines(
+    pending: &mut Vec<u8>,
+    stream: OutputStream,
+    event_tx: &mpsc::Sender<RunEvent>,
+) -> Result<(), String> {
+    while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+        let mut line = pending.drain(..=newline).collect::<Vec<_>>();
+        line.pop();
+        event_tx
+            .send(RunEvent::Output { stream, line: decode_line(&line) })
+            .await
+            .map_err(|_| "deploy output consumer closed".to_owned())?;
     }
-    if let Some(stderr) = stderr {
-        finish_output(stderr).await;
+    while pending.len() >= LINE_FRAGMENT_BYTES {
+        let fragment = pending.drain(..LINE_FRAGMENT_BYTES).collect::<Vec<_>>();
+        event_tx
+            .send(RunEvent::Output { stream, line: decode_line(&fragment) })
+            .await
+            .map_err(|_| "deploy output consumer closed".to_owned())?;
+    }
+    Ok(())
+}
+
+fn decode_line(bytes: &[u8]) -> String {
+    let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+async fn join_output(
+    stdout: JoinHandle<Result<(), String>>,
+    stderr: JoinHandle<Result<(), String>>,
+) -> Result<(), String> {
+    for task in [stdout, stderr] {
+        task.await.map_err(|error| format!("output task failed: {error}"))??;
+    }
+    Ok(())
+}
+
+async fn wait_for_cancellation(cancel_rx: &mut watch::Receiver<bool>) {
+    loop {
+        if *cancel_rx.borrow() {
+            return;
+        }
+        if cancel_rx.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
     }
 }
 
-async fn finish_output(mut handle: JoinHandle<()>) {
-    if time::timeout(OUTPUT_DRAIN_TIMEOUT, &mut handle).await.is_err() {
-        handle.abort();
-        let _ = handle.await;
+fn outcome_from_report(report: ProcessReport) -> StepOutcome {
+    if report.completion == CompletionCause::Cancelled {
+        return StepOutcome::Cancelled;
     }
-}
-
-async fn terminate(child: &mut Child) {
-    #[cfg(unix)]
-    if let Some(pid) = child.id() {
-        unsafe {
-            libc::kill(-(pid as i32), libc::SIGTERM);
+    match report.leader_exit {
+        LeaderExitObservation::Observed(LeaderExit::Code(0)) => StepOutcome::Succeeded,
+        LeaderExitObservation::Observed(LeaderExit::Code(code)) => {
+            StepOutcome::Failed(format!("action exited with status {code}"))
+        }
+        LeaderExitObservation::Observed(LeaderExit::Signal(signal)) => {
+            StepOutcome::Failed(format!("action terminated by signal {}", signal.get()))
+        }
+        LeaderExitObservation::NotObserved => {
+            StepOutcome::Failed("action completed without an observed process leader".to_owned())
         }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = child.start_kill();
-    }
-
-    if time::timeout(CANCEL_GRACE, child.wait()).await.is_ok() {
-        return;
-    }
-
-    #[cfg(unix)]
-    if let Some(pid) = child.id() {
-        unsafe {
-            libc::kill(-(pid as i32), libc::SIGKILL);
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = child.start_kill();
-    }
-    let _ = child.wait().await;
 }
 
 #[cfg(test)]

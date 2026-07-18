@@ -43,13 +43,15 @@ focused Cloudflare Pages Target: a modal prompts for a branch (prefilled with th
 branch), then Review and Run proceed against that branch alias. `v` opens **Versions** for the
 focused Target. Local history comes from the Journal; Cloudflare Pages history loads asynchronously
 from the platform with explicit loading, empty, and error states. In Cloudflare Versions the live
-production deployment is marked `● LIVE`; `e` toggles a local `⚠ ERROR` mark on the selected
-deployment, `n` attaches a note, and `d` deletes the deployment after a confirmation (the live
-deployment cannot be deleted). Choosing an eligible entry opens a rollback Review when that Target
-has a rollback owner. A second Enter starts **Run**, where
+production deployment is marked `● LIVE`; `o` opens the selected deployment in the browser; `e`
+toggles a local `⚠ ERROR` mark on the selected deployment, `n` attaches a note, and `d` deletes the
+deployment after a confirmation (the live deployment cannot be deleted). Choosing an eligible entry
+opens a rollback Review when that Target has a rollback owner. A second Enter starts **Run**, where
 Target and Step status, elapsed time, and a bounded live output tail update continuously. Completion
-opens **Summary** with the final outcome and timing breakdown. Escape moves back before execution;
-`Ctrl-C` during execution cancels the active process group and stops the plan cleanly.
+opens **Summary** with the final outcome and timing breakdown. When the Run published a Cloudflare
+Pages deployment, Summary shows the deployment URL and `o` opens it. Summary stays open: `Enter` or
+`Esc` returns to Browse to keep working, and `q` quits. `Ctrl-C` during execution cancels the active
+process group and stops the plan cleanly.
 
 Browse, Versions, and Run are keyboard-navigable split surfaces. `Left` / `Right` move between the
 visible panels, while `Tab` / `Shift-Tab` cycle them. The cyan border identifies the active region.
@@ -134,8 +136,10 @@ and the panel title shows the project's `production_branch`. Rollback calls Clou
 API and appears in the normal Run and Summary views. Cloudflare permits rollback only to successful
 production deployments, which Kit enforces before Review.
 
-`d` deletes the selected deployment through Cloudflare's delete API after a `y`/`n` confirmation,
-then refreshes the list; the live deployment is refused with an actionable notice. `e` and `n`
+`o` opens the selected deployment's URL in the browser (`xdg-open` on Linux, `open` on macOS), and
+after a Cloudflare publish the Summary shows that URL and `o` opens it there too. `d` deletes the
+selected deployment through Cloudflare's delete API after a `y`/`n` confirmation, then refreshes the
+list; the live deployment is refused with an actionable notice. `e` and `n`
 manage local annotations (see below). `p` from Browse publishes a preview: Kit substitutes the
 entered branch into `{{branch}}` and sets `KIT_DEPLOY_BRANCH`, so the same publish Step targets a
 branch alias instead of production. Kit reads the project's current production branch before every

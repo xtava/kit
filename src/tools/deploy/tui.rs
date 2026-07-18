@@ -34,6 +34,7 @@ use super::{
         VersionsState,
     },
 };
+use crate::framework::process::ProcessSupervisor;
 use crate::tui::{
     render_split_divider, Direction, EventReader, NavigationMap, NavigationRegion, Session,
     SessionOptions, SplitDividerStyle,
@@ -51,6 +52,7 @@ const BORDER: Color = Color::Rgb(76, 86, 106);
 const SELECTED: Color = Color::Rgb(59, 66, 82);
 
 pub struct Startup {
+    pub processes: ProcessSupervisor,
     pub loaded: LoadedPlan,
     pub journal_store: JournalStore,
     pub journal: DeployJournal,
@@ -63,6 +65,7 @@ pub struct Startup {
 
 pub async fn run(startup: Startup) -> Result<Option<RunOutcome>> {
     let Startup {
+        processes,
         loaded,
         journal_store,
         journal,
@@ -206,6 +209,12 @@ pub async fn run(startup: Startup) -> Result<Option<RunOutcome>> {
                             Err(error) => app.notice = Some(format!("{error:#}")),
                         }
                     }
+                    UiAction::OpenUrl { url } => {
+                        app.notice = Some(match open_url(&url) {
+                            Ok(()) => format!("Opening {url}"),
+                            Err(error) => format!("Could not open {url}: {error}"),
+                        });
+                    }
                     UiAction::Start => {
                         match app.intent.clone() {
                             Some(RunIntent::CloudflarePagesRollback {
@@ -241,7 +250,8 @@ pub async fn run(startup: Startup) -> Result<Option<RunOutcome>> {
                             ) => {
                                 let spec = prepare_run(&app, &journal_store).await?;
                                 app.begin_run(&spec);
-                                let (receiver, cancel_tx, handle) = runner::spawn(spec);
+                                let (receiver, cancel_tx, handle) =
+                                    runner::spawn_with_supervisor(processes.clone(), spec);
                                 run_events = receiver;
                                 cancel = Some(cancel_tx);
                                 run_handle = Some(handle);
@@ -295,6 +305,7 @@ enum UiAction {
     PersistLayout,
     PersistAnnotations,
     DeleteDeployment { deployment_id: String, short_id: String },
+    OpenUrl { url: String },
 }
 
 fn handle_event(event: Event, app: &mut App) -> UiAction {
@@ -449,6 +460,10 @@ fn handle_key(key: KeyEvent, app: &mut App) -> UiAction {
                 app.open_note_input();
                 UiAction::None
             }
+            KeyCode::Char('o') => match app.selected_cloudflare_deployment() {
+                Some(deployment) => UiAction::OpenUrl { url: deployment.url.clone() },
+                None => UiAction::None,
+            },
             _ => UiAction::None,
         },
         Phase::Review => match key.code {
@@ -469,7 +484,15 @@ fn handle_key(key: KeyEvent, app: &mut App) -> UiAction {
             UiAction::None
         }
         Phase::Summary => match key.code {
-            KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') => UiAction::Quit,
+            KeyCode::Char('q') => UiAction::Quit,
+            KeyCode::Enter | KeyCode::Esc => {
+                app.back_to_browse();
+                UiAction::None
+            }
+            KeyCode::Char('o') => match summary_url(app) {
+                Some(url) => UiAction::OpenUrl { url },
+                None => UiAction::None,
+            },
             _ => UiAction::None,
         },
     }
@@ -852,6 +875,28 @@ fn current_git_branch(working_dir: &Path) -> Option<String> {
     (!branch.is_empty() && branch != "HEAD").then_some(branch)
 }
 
+fn open_url(url: &str) -> Result<(), String> {
+    let program = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    std::process::Command::new(program)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(drop)
+        .map_err(|error| format!("{program}: {error}"))
+}
+
+fn summary_url(app: &App) -> Option<String> {
+    app.output.iter().rev().find_map(|line| extract_deploy_url(&line.text))
+}
+
+fn extract_deploy_url(line: &str) -> Option<String> {
+    let start = line.find("https://")?;
+    let url: String = line[start..].chars().take_while(|ch| !ch.is_whitespace()).collect();
+    url.contains(".pages.dev").then_some(url)
+}
+
 fn target_working_dir(base_dir: &Path, target: &DeployTarget) -> std::path::PathBuf {
     match target.working_dir.as_deref() {
         Some(path) if path.is_absolute() => path.to_path_buf(),
@@ -1122,6 +1167,21 @@ fn render_target_detail(
             Span::styled(format!("  {}", action_label(&step.action)), Style::default().fg(MUTED)),
         ]));
     }
+    lines.push(Line::raw(""));
+    let mut actions = vec![
+        Span::styled("Space", Style::default().fg(CYAN)),
+        Span::styled(" select   ", Style::default().fg(MUTED)),
+        Span::styled("Enter", Style::default().fg(CYAN)),
+        Span::styled(" deploy   ", Style::default().fg(MUTED)),
+        Span::styled("v", Style::default().fg(CYAN)),
+        Span::styled(" versions", Style::default().fg(MUTED)),
+    ];
+    if target.backend.is_some() {
+        actions.push(Span::styled("   ", Style::default().fg(MUTED)));
+        actions.push(Span::styled("p", Style::default().fg(CYAN).add_modifier(Modifier::BOLD)));
+        actions.push(Span::styled(" preview deploy", Style::default().fg(MUTED)));
+    }
+    lines.push(Line::from(actions));
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
@@ -1629,6 +1689,14 @@ fn render_summary(frame: &mut Frame<'_>, area: Rect, app: &App, journal_path: &P
         ),
         Line::raw(""),
     ];
+    if let Some(url) = summary_url(app) {
+        lines.push(Line::from(vec![
+            Span::styled("Deployed  ", Style::default().fg(MUTED)),
+            Span::styled(url, Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
+        ]));
+        lines.push(Line::styled("press o to open", Style::default().fg(MUTED)));
+        lines.push(Line::raw(""));
+    }
     for target in &app.progress {
         lines.push(Line::from(vec![
             status_span(target.status),
@@ -1723,9 +1791,9 @@ fn modal_free_controls(app: &App) -> &'static str {
                     "Esc targets   q quit"
                 }
             } else if app.active_region == ActiveRegion::Secondary {
-                "↑↓ scroll details   Enter rollback   e error   n note   d delete   Esc targets   q quit"
+                "↑↓ scroll details   Enter rollback   o open   e error   n note   d delete   Esc targets   q quit"
             } else if app.versions_source() == VersionsSource::CloudflarePages {
-                "↑↓ versions   Enter rollback   e error   n note   d delete   r refresh   Esc targets   q quit"
+                "↑↓ versions   Enter rollback   o open   e error   n note   d delete   r refresh   Esc targets   q quit"
             } else {
                 "↑↓ versions   ←→/Tab region   Enter rollback   drag resize   = reset   Esc targets   q quit"
             }
@@ -1734,7 +1802,7 @@ fn modal_free_controls(app: &App) -> &'static str {
         Phase::Running => {
             "↑↓ scroll   ←→/Tab region   drag resize   = reset   Ctrl-C cancel safely"
         }
-        Phase::Summary => "Enter close",
+        Phase::Summary => "o open   Enter continue   q quit",
     }
 }
 
@@ -2081,5 +2149,50 @@ mod tests {
         assert!(journal_width > app.layout_frame.split.second.width);
         assert_eq!(terminal.backend().buffer()[(secondary.x, secondary.y)].fg, CYAN);
         Ok(())
+    }
+
+    #[test]
+    fn extracts_only_pages_dev_deploy_urls() {
+        assert_eq!(
+            extract_deploy_url(
+                "✨ Deployment alias URL: https://feature-x.modular-marketing.pages.dev"
+            ),
+            Some("https://feature-x.modular-marketing.pages.dev".to_owned())
+        );
+        assert_eq!(extract_deploy_url("(!) see https://rolldown.rs/reference for options"), None);
+        assert_eq!(extract_deploy_url("Building client environment…"), None);
+    }
+
+    #[test]
+    fn summary_url_returns_the_last_deploy_link_in_output() {
+        let mut app = test_app();
+        app.output.push_back(crate::tools::deploy::state::OutputLine {
+            stream: OutputStream::Stdout,
+            text: "Take a peek over at https://abc123.example.pages.dev".to_owned(),
+        });
+        app.output.push_back(crate::tools::deploy::state::OutputLine {
+            stream: OutputStream::Stdout,
+            text: "Deployment alias URL: https://feature-x.example.pages.dev".to_owned(),
+        });
+        assert_eq!(summary_url(&app).as_deref(), Some("https://feature-x.example.pages.dev"));
+    }
+
+    #[test]
+    fn summary_stays_open_and_returns_to_browse() {
+        let mut app = test_app();
+        app.phase = Phase::Summary;
+        app.outcome = Some(RunOutcome::Succeeded);
+
+        assert!(matches!(
+            handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut app),
+            UiAction::None
+        ));
+        assert_eq!(app.phase, Phase::Browse);
+
+        app.phase = Phase::Summary;
+        assert!(matches!(
+            handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), &mut app),
+            UiAction::Quit
+        ));
     }
 }
