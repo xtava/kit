@@ -4,9 +4,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::output::{
-    CaptureReport, PartialCaptureReport, PartialRecordReport, PartialStreamReport,
-    RecordAvailability, RecordDisposition, RecordReport, StreamReport, UnavailableOutput,
+    CaptureReport, PartialCaptureReport, PartialRecordReport, PartialStreamReport, RecordReport,
+    StreamReport, UnavailableOutput,
 };
+#[cfg(target_os = "linux")]
+use super::output::{RecordAvailability, RecordDisposition};
 use super::session::ContainmentStrength;
 
 #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]

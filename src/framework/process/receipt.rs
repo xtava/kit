@@ -322,7 +322,7 @@ impl DetachedProcessReceipt {
         Ok(receipt)
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn linux_systemd(
         run_id: ProcessRunId,
         invocation_id: String,
