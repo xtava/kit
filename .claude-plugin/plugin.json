@@ -3,7 +3,7 @@
   "displayName": "kit",
   "version": "0.1.0",
   "description": "Agent skills for the kit toolbelt — drive and verify live Electron/Chrome apps over a warm CDP attachment.",
-  "author": { "name": "Ari Tavakoli", "email": "aritavakoli98@gmail.com" },
+  "author": { "name": "Kit maintainers" },
   "repository": "https://github.com/xtava/kit",
   "license": "MIT",
   "keywords": ["cdp", "electron", "chrome", "devtools", "verification", "debugging"]

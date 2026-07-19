@@ -1,7 +1,7 @@
 {
   "name": "kit",
   "description": "Skills from the kit toolbelt: warm-CDP driving and self-verification of live Electron/Chrome apps.",
-  "owner": { "name": "Ari Tavakoli", "email": "aritavakoli98@gmail.com" },
+  "owner": { "name": "Kit maintainers" },
   "plugins": [
     {
       "name": "kit",
