@@ -26,6 +26,6 @@ jobs:
   stats:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Test Stats on macOS
-        run: cargo test -j 2 tools::stats::
+        run: "cargo test -j 2 tools::stats::"

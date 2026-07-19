@@ -15,7 +15,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Validate tag and Cargo version
         id: version
         shell: bash
@@ -58,7 +58,7 @@ jobs:
             binary: kit
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build release binary
         run: cargo build --locked --release --target ${{ matrix.target }} -j 2
       - name: Package release binary
@@ -72,7 +72,7 @@ jobs:
           mkdir package release-assets
           cp "target/${TARGET}/release/${BINARY}" "package/${BINARY}"
           tar -czf "release-assets/kit-${VERSION}-${TARGET}.tar.gz" -C package "${BINARY}"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: kit-${{ matrix.target }}
           path: release-assets/*.tar.gz
@@ -85,13 +85,13 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: kit-*
           path: release-assets
           merge-multiple: true
       - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
           make_latest: true

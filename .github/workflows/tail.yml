@@ -42,7 +42,7 @@ jobs:
         os: [ubuntu-24.04, macos-15, windows-2025]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Test reusable command fixtures
         run: cargo test -j 2 framework::process::test_support
       - name: Test Tail sharing
