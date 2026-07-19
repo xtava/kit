@@ -423,6 +423,7 @@ fn demo_logs(request: &CollectionRequest, now: u64) -> LogCollection {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn source(
     id: &str,
     name: &str,
@@ -465,6 +466,7 @@ fn service(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn metric(
     id: &str,
     service_id: &str,
