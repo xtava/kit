@@ -1,122 +1,19 @@
-use std::fmt;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
-use std::process::Stdio;
 
-use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
-use thiserror::Error;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::Command;
-use tokio::task::JoinHandle;
+use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
+
+use crate::onepassword::{
+    OpClient as SharedOpClient, OpError, SecretBytes, SecretReference, SensitiveBuffer,
+    StderrPolicy,
+};
 
 use super::model::{
     AccountId, AccountSummary, CreateLoginRequest, ItemId, ItemRef, ItemSummary, PasswordRecipe,
     VaultId, VaultSummary,
 };
-use super::sensitive::{SecretBytes, SensitiveBuffer, MAX_SECRET_BYTES};
 
-const SECRET_READ_CHUNK_BYTES: usize = 1024;
 const MAX_CREATE_JSON_BYTES: usize = 1024 * 1024;
-const RUN_OUTPUT_CHUNK_BYTES: usize = 8 * 1024;
-const NO_MASKING_ENV: &str = "OP_RUN_NO_MASKING";
-
-/// One validated 1Password secret reference.
-///
-/// The inner string is private so callers cannot construct a value-bearing request by accident.
-/// `Debug` intentionally reveals only the type; explicit errors use `Display` when the reference
-/// itself is required for diagnosis.
-#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(transparent)]
-pub struct SecretReference(String);
-
-impl SecretReference {
-    pub fn new(value: String) -> Result<Self, SecretReferenceError> {
-        let Some(path) = value.strip_prefix("op://") else {
-            return Err(SecretReferenceError);
-        };
-        let valid_path = path.split('/').count() >= 3
-            && path.split('/').all(|segment| !segment.is_empty())
-            && !value.chars().any(char::is_control);
-        if !valid_path {
-            return Err(SecretReferenceError);
-        }
-        Ok(Self(value))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl<'de> Deserialize<'de> for SecretReference {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Self::new(value).map_err(D::Error::custom)
-    }
-}
-
-impl fmt::Debug for SecretReference {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("SecretReference(<op:// reference>)")
-    }
-}
-
-impl fmt::Display for SecretReference {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
-#[error("expected an op:// reference with vault, item, and field components")]
-pub struct SecretReferenceError;
-
-/// The only supported `op run` request shape.
-///
-/// Callers can supply the refs file and the direct child command, but cannot add flags to `op`
-/// itself. In particular, there is no representation for `--no-masking`.
-pub struct OpRunRequest<'a> {
-    env_file: &'a Path,
-    program: &'a str,
-    args: &'a [String],
-}
-
-impl<'a> OpRunRequest<'a> {
-    pub fn new(env_file: &'a Path, program: &'a str, args: &'a [String]) -> Self {
-        Self { env_file, program, args }
-    }
-}
-
-impl fmt::Debug for OpRunRequest<'_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("OpRunRequest")
-            .field("env_file", &self.env_file)
-            .field("program", &self.program)
-            .field("arg_count", &self.args.len())
-            .finish()
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct OpRunStatus {
-    success: bool,
-    code: Option<i32>,
-}
-
-impl OpRunStatus {
-    pub fn success(self) -> bool {
-        self.success
-    }
-
-    pub fn code(self) -> Option<i32> {
-        self.code
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LoginField {
@@ -140,78 +37,34 @@ impl LoginField {
     }
 }
 
-#[derive(Clone, Copy)]
-enum StderrPolicy {
-    CaptureSanitized,
-    Discard,
-}
-
-impl StderrPolicy {
-    fn stdio(self) -> Stdio {
-        match self {
-            Self::CaptureSanitized => Stdio::piped(),
-            Self::Discard => Stdio::null(),
-        }
-    }
-}
-
 #[derive(Clone)]
 pub struct OpClient {
-    executable: PathBuf,
+    shared: SharedOpClient,
 }
 
 impl OpClient {
     pub fn new() -> Self {
-        Self { executable: PathBuf::from("op") }
+        Self { shared: SharedOpClient::new() }
     }
 
     #[cfg(test)]
-    pub(crate) fn with_executable(executable: PathBuf) -> Self {
-        Self { executable }
-    }
-
-    fn command(&self) -> Command {
-        let mut command = Command::new(&self.executable);
-        command.kill_on_drop(true);
-        command
-    }
-
-    fn operation_command<I, S>(&self, args: I) -> Command
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<std::ffi::OsStr>,
-    {
-        let mut command = self.command();
-        command.args(args).arg("--no-color");
-        command
+    pub(crate) fn with_executable(executable: std::path::PathBuf) -> Self {
+        Self { shared: SharedOpClient::with_executable(executable) }
     }
 
     pub async fn version(&self) -> Result<(), OpError> {
-        let output = self
-            .command()
-            .arg("--version")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .output()
-            .await
-            .map_err(|source| map_spawn_error("check version", source))?;
-        check_status(
-            "check version",
-            output.status.code(),
-            &output.stderr,
-            StderrPolicy::CaptureSanitized,
-        )
+        self.shared.version().await
     }
 
     pub async fn accounts(&self) -> Result<Vec<AccountSummary>, OpError> {
         let raw: Vec<RawAccount> =
-            self.json("list accounts", ["account", "list", "--format=json"]).await?;
+            self.shared.json("list accounts", ["account", "list", "--format=json"]).await?;
         raw.into_iter().map(AccountSummary::try_from).collect()
     }
 
     pub async fn vaults(&self, account: &AccountId) -> Result<Vec<VaultSummary>, OpError> {
         let raw: Vec<RawVault> = self
+            .shared
             .json("list vaults", ["vault", "list", "--format=json", "--account", account.as_str()])
             .await?;
         raw.into_iter().map(VaultSummary::try_from).collect()
@@ -219,72 +72,10 @@ impl OpClient {
 
     pub async fn items(&self, account: &AccountId) -> Result<Vec<ItemSummary>, OpError> {
         let raw: Vec<RawItem> = self
+            .shared
             .json("list items", ["item", "list", "--format=json", "--account", account.as_str()])
             .await?;
         raw.into_iter().map(|item| item.into_summary(account.clone())).collect()
-    }
-
-    /// Resolve-check one reference without retaining or printing the resolved value.
-    pub async fn preflight_reference(&self, reference: &SecretReference) -> Result<(), OpError> {
-        let status = self
-            .operation_command(["read", reference.as_str(), "--no-newline"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await
-            .map_err(|source| map_spawn_error("preflight secret reference", source))?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(OpError::ReferenceFailed { reference: reference.clone(), status: status.code() })
-        }
-    }
-
-    /// Run one direct child command through the fixed, masking-on `op run` contract.
-    ///
-    /// `op run` owns secret resolution and masking. Kit pipes only its already-masked output and
-    /// forwards those bytes without interpreting them.
-    pub async fn run_operation(&self, request: OpRunRequest<'_>) -> Result<OpRunStatus, OpError> {
-        let mut child = self
-            .run_command(&request)
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|source| map_spawn_error("run operation", source))?;
-        let stdout = child.stdout.take().ok_or(OpError::Io {
-            operation: "run operation",
-            source: io::Error::other("op run stdout was not piped"),
-        })?;
-        let stderr = child.stderr.take().ok_or(OpError::Io {
-            operation: "run operation",
-            source: io::Error::other("op run stderr was not piped"),
-        })?;
-        let stdout_task = tokio::spawn(forward_output(stdout, OutputDestination::Stdout));
-        let stderr_task = tokio::spawn(forward_output(stderr, OutputDestination::Stderr));
-
-        let status =
-            child.wait().await.map_err(|source| OpError::Io { operation: "run operation", source });
-        let stdout_result = finish_forward(stdout_task, "stream op run stdout").await;
-        let stderr_result = finish_forward(stderr_task, "stream op run stderr").await;
-        let status = status?;
-        stdout_result?;
-        stderr_result?;
-        Ok(OpRunStatus { success: status.success(), code: status.code() })
-    }
-
-    fn run_command(&self, request: &OpRunRequest<'_>) -> Command {
-        let mut command = self.command();
-        command
-            .arg("run")
-            .arg(format!("--env-file={}", request.env_file.display()))
-            .arg("--")
-            .arg(request.program)
-            .args(request.args)
-            // An inherited opt-out must not be able to weaken Kit's fixed masking contract.
-            .env_remove(NO_MASKING_ENV);
-        command
     }
 
     pub async fn field(
@@ -292,18 +83,10 @@ impl OpClient {
         reference: &ItemRef,
         field: LoginField,
     ) -> Result<SecretBytes, OpError> {
-        let secret_reference = secret_reference(reference, field);
-        self.secret(
-            "read login field",
-            [
-                "read",
-                secret_reference.as_str(),
-                "--account",
-                reference.account_id.as_str(),
-                "--no-newline",
-            ],
-        )
-        .await
+        let secret_reference = secret_reference(reference, field)?;
+        self.shared
+            .read_reference_for_account(&secret_reference, reference.account_id.as_str())
+            .await
     }
 
     pub async fn create_login(&self, mut request: CreateLoginRequest) -> Result<(), OpError> {
@@ -311,7 +94,7 @@ impl OpClient {
         let args = create_args(&request);
         // The fixed JSON stdin buffer is now the sole Kit-owned copy needed by the subprocess.
         request.password = None;
-        self.status_with_stdin("create login", args, body).await
+        self.shared.status_with_stdin("create login", args, body).await
     }
 
     pub async fn rotate_password(&self, reference: &ItemRef) -> Result<(), OpError> {
@@ -326,7 +109,7 @@ impl OpClient {
             "--account".to_owned(),
             reference.account_id.as_str().to_owned(),
         ];
-        self.status("rotate password", &args, StderrPolicy::Discard).await
+        self.shared.status("rotate password", &args, StderrPolicy::Discard).await
     }
 
     pub async fn archive(&self, reference: &ItemRef) -> Result<(), OpError> {
@@ -340,119 +123,7 @@ impl OpClient {
             "--account".to_owned(),
             reference.account_id.as_str().to_owned(),
         ];
-        self.status("archive item", &args, StderrPolicy::CaptureSanitized).await
-    }
-
-    async fn json<T, I, S>(&self, operation: &'static str, args: I) -> Result<T, OpError>
-    where
-        T: for<'de> Deserialize<'de>,
-        I: IntoIterator<Item = S>,
-        S: AsRef<std::ffi::OsStr>,
-    {
-        let output = self
-            .operation_command(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await
-            .map_err(|source| map_spawn_error(operation, source))?;
-        check_status(
-            operation,
-            output.status.code(),
-            &output.stderr,
-            StderrPolicy::CaptureSanitized,
-        )?;
-        serde_json::from_slice(&output.stdout)
-            .map_err(|source| OpError::InvalidJson { operation, source })
-    }
-
-    async fn secret<I, S>(&self, operation: &'static str, args: I) -> Result<SecretBytes, OpError>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<std::ffi::OsStr>,
-    {
-        let mut child = self
-            .operation_command(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            // A secret-returning operation never preserves stderr: an upstream diagnostic must not
-            // become an accidental plaintext echo in Kit's heap or error UI.
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|source| map_spawn_error(operation, source))?;
-        let mut stdout = child.stdout.take().ok_or(OpError::Io {
-            operation,
-            source: io::Error::other("op stdout was not piped"),
-        })?;
-        let mut secret = SensitiveBuffer::new(MAX_SECRET_BYTES);
-        let mut chunk = Zeroizing::new([0_u8; SECRET_READ_CHUNK_BYTES]);
-
-        loop {
-            let read = stdout
-                .read(&mut chunk[..])
-                .await
-                .map_err(|source| OpError::Io { operation, source })?;
-            if read == 0 {
-                break;
-            }
-            if secret.try_extend(&chunk[..read]).is_err() {
-                terminate(&mut child).await;
-                return Err(OpError::ResponseTooLarge { operation, limit: MAX_SECRET_BYTES });
-            }
-        }
-        drop(stdout);
-
-        let status = child.wait().await.map_err(|source| OpError::Io { operation, source })?;
-        check_status(operation, status.code(), &[], StderrPolicy::Discard)?;
-        secret.into_secret().map_err(|()| OpError::InvalidResponse {
-            operation,
-            reason: "secret field was not valid UTF-8",
-        })
-    }
-
-    async fn status_with_stdin(
-        &self,
-        operation: &'static str,
-        args: Vec<String>,
-        body: Zeroizing<Vec<u8>>,
-    ) -> Result<(), OpError> {
-        let mut child = self
-            .operation_command(&args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|source| map_spawn_error(operation, source))?;
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or(OpError::Io { operation, source: io::Error::other("op stdin was not piped") })?;
-        if let Err(source) = stdin.write_all(&body).await {
-            terminate(&mut child).await;
-            return Err(OpError::Io { operation, source });
-        }
-        drop(stdin);
-        drop(body);
-        let status = child.wait().await.map_err(|source| OpError::Io { operation, source })?;
-        check_status(operation, status.code(), &[], StderrPolicy::Discard)
-    }
-
-    async fn status(
-        &self,
-        operation: &'static str,
-        args: &[String],
-        stderr_policy: StderrPolicy,
-    ) -> Result<(), OpError> {
-        let output = self
-            .operation_command(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(stderr_policy.stdio())
-            .output()
-            .await
-            .map_err(|source| map_spawn_error(operation, source))?;
-        check_status(operation, output.status.code(), &output.stderr, stderr_policy)
+        self.shared.status("archive item", &args, StderrPolicy::CaptureSanitized).await
     }
 }
 
@@ -460,137 +131,6 @@ impl Default for OpClient {
     fn default() -> Self {
         Self::new()
     }
-}
-
-#[derive(Debug, Error)]
-pub enum OpError {
-    #[error("the official 1Password CLI (`op`) is not installed or not in PATH")]
-    NotInstalled,
-    #[error("1Password could not resolve reference {reference} (status {status:?})")]
-    ReferenceFailed { reference: SecretReference, status: Option<i32> },
-    #[error("1Password CLI failed while attempting to {operation} (status {status:?}){detail}")]
-    Failed { operation: &'static str, status: Option<i32>, detail: ErrorDetail },
-    #[error("1Password CLI returned invalid JSON while attempting to {operation}: {source}")]
-    InvalidJson {
-        operation: &'static str,
-        #[source]
-        source: serde_json::Error,
-    },
-    #[error(
-        "1Password CLI returned an invalid response while attempting to {operation}: {reason}"
-    )]
-    InvalidResponse { operation: &'static str, reason: &'static str },
-    #[error(
-        "1Password CLI returned more than {limit} bytes while attempting to {operation}; refusing to retain it"
-    )]
-    ResponseTooLarge { operation: &'static str, limit: usize },
-    #[error("request was too large while attempting to {operation}; limit is {limit} bytes")]
-    RequestTooLarge { operation: &'static str, limit: usize },
-    #[error("I/O failure while attempting to {operation}: {source}")]
-    Io {
-        operation: &'static str,
-        #[source]
-        source: io::Error,
-    },
-}
-
-#[derive(Debug)]
-pub struct ErrorDetail(Option<String>);
-
-impl std::fmt::Display for ErrorDetail {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Some(detail) = self.0.as_deref() {
-            write!(formatter, ": {detail}")
-        } else {
-            Ok(())
-        }
-    }
-}
-
-fn map_spawn_error(operation: &'static str, source: io::Error) -> OpError {
-    if source.kind() == io::ErrorKind::NotFound {
-        OpError::NotInstalled
-    } else {
-        OpError::Io { operation, source }
-    }
-}
-
-async fn terminate(child: &mut tokio::process::Child) {
-    let _ = child.kill().await;
-    let _ = child.wait().await;
-}
-
-#[derive(Clone, Copy)]
-enum OutputDestination {
-    Stdout,
-    Stderr,
-}
-
-async fn forward_output<R>(mut reader: R, destination: OutputDestination) -> Result<(), io::Error>
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    let mut chunk = [0_u8; RUN_OUTPUT_CHUNK_BYTES];
-    loop {
-        let read = reader.read(&mut chunk).await?;
-        if read == 0 {
-            return Ok(());
-        }
-        match destination {
-            OutputDestination::Stdout => {
-                let mut writer = io::stdout().lock();
-                writer.write_all(&chunk[..read])?;
-                writer.flush()?;
-            }
-            OutputDestination::Stderr => {
-                let mut writer = io::stderr().lock();
-                writer.write_all(&chunk[..read])?;
-                writer.flush()?;
-            }
-        }
-    }
-}
-
-async fn finish_forward(
-    handle: JoinHandle<Result<(), io::Error>>,
-    operation: &'static str,
-) -> Result<(), OpError> {
-    match handle.await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(source)) => Err(OpError::Io { operation, source }),
-        Err(source) => Err(OpError::Io {
-            operation,
-            source: io::Error::other(format!("output task failed: {source}")),
-        }),
-    }
-}
-
-fn check_status(
-    operation: &'static str,
-    status: Option<i32>,
-    stderr: &[u8],
-    stderr_policy: StderrPolicy,
-) -> Result<(), OpError> {
-    if status == Some(0) {
-        return Ok(());
-    }
-    let detail = match stderr_policy {
-        StderrPolicy::CaptureSanitized => sanitize_stderr(stderr),
-        StderrPolicy::Discard => None,
-    };
-    Err(OpError::Failed { operation, status, detail: ErrorDetail(detail) })
-}
-
-fn sanitize_stderr(stderr: &[u8]) -> Option<String> {
-    let text = String::from_utf8_lossy(stderr);
-    let sanitized = text
-        .chars()
-        .filter(|ch| !ch.is_control() || *ch == '\n' || *ch == '\t')
-        .take(600)
-        .collect::<String>()
-        .trim()
-        .to_owned();
-    (!sanitized.is_empty()).then_some(sanitized)
 }
 
 #[derive(Deserialize)]
@@ -815,17 +355,25 @@ fn serialized_len(template: &LoginTemplate<'_>) -> Result<usize, OpError> {
     Ok(counter.length)
 }
 
-fn secret_reference(reference: &ItemRef, field: LoginField) -> String {
-    format!(
+fn secret_reference(reference: &ItemRef, field: LoginField) -> Result<SecretReference, OpError> {
+    SecretReference::new(format!(
         "op://{}/{}/{}",
         reference.vault_id.as_str(),
         reference.item_id.as_str(),
         field.reference_name()
-    )
+    ))
+    .map_err(|_| OpError::InvalidResponse {
+        operation: "read login field",
+        reason: "item identifiers could not form a valid 1Password reference",
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{path::PathBuf, process::Stdio};
+
+    use crate::onepassword::MAX_SECRET_BYTES;
+
     use super::*;
 
     #[cfg(unix)]
@@ -896,9 +444,7 @@ mod tests {
     }
 
     fn synthetic_secret() -> SecretBytes {
-        let mut buffer = SensitiveBuffer::new(MAX_SECRET_BYTES);
-        buffer.try_extend(b"synthetic-sentinel").unwrap();
-        buffer.into_secret().unwrap()
+        SecretBytes::from_utf8(b"synthetic-sentinel".to_vec()).unwrap()
     }
 
     #[test]
@@ -935,45 +481,13 @@ mod tests {
     fn field_reference_uses_ids_and_a_fixed_built_in_name() {
         let reference = item_reference();
         assert_eq!(
-            secret_reference(&reference, LoginField::Password),
+            secret_reference(&reference, LoginField::Password).unwrap().as_str(),
             "op://vault-id/item-id/password"
         );
         assert_eq!(
-            secret_reference(&reference, LoginField::Username),
+            secret_reference(&reference, LoginField::Username).unwrap().as_str(),
             "op://vault-id/item-id/username"
         );
-    }
-
-    #[test]
-    fn operation_references_are_typed_and_debug_redacted() {
-        let reference = SecretReference::new("op://vault/item/password".to_owned()).unwrap();
-
-        assert_eq!(reference.as_str(), "op://vault/item/password");
-        assert!(!format!("{reference:?}").contains("password"));
-        assert!(SecretReference::new("resolved-value".to_owned()).is_err());
-        assert!(SecretReference::new("op://missing/components".to_owned()).is_err());
-    }
-
-    #[test]
-    fn run_command_has_exact_fixed_args_and_removes_masking_opt_out() {
-        let client = OpClient::with_executable(PathBuf::from("fake-op"));
-        let args = vec!["deploy".to_owned(), "marketing".to_owned()];
-        let request = OpRunRequest::new(Path::new("/tmp/refs.env"), "kit", &args);
-        let command = client.run_command(&request);
-        let argv = command
-            .as_std()
-            .get_args()
-            .map(|argument| argument.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-        let masking_environment = command
-            .as_std()
-            .get_envs()
-            .find(|(name, _)| *name == NO_MASKING_ENV)
-            .map(|(_, value)| value);
-
-        assert_eq!(argv, ["run", "--env-file=/tmp/refs.env", "--", "kit", "deploy", "marketing",]);
-        assert_eq!(masking_environment, Some(None));
-        assert!(argv.iter().all(|argument| argument != "--no-masking"));
     }
 
     #[test]
@@ -982,14 +496,6 @@ mod tests {
         counter.write_all(b"abc").unwrap();
         assert!(counter.write_all(b"d").is_err());
         assert!(counter.exceeded);
-    }
-
-    #[test]
-    fn secret_operation_errors_do_not_include_stderr() {
-        let error =
-            check_status("read password", Some(1), b"synthetic-sentinel", StderrPolicy::Discard)
-                .unwrap_err();
-        assert!(!error.to_string().contains("synthetic-sentinel"));
     }
 
     #[cfg(unix)]

@@ -7,7 +7,7 @@ use std::{
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::tools::secrets::op::SecretReference;
+use crate::onepassword::SecretReference;
 
 pub const PROJECT_CONFIG: &str = ".kit/ops.toml";
 pub const SCHEMA_VERSION: u32 = 1;

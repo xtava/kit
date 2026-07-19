@@ -12,7 +12,7 @@ use thiserror::Error;
 
 use crate::{
     framework::{AtomicFileError, AtomicFileWriter},
-    tools::secrets::op::SecretReference,
+    onepassword::SecretReference,
 };
 
 const JOURNAL_SCHEMA_VERSION: u32 = 1;

@@ -1,19 +1,8 @@
-use std::{
-    collections::BTreeMap,
-    fs::OpenOptions,
-    io::Write,
-    path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::process::ExitStatus;
 
-use thiserror::Error;
-
-use crate::tools::secrets::op::{OpClient, OpError, OpRunRequest, OpRunStatus, SecretReference};
+use crate::onepassword::{OpClient, OpError};
 
 use super::config::Operation;
-
-const ENV_FILE_ATTEMPTS: usize = 32;
-static NEXT_ENV_FILE: AtomicU64 = AtomicU64::new(0);
 
 pub struct OpsRunner {
     client: OpClient,
@@ -24,102 +13,29 @@ impl OpsRunner {
         Self { client }
     }
 
-    pub async fn run(&self, operation: &Operation) -> Result<OpRunStatus, RunnerError> {
+    pub async fn run(&self, operation: &Operation) -> Result<ExitStatus, OpError> {
         for reference in operation.refs.values() {
             self.client.preflight_reference(reference).await?;
         }
 
-        let env_file = ScopedEnvFile::create(&operation.refs)?;
-        let request =
-            OpRunRequest::new(env_file.path(), &operation.command.program, &operation.command.args);
-        self.client.run_operation(request).await.map_err(RunnerError::from)
-    }
-}
-
-#[derive(Debug, Error)]
-pub enum RunnerError {
-    #[error(transparent)]
-    Op(#[from] OpError),
-    #[error("create ephemeral ops reference file {}: {source}", path.display())]
-    CreateEnvFile {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("write ephemeral ops reference file {}: {source}", path.display())]
-    WriteEnvFile {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("could not allocate a unique ephemeral ops reference file")]
-    AllocateEnvFile,
-}
-
-struct ScopedEnvFile {
-    path: PathBuf,
-}
-
-impl ScopedEnvFile {
-    fn create(refs: &BTreeMap<String, SecretReference>) -> Result<Self, RunnerError> {
-        for _ in 0..ENV_FILE_ATTEMPTS {
-            let nonce = NEXT_ENV_FILE.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir()
-                .join(format!("kit-ops-refs-{}-{nonce}.env", std::process::id()));
-            let mut options = OpenOptions::new();
-            options.create_new(true).write(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let mut file = match options.open(&path) {
-                Ok(file) => file,
-                Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(source) => return Err(RunnerError::CreateEnvFile { path, source }),
-            };
-            let write_result = (|| {
-                for (name, reference) in refs {
-                    writeln!(file, "{name}={}", reference.as_str())?;
-                }
-                file.sync_all()
-            })();
-            if let Err(source) = write_result {
-                drop(file);
-                let _ = std::fs::remove_file(&path);
-                return Err(RunnerError::WriteEnvFile { path, source });
-            }
-            return Ok(Self { path });
-        }
-        Err(RunnerError::AllocateEnvFile)
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl std::fmt::Debug for ScopedEnvFile {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("ScopedEnvFile").field("path", &self.path).finish()
-    }
-}
-
-impl Drop for ScopedEnvFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        self.client
+            .run_operation(&operation.refs, &operation.command.program, &operation.command.args)
+            .await
     }
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use std::{
+        collections::BTreeMap,
         io::Write as _,
         os::unix::fs::PermissionsExt,
+        path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
     };
 
     use super::*;
+    use crate::onepassword::SecretReference;
     use crate::tools::ops::config::{CommandSpec, OpsConfig, SCHEMA_VERSION};
 
     struct FakeOp {

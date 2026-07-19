@@ -1,0 +1,56 @@
+#!/bin/sh
+
+case "$1" in
+    read)
+        [ "$#" -eq 4 ] || exit 29
+        [ "$3" = "--no-newline" ] || exit 30
+        [ "$4" = "--no-color" ] || exit 31
+        case "$2" in
+            op://Tests/read/success)
+                printf 'fixture-secret-value'
+                ;;
+            op://Tests/read/failure)
+                printf 'fixture-stderr-must-not-leak' >&2
+                exit 23
+                ;;
+            op://Tests/read/empty)
+                exit 0
+                ;;
+            op://Tests/read/multiline)
+                printf 'first line\nsecond line'
+                ;;
+            op://Tests/read/invalid-utf8)
+                printf '\377'
+                ;;
+            op://Tests/read/oversized)
+                dd if=/dev/zero bs=4097 count=1 2>/dev/null | tr '\000' x
+                ;;
+            *)
+                exit 24
+                ;;
+        esac
+        ;;
+    run)
+        shift
+        case "$1" in
+            --env-file=*) env_file=${1#--env-file=} ;;
+            *) exit 25 ;;
+        esac
+        shift
+        [ "$1" = "--" ] || exit 26
+        shift
+        [ -z "${OP_RUN_NO_MASKING+x}" ] || exit 27
+
+        if grep -q '^FORBIDDEN_SECRET=op://Tests/runner/secret$' "$env_file"; then
+            secret='forbidden-plaintext-runner-fixture'
+            export FORBIDDEN_SECRET="$secret"
+            "$@" 2>&1 | sed "s/$secret/«concealed»/g"
+            exit $?
+        fi
+
+        exec "$@"
+        ;;
+    *)
+        exit 28
+        ;;
+esac

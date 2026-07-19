@@ -1,4 +1,4 @@
-use super::sensitive::SecretBytes;
+use crate::onepassword::SecretBytes;
 
 macro_rules! id_type {
     ($name:ident) => {

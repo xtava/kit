@@ -1,9 +1,5 @@
 use std::sync::Arc;
 
-use super::model::{AccountSummary, CreateLoginRequest, ItemRef, ItemSummary, VaultSummary};
-use super::op::{LoginField, OpClient, OpError};
-use super::sensitive::{SecretBytes, SensitiveInput};
-use crate::tui::{EventReader, FuzzyIndex, LineEditor, SearchMode, Session, SessionOptions};
 use anyhow::{anyhow, Result};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -12,6 +8,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 use tokio::sync::mpsc::{self, UnboundedSender};
+
+use crate::onepassword::{OpError, SecretBytes};
+use crate::tui::{EventReader, FuzzyIndex, LineEditor, SearchMode, Session, SessionOptions};
+
+use super::model::{AccountSummary, CreateLoginRequest, ItemRef, ItemSummary, VaultSummary};
+use super::op::{LoginField, OpClient};
+use super::sensitive::SensitiveInput;
 
 pub async fn run(
     client: OpClient,

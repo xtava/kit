@@ -12,7 +12,7 @@ use clap::{ArgMatches, Command, CommandFactory, FromArgMatches, Parser};
 
 use crate::{
     framework::{Context, Tool, ToolMeta},
-    tools::secrets::op::OpClient,
+    onepassword::OpClient,
 };
 
 use config::LoadedConfig;
