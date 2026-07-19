@@ -88,7 +88,8 @@ pub async fn run(
         FrecencyStore::bootstrap("render").context("open Render frecency store")?;
     let frecency = frecency_store.load().context("load Render frecency")?;
     let mut app = App::new(root, index, frecency, initial, config, theme_spec, theme)?;
-    let mut session = Session::open(SessionOptions { mouse_capture: true })?;
+    let mut session =
+        Session::open(SessionOptions { mouse_capture: true, bracketed_paste: false })?;
     let mut events = EventReader::start();
     let mut document_watch = DocumentWatch::start()?;
     document_watch.follow(app.document_path())?;

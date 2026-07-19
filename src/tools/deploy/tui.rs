@@ -34,7 +34,7 @@ use super::{
         VersionsState,
     },
 };
-use crate::framework::process::ProcessSupervisor;
+use crate::framework::{open_external, process::ProcessSupervisor, ExternalTarget};
 use crate::tui::{
     render_split_divider, Direction, EventReader, NavigationMap, NavigationRegion, Session,
     SessionOptions, SplitDividerStyle,
@@ -75,7 +75,8 @@ pub async fn run(startup: Startup) -> Result<Option<RunOutcome>> {
         layout,
         layout_warning,
     } = startup;
-    let mut session = Session::open(SessionOptions { mouse_capture: true })?;
+    let mut session =
+        Session::open(SessionOptions { mouse_capture: true, bracketed_paste: false })?;
     let mut events = EventReader::start();
     let mut app = App::new(loaded, journal, annotations, layout);
     app.notice = layout_warning;
@@ -210,7 +211,7 @@ pub async fn run(startup: Startup) -> Result<Option<RunOutcome>> {
                         }
                     }
                     UiAction::OpenUrl { url } => {
-                        app.notice = Some(match open_url(&url) {
+                        app.notice = Some(match open_external(ExternalTarget::Url(&url)) {
                             Ok(()) => format!("Opening {url}"),
                             Err(error) => format!("Could not open {url}: {error}"),
                         });
@@ -873,18 +874,6 @@ fn current_git_branch(working_dir: &Path) -> Option<String> {
     }
     let branch = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     (!branch.is_empty() && branch != "HEAD").then_some(branch)
-}
-
-fn open_url(url: &str) -> Result<(), String> {
-    let program = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-    std::process::Command::new(program)
-        .arg(url)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map(drop)
-        .map_err(|error| format!("{program}: {error}"))
 }
 
 fn summary_url(app: &App) -> Option<String> {

@@ -50,7 +50,8 @@ impl Tool for SettingsTool {
         let (_, theme) = crate::tui::theme::resolve(&args.theme)
             .with_context(|| format!("load Settings theme {:?}", args.theme))?;
         let mut editor = SettingsEditor::open(cx.config.clone(), self.sections.clone(), theme);
-        let mut session = Session::open(SessionOptions { mouse_capture: false })?;
+        let mut session =
+            Session::open(SessionOptions { mouse_capture: false, bracketed_paste: false })?;
         let mut events = EventReader::start();
         loop {
             session.draw(|frame| editor.render(frame, frame.area()))?;

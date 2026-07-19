@@ -24,7 +24,7 @@ async fn run_validated(
     let (worker, mut snapshots, mut details) = SamplerWorker::start(sampler)?;
     let initial = Arc::clone(&snapshots.borrow());
     let mut app = StatsApp::new_validated(initial, registry, mouse_capture);
-    let mut session = Session::open(SessionOptions { mouse_capture })?;
+    let mut session = Session::open(SessionOptions { mouse_capture, bracketed_paste: false })?;
     let mut events = EventReader::start();
     let mut actions = ActionController::new();
     let mut hit_map = UiRegions::default();

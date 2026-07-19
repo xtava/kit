@@ -43,7 +43,8 @@ const PAGE_ROWS: usize = 12;
 pub(super) async fn run(cx: &Context) -> Result<()> {
     let (root, manifest) = load_interactive_manifest(cx)?;
     let runtime = build_runtime_availability(cx).await;
-    let mut session = Session::open(SessionOptions { mouse_capture: true })?;
+    let mut session =
+        Session::open(SessionOptions { mouse_capture: true, bracketed_paste: false })?;
     let mut input = EventReader::start();
     let mut app = App::new(&root, &manifest, runtime);
     let result = run_session(cx, &root, &manifest, &mut session, &mut input, &mut app).await;

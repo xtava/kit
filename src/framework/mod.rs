@@ -7,6 +7,7 @@
 mod atomic_file;
 mod config;
 mod context;
+mod external;
 mod output;
 pub mod process;
 mod registry;
@@ -18,6 +19,7 @@ mod tool;
 pub(crate) use atomic_file::{AtomicFileError, AtomicFileTryLock, AtomicFileWriter};
 pub use config::{ConfigStore, ConfigValue};
 pub use context::Context;
+pub use external::{open_external, ExternalTarget};
 pub use output::{Output, OutputFormat};
 pub use registry::Registry;
 pub use repository::{RepositoryLocator, RepositoryRootError, WorktreeRoot};

@@ -88,7 +88,8 @@ pub async fn run(store: SwarmStore, processes: ProcessSupervisor) -> Result<()> 
         working_directory,
     };
     app.reconcile().await;
-    let mut session = Session::open(SessionOptions { mouse_capture: false })?;
+    let mut session =
+        Session::open(SessionOptions { mouse_capture: false, bracketed_paste: false })?;
     let mut events = EventReader::start();
     let mut interval = tokio::time::interval(RECONCILE_INTERVAL);
     let (hint_sender, mut hints) = tokio::sync::mpsc::unbounded_channel();

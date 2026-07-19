@@ -17,4 +17,5 @@ pub mod secrets;
 pub mod settings;
 pub mod stats;
 pub mod swarm;
+pub mod tail;
 pub mod update;

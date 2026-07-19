@@ -1,0 +1,47 @@
+name: Tail sharing
+
+on:
+  pull_request:
+    paths:
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
+      - "src/framework/external.rs"
+      - "src/framework/mod.rs"
+      - "src/main.rs"
+      - "src/tools/deploy/tui.rs"
+      - "src/tools/mod.rs"
+      - "src/tools/tail/**"
+      - "src/tui/session.rs"
+      - ".github/workflows/tail.yml"
+  push:
+    branches: [master]
+    paths:
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
+      - "src/framework/external.rs"
+      - "src/framework/mod.rs"
+      - "src/main.rs"
+      - "src/tools/deploy/tui.rs"
+      - "src/tools/mod.rs"
+      - "src/tools/tail/**"
+      - "src/tui/session.rs"
+      - ".github/workflows/tail.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2025]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test Tail sharing
+        run: cargo test -j 2 tools::tail
+      - name: Test platform opener construction
+        run: cargo test -j 2 framework::external

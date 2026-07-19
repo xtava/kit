@@ -1,7 +1,7 @@
 use anyhow::Result;
 use kit::framework::Registry;
 use kit::tools::{
-    build, deploy, diff, domain, ops, process, record, render, secrets, settings, stats, swarm,
+    build, deploy, diff, domain, ops, process, record, render, secrets, settings, stats, swarm, tail,
     update,
 };
 
@@ -33,6 +33,7 @@ async fn main() -> Result<()> {
         .register(secrets::tool())
         .register(stats::tool())
         .register(swarm::tool())
+        .register(tail::tool())
         .register(update::tool());
     #[cfg(unix)]
     let registry = registry.register(scout::tool()).register(cdp::tool());

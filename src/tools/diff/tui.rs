@@ -80,7 +80,7 @@ pub async fn run(
     line_numbers: LineNumbers,
 ) -> Result<()> {
     let mut app = DiffApp::with_line_numbers(documents, theme, mode, line_numbers);
-    let mut session = Session::open(SessionOptions { mouse_capture })?;
+    let mut session = Session::open(SessionOptions { mouse_capture, bracketed_paste: false })?;
     let mut events = EventReader::start();
     let mut repository_task = None;
 

@@ -7,7 +7,7 @@ use std::{
 use anyhow::{Context, Result};
 use crossterm::{
     cursor,
-    event::{DisableMouseCapture, EnableMouseCapture},
+    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -26,6 +26,7 @@ pub struct Session {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SessionOptions {
     pub mouse_capture: bool,
+    pub bracketed_paste: bool,
 }
 
 impl Session {
@@ -39,6 +40,9 @@ impl Session {
                 .context("enter alternate screen")?;
             if options.mouse_capture {
                 execute!(stdout, EnableMouseCapture).context("enable mouse capture")?;
+            }
+            if options.bracketed_paste {
+                execute!(stdout, EnableBracketedPaste).context("enable bracketed paste")?;
             }
 
             let backend = CrosstermBackend::new(stdout);
@@ -86,7 +90,13 @@ impl Drop for Session {
 fn restore_terminal() {
     let _ = disable_raw_mode();
     let mut stdout = io::stdout();
-    let _ = execute!(stdout, DisableMouseCapture, cursor::Show, LeaveAlternateScreen);
+    let _ = execute!(
+        stdout,
+        DisableBracketedPaste,
+        DisableMouseCapture,
+        cursor::Show,
+        LeaveAlternateScreen
+    );
 }
 
 fn install_panic_restore_hook() -> Arc<Mutex<Option<PanicHook>>> {
