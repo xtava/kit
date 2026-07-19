@@ -4,14 +4,18 @@
 
 ## Install
 
+Download the Linux or macOS archive for your platform from
+[GitHub Releases](https://github.com/xtava/kit/releases), put `kit` on your `PATH`, then keep it
+current with:
+
 ```bash
-git clone https://github.com/xtava/kit.git
-cd kit
-cargo install --locked --path .
+kit update
 ```
 
-Run `kit update` to rebuild and reinstall from the same checkout. It uses the checkout as-is and
-does not pull or modify Git state.
+`kit update` downloads the compatible release, verifies GitHub's SHA-256 asset digest, and replaces
+the executable. Interactive Kit sessions notify you when a cached newer version is available.
+
+Contributors can still build and install the current checkout with `./install.sh`.
 
 ## Commands
 
@@ -29,7 +33,7 @@ does not pull or modify Git state.
 | `kit secrets` | Browse, search, and manage 1Password through a local TUI backed by the official `op` CLI. |
 | `kit swarm` | Run deterministic multi-thread Codex councils and independently inspect them in a tree/detail TUI. |
 | `kit settings` | Edit tool-owned operator preferences in a shared TUI. |
-| `kit update` | Rebuild and reinstall Kit from its source checkout. |
+| `kit update` | Verify and install the newest compatible GitHub release. |
 
 Use built-in help for the current command surface:
 

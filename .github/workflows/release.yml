@@ -1,0 +1,98 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate tag and Cargo version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          cargo_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            if [[ ! "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "Release tags must use vMAJOR.MINOR.PATCH; received ${tag}" >&2
+              exit 1
+            fi
+            version="${tag#v}"
+            if [[ "${version}" != "${cargo_version}" ]]; then
+              echo "Tag ${tag} does not match Cargo.toml version ${cargo_version}" >&2
+              exit 1
+            fi
+          else
+            version="${cargo_version}"
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+  build:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            binary: kit
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            binary: kit
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            binary: kit
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            binary: kit
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build release binary
+        run: cargo build --locked --release --target ${{ matrix.target }} -j 2
+      - name: Package release binary
+        shell: bash
+        env:
+          BINARY: ${{ matrix.binary }}
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir package release-assets
+          cp "target/${TARGET}/release/${BINARY}" "package/${BINARY}"
+          tar -czf "release-assets/kit-${VERSION}-${TARGET}.tar.gz" -C package "${BINARY}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kit-${{ matrix.target }}
+          path: release-assets/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'push'
+    needs: [validate, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: kit-*
+          path: release-assets
+          merge-multiple: true
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          make_latest: true
+          files: release-assets/*.tar.gz
