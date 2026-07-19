@@ -10,6 +10,9 @@ mod session;
 mod spec;
 mod supervisor;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 mod detached;
 
 #[cfg(target_os = "linux")]
