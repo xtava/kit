@@ -9,6 +9,9 @@ on:
 permissions:
   contents: read
 
+env:
+  RUSTFLAGS: "-D warnings"
+
 jobs:
   validate:
     runs-on: ubuntu-24.04

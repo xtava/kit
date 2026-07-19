@@ -1,8 +1,11 @@
 use std::{
-    fs::{File, OpenOptions, TryLockError},
+    fs::{File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
 };
+
+#[cfg(target_os = "linux")]
+use std::fs::TryLockError;
 
 use thiserror::Error;
 
@@ -18,6 +21,7 @@ pub struct AtomicFileWriter {
 }
 
 #[derive(Debug)]
+#[cfg(target_os = "linux")]
 pub enum AtomicFileTryLock {
     Acquired(File),
     Busy,
@@ -68,6 +72,7 @@ impl AtomicFileWriter {
     }
 
     /// Try to acquire the writer lock without waiting for another writer.
+    #[cfg(target_os = "linux")]
     pub fn try_lock(&self) -> Result<AtomicFileTryLock, AtomicFileError> {
         let (path, file) = self.open_lock()?;
         match file.try_lock() {

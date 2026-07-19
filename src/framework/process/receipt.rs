@@ -25,6 +25,7 @@ enum DetachedRecoveryEnvelope {
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "phase", rename_all = "kebab-case", deny_unknown_fields)]
+#[cfg(target_os = "linux")]
 pub(crate) enum PersistedDetachedLaunchIntent {
     Prepared { run_id: ProcessRunId, host_executable: String, capability_path: String },
     Authority { recovery: String },
@@ -54,6 +55,7 @@ pub(crate) struct DetachedCommitGrant {
 }
 
 impl DetachedCommitGrant {
+    #[cfg(target_os = "linux")]
     pub(crate) fn new(run_dir: PathBuf, path: PathBuf, bytes: Box<[u8]>) -> Self {
         Self { run_dir, path, bytes: Zeroizing::new(bytes) }
     }
@@ -74,6 +76,7 @@ impl fmt::Debug for DetachedLaunchTransaction {
 }
 
 impl DetachedLaunchTransaction {
+    #[cfg(target_os = "linux")]
     pub(crate) fn new(
         supervisor: ProcessSupervisor,
         receipt: DetachedProcessReceipt,
@@ -110,6 +113,7 @@ impl DetachedLaunchTransaction {
         }
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) async fn abandon(self) {
         let supervisor = self.supervisor.clone();
         let _ = supervisor.abandon_detached_transaction(&self.receipt).await;
@@ -262,6 +266,7 @@ impl DetachedLaunchRecovery {
         Ok(Self { run_id, unit_name, invocation_id })
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) fn linux_systemd(
         run_id: ProcessRunId,
         unit_name: String,
@@ -273,6 +278,7 @@ impl DetachedLaunchRecovery {
         Ok(Self { run_id, unit_name, invocation_id })
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) fn systemd_authority(&self) -> (&str, &str) {
         (&self.unit_name, &self.invocation_id)
     }
@@ -316,6 +322,7 @@ impl DetachedProcessReceipt {
         Ok(receipt)
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) fn linux_systemd(
         run_id: ProcessRunId,
         invocation_id: String,
@@ -386,6 +393,7 @@ pub struct PendingDetachedLaunch {
 }
 
 impl PendingDetachedLaunch {
+    #[cfg(target_os = "linux")]
     pub(crate) fn new(run_id: ProcessRunId, phase: PendingDetachedLaunchPhase) -> Self {
         Self { run_id, phase }
     }

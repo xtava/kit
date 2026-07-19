@@ -22,6 +22,9 @@ on:
 permissions:
   contents: read
 
+env:
+  RUSTFLAGS: "-D warnings"
+
 jobs:
   stats:
     runs-on: macos-15

@@ -124,6 +124,7 @@ pub struct RecordedOutputPath {
 }
 
 impl RecordedOutputPath {
+    #[cfg(target_os = "linux")]
     pub(crate) fn new(path: PathBuf) -> Self {
         Self { path, _retention: None }
     }

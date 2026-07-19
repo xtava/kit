@@ -50,20 +50,22 @@ impl AttachedGroup {
         let options = ProcessGroupOptions::default()
             .shutdown_timeout(termination.grace_period)
             .escalate_to_kill(true);
-        let mut group = ProcessGroup::with_options(options.clone()).map_err(|source| {
+        let group = ProcessGroup::with_options(options.clone()).map_err(|source| {
             ProcessStartError::ContainmentSetupFailed { message: source.to_string() }
         })?;
         #[cfg(target_os = "linux")]
-        if requirement == ContainmentRequirement::CompleteTree
+        let group = if requirement == ContainmentRequirement::CompleteTree
             && group.mechanism() == Mechanism::ProcessGroup
         {
             super::linux_systemd::ensure_attached_delegation()
                 .await
                 .map_err(|message| ProcessStartError::ContainmentSetupFailed { message })?;
-            group = ProcessGroup::with_options(options).map_err(|source| {
+            ProcessGroup::with_options(options).map_err(|source| {
                 ProcessStartError::ContainmentSetupFailed { message: source.to_string() }
-            })?;
-        }
+            })?
+        } else {
+            group
+        };
         let strength = match group.mechanism() {
             Mechanism::CgroupV2 | Mechanism::JobObject => ContainmentStrength::CompleteTree,
             Mechanism::ProcessGroup => ContainmentStrength::ProcessGroup,
@@ -127,11 +129,16 @@ impl AttachedGroup {
     }
 
     pub(crate) fn target_members(&self) -> Result<Vec<u32>, processkit::Error> {
-        let mut members = self.group.members()?;
+        let members = self.group.members()?;
         #[cfg(target_os = "linux")]
-        if let Some(guardian) = &self.guardian {
-            members.retain(|pid| *pid != guardian.pid);
+        {
+            let mut members = members;
+            if let Some(guardian) = &self.guardian {
+                members.retain(|pid| *pid != guardian.pid);
+            }
+            return Ok(members);
         }
+        #[cfg(not(target_os = "linux"))]
         Ok(members)
     }
 

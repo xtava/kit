@@ -34,6 +34,9 @@ on:
 permissions:
   contents: read
 
+env:
+  RUSTFLAGS: "-D warnings"
+
 jobs:
   test:
     strategy:

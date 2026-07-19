@@ -16,7 +16,9 @@ mod settings;
 mod terminal;
 mod tool;
 
-pub(crate) use atomic_file::{AtomicFileError, AtomicFileTryLock, AtomicFileWriter};
+#[cfg(target_os = "linux")]
+pub(crate) use atomic_file::AtomicFileTryLock;
+pub(crate) use atomic_file::{AtomicFileError, AtomicFileWriter};
 pub use config::{ConfigStore, ConfigValue};
 pub use context::Context;
 pub use external::{open_external, ExternalTarget};

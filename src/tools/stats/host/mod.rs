@@ -49,22 +49,28 @@ impl ProcessAction {
 #[derive(Debug, Error)]
 pub enum ActionError {
     #[error("refusing to act on PID 1")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     Init,
     #[error("refusing to act on a system process")]
     #[cfg(target_os = "windows")]
     SystemProcess,
     #[error("refusing to act on the monitor itself")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     SelfProcess,
     #[error("refusing to terminate critical process {0}")]
     #[cfg(target_os = "windows")]
     Protected(u32),
     #[error("invalid process id {0}")]
+    #[cfg(target_os = "linux")]
     InvalidPid(u32),
     #[error("process {0} is no longer available")]
+    #[cfg(target_os = "linux")]
     Unavailable(u32),
     #[error("process {pid} was replaced before the action could be performed")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     Replaced { pid: u32 },
     #[error("could not {operation} process {pid}: {source}")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     Io {
         pid: u32,
         operation: &'static str,

@@ -212,6 +212,7 @@ pub(crate) struct RunDirectoryLease {
 }
 
 impl RunDirectoryLease {
+    #[cfg(target_os = "linux")]
     pub(crate) fn retain(&self) {
         self.retain.store(true, Ordering::Release);
     }
@@ -226,6 +227,7 @@ impl RunDirectory {
         &self.retention.path
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) fn retain(&mut self) {
         self.retention.retain();
     }
@@ -316,6 +318,7 @@ impl ProcessSupervisor {
         })
     }
 
+    #[cfg(target_os = "linux")]
     pub(super) fn state_root(&self) -> &Path {
         &self.inner.state_root
     }
@@ -377,6 +380,7 @@ impl ProcessSupervisor {
         self.prepare_run(true)
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) fn prepare_detached(&self) -> Result<PreparedProcessRun, ProcessPrepareError> {
         self.prepare_run(false)
     }

@@ -150,6 +150,7 @@ pub struct ProcessFailureReport {
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+#[cfg(target_os = "linux")]
 pub(crate) enum PersistedDetachedOutput {
     Discarded,
     Recorded {
@@ -163,6 +164,7 @@ pub(crate) enum PersistedDetachedOutput {
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "report", rename_all = "kebab-case", deny_unknown_fields)]
+#[cfg(target_os = "linux")]
 pub(crate) enum PersistedDetachedReport {
     Completed(PersistedDetachedCompletedReport),
     InfrastructureFailure(PersistedDetachedFailureReport),
@@ -170,6 +172,7 @@ pub(crate) enum PersistedDetachedReport {
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg(target_os = "linux")]
 pub(crate) struct PersistedDetachedCompletedReport {
     pub run_id: ProcessRunId,
     pub unit_name: String,
@@ -184,6 +187,7 @@ pub(crate) struct PersistedDetachedCompletedReport {
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg(target_os = "linux")]
 pub(crate) struct PersistedDetachedFailureReport {
     pub run_id: ProcessRunId,
     pub unit_name: String,
@@ -197,6 +201,7 @@ pub(crate) struct PersistedDetachedFailureReport {
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "evidence", rename_all = "kebab-case", deny_unknown_fields)]
+#[cfg(target_os = "linux")]
 pub(crate) enum PersistedDetachedTerminal {
     Completed(PersistedDetachedTarget),
     InfrastructureFailure(PersistedDetachedInfrastructureFailure),
@@ -204,6 +209,7 @@ pub(crate) enum PersistedDetachedTerminal {
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg(target_os = "linux")]
 pub(crate) struct PersistedDetachedTarget {
     pub run_id: ProcessRunId,
     pub leader_exit: LeaderExitObservation,
@@ -214,6 +220,7 @@ pub(crate) struct PersistedDetachedTarget {
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg(target_os = "linux")]
 pub(crate) struct PersistedDetachedInfrastructureFailure {
     pub run_id: ProcessRunId,
     pub leader_exit: LeaderExitObservation,

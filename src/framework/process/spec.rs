@@ -328,10 +328,15 @@ pub enum DetachedLifetimeRequirement {
 
 #[derive(Clone, Debug)]
 pub struct DetachedProcessSpec {
+    #[cfg(target_os = "linux")]
     pub(crate) command: CommandSpec,
+    #[cfg(target_os = "linux")]
     pub(crate) stdout: DetachedOutputPolicy,
+    #[cfg(target_os = "linux")]
     pub(crate) stderr: DetachedOutputPolicy,
+    #[cfg(target_os = "linux")]
     pub(crate) lifetime: DetachedLifetimeRequirement,
+    #[cfg(target_os = "linux")]
     pub(crate) termination: TerminationPolicy,
 }
 
@@ -343,6 +348,14 @@ impl DetachedProcessSpec {
         lifetime: DetachedLifetimeRequirement,
         termination: TerminationPolicy,
     ) -> Self {
-        Self { command, stdout, stderr, lifetime, termination }
+        #[cfg(target_os = "linux")]
+        {
+            Self { command, stdout, stderr, lifetime, termination }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            drop((command, stdout, stderr, lifetime, termination));
+            Self {}
+        }
     }
 }

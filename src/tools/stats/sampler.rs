@@ -915,18 +915,23 @@ fn push_warning(warnings: &mut Vec<SampleWarning>, pid: Option<u32>, message: St
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
     use std::process::{Command, Stdio};
 
+    #[cfg(target_os = "linux")]
     use rustix::fd::OwnedFd;
+    #[cfg(target_os = "linux")]
     use rustix::process::{pidfd_open, pidfd_send_signal, Pid, PidfdFlags, Signal};
 
     use super::*;
 
+    #[cfg(target_os = "linux")]
     struct DisposableChild {
         child: std::process::Child,
         pidfd: OwnedFd,
     }
 
+    #[cfg(target_os = "linux")]
     impl Drop for DisposableChild {
         fn drop(&mut self) {
             let _ = pidfd_send_signal(&self.pidfd, Signal::KILL);
@@ -1085,6 +1090,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     #[ignore = "spawns a disposable CPU-pinned busy process"]
     fn controlled_pinned_process_appears_on_its_core() {
         let child = Command::new("taskset")
