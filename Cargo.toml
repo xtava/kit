@@ -20,7 +20,7 @@ toml = "1.1"
 toml_edit = "0.25"
 directories = "6"
 unicode-width = "0.2"
-url = "2.5"
+url = { version = "2.5", features = ["serde"] }
 thiserror = "2"
 zeroize = "1"
 shell-words = "1"
@@ -43,7 +43,7 @@ similar = { version = "3", features = ["inline", "unicode"] }
 time = { version = "0.3", features = ["formatting"] }
 sysinfo = { version = "=0.37.2", default-features = false, features = ["system", "user"] }
 
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
 hickory-resolver = { version = "0.26", features = ["tokio"] }
 idna = "1.1"
 

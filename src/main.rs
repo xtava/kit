@@ -1,8 +1,8 @@
 use anyhow::Result;
 use kit::framework::Registry;
 use kit::tools::{
-    build, deploy, diff, domain, ops, process, record, render, secrets, settings, stats, swarm, tail,
-    update,
+    build, deploy, diff, domain, monitor, ops, process, record, render, secrets, settings, stats,
+    swarm, tail, update,
 };
 
 #[cfg(unix)]
@@ -26,6 +26,7 @@ async fn main() -> Result<()> {
         .register(deploy::tool())
         .register(diff::tool())
         .register(domain::tool())
+        .register(monitor::tool())
         .register(ops::tool())
         .register(process::tool())
         .register(record::tool())

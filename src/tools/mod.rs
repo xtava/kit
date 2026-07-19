@@ -7,6 +7,7 @@ pub mod cdp;
 pub mod deploy;
 pub mod diff;
 pub mod domain;
+pub mod monitor;
 pub mod ops;
 pub mod process;
 pub mod record;

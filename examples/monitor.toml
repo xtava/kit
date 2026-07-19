@@ -1,0 +1,83 @@
+# Copy to .kit/monitor.toml or ~/.config/kit/monitor.toml and replace the example costs.
+version = 1
+default_environment = "production"
+
+[[environments]]
+id = "production"
+name = "Production"
+monthly_budget_usd = 300.0
+required_sources = ["api-health", "metrics"]
+
+[[sources]]
+type = "http-health"
+id = "api-health"
+name = "Example API"
+environment = "production"
+url = "https://api.example.test/health"
+expected_status = 200
+
+# Point this at the private Prometheus endpoint available to the operator machine.
+[[sources]]
+type = "prometheus"
+id = "metrics"
+name = "Production Prometheus"
+environment = "production"
+url = "http://prometheus.internal:9090"
+auth = { type = "basic", username = "monitor", password_env = "PROMETHEUS_PASSWORD" }
+
+[[services]]
+id = "api"
+name = "API"
+environment = "production"
+health_source = "api-health"
+
+[[services.metrics]]
+id = "cpu"
+name = "CPU utilization"
+source = "metrics"
+query = "process_cpu_utilization"
+unit = "percent"
+warning_above = 0.70
+critical_above = 0.90
+
+[[services.metrics]]
+id = "memory"
+name = "System memory"
+source = "metrics"
+query = "system_memory_utilization"
+unit = "percent"
+warning_above = 0.70
+critical_above = 0.90
+
+[[services.metrics]]
+id = "prisma-p95"
+name = "Prisma query p95"
+source = "metrics"
+query = "histogram_quantile(0.95, rate(prisma_client_queries_duration_histogram_ms_bucket[5m]))"
+unit = "milliseconds"
+warning_above = 250.0
+critical_above = 1000.0
+
+# Replace these illustrative values with the actual recurring amounts from each provider.
+[[costs]]
+id = "hetzner-server"
+name = "Production server"
+provider = "Hetzner"
+environment = "production"
+service = "api"
+monthly_usd = 0.0
+confidence = "fixed"
+
+[[costs]]
+id = "cloudflare"
+name = "Cloudflare services"
+provider = "Cloudflare"
+environment = "production"
+monthly_usd = 0.0
+confidence = "estimated"
+
+[limits]
+request_timeout_ms = 8000
+max_log_events = 500
+max_lookback_hours = 168
+stale_after_secs = 90
