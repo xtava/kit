@@ -399,7 +399,7 @@ impl Sampler {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub fn sample_detail(
         &mut self,
         request: DetailRequest,
