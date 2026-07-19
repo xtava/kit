@@ -375,7 +375,7 @@ mod tests {
     #[cfg(unix)]
     use std::fs;
 
-    use crate::framework::process::test_support::{CommandFixture, CommandResponse, OutputEvent};
+    use crate::framework::process::test_support::{CommandFixture, CommandResponse};
 
     use super::*;
 
@@ -469,8 +469,7 @@ mod tests {
         fixture
             .respond(
                 ["login"],
-                CommandResponse::hang()
-                    .event(OutputEvent::stderr("https://login.tailscale.com/a/test-token\n")),
+                CommandResponse::hang().stderr("https://login.tailscale.com/a/test-token\n"),
             )
             .unwrap();
         fixture

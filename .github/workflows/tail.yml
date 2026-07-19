@@ -8,6 +8,7 @@ on:
       - "rust-toolchain.toml"
       - "src/framework/external.rs"
       - "src/framework/mod.rs"
+      - "src/framework/process/**"
       - "src/main.rs"
       - "src/tools/deploy/tui.rs"
       - "src/tools/mod.rs"
@@ -22,6 +23,7 @@ on:
       - "rust-toolchain.toml"
       - "src/framework/external.rs"
       - "src/framework/mod.rs"
+      - "src/framework/process/**"
       - "src/main.rs"
       - "src/tools/deploy/tui.rs"
       - "src/tools/mod.rs"
@@ -41,6 +43,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Test reusable command fixtures
+        run: cargo test -j 2 framework::process::test_support
       - name: Test Tail sharing
         run: cargo test -j 2 tools::tail
       - name: Test platform opener construction
