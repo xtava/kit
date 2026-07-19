@@ -195,6 +195,7 @@ impl CommandFixture {
 
     pub(crate) fn invocations(&self) -> Result<Vec<Invocation>> {
         let mut directories = directories(&self.root.join("observed"))?;
+        directories.retain(|directory| directory.join("ready").is_file());
         directories.sort();
         directories.into_iter().map(|path| read_invocation(&path)).collect()
     }
@@ -493,7 +494,7 @@ fn write_response(root: &Path, response: &CommandResponse) -> Result<()> {
 
 fn read_invocation(root: &Path) -> Result<Invocation> {
     let arguments = read_arguments(&root.join("arguments"))?;
-    let stdin = fs::read(root.join("stdin")).unwrap_or_default();
+    let stdin = fs::read(root.join("stdin"))?;
     let pid = fs::read_to_string(root.join("pid"))?.trim().parse()?;
     Ok(Invocation { arguments, stdin, pid })
 }

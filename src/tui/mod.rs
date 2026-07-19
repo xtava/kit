@@ -12,6 +12,7 @@ mod context_menu;
 mod editor;
 mod events;
 pub mod fuzzy;
+mod history;
 pub mod markdown;
 mod navigation;
 mod search;
@@ -33,6 +34,7 @@ pub use context_menu::{
 };
 pub use editor::LineEditor;
 pub use events::EventReader;
+pub use history::NavigationHistory;
 pub use navigation::{Direction, NavigationMap, NavigationRegion};
 pub use search::{Frecency, FrecencyError, FrecencyStore, FuzzyIndex, SearchMatch, SearchMode};
 pub use session::{Session, SessionOptions};

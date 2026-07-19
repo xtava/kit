@@ -11,6 +11,7 @@ use super::AtomicFileWriter;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConfigValue {
     Bool(bool),
+    Integer(i64),
     String(String),
 }
 
@@ -73,6 +74,7 @@ impl ConfigStore {
             raw.parse::<DocumentMut>().with_context(|| format!("parse {}", path.display()))?;
         let item = match value {
             ConfigValue::Bool(value) => toml_value(value),
+            ConfigValue::Integer(value) => toml_value(value),
             ConfigValue::String(value) => toml_value(value),
         };
         let decor =
@@ -116,6 +118,22 @@ mod tests {
         assert!(raw.contains("# policy"));
         assert!(raw.contains("extra = 7"));
         assert!(raw.contains("line_numbers = \"never\""));
+        let _ = std::fs::remove_dir_all(&store.dir);
+        Ok(())
+    }
+
+    #[test]
+    fn integer_edit_preserves_other_fields() -> Result<()> {
+        let store = store("integer");
+        std::fs::create_dir_all(&store.dir)?;
+        let path = store.path("tail");
+        std::fs::write(&path, "mouse = true\nsplit_ratio = 440\n")?;
+
+        store.set("tail", "split_ratio", ConfigValue::Integer(615))?;
+        let raw = std::fs::read_to_string(&path)?;
+
+        assert!(raw.contains("mouse = true"));
+        assert!(raw.contains("split_ratio = 615"));
         let _ = std::fs::remove_dir_all(&store.dir);
         Ok(())
     }

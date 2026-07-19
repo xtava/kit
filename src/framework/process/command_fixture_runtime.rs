@@ -41,6 +41,7 @@ fn run() -> Result<(), String> {
     let mut stdin = Vec::new();
     io::stdin().read_to_end(&mut stdin).map_err(|error| error.to_string())?;
     fs::write(invocation.join("stdin"), &stdin).map_err(|error| error.to_string())?;
+    fs::write(invocation.join("ready"), []).map_err(|error| error.to_string())?;
     let expected_stdin = response.join("expected-stdin");
     if expected_stdin.exists() {
         let expected = fs::read(expected_stdin).map_err(|error| error.to_string())?;

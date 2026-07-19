@@ -2,6 +2,8 @@
 
 mod cache;
 mod client;
+mod config;
+mod contributions;
 mod file_input;
 mod model;
 mod tui;
@@ -10,7 +12,7 @@ use anyhow::{bail, Context as _, Result};
 use async_trait::async_trait;
 use clap::{ArgMatches, Command};
 
-use crate::framework::{Context, Tool, ToolMeta};
+use crate::framework::{Context, SettingsSection, Tool, ToolMeta};
 
 pub fn tool() -> TailTool {
     TailTool
@@ -32,6 +34,10 @@ impl Tool for TailTool {
         Command::new("tail").about("Share text and files across your Tailscale devices")
     }
 
+    fn settings(&self) -> Option<SettingsSection> {
+        Some(config::settings())
+    }
+
     async fn run(&self, cx: &Context, _matches: &ArgMatches) -> Result<()> {
         if !cx.term.interactive() {
             bail!("kit tail requires an interactive terminal");
@@ -43,6 +49,7 @@ impl Tool for TailTool {
         let client = client::TailClient::new(cx.processes.clone(), working_directory);
         let readiness = client.readiness().await?;
         let cache = cache::ReceiveCache::discover()?;
-        tui::run(client, cache, readiness).await
+        let config = config::Config::load(cx.config.clone())?;
+        tui::run(client, cache, readiness, config).await
     }
 }

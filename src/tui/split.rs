@@ -25,6 +25,10 @@ impl SplitRatio {
         Self(self.0.saturating_add_signed(delta).clamp(1, RATIO_SCALE - 1))
     }
 
+    pub const fn value(self) -> u16 {
+        self.0
+    }
+
     fn from_divider(divider: u16, available: u16) -> Self {
         if available == 0 {
             return Self::new(RATIO_SCALE / 2);

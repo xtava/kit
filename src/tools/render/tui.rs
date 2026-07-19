@@ -34,9 +34,9 @@ use crate::tui::{
     markdown::{has_heading, MarkdownHeading, MarkdownLink, MarkdownRenderer, MarkdownSearchLine},
     render_split_divider,
     theme::{self, TuiTheme},
-    CommandSet, CommandSpec, EventReader, Frecency, FrecencyStore, LineEditor, ParsedInput,
-    Session, SessionOptions, SettingsEditor, SettingsFlow, SplitDividerStyle, SplitDrag,
-    SplitFrame, SplitMinimums, SplitRatio, Suggestion, SuggestionMenu,
+    CommandSet, CommandSpec, EventReader, Frecency, FrecencyStore, LineEditor, NavigationHistory,
+    ParsedInput, Session, SessionOptions, SettingsEditor, SettingsFlow, SplitDividerStyle,
+    SplitDrag, SplitFrame, SplitMinimums, SplitRatio, Suggestion, SuggestionMenu,
 };
 
 const SUGGESTION_ROWS: usize = 8;
@@ -234,7 +234,7 @@ struct App {
     toc_split_ratio: SplitRatio,
     toc_split_frame: SplitFrame,
     toc_drag: Option<SplitDrag<()>>,
-    history: NavigationHistory,
+    history: NavigationHistory<PathBuf>,
     notice: Notice,
 }
 
@@ -253,39 +253,6 @@ struct TocHit {
 struct LinkHit {
     area: Rect,
     destination: String,
-}
-
-#[derive(Default)]
-struct NavigationHistory {
-    entries: Vec<PathBuf>,
-    cursor: Option<usize>,
-}
-
-impl NavigationHistory {
-    fn visit(&mut self, path: PathBuf) {
-        if self.current() == Some(path.as_path()) {
-            return;
-        }
-        let keep = self.cursor.map_or(0, |cursor| cursor + 1);
-        self.entries.truncate(keep);
-        self.entries.push(path);
-        self.cursor = Some(self.entries.len() - 1);
-    }
-
-    fn current(&self) -> Option<&Path> {
-        self.cursor.and_then(|cursor| self.entries.get(cursor)).map(PathBuf::as_path)
-    }
-
-    fn target(&self, delta: isize) -> Option<(usize, &Path)> {
-        let cursor = self.cursor?;
-        let target = cursor.checked_add_signed(delta)?;
-        self.entries.get(target).map(|path| (target, path.as_path()))
-    }
-
-    fn select(&mut self, cursor: usize) {
-        debug_assert!(cursor < self.entries.len());
-        self.cursor = Some(cursor);
-    }
 }
 
 fn document_search_notice(search: &DocumentSearch) -> String {
@@ -940,7 +907,7 @@ impl App {
 
     fn move_history(&mut self, delta: isize) {
         let Some((cursor, path)) =
-            self.history.target(delta).map(|(cursor, path)| (cursor, path.to_path_buf()))
+            self.history.target(delta).map(|(cursor, path)| (cursor, path.clone()))
         else {
             let direction = if delta.is_negative() { "back" } else { "forward" };
             self.notice = Notice::info(format!("no {direction} history"));
@@ -2019,7 +1986,7 @@ mod tests {
 
         app.on_mouse(click);
         assert_eq!(app.document_path(), Some(guide.as_path()));
-        assert_eq!(app.history.entries, vec![readme.clone(), guide.clone()]);
+        assert_eq!(app.history.entries(), [readme.clone(), guide.clone()]);
         assert_eq!(app.frecency.visits(&readme), 1);
         assert_eq!(app.frecency.visits(&guide), 1);
 
@@ -2027,7 +1994,7 @@ mod tests {
         assert_eq!(app.document_path(), Some(readme.as_path()));
         app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         assert_eq!(app.document_path(), Some(guide.as_path()));
-        assert_eq!(app.history.entries, vec![readme.clone(), guide.clone()]);
+        assert_eq!(app.history.entries(), [readme.clone(), guide.clone()]);
         assert_eq!(app.frecency.visits(&readme), 1);
         assert_eq!(app.frecency.visits(&guide), 1);
     }
@@ -2058,7 +2025,7 @@ mod tests {
         assert_eq!(app.document_path(), Some(paths[1].as_path()));
         app.open(paths[3].clone()).unwrap();
 
-        assert_eq!(app.history.entries, vec![paths[0].clone(), paths[1].clone(), paths[3].clone()]);
+        assert_eq!(app.history.entries(), [paths[0].clone(), paths[1].clone(), paths[3].clone()]);
         assert!(app.history.target(1).is_none());
         app.move_history(-1);
         assert_eq!(app.document_path(), Some(paths[1].as_path()));
