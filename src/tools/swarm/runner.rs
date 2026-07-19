@@ -973,12 +973,13 @@ sleep 2
         let exited = store.create(create_spec()).unwrap();
         let exited_executable = directory.join("exited-owner");
         write_executable(&exited_executable, "#!/bin/sh\nexit 3\n");
-        assert!(matches!(
-            SwarmLauncher::new(store.clone(), exited_executable, processes.clone())
-                .launch(&exited.id)
-                .await,
-            Err(LaunchError::Exited { .. })
-        ));
+        let exited_result = SwarmLauncher::new(store.clone(), exited_executable, processes.clone())
+            .launch(&exited.id)
+            .await;
+        assert!(
+            matches!(exited_result, Err(LaunchError::Exited { .. })),
+            "unexpected exited launch result: {exited_result:?}"
+        );
         assert_eq!(store.read_journal(&exited.id).unwrap().projection.status, RunStatus::Failed);
         assert!(store.valid_result(&exited.id).unwrap().is_some());
         store.delete(&exited.id).unwrap();
