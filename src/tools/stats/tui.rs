@@ -97,8 +97,8 @@ mod tests {
     use super::super::host::ProcessAction;
     use super::super::model::{
         CapabilityState, CpuSample, DetailCompleteness, DetailData, DetailOutcome, DetailRequest,
-        DetailRequestKind, DetailSnapshot, Observed, ProcessIdentity, ProcessKey, ProcessSample,
-        ProcessState, SampleReadiness, StatsSnapshot, SystemSample, ThreadSample,
+        DetailRequestKind, DetailSnapshot, HostCapabilities, Observed, ProcessIdentity, ProcessKey,
+        ProcessSample, ProcessState, SampleReadiness, StatsSnapshot, SystemSample, ThreadSample,
     };
     use super::*;
     use crossterm::event::{
@@ -167,7 +167,14 @@ mod tests {
             interval_ms: 1_000,
             collection_duration_ms: 5,
             readiness: SampleReadiness::Ready,
-            host: super::super::host::capabilities(),
+            host: HostCapabilities {
+                last_observed_core: CapabilityState::Available,
+                threads: CapabilityState::Available,
+                resources: CapabilityState::Available,
+                graceful_terminate: CapabilityState::Available,
+                force_terminate: CapabilityState::Available,
+                code_profile: CapabilityState::Available,
+            },
             system: SystemSample {
                 global_cpu_percent: 25.0,
                 cpus: vec![CpuSample { logical_index: 0, usage_percent: 25.0 }],
