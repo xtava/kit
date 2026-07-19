@@ -373,9 +373,14 @@ fn classify_preflight_error(error: &anyhow::Error) -> Readiness {
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
-    use std::{fs, os::unix::fs::PermissionsExt};
+    use std::fs;
+
+    use crate::framework::process::test_support::{CommandFixture, CommandResponse, OutputEvent};
 
     use super::*;
+
+    const READY_STATUS: &str = r#"{"BackendState":"Running","TailscaleIPs":["100.64.0.1"],"Self":{"ID":"me","DNSName":"desktop.test.ts.net.","HostName":"desktop","OS":"linux","Online":true,"TailscaleIPs":["100.64.0.1"]},"Peer":{"peer":{"ID":"peer","DNSName":"laptop.test.ts.net.","HostName":"laptop","OS":"linux","Online":true,"TailscaleIPs":["100.64.0.2"]}}}"#;
+    const NEEDS_LOGIN_STATUS: &str = r#"{"BackendState":"NeedsLogin"}"#;
 
     #[test]
     fn extracts_login_url_from_mixed_output() {
@@ -405,35 +410,30 @@ mod tests {
         assert_eq!(peers[0].send_target(), Some("100.64.0.2"));
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn fake_cli_proves_readiness_targets_and_private_text_stdin() {
-        let root = std::env::temp_dir().join(format!("kit-tail-client-{}", uuid::Uuid::new_v4()));
-        fs::create_dir(&root).unwrap();
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
-        let executable = root.join("tailscale");
-        let stdin_path = root.join("stdin");
-        let args_path = root.join("args");
-        let script = format!(
-            r#"#!/bin/sh
-if [ "$1" = "status" ]; then
-  printf '%s\n' '{{"BackendState":"Running","TailscaleIPs":["100.64.0.1"],"Self":{{"ID":"me","DNSName":"desktop.test.ts.net.","HostName":"desktop","OS":"linux","Online":true,"TailscaleIPs":["100.64.0.1"]}},"Peer":{{"peer":{{"ID":"peer","DNSName":"laptop.test.ts.net.","HostName":"laptop","OS":"linux","Online":true,"TailscaleIPs":["100.64.0.2"]}}}}}}'
-elif [ "$1" = "file" ] && [ "$2" = "cp" ] && [ "$3" = "--targets" ]; then
-  printf '100.64.0.2\tlaptop\n'
-elif [ "$1" = "file" ] && [ "$2" = "cp" ]; then
-  cat > '{}'
-  printf '%s\n' "$@" > '{}'
-else
-  exit 64
-fi
-"#,
-            stdin_path.display(),
-            args_path.display(),
+        let mut fixture = CommandFixture::new().unwrap();
+        fixture
+            .respond(["status", "--json"], CommandResponse::success().stdout(READY_STATUS))
+            .unwrap();
+        fixture
+            .respond(
+                ["file", "cp", "--targets"],
+                CommandResponse::success().stdout("100.64.0.2\tlaptop\n"),
+            )
+            .unwrap();
+        fixture
+            .respond(
+                ["file", "cp", "--name=clipboard.txt", "-", "100.64.0.2:"],
+                CommandResponse::success().expect_stdin("hello from stdin"),
+            )
+            .unwrap();
+        let processes = ProcessSupervisor::for_test(fixture.root().join("processes")).unwrap();
+        let client = TailClient::with_executable(
+            processes,
+            fixture.root().to_path_buf(),
+            fixture.executable(),
         );
-        fs::write(&executable, script).unwrap();
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
-        let processes = ProcessSupervisor::for_test(root.join("processes")).unwrap();
-        let client = TailClient::with_executable(processes, root.clone(), executable);
 
         let Readiness::Ready { peers, .. } = client.readiness().await.unwrap() else {
             panic!("fake CLI was not ready")
@@ -449,48 +449,43 @@ fi
             )
             .await
             .unwrap();
-        assert_eq!(fs::read_to_string(stdin_path).unwrap(), "hello from stdin");
-        let args = fs::read_to_string(args_path).unwrap();
-        assert!(args.contains("--name=clipboard.txt"));
-        assert!(args.contains("100.64.0.2:"));
-        fs::remove_dir_all(root).unwrap();
+        let sent = fixture
+            .invocations()
+            .unwrap()
+            .into_iter()
+            .find(|invocation| {
+                invocation.arguments
+                    == ["file", "cp", "--name=clipboard.txt", "-", "100.64.0.2:"]
+                        .map(OsString::from)
+            })
+            .unwrap();
+        assert_eq!(sent.stdin, b"hello from stdin");
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn fake_login_stays_alive_until_readiness_and_is_reaped() {
-        let root = std::env::temp_dir().join(format!("kit-tail-login-{}", uuid::Uuid::new_v4()));
-        fs::create_dir(&root).unwrap();
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
-        let executable = root.join("tailscale");
-        let ready_path = root.join("ready");
-        let pid_path = root.join("pid");
-        let script = format!(
-            r#"#!/bin/sh
-if [ "$1" = "status" ]; then
-  if [ -f '{}' ]; then
-    printf '%s\n' '{{"BackendState":"Running","TailscaleIPs":["100.64.0.1"],"Self":{{"ID":"me","DNSName":"desktop.test.ts.net.","HostName":"desktop","OS":"linux","Online":true,"TailscaleIPs":["100.64.0.1"]}}}}'
-  else
-    printf '%s\n' '{{"BackendState":"NeedsLogin"}}'
-  fi
-elif [ "$1" = "login" ]; then
-  printf '%s\n' 'https://login.tailscale.com/a/test-token' >&2
-  printf '%s\n' "$$" > '{}'
-  while [ ! -f '{}' ]; do sleep 1; done
-elif [ "$1" = "file" ] && [ "$2" = "cp" ] && [ "$3" = "--targets" ]; then
-  exit 0
-else
-  exit 64
-fi
-"#,
-            ready_path.display(),
-            pid_path.display(),
-            ready_path.display(),
+        let mut fixture = CommandFixture::new().unwrap();
+        fixture
+            .respond(
+                ["login"],
+                CommandResponse::hang()
+                    .event(OutputEvent::stderr("https://login.tailscale.com/a/test-token\n")),
+            )
+            .unwrap();
+        fixture
+            .respond(["status", "--json"], CommandResponse::success().stdout(NEEDS_LOGIN_STATUS))
+            .unwrap();
+        fixture
+            .respond(["status", "--json"], CommandResponse::success().stdout(READY_STATUS))
+            .unwrap();
+        fixture.respond(["file", "cp", "--targets"], CommandResponse::success()).unwrap();
+        let processes = ProcessSupervisor::for_test(fixture.root().join("processes")).unwrap();
+        let client = TailClient::with_executable(
+            processes,
+            fixture.root().to_path_buf(),
+            fixture.executable(),
         );
-        fs::write(&executable, script).unwrap();
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
-        let processes = ProcessSupervisor::for_test(root.join("processes")).unwrap();
-        let client = TailClient::with_executable(processes, root.clone(), executable);
         let (mut events, _cancel, task) = client.start_login();
 
         let url =
@@ -498,113 +493,79 @@ fi
         assert!(
             matches!(url, LoginEvent::Url(ref url) if url == "https://login.tailscale.com/a/test-token")
         );
-        let pid = wait_for_pid(&pid_path).await;
-        assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
-        fs::write(&ready_path, "ready").unwrap();
+        let login = fixture.wait_for_invocation(["login"], Duration::from_secs(3)).await.unwrap();
+        assert_eq!(unsafe { libc::kill(login.pid as i32, 0) }, 0);
         let ready =
             tokio::time::timeout(Duration::from_secs(4), events.recv()).await.unwrap().unwrap();
         assert!(matches!(ready, LoginEvent::Ready(Readiness::Ready { .. })));
         task.await.unwrap();
-        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
-        fs::remove_dir_all(root).unwrap();
+        assert_eq!(unsafe { libc::kill(login.pid as i32, 0) }, -1);
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn fake_login_cancellation_is_acknowledged_after_reaping() {
-        let root = std::env::temp_dir().join(format!("kit-tail-cancel-{}", uuid::Uuid::new_v4()));
-        fs::create_dir(&root).unwrap();
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
-        let executable = root.join("tailscale");
-        let pid_path = root.join("pid");
-        let script = format!(
-            r#"#!/bin/sh
-if [ "$1" = "status" ]; then
-  printf '%s\n' '{{"BackendState":"NeedsLogin"}}'
-elif [ "$1" = "login" ]; then
-  printf '%s\n' 'https://login.tailscale.com/a/cancel-token'
-  printf '%s\n' "$$" > '{}'
-  while true; do sleep 1; done
-else
-  exit 64
-fi
-"#,
-            pid_path.display(),
+        let mut fixture = CommandFixture::new().unwrap();
+        fixture
+            .respond(
+                ["login"],
+                CommandResponse::hang().stdout("https://login.tailscale.com/a/cancel-token\n"),
+            )
+            .unwrap();
+        fixture
+            .respond(["status", "--json"], CommandResponse::success().stdout(NEEDS_LOGIN_STATUS))
+            .unwrap();
+        let processes = ProcessSupervisor::for_test(fixture.root().join("processes")).unwrap();
+        let client = TailClient::with_executable(
+            processes,
+            fixture.root().to_path_buf(),
+            fixture.executable(),
         );
-        fs::write(&executable, script).unwrap();
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
-        let processes = ProcessSupervisor::for_test(root.join("processes")).unwrap();
-        let client = TailClient::with_executable(processes, root.clone(), executable);
         let (mut events, cancel, task) = client.start_login();
 
         let url =
             tokio::time::timeout(Duration::from_secs(3), events.recv()).await.unwrap().unwrap();
         assert!(matches!(url, LoginEvent::Url(_)));
-        let pid = fs::read_to_string(&pid_path).unwrap().trim().parse::<i32>().unwrap();
-        assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
+        let login = fixture.wait_for_invocation(["login"], Duration::from_secs(3)).await.unwrap();
+        assert_eq!(unsafe { libc::kill(login.pid as i32, 0) }, 0);
         cancel.send(true).unwrap();
         let cancelled =
             tokio::time::timeout(Duration::from_secs(4), events.recv()).await.unwrap().unwrap();
         assert!(matches!(cancelled, LoginEvent::Cancelled));
         task.await.unwrap();
-        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
-        fs::remove_dir_all(root).unwrap();
+        assert_eq!(unsafe { libc::kill(login.pid as i32, 0) }, -1);
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn fake_transfer_cancellation_returns_only_after_reaping() {
-        let root = std::env::temp_dir().join(format!("kit-tail-send-{}", uuid::Uuid::new_v4()));
-        fs::create_dir(&root).unwrap();
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
-        let executable = root.join("tailscale");
-        let pid_path = root.join("pid");
-        let script = format!(
-            r#"#!/bin/sh
-if [ "$1" = "file" ] && [ "$2" = "cp" ]; then
-  printf '%s\n' "$$" > '{}'
-  while true; do sleep 1; done
-else
-  exit 64
-fi
-"#,
-            pid_path.display(),
-        );
-        fs::write(&executable, script).unwrap();
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
-        let processes = ProcessSupervisor::for_test(root.join("processes")).unwrap();
-        let client = TailClient::with_executable(processes, root.clone(), executable);
-        let payload = root.join("payload.txt");
+        let mut fixture = CommandFixture::new().unwrap();
+        let payload = fixture.root().join("payload.txt");
         fs::write(&payload, "payload").unwrap();
+        let arguments = vec![
+            OsString::from("file"),
+            OsString::from("cp"),
+            payload.as_os_str().to_owned(),
+            OsString::from("100.64.0.2:"),
+        ];
+        fixture.respond(arguments.clone(), CommandResponse::hang()).unwrap();
+        let processes = ProcessSupervisor::for_test(fixture.root().join("processes")).unwrap();
+        let client = TailClient::with_executable(
+            processes,
+            fixture.root().to_path_buf(),
+            fixture.executable(),
+        );
         let (cancel, cancel_receiver) = watch::channel(false);
         let transfer = tokio::spawn({
             let client = client.clone();
             let payload = payload.clone();
             async move { client.send_files(&[payload], "100.64.0.2", cancel_receiver).await }
         });
-        let pid = wait_for_pid(&pid_path).await;
+        let invocation =
+            fixture.wait_for_invocation(arguments, Duration::from_secs(3)).await.unwrap();
         cancel.send(true).unwrap();
         let error = transfer.await.unwrap().unwrap_err();
         assert!(format!("{error:#}").contains("operation cancelled"));
-        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[cfg(unix)]
-    async fn wait_for_pid(path: &Path) -> i32 {
-        tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                if let Ok(pid) = fs::read_to_string(path).and_then(|contents| {
-                    contents.trim().parse().map_err(|error| {
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, error)
-                    })
-                }) {
-                    return pid;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("fake CLI did not publish a valid PID")
+        assert_eq!(unsafe { libc::kill(invocation.pid as i32, 0) }, -1);
     }
 }
