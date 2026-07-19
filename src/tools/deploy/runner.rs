@@ -1,10 +1,4 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    ffi::OsString,
-    num::NonZeroUsize,
-    path::PathBuf,
-    time::Duration,
-};
+use std::{collections::BTreeMap, ffi::OsString, num::NonZeroUsize, path::PathBuf, time::Duration};
 
 use tokio::{
     sync::{mpsc, watch},
@@ -13,11 +7,11 @@ use tokio::{
 };
 
 use crate::framework::process::{
-    CommandSpec, CompletionCause, ContainmentRequirement, EnvironmentBase, InputPolicy, LeaderExit,
-    LeaderExitObservation, OutputPolicy, ProcessByteEvent, ProcessControl, ProcessEnvironment,
-    ProcessLabel, ProcessOutputHandle, ProcessReport, ProcessSpec, ProcessSupervisor,
-    StartedProcess, StreamPolicy, TerminationPolicy,
+    CompletionCause, ContainmentRequirement, InputPolicy, LeaderExit, LeaderExitObservation,
+    OutputPolicy, ProcessByteEvent, ProcessControl, ProcessLabel, ProcessOutputHandle,
+    ProcessReport, ProcessSpec, ProcessSupervisor, StartedProcess, StreamPolicy, TerminationPolicy,
 };
+use crate::onepassword::OpClient;
 
 use super::config::{DeployAction, DeployTarget};
 use super::environment::TargetEnvironment;
@@ -25,7 +19,7 @@ use super::journal::VersionId;
 
 const CANCEL_GRACE: Duration = Duration::from_secs(2);
 const OUTPUT_IN_FLIGHT_BYTES: NonZeroUsize = NonZeroUsize::new(256 * 1024).unwrap();
-const LINE_FRAGMENT_BYTES: usize = 64 * 1024;
+const MAX_OUTPUT_LINE_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OutputStream {
@@ -88,6 +82,7 @@ pub enum RunOperation {
 
 struct StepExecution<'a> {
     processes: &'a ProcessSupervisor,
+    op: &'a OpClient,
     action: &'a DeployAction,
     working_dir: &'a std::path::Path,
     version: &'a VersionId,
@@ -101,22 +96,32 @@ pub fn spawn_with_supervisor(
     processes: ProcessSupervisor,
     spec: RunSpec,
 ) -> (mpsc::Receiver<RunEvent>, watch::Sender<bool>, JoinHandle<()>) {
+    spawn_with_supervisor_and_op(processes, OpClient::new(), spec)
+}
+
+fn spawn_with_supervisor_and_op(
+    processes: ProcessSupervisor,
+    op: OpClient,
+    spec: RunSpec,
+) -> (mpsc::Receiver<RunEvent>, watch::Sender<bool>, JoinHandle<()>) {
     let (event_tx, event_rx) = mpsc::channel(256);
     let (cancel_tx, cancel_rx) = watch::channel(false);
-    let handle = tokio::spawn(run(processes, spec, event_tx, cancel_rx));
+    let handle = tokio::spawn(run(processes, op, spec, event_tx, cancel_rx));
     (event_rx, cancel_tx, handle)
 }
 
 #[cfg(test)]
 fn spawn(spec: RunSpec) -> (mpsc::Receiver<RunEvent>, watch::Sender<bool>, JoinHandle<()>) {
-    spawn_with_supervisor(
+    spawn_with_supervisor_and_op(
         ProcessSupervisor::bootstrap().expect("bootstrap process supervisor for deploy test"),
+        tests::passthrough_op_client(),
         spec,
     )
 }
 
 async fn run(
     processes: ProcessSupervisor,
+    op: OpClient,
     spec: RunSpec,
     event_tx: mpsc::Sender<RunEvent>,
     mut cancel_rx: watch::Receiver<bool>,
@@ -170,6 +175,7 @@ async fn run(
             let working_dir = resolve_working_dir(&spec.base_dir, target, step_index);
             let outcome = execute(StepExecution {
                 processes: &processes,
+                op: &op,
                 action: &step.action,
                 working_dir: &working_dir,
                 version: &run_target.version,
@@ -271,6 +277,7 @@ fn resolve_working_dir(
 async fn execute(execution: StepExecution<'_>) -> StepOutcome {
     let StepExecution {
         processes,
+        op,
         action,
         working_dir,
         version,
@@ -305,19 +312,16 @@ async fn execute(execution: StepExecution<'_>) -> StepOutcome {
     if let Some(branch) = branch {
         values.insert(OsString::from("KIT_DEPLOY_BRANCH"), OsString::from(branch));
     }
-    let process_environment =
-        match ProcessEnvironment::new(EnvironmentBase::Inherit, values, BTreeSet::new()) {
-            Ok(environment) => environment,
-            Err(error) => {
-                return StepOutcome::Failed(format!("prepare action environment: {error}"));
-            }
-        };
     let label = ProcessLabel::new("deploy step".to_owned()).expect("static process label is valid");
-    let command =
-        match CommandSpec::new(program, arguments, working_dir, process_environment, label) {
-            Ok(command) => command,
-            Err(error) => return StepOutcome::Failed(format!("prepare action: {error}")),
-        };
+    let references = environment.references();
+    let prepared = match op.prepare_run(&references, program, arguments) {
+        Ok(prepared) => prepared,
+        Err(error) => return StepOutcome::Failed(format!("prepare masked action: {error}")),
+    };
+    let command = match prepared.command_spec(working_dir, values, label) {
+        Ok(command) => command,
+        Err(error) => return StepOutcome::Failed(format!("prepare masked action: {error}")),
+    };
     let stream = OutputPolicy::Stream(StreamPolicy::new(OUTPUT_IN_FLIGHT_BYTES));
     let process = ProcessSpec::new(
         command,
@@ -436,13 +440,17 @@ fn stream_lines(
             match output.next().await.map_err(|error| error.to_string())? {
                 ProcessByteEvent::Chunk { bytes, .. } => {
                     pending.extend_from_slice(bytes.as_ref());
+                    if pending.len() > MAX_OUTPUT_LINE_BYTES {
+                        return Err(format!(
+                            "masked process output line exceeded the {MAX_OUTPUT_LINE_BYTES}-byte limit"
+                        ));
+                    }
                     emit_complete_lines(&mut pending, stream, &event_tx).await?;
                 }
                 ProcessByteEvent::End => {
                     if !pending.is_empty() {
-                        let line = decode_line(&pending);
                         event_tx
-                            .send(RunEvent::Output { stream, line })
+                            .send(RunEvent::Output { stream, line: decode_line(&pending) })
                             .await
                             .map_err(|_| "deploy output consumer closed".to_owned())?;
                     }
@@ -464,13 +472,6 @@ async fn emit_complete_lines(
         line.pop();
         event_tx
             .send(RunEvent::Output { stream, line: decode_line(&line) })
-            .await
-            .map_err(|_| "deploy output consumer closed".to_owned())?;
-    }
-    while pending.len() >= LINE_FRAGMENT_BYTES {
-        let fragment = pending.drain(..LINE_FRAGMENT_BYTES).collect::<Vec<_>>();
-        event_tx
-            .send(RunEvent::Output { stream, line: decode_line(&fragment) })
             .await
             .map_err(|_| "deploy output consumer closed".to_owned())?;
     }
@@ -524,7 +525,10 @@ fn outcome_from_report(report: ProcessReport) -> StepOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::deploy::{config::DeployStep, environment::parse_dotenv};
+    use crate::tools::deploy::{
+        config::DeployStep,
+        environment::{parse_dotenv, TargetEnvironment},
+    };
 
     fn target(action: DeployAction) -> DeployTarget {
         DeployTarget {
@@ -537,6 +541,12 @@ mod tests {
             backend: None,
             rollback: None,
         }
+    }
+
+    pub(super) fn passthrough_op_client() -> OpClient {
+        OpClient::with_executable(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-op"),
+        )
     }
 
     async fn final_outcome(spec: RunSpec) -> RunOutcome {
@@ -681,6 +691,66 @@ mod tests {
 
         assert_eq!(result.0, RunOutcome::Succeeded);
         assert_eq!(result.1, "from-process");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn target_environment_cannot_disable_op_run_masking(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let environment = parse_dotenv("OP_RUN_NO_MASKING=1")?;
+
+        let (outcome, output) = output_for(environment, "OP_RUN_NO_MASKING").await;
+
+        assert_eq!(outcome, RunOutcome::Succeeded);
+        assert!(output.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn masked_op_run_never_emits_secret_even_after_a_long_unterminated_line(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        const FORBIDDEN: &str = "forbidden-plaintext-runner-fixture";
+        let environment = parse_dotenv("FORBIDDEN_SECRET=op://Tests/runner/secret")?;
+        let spec = RunSpec {
+            base_dir: std::env::temp_dir(),
+            operation: RunOperation::Deploy,
+            targets: vec![RunTargetSpec {
+                target: target(DeployAction::Shell {
+                    script: concat!(
+                        "i=0; ",
+                        "while [ \"$i\" -lt 70000 ]; do printf x; i=$((i + 1)); done; ",
+                        "printf '%s' \"$FORBIDDEN_SECRET\""
+                    )
+                    .to_owned(),
+                }),
+                version: VersionId("abc123".to_owned()),
+                branch: None,
+                environment,
+            }],
+        };
+        let (mut events, _cancel, handle) = spawn_with_supervisor_and_op(
+            ProcessSupervisor::bootstrap()?,
+            passthrough_op_client(),
+            spec,
+        );
+        let mut outcome = RunOutcome::Failed;
+        let mut output = String::new();
+        while let Some(event) = events.recv().await {
+            match event {
+                RunEvent::Output { line, .. } => {
+                    assert!(!line.contains(FORBIDDEN));
+                    output.push_str(&line);
+                }
+                RunEvent::Finished { outcome: finished, .. } => outcome = finished,
+                _ => {}
+            }
+        }
+        handle.await?;
+
+        assert_eq!(outcome, RunOutcome::Succeeded);
+        assert!(output.len() >= 70_000);
+        assert!(output.contains("«concealed»"));
+        assert!(!output.contains(FORBIDDEN));
         Ok(())
     }
 }

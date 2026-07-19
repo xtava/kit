@@ -35,6 +35,7 @@ use super::{
     },
 };
 use crate::framework::{open_external, process::ProcessSupervisor, ExternalTarget};
+use crate::onepassword::OpClient;
 use crate::tui::{
     render_split_divider, Direction, EventReader, NavigationMap, NavigationRegion, Session,
     SessionOptions, SplitDividerStyle,
@@ -85,6 +86,8 @@ pub async fn run(startup: Startup) -> Result<Option<RunOutcome>> {
     let mut cancel: Option<watch::Sender<bool>> = None;
     let mut run_handle: Option<JoinHandle<()>> = None;
     let mut versions_handle: Option<JoinHandle<()>> = None;
+    let mut preparation_handle: Option<(u64, JoinHandle<()>)> = None;
+    let mut next_preparation_id = 0_u64;
     let mut run_active = false;
     let mut quit_after_run = false;
     let mut fatal_error = None;
@@ -96,7 +99,7 @@ pub async fn run(startup: Startup) -> Result<Option<RunOutcome>> {
 
         tokio::select! {
             _ = tick.tick() => {
-                if app.phase == Phase::Running
+                if matches!(app.phase, Phase::Preparing | Phase::Running)
                     || matches!(app.versions, VersionsState::CloudflareLoading)
                 {
                     app.spinner = app.spinner.wrapping_add(1);
@@ -147,6 +150,30 @@ pub async fn run(startup: Startup) -> Result<Option<RunOutcome>> {
                             app.notice = Some(format!("Could not delete {short_id}: {error}"));
                         }
                     },
+                    Some(BackendEvent::RunPrepared { preparation_id, result }) => {
+                        let current = preparation_handle
+                            .as_ref()
+                            .is_some_and(|(active_id, _)| *active_id == preparation_id);
+                        if current {
+                            preparation_handle = None;
+                            if app.phase == Phase::Preparing {
+                                match result {
+                                    Ok(spec) => {
+                                        app.begin_run(&spec);
+                                        let (receiver, cancel_tx, handle) =
+                                            runner::spawn_with_supervisor(processes.clone(), spec);
+                                        run_events = receiver;
+                                        cancel = Some(cancel_tx);
+                                        run_handle = Some(handle);
+                                        run_active = true;
+                                    }
+                                    Err(error) => {
+                                        app.fail_run_preparation(error);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     None => {}
                 }
             }
@@ -174,6 +201,12 @@ pub async fn run(startup: Startup) -> Result<Option<RunOutcome>> {
                             let _ = cancel.send(true);
                             app.notice = Some("Cancelling the active Step…".to_owned());
                         }
+                    }
+                    UiAction::CancelPreparation => {
+                        if let Some((_, handle)) = preparation_handle.take() {
+                            handle.abort();
+                        }
+                        app.back_from_review();
                     }
                     UiAction::LoadVersions => {
                         if let Some(handle) = versions_handle.take() {
@@ -229,34 +262,28 @@ pub async fn run(startup: Startup) -> Result<Option<RunOutcome>> {
                                     .get(target_index)
                                     .cloned()
                                     .ok_or_else(|| anyhow!("selected Cloudflare Pages Target no longer exists"))?;
-                                let environment = app
-                                    .loaded
-                                    .environments
-                                    .get(&target.id)
-                                    .ok_or_else(|| anyhow!("Target '{}' has no loaded environment", target.id))?;
-                                let client = CloudflarePagesClient::for_target(&target, environment)?
-                                    .ok_or_else(|| anyhow!("selected Target has no Cloudflare Pages backend"))?;
+                                let environment = target_environment(&app.loaded, &target.id)?;
                                 app.begin_cloudflare_rollback(&target, &deployment);
                                 let (receiver, cancel_tx, handle) =
-                                    spawn_cloudflare_rollback(client, deployment.id);
+                                    spawn_cloudflare_rollback(target, environment, deployment.id);
                                 run_events = receiver;
                                 cancel = Some(cancel_tx);
                                 run_handle = Some(handle);
                                 run_active = true;
                             }
-                            Some(
-                                RunIntent::Deploy
-                                | RunIntent::DeployPreview { .. }
-                                | RunIntent::Rollback { .. },
-                            ) => {
-                                let spec = prepare_run(&app, &journal_store).await?;
-                                app.begin_run(&spec);
-                                let (receiver, cancel_tx, handle) =
-                                    runner::spawn_with_supervisor(processes.clone(), spec);
-                                run_events = receiver;
-                                cancel = Some(cancel_tx);
-                                run_handle = Some(handle);
-                                run_active = true;
+                            Some(intent) => {
+                                if preparation_handle.is_none() {
+                                    next_preparation_id = next_preparation_id.wrapping_add(1);
+                                    let handle = spawn_run_preparation(
+                                        &app,
+                                        intent,
+                                        journal_store.clone(),
+                                        next_preparation_id,
+                                        backend_tx.clone(),
+                                    );
+                                    app.begin_run_preparation();
+                                    preparation_handle = Some((next_preparation_id, handle));
+                                }
                             }
                             None => return Err(anyhow!("no deploy Run is selected")),
                         }
@@ -275,6 +302,9 @@ pub async fn run(startup: Startup) -> Result<Option<RunOutcome>> {
         let _ = handle.await;
     }
     if let Some(handle) = versions_handle {
+        handle.abort();
+    }
+    if let Some((_, handle)) = preparation_handle {
         handle.abort();
     }
     let layout_exit_warning = if layout_dirty {
@@ -302,6 +332,7 @@ enum UiAction {
     Quit,
     Start,
     Cancel,
+    CancelPreparation,
     LoadVersions,
     PersistLayout,
     PersistAnnotations,
@@ -476,6 +507,11 @@ fn handle_key(key: KeyEvent, app: &mut App) -> UiAction {
             KeyCode::Enter => UiAction::Start,
             _ => UiAction::None,
         },
+        Phase::Preparing => match key.code {
+            KeyCode::Esc => UiAction::CancelPreparation,
+            KeyCode::Char('q') => UiAction::Quit,
+            _ => UiAction::None,
+        },
         Phase::Running => {
             if matches!(key.code, KeyCode::Up | KeyCode::Char('k')) {
                 scroll_or_select(app, -1);
@@ -494,6 +530,14 @@ fn handle_key(key: KeyEvent, app: &mut App) -> UiAction {
                 Some(url) => UiAction::OpenUrl { url },
                 None => UiAction::None,
             },
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.scroll_summary_log(-1);
+                UiAction::None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.scroll_summary_log(1);
+                UiAction::None
+            }
             _ => UiAction::None,
         },
     }
@@ -646,76 +690,74 @@ fn persist_layout(app: &mut App, store: &LayoutStore, dirty: &mut bool) {
     }
 }
 
-async fn prepare_run(app: &App, journal_store: &JournalStore) -> Result<RunSpec> {
-    match app.intent.as_ref().ok_or_else(|| anyhow!("no deploy Run is selected"))? {
+fn spawn_run_preparation(
+    app: &App,
+    intent: RunIntent,
+    journal_store: JournalStore,
+    preparation_id: u64,
+    sender: mpsc::Sender<BackendEvent>,
+) -> JoinHandle<()> {
+    let loaded = app.loaded.clone();
+    let targets = app.review_targets();
+    tokio::spawn(async move {
+        let result = prepare_run(&loaded, intent, targets, &journal_store)
+            .await
+            .map_err(|error| format!("{error:#}"));
+        let _ = sender.send(BackendEvent::RunPrepared { preparation_id, result }).await;
+    })
+}
+
+async fn prepare_run(
+    loaded: &LoadedPlan,
+    intent: RunIntent,
+    review_targets: Vec<DeployTarget>,
+    journal_store: &JournalStore,
+) -> Result<RunSpec> {
+    let op = OpClient::new();
+    match intent {
         RunIntent::Deploy => {
             let mut targets = Vec::new();
-            for target in app.selected_targets() {
-                let working_dir = target_working_dir(&app.loaded.base_dir, &target);
+            for target in review_targets {
+                let working_dir = target_working_dir(&loaded.base_dir, &target);
                 let version = journal_store.current_version(&target.id, &working_dir).await?;
-                let environment =
-                    app.loaded.environments.get(&target.id).cloned().ok_or_else(|| {
-                        anyhow!("Target '{}' has no loaded environment", target.id)
-                    })?;
-                let branch = cloudflare_production_branch(&target, &environment).await?;
+                let environment = target_environment(loaded, &target.id)?;
+                let branch = cloudflare_production_branch(&target, &environment, &op).await?;
                 targets.push(RunTargetSpec { target, version, branch, environment });
             }
             Ok(RunSpec {
-                base_dir: app.loaded.base_dir.clone(),
+                base_dir: loaded.base_dir.clone(),
                 operation: RunOperation::Deploy,
                 targets,
             })
         }
         RunIntent::DeployPreview { branch, .. } => {
-            let target = app
-                .review_targets()
+            let target = review_targets
                 .into_iter()
                 .next()
                 .ok_or_else(|| anyhow!("selected preview Target no longer exists"))?;
-            let working_dir = target_working_dir(&app.loaded.base_dir, &target);
+            let working_dir = target_working_dir(&loaded.base_dir, &target);
             let version = journal_store.current_version(&target.id, &working_dir).await?;
-            let environment = app
-                .loaded
-                .environments
-                .get(&target.id)
-                .cloned()
-                .ok_or_else(|| anyhow!("Target '{}' has no loaded environment", target.id))?;
-            let production = cloudflare_production_branch(&target, &environment)
+            let environment = target_environment(loaded, &target.id)?;
+            let production = cloudflare_production_branch(&target, &environment, &op)
                 .await?
                 .ok_or_else(|| anyhow!("selected Target has no Cloudflare Pages backend"))?;
-            ensure_preview_branch(branch, &production)?;
+            ensure_preview_branch(&branch, &production)?;
             Ok(RunSpec {
-                base_dir: app.loaded.base_dir.clone(),
+                base_dir: loaded.base_dir.clone(),
                 operation: RunOperation::Deploy,
-                targets: vec![RunTargetSpec {
-                    target,
-                    version,
-                    branch: Some(branch.clone()),
-                    environment,
-                }],
+                targets: vec![RunTargetSpec { target, version, branch: Some(branch), environment }],
             })
         }
         RunIntent::Rollback { version, .. } => {
-            let target = app
-                .review_targets()
+            let target = review_targets
                 .into_iter()
                 .next()
                 .ok_or_else(|| anyhow!("selected Target has no rollback Steps"))?;
-            let environment = app
-                .loaded
-                .environments
-                .get(&target.id)
-                .cloned()
-                .ok_or_else(|| anyhow!("Target '{}' has no loaded environment", target.id))?;
+            let environment = target_environment(loaded, &target.id)?;
             Ok(RunSpec {
-                base_dir: app.loaded.base_dir.clone(),
+                base_dir: loaded.base_dir.clone(),
                 operation: RunOperation::Rollback { selected_version: version.clone() },
-                targets: vec![RunTargetSpec {
-                    target,
-                    version: version.clone(),
-                    branch: None,
-                    environment,
-                }],
+                targets: vec![RunTargetSpec { target, version, branch: None, environment }],
             })
         }
         RunIntent::CloudflarePagesRollback { .. } => {
@@ -727,8 +769,9 @@ async fn prepare_run(app: &App, journal_store: &JournalStore) -> Result<RunSpec>
 async fn cloudflare_production_branch(
     target: &DeployTarget,
     environment: &super::environment::TargetEnvironment,
+    op: &OpClient,
 ) -> Result<Option<String>> {
-    let Some(client) = CloudflarePagesClient::for_target(target, environment)? else {
+    let Some(client) = CloudflarePagesClient::for_target(target, environment, op).await? else {
         return Ok(None);
     };
     Ok(Some(client.get_project().await?.production_branch))
@@ -744,20 +787,33 @@ fn ensure_preview_branch(branch: &str, production: &str) -> Result<()> {
 enum BackendEvent {
     VersionsLoaded { target_id: String, result: Result<CloudflareVersions, String> },
     Deleted { short_id: String, result: Result<(), String> },
+    RunPrepared { preparation_id: u64, result: Result<RunSpec, String> },
+}
+
+fn target_environment(
+    loaded: &LoadedPlan,
+    target_id: &str,
+) -> Result<super::environment::TargetEnvironment> {
+    loaded
+        .environments
+        .get(target_id)
+        .cloned()
+        .ok_or_else(|| anyhow!("Target '{target_id}' has no loaded environment"))
 }
 
 fn spawn_versions_load(app: &App, sender: mpsc::Sender<BackendEvent>) -> Result<JoinHandle<()>> {
-    let target = app.focused_target().ok_or_else(|| anyhow!("no Target is selected"))?;
+    let target = app.focused_target().cloned().ok_or_else(|| anyhow!("no Target is selected"))?;
     let target_id = target.id.clone();
-    let environment = app
-        .loaded
-        .environments
-        .get(&target.id)
-        .ok_or_else(|| anyhow!("Target '{}' has no loaded environment", target.id))?;
-    let client = CloudflarePagesClient::for_target(target, environment)?
-        .ok_or_else(|| anyhow!("selected Target has no Cloudflare Pages backend"))?;
+    let environment = target_environment(&app.loaded, &target.id)?;
     Ok(tokio::spawn(async move {
-        let result = client.load_versions().await.map_err(|error| error.to_string());
+        let result = async {
+            let client = CloudflarePagesClient::for_target(&target, &environment, &OpClient::new())
+                .await?
+                .ok_or_else(|| anyhow!("selected Target has no Cloudflare Pages backend"))?;
+            client.load_versions().await.map_err(anyhow::Error::from)
+        }
+        .await
+        .map_err(|error| format!("{error:#}"));
         let _ = sender.send(BackendEvent::VersionsLoaded { target_id, result }).await;
     }))
 }
@@ -768,23 +824,24 @@ fn spawn_delete(
     short_id: String,
     sender: mpsc::Sender<BackendEvent>,
 ) -> Result<JoinHandle<()>> {
-    let target = app.focused_target().ok_or_else(|| anyhow!("no Target is selected"))?;
-    let environment = app
-        .loaded
-        .environments
-        .get(&target.id)
-        .ok_or_else(|| anyhow!("Target '{}' has no loaded environment", target.id))?;
-    let client = CloudflarePagesClient::for_target(target, environment)?
-        .ok_or_else(|| anyhow!("selected Target has no Cloudflare Pages backend"))?;
+    let target = app.focused_target().cloned().ok_or_else(|| anyhow!("no Target is selected"))?;
+    let environment = target_environment(&app.loaded, &target.id)?;
     Ok(tokio::spawn(async move {
-        let result =
-            client.delete_deployment(&deployment_id).await.map_err(|error| error.to_string());
+        let result = async {
+            let client = CloudflarePagesClient::for_target(&target, &environment, &OpClient::new())
+                .await?
+                .ok_or_else(|| anyhow!("selected Target has no Cloudflare Pages backend"))?;
+            client.delete_deployment(&deployment_id).await.map_err(anyhow::Error::from)
+        }
+        .await
+        .map_err(|error| format!("{error:#}"));
         let _ = sender.send(BackendEvent::Deleted { short_id, result }).await;
     }))
 }
 
 fn spawn_cloudflare_rollback(
-    client: CloudflarePagesClient,
+    target: DeployTarget,
+    environment: super::environment::TargetEnvironment,
     deployment_id: String,
 ) -> (mpsc::Receiver<runner::RunEvent>, watch::Sender<bool>, JoinHandle<()>) {
     let (event_tx, event_rx) = mpsc::channel(16);
@@ -805,8 +862,16 @@ fn spawn_cloudflare_rollback(
             }
         };
         tokio::pin!(cancellation);
+        let rollback = async {
+            let client = CloudflarePagesClient::for_target(&target, &environment, &OpClient::new())
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "selected Target has no Cloudflare Pages backend".to_owned())?;
+            client.rollback(&deployment_id).await.map_err(|error| error.to_string())
+        };
+        tokio::pin!(rollback);
         let result = tokio::select! {
-            result = client.rollback(&deployment_id) => Some(result),
+            result = &mut rollback => Some(result),
             () = &mut cancellation => None,
         };
         let elapsed = started.elapsed();
@@ -920,7 +985,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App, journal_path: &Path) {
     match app.phase {
         Phase::Browse => render_browse(frame, areas[1], app),
         Phase::Versions => render_versions(frame, areas[1], app),
-        Phase::Review => render_review(frame, areas[1], app),
+        Phase::Review | Phase::Preparing => render_review(frame, areas[1], app),
         Phase::Running => render_running(frame, areas[1], app),
         Phase::Summary => render_summary(frame, areas[1], app, journal_path),
     }
@@ -1038,6 +1103,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Phase::Browse => "targets",
         Phase::Versions => "versions",
         Phase::Review => "review",
+        Phase::Preparing => "preparing",
         Phase::Running => "running",
         Phase::Summary => "summary",
     };
@@ -1736,10 +1802,37 @@ fn render_summary(frame: &mut Frame<'_>, area: Rect, app: &App, journal_path: &P
         },
         Style::default().fg(MUTED),
     ));
+    if app.output.is_empty() {
+        frame.render_widget(
+            Paragraph::new(lines).wrap(Wrap { trim: false }).block(panel(" Summary ")),
+            area,
+        );
+        return;
+    }
+    let panes =
+        Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).split(area);
     frame.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }).block(panel(" Summary ")),
-        area,
+        panes[0],
     );
+    let log_area = panes[1];
+    let inner_height = log_area.height.saturating_sub(2) as usize;
+    let output_end = app.output.len().saturating_sub(app.secondary_scroll as usize);
+    let output_start = output_end.saturating_sub(inner_height);
+    let output = app
+        .output
+        .iter()
+        .skip(output_start)
+        .take(output_end.saturating_sub(output_start))
+        .map(|line| {
+            let style = match line.stream {
+                OutputStream::Stdout => Style::default().fg(TEXT),
+                OutputStream::Stderr => Style::default().fg(YELLOW),
+            };
+            Line::styled(truncate(&line.text, log_area.width.saturating_sub(4) as usize), style)
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(output).block(panel(" Deploy log · ↑↓ scroll ")), log_area);
 }
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -1751,8 +1844,13 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         None => modal_free_controls(app),
     };
     if let Some(notice) = &app.notice {
+        let notice = if app.phase == Phase::Preparing {
+            format!("{} {notice}", SPINNER[app.spinner % SPINNER.len()])
+        } else {
+            notice.clone()
+        };
         let lines = vec![
-            Line::styled(notice.clone(), Style::default().fg(YELLOW)),
+            Line::styled(notice, Style::default().fg(YELLOW)),
             Line::styled(controls, Style::default().fg(MUTED)),
         ];
         frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), area);
@@ -1788,10 +1886,11 @@ fn modal_free_controls(app: &App) -> &'static str {
             }
         }
         Phase::Review => "Enter run   Esc back   q quit",
+        Phase::Preparing => "Esc cancel preparation   q quit",
         Phase::Running => {
             "↑↓ scroll   ←→/Tab region   drag resize   = reset   Ctrl-C cancel safely"
         }
-        Phase::Summary => "o open   Enter continue   q quit",
+        Phase::Summary => "↑↓ scroll logs   o open   Enter continue   q quit",
     }
 }
 

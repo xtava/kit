@@ -22,6 +22,7 @@ pub enum Phase {
     Browse,
     Versions,
     Review,
+    Preparing,
     Running,
     Summary,
 }
@@ -609,9 +610,30 @@ impl App {
         self.notice = None;
     }
 
+    /// Scroll the retained deploy log on the Summary screen; a negative delta scrolls back into
+    /// history, a positive delta returns toward the latest line.
+    pub fn scroll_summary_log(&mut self, delta: isize) {
+        let maximum = u16::try_from(self.output.len()).unwrap_or(u16::MAX);
+        self.secondary_scroll = if delta < 0 {
+            self.secondary_scroll.saturating_add(1).min(maximum)
+        } else {
+            self.secondary_scroll.saturating_sub(1)
+        };
+    }
+
     pub fn back_to_browse(&mut self) {
         self.change_phase(Phase::Browse);
         self.notice = None;
+    }
+
+    pub fn begin_run_preparation(&mut self) {
+        self.change_phase(Phase::Preparing);
+        self.notice = Some("Resolving deployment inputs…".to_owned());
+    }
+
+    pub fn fail_run_preparation(&mut self, error: String) {
+        self.change_phase(Phase::Review);
+        self.notice = Some(format!("Could not prepare Run: {error}"));
     }
 
     pub fn begin_run(&mut self, spec: &RunSpec) {
@@ -809,7 +831,7 @@ impl App {
             Phase::Browse => Some(SplitSurface::Browse),
             Phase::Versions => Some(SplitSurface::Versions),
             Phase::Running => Some(SplitSurface::Running),
-            Phase::Review | Phase::Summary => None,
+            Phase::Review | Phase::Preparing | Phase::Summary => None,
         }
     }
 
@@ -1073,6 +1095,21 @@ mod tests {
         app.toggle_focused();
         app.review_deploy();
         assert_eq!(app.phase, Phase::Review);
+    }
+
+    #[test]
+    fn run_preparation_is_an_explicit_phase_and_failure_returns_to_review() {
+        let mut app = app();
+        app.toggle_focused();
+        app.review_deploy();
+
+        app.begin_run_preparation();
+        assert_eq!(app.phase, Phase::Preparing);
+        assert!(app.notice.as_deref().is_some_and(|notice| notice.contains("Resolving")));
+
+        app.fail_run_preparation("synthetic failure".to_owned());
+        assert_eq!(app.phase, Phase::Review);
+        assert!(app.notice.as_deref().is_some_and(|notice| notice.contains("synthetic failure")));
     }
 
     #[test]

@@ -469,14 +469,15 @@ action = { type = "shell", script = " " }
 
         let loaded =
             LoadedPlan::load(Some(config_path), root.clone(), root.join("unused-xdg-deploy.toml"))?;
-        let value = loaded
-            .environments
-            .get("preview")
-            .and_then(|environment| environment.resolve("KIT_DEPLOY_RELATIVE_ENV_TEST"));
+        let environment = loaded.environments.get("preview").expect("preview environment loaded");
+        let value = environment
+            .child_values()
+            .find(|(name, _)| *name == "KIT_DEPLOY_RELATIVE_ENV_TEST")
+            .map(|(_, value)| value);
         let _ = std::fs::remove_dir_all(root);
 
         assert_eq!(loaded.plan.targets[0].env_file.as_deref(), Some(Path::new("secrets.env")));
-        assert_eq!(value.as_deref(), Some("loaded"));
+        assert_eq!(value, Some("loaded"));
         Ok(())
     }
 

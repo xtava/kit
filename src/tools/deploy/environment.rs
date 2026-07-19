@@ -6,10 +6,18 @@ use std::{
 
 use thiserror::Error;
 
-/// Validated dotenv values for one Target, with secret values redacted from Debug output.
+use crate::onepassword::SecretReference;
+
+/// Validated environment values for one Target, with values redacted from Debug output.
 #[derive(Clone, Default, Eq, PartialEq)]
 pub struct TargetEnvironment {
-    values: BTreeMap<String, String>,
+    values: BTreeMap<String, TargetEnvironmentValue>,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+enum TargetEnvironmentValue {
+    Literal(String),
+    Reference(SecretReference),
 }
 
 /// Loaded Target environments keyed by stable Target ID.
@@ -48,26 +56,34 @@ impl TargetEnvironment {
         })
     }
 
-    pub fn resolve(&self, name: &str) -> Option<String> {
-        self.resolve_with(name, |name| std::env::var(name))
-    }
-
+    /// Literal values absent from the parent environment are passed to `op run`. References are
+    /// kept out of the process environment and written only to its scoped refs file.
     pub fn child_values(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.values.iter().filter_map(|(name, value)| {
-            std::env::var_os(name).is_none().then_some((name.as_str(), value.as_str()))
+        self.values.iter().filter_map(|(name, value)| match value {
+            TargetEnvironmentValue::Literal(value) if std::env::var_os(name).is_none() => {
+                Some((name.as_str(), value.as_str()))
+            }
+            TargetEnvironmentValue::Literal(_) | TargetEnvironmentValue::Reference(_) => None,
         })
     }
 
-    fn resolve_with<F>(&self, name: &str, process_value: F) -> Option<String>
-    where
-        F: FnOnce(&str) -> Result<String, std::env::VarError>,
-    {
-        match process_value(name) {
-            Ok(value) => (!value.trim().is_empty()).then_some(value),
-            Err(std::env::VarError::NotPresent) => {
-                self.values.get(name).filter(|value| !value.trim().is_empty()).cloned()
-            }
-            Err(std::env::VarError::NotUnicode(_)) => None,
+    pub fn references(&self) -> BTreeMap<String, SecretReference> {
+        self.values
+            .iter()
+            .filter_map(|(name, value)| match value {
+                TargetEnvironmentValue::Reference(reference) => {
+                    Some((name.clone(), reference.clone()))
+                }
+                TargetEnvironmentValue::Literal(_) => None,
+            })
+            .collect()
+    }
+
+    /// Return exactly one configured reference for an in-process API consumer.
+    pub fn reference(&self, name: &str) -> Option<&SecretReference> {
+        match self.values.get(name) {
+            Some(TargetEnvironmentValue::Reference(reference)) => Some(reference),
+            Some(TargetEnvironmentValue::Literal(_)) | None => None,
         }
     }
 }
@@ -77,6 +93,14 @@ impl fmt::Debug for TargetEnvironment {
         formatter
             .debug_struct("TargetEnvironment")
             .field("value_count", &self.values.len())
+            .field(
+                "reference_count",
+                &self
+                    .values
+                    .values()
+                    .filter(|value| matches!(value, TargetEnvironmentValue::Reference(_)))
+                    .count(),
+            )
             .finish()
     }
 }
@@ -119,6 +143,13 @@ pub fn parse_dotenv(raw: &str) -> Result<TargetEnvironment, DotenvParseError> {
             ));
         }
         let value = parse_value(raw_value.trim(), line_number)?;
+        let value = if value.starts_with("op://") {
+            TargetEnvironmentValue::Reference(SecretReference::new(value).map_err(|error| {
+                parse_error(line_number, &format!("invalid 1Password reference: {error}"))
+            })?)
+        } else {
+            TargetEnvironmentValue::Literal(value)
+        };
         values.insert(name.to_owned(), value);
     }
     Ok(TargetEnvironment { values })
@@ -161,19 +192,47 @@ mod tests {
             "\n# deployment secrets\n PLAIN = value \nDOUBLE=\"two words\"\nSINGLE='three words'\nEMPTY=\n",
         )?;
 
-        assert_eq!(environment.values.get("PLAIN").map(String::as_str), Some("value"));
-        assert_eq!(environment.values.get("DOUBLE").map(String::as_str), Some("two words"));
-        assert_eq!(environment.values.get("SINGLE").map(String::as_str), Some("three words"));
-        assert_eq!(environment.values.get("EMPTY").map(String::as_str), Some(""));
+        let literal = |name| match environment.values.get(name) {
+            Some(TargetEnvironmentValue::Literal(value)) => Some(value.as_str()),
+            Some(TargetEnvironmentValue::Reference(_)) | None => None,
+        };
+        assert_eq!(literal("PLAIN"), Some("value"));
+        assert_eq!(literal("DOUBLE"), Some("two words"));
+        assert_eq!(literal("SINGLE"), Some("three words"));
+        assert_eq!(literal("EMPTY"), Some(""));
         Ok(())
     }
 
     #[test]
-    fn process_environment_overrides_file_value() -> Result<(), DotenvParseError> {
-        let environment = parse_dotenv("TOKEN=file-token")?;
-        let resolved = environment.resolve_with("TOKEN", |_| Ok("process-token".to_owned()));
+    fn separates_literal_child_values_from_onepassword_references(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let environment =
+            parse_dotenv("PLAIN=value\nOTHER=two words\nTOKEN=op://Deploy/example/token")?;
 
-        assert_eq!(resolved.as_deref(), Some("process-token"));
+        assert_eq!(
+            environment.child_values().collect::<Vec<_>>(),
+            [("OTHER", "two words"), ("PLAIN", "value")]
+        );
+        assert_eq!(
+            environment.references().get("TOKEN").map(SecretReference::as_str),
+            Some("op://Deploy/example/token")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn debug_reports_shape_without_environment_values_or_reference_paths(
+    ) -> Result<(), DotenvParseError> {
+        let environment = parse_dotenv(
+            "PLAIN=literal-value-sentinel\nTOKEN=op://SensitiveVault/SensitiveItem/password",
+        )?;
+        let debug = format!("{environment:?}");
+
+        assert!(debug.contains("value_count: 2"));
+        assert!(debug.contains("reference_count: 1"));
+        assert!(!debug.contains("literal-value-sentinel"));
+        assert!(!debug.contains("SensitiveVault"));
+        assert!(!debug.contains("SensitiveItem"));
         Ok(())
     }
 

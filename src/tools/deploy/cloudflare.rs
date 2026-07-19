@@ -2,18 +2,18 @@ use reqwest::{Client, StatusCode, Url};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::onepassword::{OpClient, OpError, SecretBytes};
+
 use super::config::{DeployTarget, TargetBackend};
 use super::environment::TargetEnvironment;
 
 const API_ROOT: &str = "https://api.cloudflare.com/client/v4";
 
-#[derive(Clone)]
 pub struct CloudflarePagesClient {
     http: Client,
     account_id: String,
     project: String,
-    token_env: String,
-    environment: TargetEnvironment,
+    token: SecretBytes,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -86,9 +86,15 @@ pub struct CloudflareVersions {
 #[derive(Debug, Error)]
 pub enum CloudflareError {
     #[error(
-        "Cloudflare API token is unavailable; add '{token_env}' to this Target's env_file or set the environment variable to a Cloudflare API token with Pages read/write access"
+        "Cloudflare API token is unavailable; add '{token_env}=op://<vault>/<item>/<field>' to this Target's env_file"
     )]
     MissingToken { token_env: String },
+    #[error("resolve Cloudflare API token from '{token_env}': {source}")]
+    ResolveToken {
+        token_env: String,
+        #[source]
+        source: OpError,
+    },
     #[error("build Cloudflare API client: {0}")]
     BuildClient(#[source] reqwest::Error),
     #[error("build Cloudflare API URL")]
@@ -129,9 +135,10 @@ struct ResultInfo {
 struct RollbackRequest {}
 
 impl CloudflarePagesClient {
-    pub fn for_target(
+    pub async fn for_target(
         target: &DeployTarget,
         environment: &TargetEnvironment,
+        op: &OpClient,
     ) -> Result<Option<Self>, CloudflareError> {
         let Some(TargetBackend::CloudflarePages { account_id, project, token_env, .. }) =
             &target.backend
@@ -142,23 +149,28 @@ impl CloudflarePagesClient {
             .user_agent(concat!("kit/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(CloudflareError::BuildClient)?;
+        let reference = environment
+            .reference(token_env)
+            .ok_or_else(|| CloudflareError::MissingToken { token_env: token_env.to_owned() })?;
+        let token = op.read_reference(reference).await.map_err(|source| {
+            CloudflareError::ResolveToken { token_env: token_env.to_owned(), source }
+        })?;
         Ok(Some(Self {
             http,
             account_id: account_id.to_owned(),
             project: project.to_owned(),
-            token_env: token_env.to_owned(),
-            environment: environment.clone(),
+            token,
         }))
     }
 
     pub async fn list_deployments(&self) -> Result<Vec<CloudflareDeployment>, CloudflareError> {
-        let token = self.token()?;
-        let first = self.deployment_page(&token, None).await?;
+        let token = self.token.as_str();
+        let first = self.deployment_page(token, None).await?;
         let total_pages =
             first.result_info.as_ref().and_then(|info| info.total_pages).unwrap_or(1).max(1);
         let mut deployments = first.result.ok_or(CloudflareError::MissingResult)?;
         for page in 2..=total_pages {
-            let response = self.deployment_page(&token, Some(page)).await?;
+            let response = self.deployment_page(token, Some(page)).await?;
             deployments.extend(response.result.ok_or(CloudflareError::MissingResult)?);
         }
         deployments.sort_by(|left, right| right.created_on.cmp(&left.created_on));
@@ -180,7 +192,7 @@ impl CloudflarePagesClient {
         &self,
         deployment_id: &str,
     ) -> Result<CloudflareDeployment, CloudflareError> {
-        let token = self.token()?;
+        let token = self.token.as_str();
         let mut url = self.deployments_url()?;
         url.path_segments_mut()
             .map_err(|()| CloudflareError::InvalidUrl)?
@@ -208,7 +220,7 @@ impl CloudflarePagesClient {
     }
 
     pub async fn get_project(&self) -> Result<CloudflareProject, CloudflareError> {
-        let token = self.token()?;
+        let token = self.token.as_str();
         let response = self
             .http
             .get(self.project_url()?)
@@ -221,7 +233,7 @@ impl CloudflarePagesClient {
     }
 
     pub async fn delete_deployment(&self, deployment_id: &str) -> Result<(), CloudflareError> {
-        let token = self.token()?;
+        let token = self.token.as_str();
         let mut url = self.deployments_url()?;
         url.path_segments_mut().map_err(|()| CloudflareError::InvalidUrl)?.push(deployment_id);
         url.query_pairs_mut().append_pair("force", "true");
@@ -234,12 +246,6 @@ impl CloudflarePagesClient {
             .map_err(CloudflareError::Request)?;
         let _: ApiResponse<serde_json::Value> = decode(response).await?;
         Ok(())
-    }
-
-    fn token(&self) -> Result<String, CloudflareError> {
-        self.environment
-            .resolve(&self.token_env)
-            .ok_or_else(|| CloudflareError::MissingToken { token_env: self.token_env.clone() })
     }
 
     fn deployments_url(&self) -> Result<Url, CloudflareError> {
@@ -369,6 +375,12 @@ mod tests {
         }
     }
 
+    fn fake_op() -> OpClient {
+        OpClient::with_executable(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-op"),
+        )
+    }
+
     #[test]
     fn parses_cloudflare_deployment_response_with_extra_fields() -> Result<(), serde_json::Error> {
         let fixture = r#"{
@@ -400,21 +412,54 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn resolves_backend_token_from_target_environment() -> Result<(), Box<dyn std::error::Error>> {
-        let environment = parse_dotenv("KIT_DEPLOY_CLOUDFLARE_TOKEN_FROM_FILE_TEST=file-token")?;
-        let client = CloudflarePagesClient::for_target(&pages_target(), &environment)?
+    #[tokio::test]
+    async fn resolves_backend_token_from_target_environment(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let environment =
+            parse_dotenv("KIT_DEPLOY_CLOUDFLARE_TOKEN_FROM_FILE_TEST=op://Tests/read/success")?;
+        let client = CloudflarePagesClient::for_target(&pages_target(), &environment, &fake_op())
+            .await?
             .ok_or("Pages Target did not create a Cloudflare client")?;
 
-        assert_eq!(client.token()?.as_str(), "file-token");
+        assert_eq!(client.token.as_str(), "fixture-secret-value");
         Ok(())
     }
 
-    #[test]
-    fn first_page_uses_platform_defaults_and_later_pages_only_select_page(
+    #[tokio::test]
+    async fn rejects_a_literal_cloudflare_token_as_an_unmasked_secret_source(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let environment = TargetEnvironment::default();
-        let client = CloudflarePagesClient::for_target(&pages_target(), &environment)?
+        let environment = parse_dotenv("KIT_DEPLOY_CLOUDFLARE_TOKEN_FROM_FILE_TEST=file-token")?;
+        let result =
+            CloudflarePagesClient::for_target(&pages_target(), &environment, &fake_op()).await;
+        let Err(error) = result else { panic!("literal Cloudflare token unexpectedly succeeded") };
+
+        assert!(matches!(error, CloudflareError::MissingToken { .. }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolves_only_the_backend_token_and_ignores_unrelated_references(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let environment = parse_dotenv(
+            "KIT_DEPLOY_CLOUDFLARE_TOKEN_FROM_FILE_TEST=op://Tests/read/success\n\
+             CLOUDFLARE_ACCOUNT_ID=op://Tests/read/failure",
+        )?;
+        let client = CloudflarePagesClient::for_target(&pages_target(), &environment, &fake_op())
+            .await?
+            .ok_or("Pages Target did not create a Cloudflare client")?;
+
+        assert_eq!(client.token.as_str(), "fixture-secret-value");
+        assert_eq!(client.account_id, "<account-id>");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn first_page_uses_platform_defaults_and_later_pages_only_select_page(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let environment =
+            parse_dotenv("KIT_DEPLOY_CLOUDFLARE_TOKEN_FROM_FILE_TEST=op://Tests/read/success")?;
+        let client = CloudflarePagesClient::for_target(&pages_target(), &environment, &fake_op())
+            .await?
             .ok_or("Pages Target did not create a Cloudflare client")?;
 
         assert_eq!(client.deployment_page_url(None)?.query(), None);
