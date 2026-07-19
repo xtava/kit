@@ -228,6 +228,8 @@ struct App {
     suggestions: Option<SuggestionMenu>,
     search: Option<DocumentSearch>,
     toc_hits: Vec<TocHit>,
+    toc_toggle_hit: Option<Rect>,
+    toc_collapsed: bool,
     link_hits: Vec<LinkHit>,
     toc_split_ratio: SplitRatio,
     toc_split_frame: SplitFrame,
@@ -325,6 +327,8 @@ impl App {
             suggestions: None,
             search: None,
             toc_hits: Vec::new(),
+            toc_toggle_hit: None,
+            toc_collapsed: false,
             link_hits: Vec::new(),
             toc_split_ratio: DEFAULT_TOC_SPLIT_RATIO,
             toc_split_frame: SplitFrame::default(),
@@ -357,6 +361,14 @@ impl App {
             if key.code == KeyCode::Esc {
                 self.cancel_toc_drag();
             }
+            return Flow::Continue;
+        }
+        if self.input.value().is_empty()
+            && key.modifiers == KeyModifiers::CONTROL
+            && key.code == KeyCode::Char('t')
+            && self.toc_toggle_hit.is_some()
+        {
+            self.toggle_toc();
             return Flow::Continue;
         }
         if self.input.value().is_empty() && self.toc_split_frame.separator.width > 0 {
@@ -472,6 +484,13 @@ impl App {
         }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                if self
+                    .toc_toggle_hit
+                    .is_some_and(|area| rect_contains(area, mouse.column, mouse.row))
+                {
+                    self.toggle_toc();
+                    return;
+                }
                 if self.begin_toc_drag(mouse.column, mouse.row) {
                     return;
                 }
@@ -544,6 +563,12 @@ impl App {
 
     fn reset_toc_split(&mut self) {
         self.toc_split_ratio = DEFAULT_TOC_SPLIT_RATIO;
+    }
+
+    fn toggle_toc(&mut self) {
+        self.toc_collapsed = !self.toc_collapsed;
+        let action = if self.toc_collapsed { "collapsed" } else { "expanded" };
+        self.notice = Notice::info(format!("{action} contents panel"));
     }
 
     fn resize_toc_split(&mut self, cells: i16) {
@@ -662,7 +687,7 @@ impl App {
                 self.input.clear();
                 self.suggestions = None;
                 self.notice = Notice::info(
-                    "/find searches · n/N moves · drag or </> resizes · = resets · /quit exits"
+                    "/find searches · n/N moves · Ctrl-T toggles contents · drag or </> resizes · = resets · /quit exits"
                         .to_owned(),
                 );
                 Flow::Continue
@@ -1122,6 +1147,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
 
 fn render_document(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     app.toc_hits.clear();
+    app.toc_toggle_hit = None;
     app.link_hits.clear();
     app.toc_split_frame = SplitFrame::default();
     let Some(document) = &app.document else {
@@ -1146,10 +1172,11 @@ fn render_document(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 
     let renderer = MarkdownRenderer::new(app.theme);
     let toc_heading_depth = app.config.toc_heading_depth();
-    let supports_toc = area.width >= TOC_MIN_LAYOUT_WIDTH;
+    let toc_available =
+        area.width >= TOC_MIN_LAYOUT_WIDTH && has_heading(&document.markdown, toc_heading_depth);
     let mut document_area = area;
     let mut toc_area = None;
-    let rendered = if supports_toc && has_heading(&document.markdown, toc_heading_depth) {
+    let rendered = if toc_available && !app.toc_collapsed {
         let split = SplitFrame::horizontal(
             area,
             app.toc_split_ratio,
@@ -1162,7 +1189,7 @@ fn render_document(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     } else {
         renderer.render_with_outline(&document.markdown, area.width.saturating_sub(4).max(1))
     };
-    if toc_area.is_none() {
+    if !toc_available || app.toc_collapsed {
         app.cancel_toc_drag();
     }
     let mut text = rendered.text;
@@ -1189,12 +1216,28 @@ fn render_document(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         format!(" markdown ─ {}/{} ", app.scroll_top + 1, max_scroll + 1)
     };
     let scroll = app.scroll_top.min(u16::MAX as usize) as u16;
+    let mut document_panel = panel(title, app.theme);
+    if toc_available && app.toc_collapsed {
+        let toggle_title = " contents [+] ";
+        let width = (toggle_title.width() as u16).min(document_area.width.saturating_sub(2));
+        app.toc_toggle_hit = Some(Rect::new(
+            document_area.right().saturating_sub(1).saturating_sub(width),
+            document_area.y,
+            width,
+            1,
+        ));
+        document_panel = document_panel.title(
+            Line::styled(toggle_title, Style::default().fg(app.theme.accent)).right_aligned(),
+        );
+    }
     frame.render_widget(
-        Paragraph::new(text).block(panel(title, app.theme)).scroll((scroll, 0)),
+        Paragraph::new(text).block(document_panel).scroll((scroll, 0)),
         document_area,
     );
     if let Some(toc_area) = toc_area {
-        app.toc_hits = render_toc(frame, toc_area, &headings, app.scroll_top, app.theme);
+        let (hits, toggle_hit) = render_toc(frame, toc_area, &headings, app.scroll_top, app.theme);
+        app.toc_hits = hits;
+        app.toc_toggle_hit = Some(toggle_hit);
         render_split_divider(
             frame,
             app.toc_split_frame,
@@ -1247,7 +1290,7 @@ fn render_toc(
     headings: &[MarkdownHeading],
     scroll_top: usize,
     theme: TuiTheme,
-) -> Vec<TocHit> {
+) -> (Vec<TocHit>, Rect) {
     let active = headings.iter().rposition(|heading| heading.line <= scroll_top);
     let visible_rows = area.height.saturating_sub(2) as usize;
     let start = active
@@ -1287,11 +1330,17 @@ fn render_toc(
         })
         .collect();
     let title = active.map_or_else(
-        || " contents ".to_owned(),
-        |index| format!(" contents ─ {}/{} ", index + 1, headings.len()),
+        || " contents [-] ".to_owned(),
+        |index| format!(" contents [-] ─ {}/{} ", index + 1, headings.len()),
     );
-    frame.render_widget(Paragraph::new(lines).block(panel(title, theme)), area);
-    hits
+    let width = (title.width() as u16).min(area.width.saturating_sub(2));
+    let toggle_hit = Rect::new(area.x.saturating_add(1), area.y, width, 1);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(panel(Line::styled(title, Style::default().fg(theme.accent)), theme)),
+        area,
+    );
+    (hits, toggle_hit)
 }
 
 fn matching_document_lines(
@@ -1714,6 +1763,99 @@ mod tests {
             .join("\n");
         assert!(!narrow_screen.contains("contents"), "{narrow_screen}");
         assert_eq!(app.toc_split_frame, SplitFrame::default());
+        assert!(app.toc_toggle_hit.is_none());
+    }
+
+    #[test]
+    fn contents_control_toggles_by_keyboard_and_mouse() {
+        let temp = TempDir::new();
+        fs::write(temp.0.join("README.md"), "# Overview\n\nIntro.\n\n## Setup\n\nSteps.").unwrap();
+        let root = temp.0.canonicalize().unwrap();
+        let mut config = test_config(&temp);
+        config.set_toc_heading_depth(2).unwrap();
+        let mut app = App::new(
+            root.clone(),
+            test_index(&root),
+            Frecency::default(),
+            Some(PathBuf::from("README.md")),
+            config,
+            "nord".to_owned(),
+            theme::NORD,
+        )
+        .unwrap();
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let split_ratio = app.toc_split_ratio;
+        assert!(!app.toc_collapsed);
+        let toggle_hit = app.toc_toggle_hit.unwrap();
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: toggle_hit.x,
+            row: toggle_hit.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.toc_collapsed);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(app.toc_hits.is_empty());
+        assert_eq!(app.toc_split_frame, SplitFrame::default());
+        let toggle_hit = app.toc_toggle_hit.unwrap();
+        let screen = (0..terminal.backend().buffer().area.height)
+            .map(|y| {
+                (0..terminal.backend().buffer().area.width)
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen.contains("contents [+]"), "{screen}");
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: toggle_hit.x,
+            row: toggle_hit.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(!app.toc_collapsed);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.toc_split_ratio, split_ratio);
+        assert!(!app.toc_hits.is_empty());
+        assert_ne!(app.toc_split_frame, SplitFrame::default());
+
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert!(app.toc_collapsed);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert!(!app.toc_collapsed);
+    }
+
+    #[test]
+    fn contents_shortcut_does_not_capture_prompt_input() {
+        let temp = TempDir::new();
+        fs::write(temp.0.join("README.md"), "# Overview").unwrap();
+        let root = temp.0.canonicalize().unwrap();
+        let mut app = App::new(
+            root.clone(),
+            test_index(&root),
+            Frecency::default(),
+            Some(PathBuf::from("README.md")),
+            test_config(&temp),
+            "nord".to_owned(),
+            theme::NORD,
+        )
+        .unwrap();
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        assert_eq!(app.input.value(), "t");
+        assert!(!app.toc_collapsed);
+
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert_eq!(app.input.value(), "t");
+        assert!(!app.toc_collapsed);
     }
 
     #[test]
