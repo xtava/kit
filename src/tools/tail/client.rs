@@ -166,6 +166,7 @@ impl TailClient {
         let wait = started.session.wait();
         tokio::pin!(wait);
         let (report, cancelled) = tokio::select! {
+            biased;
             report = &mut wait => (report, false),
             changed = cancel.changed() => {
                 let _ = changed;

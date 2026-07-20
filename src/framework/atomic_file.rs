@@ -1,16 +1,13 @@
 use std::{
-    fs::{File, OpenOptions},
+    fs::{File, OpenOptions, TryLockError},
     io::Write,
     path::{Path, PathBuf},
 };
 
-#[cfg(target_os = "linux")]
-use std::fs::TryLockError;
-
 use thiserror::Error;
 
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 /// Shared lock and atomic-replacement mechanics for small Kit-owned state files.
 #[derive(Clone, Debug)]
@@ -21,7 +18,6 @@ pub struct AtomicFileWriter {
 }
 
 #[derive(Debug)]
-#[cfg(target_os = "linux")]
 pub enum AtomicFileTryLock {
     Acquired(File),
     Busy,
@@ -72,7 +68,6 @@ impl AtomicFileWriter {
     }
 
     /// Try to acquire the writer lock without waiting for another writer.
-    #[cfg(target_os = "linux")]
     pub fn try_lock(&self) -> Result<AtomicFileTryLock, AtomicFileError> {
         let (path, file) = self.open_lock()?;
         match file.try_lock() {
@@ -134,12 +129,37 @@ impl AtomicFileWriter {
     fn open_lock(&self) -> Result<(PathBuf, File), AtomicFileError> {
         self.ensure_dir()?;
         let path = self.dir.join(&self.lock_name);
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
+        let mut options = OpenOptions::new();
+        options.create(true).truncate(false).read(true).write(true);
+        #[cfg(unix)]
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        let file = options
             .open(&path)
+            .map_err(|source| AtomicFileError::OpenLock { path: path.clone(), source })?;
+        let metadata = file
+            .metadata()
+            .map_err(|source| AtomicFileError::OpenLock { path: path.clone(), source })?;
+        if !metadata.file_type().is_file() {
+            return Err(AtomicFileError::OpenLock {
+                path,
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "state lock is not a regular file",
+                ),
+            });
+        }
+        #[cfg(unix)]
+        if metadata.nlink() != 1 {
+            return Err(AtomicFileError::OpenLock {
+                path,
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "state lock has multiple hard links",
+                ),
+            });
+        }
+        #[cfg(unix)]
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
             .map_err(|source| AtomicFileError::OpenLock { path: path.clone(), source })?;
         Ok((path, file))
     }
@@ -162,6 +182,53 @@ mod tests {
 
         assert_eq!(std::fs::read(&path).expect("read state"), b"two");
         assert!(!dir.join(format!(".state.{}.tmp", std::process::id())).exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn try_lock_excludes_a_second_owner_and_releases_on_drop() {
+        let dir = std::env::temp_dir().join(format!(
+            "kit-atomic-file-lock-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let writer = AtomicFileWriter::new(&dir, "state.lock", ".state");
+
+        let AtomicFileTryLock::Acquired(first) = writer.try_lock().expect("acquire first lock")
+        else {
+            panic!("first owner must acquire the lock");
+        };
+        assert!(matches!(writer.try_lock().expect("probe second lock"), AtomicFileTryLock::Busy));
+        drop(first);
+        assert!(matches!(
+            writer.try_lock().expect("reacquire released lock"),
+            AtomicFileTryLock::Acquired(_)
+        ));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_refuses_a_symlink_without_touching_its_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let dir = std::env::temp_dir().join(format!(
+            "kit-atomic-file-symlink-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("outside");
+        std::fs::write(&target, b"unchanged").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        symlink(&target, dir.join("state.lock")).unwrap();
+        let writer = AtomicFileWriter::new(&dir, "state.lock", ".state");
+
+        assert!(writer.try_lock().is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"unchanged");
+        assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o644);
+
         let _ = std::fs::remove_dir_all(dir);
     }
 }

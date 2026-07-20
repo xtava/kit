@@ -3,7 +3,7 @@ use std::path::PathBuf;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PastedInput {
     Text(String),
-    Files(Vec<PathBuf>),
+    Files { raw: String, paths: Vec<PathBuf> },
     Ambiguous { raw: String, existing: Vec<PathBuf>, missing: Vec<String> },
 }
 
@@ -21,7 +21,7 @@ pub fn classify(raw: String) -> PastedInput {
         }
     }
     match (existing.is_empty(), missing.is_empty()) {
-        (false, true) => PastedInput::Files(existing),
+        (false, true) => PastedInput::Files { raw, paths: existing },
         (true, _) => PastedInput::Text(raw),
         (false, false) => PastedInput::Ambiguous { raw, existing, missing },
     }
@@ -83,7 +83,7 @@ mod tests {
         fs::write(&first, "a").unwrap();
         fs::write(&second, "c").unwrap();
         let raw = format!("'{}' {}", first.display(), url::Url::from_file_path(&second).unwrap());
-        assert_eq!(classify(raw), PastedInput::Files(vec![first, second]));
+        assert_eq!(classify(raw.clone()), PastedInput::Files { raw, paths: vec![first, second] });
         fs::remove_dir_all(temp).unwrap();
     }
 

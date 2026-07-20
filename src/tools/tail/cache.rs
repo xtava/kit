@@ -1,5 +1,5 @@
 use std::{
-    fs,
+    fs::{self, File},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -9,10 +9,15 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::framework::{AtomicFileTryLock, AtomicFileWriter};
+
 const RETENTION_SECONDS: i64 = 30 * 24 * 60 * 60;
 const TEXT_LIMIT_BYTES: u64 = 1024 * 1024;
 const MANIFEST: &str = "manifest.json";
 const PAYLOAD: &str = "payload";
+const INCOMING_PREFIX: &str = ".incoming-";
+const COMPLETED_PREFIX: &str = ".completed-";
+const RECEIVER_LOCK: &str = ".receiver.lock";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ItemKind {
@@ -63,9 +68,47 @@ pub struct StagingDirectory {
     consumed: bool,
 }
 
+pub struct CompletedStagingDirectory {
+    root: PathBuf,
+    path: PathBuf,
+}
+
+pub(super) enum ReceiverLeaseAttempt {
+    Acquired(ReceiverLease),
+    Busy,
+}
+
+pub(super) struct ReceiverLease {
+    cache: ReceiveCache,
+    _lock: File,
+}
+
+impl ReceiverLease {
+    pub(super) fn recover_staging(&self) -> Result<Vec<CachedItem>> {
+        self.cache.recover_staging()
+    }
+}
+
 impl StagingDirectory {
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Atomically record that Tailscale finished writing this receive batch.
+    pub fn complete(mut self) -> Result<CompletedStagingDirectory> {
+        ensure_staging_directory(&self.root, &self.path, INCOMING_PREFIX)?;
+        let id = staging_id(&self.path, INCOMING_PREFIX)
+            .context("receive staging directory has no valid identity")?;
+        let completed_path = self.root.join(format!("{COMPLETED_PREFIX}{id}"));
+        fs::rename(&self.path, &completed_path).with_context(|| {
+            format!(
+                "mark receive batch complete: {} -> {}",
+                self.path.display(),
+                completed_path.display()
+            )
+        })?;
+        self.consumed = true;
+        Ok(CompletedStagingDirectory { root: self.root.clone(), path: completed_path })
     }
 }
 
@@ -90,16 +133,29 @@ impl ReceiveCache {
     }
 
     pub fn staging_directory(&self) -> Result<StagingDirectory> {
-        let path = self.root.join(format!(".incoming-{}", Uuid::new_v4()));
+        let path = self.root.join(format!("{INCOMING_PREFIX}{}", Uuid::new_v4()));
         create_private_directory(&path)?;
         Ok(StagingDirectory { root: self.root.clone(), path, consumed: false })
     }
 
-    pub fn import_staging(&self, mut staging: StagingDirectory) -> Result<Vec<CachedItem>> {
+    pub(super) fn try_receiver_lease(&self) -> Result<ReceiverLeaseAttempt> {
+        let writer = AtomicFileWriter::new(&self.root, RECEIVER_LOCK, ".receiver");
+        match writer.try_lock()? {
+            AtomicFileTryLock::Acquired(lock) => {
+                Ok(ReceiverLeaseAttempt::Acquired(ReceiverLease {
+                    cache: self.clone(),
+                    _lock: lock,
+                }))
+            }
+            AtomicFileTryLock::Busy => Ok(ReceiverLeaseAttempt::Busy),
+        }
+    }
+
+    pub fn import_staging(&self, staging: CompletedStagingDirectory) -> Result<Vec<CachedItem>> {
         if staging.root != self.root {
             bail!("receive staging directory belongs to a different cache");
         }
-        ensure_direct_child(&self.root, &staging.path, ".incoming-")?;
+        ensure_staging_directory(&self.root, &staging.path, COMPLETED_PREFIX)?;
         let mut imported = Vec::new();
         for entry in fs::read_dir(&staging.path)
             .with_context(|| format!("read {}", staging.path.display()))?
@@ -112,7 +168,6 @@ impl ReceiveCache {
             match self.import_file(&entry.path()) {
                 Ok(item) => imported.push(item),
                 Err(error) => {
-                    staging.consumed = true;
                     return Err(error.context(format!(
                         "received files preserved in {}",
                         staging.path.display()
@@ -122,8 +177,38 @@ impl ReceiveCache {
         }
         fs::remove_dir_all(&staging.path)
             .with_context(|| format!("remove {}", staging.path.display()))?;
-        staging.consumed = true;
         Ok(imported)
+    }
+
+    fn recover_staging(&self) -> Result<Vec<CachedItem>> {
+        let mut paths = Vec::new();
+        let mut interrupted = 0_usize;
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let metadata = fs::symlink_metadata(entry.path())?;
+            if metadata.file_type().is_dir() {
+                if is_staging_name(&entry.file_name(), COMPLETED_PREFIX) {
+                    paths.push(entry.path());
+                } else if is_staging_name(&entry.file_name(), INCOMING_PREFIX) {
+                    interrupted += 1;
+                }
+            }
+        }
+        paths.sort();
+
+        let mut recovered = Vec::new();
+        for path in paths {
+            recovered.extend(
+                self.import_staging(CompletedStagingDirectory { root: self.root.clone(), path })?,
+            );
+        }
+        if interrupted > 0 {
+            bail!(
+                "{interrupted} interrupted receive batch(es) preserved in {}",
+                self.root.display()
+            );
+        }
+        Ok(recovered)
     }
 
     pub fn list(&self) -> Result<Vec<CachedItem>> {
@@ -285,6 +370,24 @@ fn ensure_direct_child(root: &Path, path: &Path, prefix: &str) -> Result<()> {
     Ok(())
 }
 
+fn ensure_staging_directory(root: &Path, path: &Path, prefix: &str) -> Result<()> {
+    ensure_direct_child(root, path, prefix)?;
+    if !path.file_name().is_some_and(|name| is_staging_name(name, prefix)) {
+        bail!("refusing unowned receive staging directory");
+    }
+    Ok(())
+}
+
+fn is_staging_name(name: &std::ffi::OsStr, prefix: &str) -> bool {
+    name.to_str()
+        .and_then(|name| name.strip_prefix(prefix))
+        .is_some_and(|id| Uuid::parse_str(id).is_ok())
+}
+
+fn staging_id<'a>(path: &'a Path, prefix: &str) -> Option<&'a str> {
+    path.file_name()?.to_str()?.strip_prefix(prefix).filter(|id| Uuid::parse_str(id).is_ok())
+}
+
 fn unique_destination(directory: &Path, name: &str) -> PathBuf {
     let safe_name = safe_name(name);
     let initial = directory.join(safe_name);
@@ -393,7 +496,7 @@ mod tests {
         let staging = cache.staging_directory().unwrap();
         let staging_path = staging.path().to_owned();
         fs::write(staging.path().join("note.txt"), "hello").unwrap();
-        let items = cache.import_staging(staging).unwrap();
+        let items = cache.import_staging(staging.complete().unwrap()).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].kind, ItemKind::Text);
         assert_eq!(cache.read_text(&items[0]).unwrap(), "hello");
@@ -422,12 +525,108 @@ mod tests {
     }
 
     #[test]
+    fn receiver_lease_excludes_parallel_watchers_and_releases_on_drop() {
+        let root = test_directory();
+        let cache = ReceiveCache::at(root.clone()).unwrap();
+
+        let ReceiverLeaseAttempt::Acquired(first) = cache.try_receiver_lease().unwrap() else {
+            panic!("first watcher must own the receiver lease");
+        };
+        assert!(matches!(cache.try_receiver_lease().unwrap(), ReceiverLeaseAttempt::Busy));
+        drop(first);
+        assert!(matches!(cache.try_receiver_lease().unwrap(), ReceiverLeaseAttempt::Acquired(_)));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn receiver_lease_recovers_only_completed_staging_before_watching() {
+        let root = test_directory();
+        let cache = ReceiveCache::at(root.clone()).unwrap();
+        let staging = cache.staging_directory().unwrap();
+        fs::write(staging.path().join("recovered.txt"), "survived").unwrap();
+        let completed = staging.complete().unwrap();
+        let completed_path = completed.path.clone();
+        drop(completed);
+
+        let ReceiverLeaseAttempt::Acquired(lease) = cache.try_receiver_lease().unwrap() else {
+            panic!("receiver lease must be available");
+        };
+        let recovered = lease.recover_staging().unwrap();
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(cache.read_text(&recovered[0]).unwrap(), "survived");
+        assert!(!completed_path.exists());
+        drop(lease);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn receiver_lease_never_imports_an_incomplete_staging_directory() {
+        let root = test_directory();
+        let cache = ReceiveCache::at(root.clone()).unwrap();
+        let staging = cache.staging_directory().unwrap();
+        let staging_path = staging.path().to_owned();
+        fs::write(staging.path().join("partial.txt"), "not proven complete").unwrap();
+        std::mem::forget(staging);
+
+        let ReceiverLeaseAttempt::Acquired(lease) = cache.try_receiver_lease().unwrap() else {
+            panic!("receiver lease must be available");
+        };
+        let error = lease.recover_staging().unwrap_err();
+        assert!(format!("{error:#}").contains("interrupted receive batch"));
+        assert_eq!(
+            fs::read_to_string(staging_path.join("partial.txt")).unwrap(),
+            "not proven complete"
+        );
+
+        drop(lease);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn completed_staging_is_preserved_when_import_fails() {
+        let root = test_directory();
+        let other_root = test_directory();
+        let cache = ReceiveCache::at(root.clone()).unwrap();
+        let other_cache = ReceiveCache::at(other_root.clone()).unwrap();
+        let staging = cache.staging_directory().unwrap();
+        fs::write(staging.path().join("keep.txt"), "keep").unwrap();
+        let completed = staging.complete().unwrap();
+        let completed_path = completed.path.clone();
+
+        assert!(other_cache.import_staging(completed).is_err());
+        assert_eq!(fs::read_to_string(completed_path.join("keep.txt")).unwrap(), "keep");
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(other_root).unwrap();
+    }
+
+    #[test]
+    fn staging_recovery_ignores_similarly_named_unowned_directories() {
+        let root = test_directory();
+        let cache = ReceiveCache::at(root.clone()).unwrap();
+        let unowned = root.join(".incoming-not-a-uuid");
+        fs::create_dir(&unowned).unwrap();
+        fs::write(unowned.join("keep.txt"), "keep").unwrap();
+
+        let ReceiverLeaseAttempt::Acquired(lease) = cache.try_receiver_lease().unwrap() else {
+            panic!("receiver lease must be available");
+        };
+        assert!(lease.recover_staging().unwrap().is_empty());
+        assert_eq!(fs::read_to_string(unowned.join("keep.txt")).unwrap(), "keep");
+
+        drop(lease);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn prune_removes_items_older_than_thirty_days() {
         let root = test_directory();
         let cache = ReceiveCache::at(root.clone()).unwrap();
         let staging = cache.staging_directory().unwrap();
         fs::write(staging.path().join("old.txt"), "old").unwrap();
-        let item = cache.import_staging(staging).unwrap().remove(0);
+        let item = cache.import_staging(staging.complete().unwrap()).unwrap().remove(0);
         let manifest = Manifest { name: item.name.clone(), received_at: 0 };
         fs::write(item.directory.join(MANIFEST), serde_json::to_vec(&manifest).unwrap()).unwrap();
         assert_eq!(cache.prune().unwrap(), 1);
@@ -445,7 +644,7 @@ mod tests {
         {
             let staging = cache.staging_directory().unwrap();
             fs::write(staging.path().join(name), name).unwrap();
-            let item = cache.import_staging(staging).unwrap().remove(0);
+            let item = cache.import_staging(staging.complete().unwrap()).unwrap().remove(0);
             let manifest = Manifest { name: item.name, received_at };
             fs::write(item.directory.join(MANIFEST), serde_json::to_vec(&manifest).unwrap())
                 .unwrap();
@@ -483,7 +682,7 @@ mod tests {
         let cache = ReceiveCache::at(root.clone()).unwrap();
         let staging = cache.staging_directory().unwrap();
         fs::write(staging.path().join("note.txt"), "new").unwrap();
-        let item = cache.import_staging(staging).unwrap().remove(0);
+        let item = cache.import_staging(staging.complete().unwrap()).unwrap().remove(0);
         fs::write(destination.join("note.txt"), "old").unwrap();
         let saved = cache.save_to(&item, &destination, SaveConflictResolution::Rename).unwrap();
         assert_eq!(saved.file_name().unwrap(), "note (1).txt");
@@ -500,7 +699,7 @@ mod tests {
         let cache = ReceiveCache::at(root.clone()).unwrap();
         let staging = cache.staging_directory().unwrap();
         fs::write(staging.path().join("note.txt"), "new").unwrap();
-        let item = cache.import_staging(staging).unwrap().remove(0);
+        let item = cache.import_staging(staging.complete().unwrap()).unwrap().remove(0);
         let destination_file = destination.join("note.txt");
         fs::write(&destination_file, "old").unwrap();
         let saved = cache.save_to(&item, &destination, SaveConflictResolution::Replace).unwrap();
@@ -522,7 +721,7 @@ mod tests {
         let outside = root.parent().unwrap().join(format!("outside-{}", Uuid::new_v4()));
         fs::write(&outside, "do not import").unwrap();
         symlink(&outside, staging.path().join("link")).unwrap();
-        let items = cache.import_staging(staging).unwrap();
+        let items = cache.import_staging(staging.complete().unwrap()).unwrap();
         assert!(items.is_empty());
         assert_eq!(fs::read_to_string(&outside).unwrap(), "do not import");
         fs::remove_file(outside).unwrap();

@@ -100,6 +100,10 @@ impl AttachedGroup {
     }
 
     pub(crate) fn spawn(&self, command: Command) -> Result<Child, ProcessStartError> {
+        let mut command = command;
+        if self.strength == ContainmentStrength::ProcessGroup {
+            arm_parent_death(&mut command);
+        }
         self.group
             .spawn(command)
             .map_err(|source| ProcessStartError::SpawnFailed { message: source.to_string() })
@@ -136,7 +140,7 @@ impl AttachedGroup {
             if let Some(guardian) = &self.guardian {
                 members.retain(|pid| *pid != guardian.pid);
             }
-            return Ok(members);
+            Ok(members)
         }
         #[cfg(not(target_os = "linux"))]
         Ok(members)
@@ -210,6 +214,31 @@ impl AttachedGroup {
         Ok(())
     }
 }
+
+#[cfg(target_os = "linux")]
+fn arm_parent_death(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    let owner_pid = std::process::id();
+    // ProcessKit's raw ProcessGroup::spawn seam cannot carry its kill_on_parent_death option.
+    // Mirror that option only for the process-group fallback; complete-tree containment has Kit's
+    // cgroup guardian, and process_group(0) runs before pre_exec. The parent check closes the race
+    // where Kit exits between fork and this hook executing.
+    unsafe {
+        command.as_std_mut().pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() as u32 != owner_pid {
+                libc::_exit(0);
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn arm_parent_death(_command: &mut Command) {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TerminationRequest {
@@ -319,4 +348,98 @@ fn open_own_cgroup_kill(owner_pid: u32) -> Option<std::fs::File> {
             .open(std::path::Path::new(root).join(relative).join("cgroup.kill"))
             .ok()
     })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use std::{
+        path::Path,
+        process::{Command as StdCommand, Stdio},
+        time::{Duration, Instant},
+    };
+
+    use tokio::process::Command;
+    use uuid::Uuid;
+
+    use super::AttachedGroup;
+    use crate::framework::process::{ContainmentRequirement, TerminationPolicy};
+
+    const HELPER_PID_FILE: &str = "KIT_ATTACHED_PARENT_DEATH_PID_FILE";
+
+    #[test]
+    #[ignore = "re-executed by attached_child_dies_when_its_kit_owner_is_killed"]
+    fn attached_parent_death_helper() {
+        let Some(pid_file) = std::env::var_os(HELPER_PID_FILE) else { return };
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async move {
+            let group = AttachedGroup::create(
+                ContainmentRequirement::ExplicitProcessGroup,
+                TerminationPolicy::new(Duration::from_millis(100)),
+            )
+            .await
+            .unwrap();
+            let mut command = Command::new("sleep");
+            command.arg("60").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+            let child = group.spawn(command).unwrap();
+            std::fs::write(pid_file, child.id().unwrap().to_string()).unwrap();
+
+            std::future::pending::<()>().await;
+            drop((child, group));
+        });
+    }
+
+    #[test]
+    fn attached_child_dies_when_its_kit_owner_is_killed() {
+        let directory =
+            std::env::temp_dir().join(format!("kit-attached-parent-death-{}", Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let pid_file = directory.join("child.pid");
+        let mut owner = StdCommand::new(std::env::current_exe().unwrap())
+            .arg("attached_parent_death_helper")
+            .arg("--ignored")
+            .arg("--nocapture")
+            .env(HELPER_PID_FILE, &pid_file)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        if !wait_until(Duration::from_secs(5), || pid_file.is_file()) {
+            let _ = owner.kill();
+            let _ = owner.wait();
+            panic!("attached owner did not publish its child pid");
+        }
+        let child_pid = std::fs::read_to_string(&pid_file).unwrap().trim().parse::<u32>().unwrap();
+        owner.kill().unwrap();
+        owner.wait().unwrap();
+
+        let child_died = wait_until(Duration::from_secs(5), || process_is_dead(child_pid));
+        if !child_died {
+            unsafe {
+                libc::kill(child_pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+        let _ = std::fs::remove_dir_all(directory);
+        assert!(child_died, "attached child {child_pid} survived its Kit owner");
+    }
+
+    fn wait_until(timeout: Duration, predicate: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if predicate() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        predicate()
+    }
+
+    fn process_is_dead(pid: u32) -> bool {
+        let path = format!("/proc/{pid}/stat");
+        let Ok(stat) = std::fs::read_to_string(Path::new(&path)) else { return true };
+        stat.rsplit_once(") ")
+            .and_then(|(_, fields)| fields.chars().next())
+            .is_some_and(|state| state == 'Z')
+    }
 }
