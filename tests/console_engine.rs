@@ -69,7 +69,7 @@ impl IsolatedAgent {
         }
         let child = command.spawn().expect("start isolated Console agent");
         let mut agent = Self { runtime_root, socket, log_path, child: Some(child) };
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(10);
         while !agent.socket.exists() && Instant::now() < deadline {
             if let Some(status) =
                 agent.child.as_mut().expect("live child").try_wait().expect("observe Console agent")
@@ -130,7 +130,7 @@ impl IsolatedAgent {
                     let _ = child.wait();
                 }
                 self.child.take();
-                bail!("Console agent did not stop within five seconds of SIGTERM");
+                bail!("Console agent did not stop within ten seconds of SIGTERM");
             }
             thread::sleep(Duration::from_millis(10));
         }

@@ -36,7 +36,7 @@ impl PublicConsole {
         command.env("TERM", "xterm-256color");
         command.env("RUST_BACKTRACE", "1");
         command.env("RUST_LOG", "wezterm_client=warn");
-        command.env("XDG_RUNTIME_DIR", harness.runtime_root());
+        command.env("KIT_CONSOLE_RUNTIME_DIR", harness.runtime_root());
         command.env("XDG_CONFIG_HOME", &config_root);
         let child = pair.slave.spawn_command(command).context("start public kit console")?;
         drop(pair.slave);
@@ -183,7 +183,7 @@ impl PublicConsole {
     }
 
     fn finish(mut self) -> Result<Vec<u8>> {
-        self.send(b"\x11")?;
+        self.send(b"\x02\x11")?;
         let deadline = Instant::now() + EXIT_TIMEOUT;
         let status = loop {
             if let Some(status) = self.child.try_wait().context("observe Console exit")? {
@@ -263,7 +263,7 @@ async fn public_console_drives_keyboard_mouse_history_resize_paste_and_clipboard
     std::fs::remove_file(&first_receipt).context("remove Console input receipt")?;
 
     console.clear_output()?;
-    console.send(b"\x0e")?;
+    console.send(b"\x02\x0e")?;
     if console.wait_for_any_output(&[b"attached", b"observing"])? == 1 {
         console.clear_output()?;
         console.send(b"\x02t")?;
@@ -283,7 +283,7 @@ async fn public_console_drives_keyboard_mouse_history_resize_paste_and_clipboard
     let title = format!("{shell_name}{title_suffix}");
     console.type_text(&title_suffix)?;
     console.send(b"\r")?;
-    console.wait_for_output(title.as_bytes())?;
+    console.wait_for_output(title_suffix.as_bytes())?;
 
     console.clear_output()?;
     console.send(b"\x02\x1b[D")?;
@@ -305,7 +305,7 @@ async fn public_console_drives_keyboard_mouse_history_resize_paste_and_clipboard
 
     console.clear_output()?;
     console.send(b"\x02\x1b[C")?;
-    console.wait_for_output(title.as_bytes())?;
+    console.wait_for_output(title_suffix.as_bytes())?;
     console.clear_output()?;
     console.send(b"t")?;
     console.wait_for_any_output(&[b"attached", b"already has control"])?;

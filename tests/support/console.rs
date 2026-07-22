@@ -25,7 +25,7 @@ use wezterm_term::TerminalSize;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const RPC_TIMEOUT: Duration = Duration::from_secs(3);
 const READY_TIMEOUT: Duration = Duration::from_secs(8);
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const OUTPUT_LINES: isize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -44,22 +44,22 @@ pub struct LocalConsoleHarness {
 
 impl LocalConsoleHarness {
     pub fn start() -> Result<Self> {
-        let runtime_root = std::env::temp_dir().join(format!(
-            "kit-console-live-{}-{}",
+        let runtime_root = PathBuf::from("/tmp").join(format!(
+            "kc-live-{}-{}",
             std::process::id(),
-            uuid::Uuid::new_v4()
+            uuid::Uuid::new_v4().simple()
         ));
         fs::create_dir(&runtime_root)
             .with_context(|| format!("create Console runtime root {}", runtime_root.display()))?;
         fs::set_permissions(&runtime_root, fs::Permissions::from_mode(0o700))
             .with_context(|| format!("secure Console runtime root {}", runtime_root.display()))?;
-        let socket = runtime_root.join("kit/console/agent.sock");
+        let socket = runtime_root.join("agent.sock");
         let log_path = runtime_root.join("agent.log");
         let log = fs::File::create(&log_path)
             .with_context(|| format!("create Console agent log {}", log_path.display()))?;
         let child = Command::new(env!("CARGO_BIN_EXE_kit"))
             .args(["console", "__agent"])
-            .env("XDG_RUNTIME_DIR", &runtime_root)
+            .env("KIT_CONSOLE_RUNTIME_DIR", &runtime_root)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(log))
