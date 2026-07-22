@@ -208,6 +208,13 @@ impl Drop for ClientProjection {
 }
 
 pub(crate) fn console_runtime_dir() -> Result<PathBuf> {
+    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+        let runtime_dir = PathBuf::from(runtime_dir);
+        if !runtime_dir.is_absolute() {
+            bail!("XDG_RUNTIME_DIR must be an absolute path");
+        }
+        return Ok(runtime_dir.join("kit/console"));
+    }
     let project = ProjectDirs::from("", "", "kit").context("resolving Kit runtime directory")?;
     let base = project
         .runtime_dir()

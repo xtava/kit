@@ -71,11 +71,18 @@ impl IsolatedAgent {
             if let Some(status) =
                 agent.child.as_mut().expect("live child").try_wait().expect("observe Console agent")
             {
-                panic!("Console agent exited before readiness: {status}");
+                panic!(
+                    "Console agent exited before readiness: {status}; log={:?}",
+                    agent.diagnostics()
+                );
             }
             thread::sleep(Duration::from_millis(10));
         }
-        assert!(agent.socket.exists(), "Console agent did not create its socket");
+        assert!(
+            agent.socket.exists(),
+            "Console agent did not create its socket; log={:?}",
+            agent.diagnostics()
+        );
         agent
     }
 
