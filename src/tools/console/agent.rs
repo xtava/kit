@@ -89,8 +89,7 @@ fn run_owner(ready: tokio::sync::oneshot::Sender<AgentControl>) -> Result<()> {
     wezterm_config::use_this_configuration(config);
 
     let runtime_dir = console_runtime_dir()?;
-    wezterm_config::create_user_owned_dirs(&runtime_dir)
-        .context("creating the Console runtime directory")?;
+    super::runtime::prepare(&runtime_dir)?;
     wezterm_config::create_user_owned_dirs(&wezterm_config::RUNTIME_DIR)
         .context("creating the embedded WezTerm runtime directory")?;
     let lock_path = console_lock_path()?;

@@ -1,9 +1,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
-    fs::DirBuilder,
     num::NonZeroUsize,
-    os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -39,12 +38,8 @@ pub(crate) enum SshRelayError {
     Prepare(String),
     #[error("create private Console relay workspace: {0}")]
     Workspace(String),
-    #[error("prepare private Console relay runtime {}: {source}", path.display())]
-    Runtime {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
+    #[error("prepare private Console relay runtime: {0}")]
+    Runtime(String),
     #[error("bind private Console relay socket {}: {source}", path.display())]
     Bind {
         path: PathBuf,
@@ -213,45 +208,19 @@ async fn run_owner(
 }
 
 fn bind_relay_socket() -> Result<RelayListener, SshRelayError> {
-    let runtime_dir = relay_runtime_dir()?;
+    let runtime_dir = super::super::runtime::directory()
+        .map_err(|error| SshRelayError::Runtime(error.to_string()))?;
+    super::super::runtime::prepare(&runtime_dir)
+        .map_err(|error| SshRelayError::Runtime(error.to_string()))?;
     let socket_path = runtime_dir.join(format!("r-{}.sock", uuid::Uuid::new_v4().simple()));
+    super::super::runtime::validate_socket_path(&socket_path)
+        .map_err(|error| SshRelayError::Runtime(error.to_string()))?;
     let socket = RelaySocketLease { path: socket_path.clone() };
     let listener = UnixListener::bind(&socket_path)
         .map_err(|source| SshRelayError::Bind { path: socket_path.clone(), source })?;
     std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
         .map_err(|source| SshRelayError::Protect { path: socket_path, source })?;
     Ok(RelayListener { listener, socket })
-}
-
-fn relay_runtime_dir() -> Result<PathBuf, SshRelayError> {
-    // macOS counts the literal Unix-socket path against a 104-byte sockaddr limit. TMPDIR paths
-    // are routinely longer than that before the ProcessSupervisor workspace suffix is added, so
-    // relays use one short, predictable parent whose ownership and mode are verified below.
-    let effective_user = unsafe { libc::geteuid() };
-    let path = PathBuf::from("/tmp").join(format!("kit-console-{effective_user}"));
-    let mut builder = DirBuilder::new();
-    builder.mode(0o700);
-    match builder.create(&path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(source) => return Err(SshRelayError::Runtime { path, source }),
-    }
-    let metadata = std::fs::symlink_metadata(&path)
-        .map_err(|source| SshRelayError::Runtime { path: path.clone(), source })?;
-    if !metadata.file_type().is_dir()
-        || metadata.file_type().is_symlink()
-        || metadata.uid() != effective_user
-        || metadata.mode() & 0o077 != 0
-    {
-        return Err(SshRelayError::Runtime {
-            path,
-            source: std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "relay runtime must be an owned private directory",
-            ),
-        });
-    }
-    Ok(path)
 }
 
 async fn run_epoch(

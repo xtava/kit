@@ -17,7 +17,6 @@ use crossterm::event::{
     MouseButton as CrosstermMouseButton, MouseEvent as CrosstermMouseEvent,
     MouseEventKind as CrosstermMouseEventKind,
 };
-use directories::ProjectDirs;
 use termwiz::input::{KeyCode, KeyEvent, Modifiers};
 use tokio::sync::watch;
 use wezterm_client::client::{
@@ -208,19 +207,7 @@ impl Drop for ClientProjection {
 }
 
 pub(crate) fn console_runtime_dir() -> Result<PathBuf> {
-    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-        let runtime_dir = PathBuf::from(runtime_dir);
-        if !runtime_dir.is_absolute() {
-            bail!("XDG_RUNTIME_DIR must be an absolute path");
-        }
-        return Ok(runtime_dir.join("kit/console"));
-    }
-    let project = ProjectDirs::from("", "", "kit").context("resolving Kit runtime directory")?;
-    let base = project
-        .runtime_dir()
-        .or_else(|| project.state_dir())
-        .unwrap_or_else(|| project.data_local_dir());
-    Ok(base.join("console"))
+    super::runtime::directory()
 }
 
 pub(crate) fn console_socket_path() -> Result<PathBuf> {
@@ -238,16 +225,6 @@ pub(crate) fn unix_domain() -> Result<UnixDomain> {
         no_serve_automatically: true,
         ..Default::default()
     })
-}
-
-fn validate_owned_private_directory(path: &Path, metadata: &Metadata) -> Result<()> {
-    if metadata.file_type().is_symlink() {
-        bail!("Console runtime directory {} must not be a symlink", path.display());
-    }
-    if !metadata.file_type().is_dir() {
-        bail!("Console runtime path {} is not a directory", path.display());
-    }
-    validate_owned_mode(path, metadata, 0o077, "group/other access is forbidden")
 }
 
 fn validate_owned_private_socket(path: &Path, metadata: &Metadata) -> Result<()> {
@@ -297,7 +274,9 @@ fn inspect_console_socket(runtime_dir: &Path, socket_path: &Path) -> ConsoleSock
             }
         }
         Ok(metadata) => {
-            if let Err(error) = validate_owned_private_directory(runtime_dir, &metadata) {
+            if let Err(error) =
+                super::runtime::validate_owned_private_directory(runtime_dir, &metadata)
+            {
                 return ConsoleSocketProbe::Rejected {
                     path: runtime_dir.to_path_buf(),
                     detail: format!("{error:#}"),

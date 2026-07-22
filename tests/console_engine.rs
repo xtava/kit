@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::future::Future;
+use std::os::unix::fs::PermissionsExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::thread;
@@ -45,19 +46,21 @@ impl IsolatedAgent {
     }
 
     fn start_with_env(environment: &[(&str, &str)]) -> Self {
-        let runtime_root = std::env::temp_dir().join(format!(
-            "kit-console-headless-{}-{}",
+        let runtime_root = std::path::PathBuf::from("/tmp").join(format!(
+            "kc-{}-{}",
             std::process::id(),
-            uuid::Uuid::new_v4()
+            uuid::Uuid::new_v4().simple()
         ));
         fs::create_dir(&runtime_root).expect("create isolated Console runtime root");
-        let socket = runtime_root.join("kit/console/agent.sock");
+        fs::set_permissions(&runtime_root, fs::Permissions::from_mode(0o700))
+            .expect("protect isolated Console runtime root");
+        let socket = runtime_root.join("agent.sock");
         let log_path = runtime_root.join("agent.log");
         let log = fs::File::create(&log_path).expect("create isolated Console agent log");
         let mut command = Command::new(env!("CARGO_BIN_EXE_kit"));
         command
             .args(["console", "__agent"])
-            .env("XDG_RUNTIME_DIR", &runtime_root)
+            .env("KIT_CONSOLE_RUNTIME_DIR", &runtime_root)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(log));
