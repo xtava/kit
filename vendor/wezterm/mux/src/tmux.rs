@@ -99,12 +99,21 @@ impl TmuxDomainState {
                             let domain_id = self.domain_id;
                             *self.state.lock() = State::Idle;
                             let resp = response.clone();
-                            promise::spawn::spawn_into_main_thread(async move {
-                                if let Err(err) = cmd.process_result(domain_id, &resp) {
-                                    log::error!("Tmux processing command result error: {}", err);
-                                }
-                            })
-                            .detach();
+                            let mux = Mux::get();
+                            if let Err(err) = mux.try_spawn_runtime_task(
+                                "schedule tmux command result",
+                                async move {
+                                    if let Err(err) = cmd.process_result(domain_id, &resp) {
+                                        log::error!(
+                                            "Tmux processing command result error: {}",
+                                            err
+                                        );
+                                    }
+                                    Ok(())
+                                },
+                            ) {
+                                log::error!("failed to schedule tmux command result: {err:#}");
+                            }
                         }
                     }
                     State::Idle => {}
@@ -131,12 +140,22 @@ impl TmuxDomainState {
 
                     // Force to quit the tmux mode
                     let pane_id = self.pane_id;
-                    promise::spawn::spawn_into_main_thread_with_low_priority(async move {
-                        if let Some(x) = Mux::get().get_pane(pane_id) {
-                            let _ = write!(x.writer(), "\n\n");
-                        }
-                    })
-                    .detach();
+                    let mux = Mux::get();
+                    let weak_mux = Arc::downgrade(&mux);
+                    if let Err(err) = mux.try_spawn_runtime_task_low_priority(
+                        "schedule tmux exit wake",
+                        async move {
+                            let Some(mux) = weak_mux.upgrade() else {
+                                return Ok(());
+                            };
+                            if let Some(x) = mux.get_pane(pane_id) {
+                                let _ = write!(x.writer(), "\n\n");
+                            }
+                            Ok(())
+                        },
+                    ) {
+                        log::error!("failed to schedule tmux exit wake: {err:#}");
+                    }
 
                     return;
                 }
@@ -260,15 +279,20 @@ impl TmuxDomainState {
 
     /// schedule a `send_next_command` into main thread
     pub fn schedule_send_next_command(domain_id: usize) {
-        promise::spawn::spawn_into_main_thread(async move {
-            let mux = Mux::get();
-            if let Some(domain) = mux.get_domain(domain_id) {
-                if let Some(tmux_domain) = domain.downcast_ref::<TmuxDomain>() {
-                    tmux_domain.send_next_command();
+        let mux = Mux::get();
+        let weak_mux = Arc::downgrade(&mux);
+        if let Err(err) = mux.try_spawn_runtime_task("schedule next tmux command", async move {
+            if let Some(mux) = weak_mux.upgrade() {
+                if let Some(domain) = mux.get_domain(domain_id) {
+                    if let Some(tmux_domain) = domain.downcast_ref::<TmuxDomain>() {
+                        tmux_domain.send_next_command();
+                    }
                 }
             }
-        })
-        .detach();
+            Ok(())
+        }) {
+            log::error!("failed to schedule next tmux command: {err:#}");
+        }
     }
 
     /// create a standalone window for tmux tabs

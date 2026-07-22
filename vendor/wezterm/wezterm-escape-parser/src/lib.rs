@@ -85,6 +85,38 @@ impl Action {
         }
         dest.push(self);
     }
+
+    /// Returns a non-allocating upper bound for memory owned by this action.
+    ///
+    /// Capacity, rather than length, is used for every collection so callers can charge the
+    /// complete allocation before retaining or expanding terminal state from this action.
+    pub fn retained_size_upper_bound(&self) -> usize {
+        let inline = core::mem::size_of::<Self>();
+        let heap = match self {
+            Self::Print(_) | Self::Control(_) | Self::Esc(_) => 0,
+            Self::PrintString(value) => value.capacity(),
+            Self::DeviceControl(control) => control.retained_size_upper_bound(),
+            Self::OperatingSystemCommand(command) => core::mem::size_of::<OperatingSystemCommand>()
+                .saturating_add(command.retained_size_upper_bound()),
+            Self::CSI(command) => command.retained_size_upper_bound(),
+            Self::Sixel(sixel) => core::mem::size_of::<Sixel>().saturating_add(
+                sixel
+                    .data
+                    .capacity()
+                    .saturating_mul(core::mem::size_of::<SixelData>()),
+            ),
+            Self::XtGetTcap(names) => names.iter().fold(
+                names
+                    .capacity()
+                    .saturating_mul(core::mem::size_of::<String>()),
+                |bytes, name| bytes.saturating_add(name.capacity()),
+            ),
+            Self::KittyImage(image) => {
+                core::mem::size_of::<KittyImage>().saturating_add(image.retained_size_upper_bound())
+            }
+        };
+        inline.saturating_add(heap)
+    }
 }
 
 #[cfg(all(test, target_pointer_width = "64"))]
@@ -260,6 +292,39 @@ impl Display for DeviceControlMode {
             Self::ShortDeviceControl(s) => s.fmt(f),
             #[cfg(feature = "tmux_cc")]
             Self::TmuxEvents(_) => write!(f, "tmux event"),
+        }
+    }
+}
+
+impl DeviceControlMode {
+    fn retained_size_upper_bound(&self) -> usize {
+        match self {
+            Self::Enter(mode) => core::mem::size_of::<EnterDeviceControlMode>()
+                .saturating_add(
+                    mode.params
+                        .capacity()
+                        .saturating_mul(core::mem::size_of::<i64>()),
+                )
+                .saturating_add(mode.intermediates.capacity()),
+            Self::ShortDeviceControl(control) => core::mem::size_of::<ShortDeviceControl>()
+                .saturating_add(
+                    control
+                        .params
+                        .capacity()
+                        .saturating_mul(core::mem::size_of::<i64>()),
+                )
+                .saturating_add(control.intermediates.capacity())
+                .saturating_add(control.data.capacity()),
+            Self::Exit | Self::Data(_) => 0,
+            #[cfg(feature = "tmux_cc")]
+            Self::TmuxEvents(events) => events.iter().fold(
+                core::mem::size_of::<Vec<Event>>().saturating_add(
+                    events
+                        .capacity()
+                        .saturating_mul(core::mem::size_of::<Event>()),
+                ),
+                |bytes, event| bytes.saturating_add(event.retained_size_upper_bound()),
+            ),
         }
     }
 }
@@ -607,5 +672,104 @@ impl OneBased {
 impl Display for OneBased {
     fn fmt(&self, f: &mut Formatter) -> FmtResult {
         self.value.fmt(f)
+    }
+}
+
+#[cfg(test)]
+mod retained_size_tests {
+    use super::*;
+    use crate::apc::{
+        KittyImageCompression, KittyImageData, KittyImageTransmit, KittyImageVerbosity,
+    };
+    use crate::osc::ITermProprietary;
+
+    #[test]
+    fn retained_bound_counts_print_string_capacity() {
+        let mut value = String::with_capacity(4_096);
+        value.push('x');
+        let capacity = value.capacity();
+        let action = Action::PrintString(value);
+
+        assert_eq!(
+            action.retained_size_upper_bound(),
+            core::mem::size_of::<Action>() + capacity
+        );
+    }
+
+    #[test]
+    fn retained_bound_counts_nested_osc_strings() {
+        let name = String::with_capacity(1_024);
+        let value = String::with_capacity(2_048);
+        let nested_capacity = name.capacity() + value.capacity();
+        let action = Action::OperatingSystemCommand(Box::new(
+            OperatingSystemCommand::ITermProprietary(ITermProprietary::SetUserVar { name, value }),
+        ));
+
+        assert_eq!(
+            action.retained_size_upper_bound(),
+            core::mem::size_of::<Action>()
+                + core::mem::size_of::<OperatingSystemCommand>()
+                + nested_capacity
+        );
+    }
+
+    #[test]
+    fn retained_bound_counts_binary_kitty_payload_without_formatting_it() {
+        let payload = Vec::with_capacity(8_192);
+        let payload_capacity = payload.capacity();
+        let action = Action::KittyImage(Box::new(KittyImage::TransmitData {
+            transmit: KittyImageTransmit {
+                format: None,
+                data: KittyImageData::DirectBin(payload),
+                width: None,
+                height: None,
+                image_id: None,
+                image_number: None,
+                compression: KittyImageCompression::None,
+                more_data_follows: true,
+            },
+            verbosity: KittyImageVerbosity::Quiet,
+        }));
+
+        assert_eq!(
+            action.retained_size_upper_bound(),
+            core::mem::size_of::<Action>() + core::mem::size_of::<KittyImage>() + payload_capacity
+        );
+    }
+
+    #[test]
+    fn retained_bound_counts_every_nested_vector_capacity() {
+        let mut names = Vec::with_capacity(16);
+        names.push(String::with_capacity(512));
+        let expected_names =
+            names.capacity() * core::mem::size_of::<String>() + names[0].capacity();
+        let names_action = Action::XtGetTcap(names);
+        assert_eq!(
+            names_action.retained_size_upper_bound(),
+            core::mem::size_of::<Action>() + expected_names
+        );
+
+        let mut params = Vec::with_capacity(32);
+        params.push(1);
+        let mut intermediates = Vec::with_capacity(64);
+        intermediates.push(b'$');
+        let mut data = Vec::with_capacity(1_024);
+        data.push(b'x');
+        let expected_control = core::mem::size_of::<ShortDeviceControl>()
+            + params.capacity() * core::mem::size_of::<i64>()
+            + intermediates.capacity()
+            + data.capacity();
+        let control_action = Action::DeviceControl(DeviceControlMode::ShortDeviceControl(
+            Box::new(ShortDeviceControl {
+                params,
+                intermediates,
+                byte: b'q',
+                data,
+            }),
+        ));
+        assert_eq!(
+            control_action.retained_size_upper_bound(),
+            core::mem::size_of::<Action>() + expected_control
+        );
     }
 }

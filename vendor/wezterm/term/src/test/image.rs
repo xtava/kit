@@ -63,10 +63,10 @@ fn kitty_image_with_zero_pixel_dimensions_does_not_panic() {
     // No `c=`/`r=`, so the placement is computed from the (zero) cell pixel
     // size, exercising the divide that previously panicked.
     let seq = format!("\x1b_Ga=T,t=d,f=100;{}\x1b\\", TINY_PNG_BASE64);
-    term.advance_bytes(seq.as_bytes());
+    term.advance_bytes(seq.as_bytes()).unwrap();
 
     // The image is refused, so the cursor never moved;
     // Printing normal text and observing it confirms we recovered rather than crashing.
-    term.advance_bytes(b"ok");
+    term.advance_bytes(b"ok").unwrap();
     assert_visible_contents(&term, file!(), line!(), &["ok", "", ""]);
 }

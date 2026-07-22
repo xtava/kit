@@ -1,0 +1,8 @@
+[package]
+name = "wezterm-runtime-admission"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+thiserror.workspace = true

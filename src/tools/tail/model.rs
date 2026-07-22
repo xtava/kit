@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use crate::tailscale;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Device {
@@ -17,6 +17,27 @@ impl Device {
     }
 }
 
+impl From<tailscale::Node> for Device {
+    fn from(node: tailscale::Node) -> Self {
+        let addresses =
+            node.addresses.into_iter().map(|address| address.to_string()).collect::<Vec<_>>();
+        let dns_name = if node.dns_name.is_empty() {
+            addresses.first().cloned().unwrap_or_default()
+        } else {
+            node.dns_name
+        };
+        Self {
+            id: node.id,
+            name: node.host_name,
+            dns_name,
+            os: node.os,
+            online: node.online,
+            addresses,
+            taildrop_target: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Readiness {
     Ready { local: Device, peers: Vec<Device> },
@@ -27,108 +48,40 @@ pub enum Readiness {
     Unsupported(String),
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-pub(crate) struct RawStatus {
-    #[serde(default)]
-    pub backend_state: String,
-    #[serde(default)]
-    pub tailscale_i_ps: Vec<String>,
-    #[serde(rename = "Self")]
-    pub local: Option<RawDevice>,
-    #[serde(default, rename = "Peer")]
-    pub peers: std::collections::BTreeMap<String, RawDevice>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-pub(crate) struct RawDevice {
-    #[serde(default, rename = "ID")]
-    id: String,
-    #[serde(default, rename = "DNSName")]
-    dns_name: String,
-    #[serde(default)]
-    host_name: String,
-    #[serde(default, rename = "OS")]
-    os: String,
-    #[serde(default)]
-    online: bool,
-    #[serde(default, rename = "TailscaleIPs")]
-    tailscale_i_ps: Vec<String>,
-}
-
-impl RawDevice {
-    fn into_device(self) -> Device {
-        let addresses = self.tailscale_i_ps;
-        Device {
-            id: self.id,
-            name: self.host_name,
-            dns_name: if self.dns_name.is_empty() {
-                addresses.first().cloned().unwrap_or_default()
-            } else {
-                self.dns_name.trim_end_matches('.').to_owned()
+impl From<tailscale::Readiness> for Readiness {
+    fn from(readiness: tailscale::Readiness) -> Self {
+        match readiness {
+            tailscale::Readiness::Ready(status) => Self::Ready {
+                local: status.local.into(),
+                peers: status.peers.into_iter().map(Device::from).collect(),
             },
-            os: self.os,
-            online: self.online,
-            addresses,
-            taildrop_target: None,
+            tailscale::Readiness::NeedsLogin => Self::NeedsLogin,
+            tailscale::Readiness::CliUnavailable(error) => Self::CliUnavailable(error),
+            tailscale::Readiness::DaemonUnavailable(error) => Self::DaemonUnavailable(error),
+            tailscale::Readiness::PermissionDenied(error) => Self::PermissionDenied(error),
+            tailscale::Readiness::Unsupported(error) => Self::Unsupported(error),
         }
-    }
-}
-
-impl RawStatus {
-    pub fn readiness(self) -> Readiness {
-        match self.backend_state.as_str() {
-            "NeedsLogin" => return Readiness::NeedsLogin,
-            "Running" if self.tailscale_i_ps.is_empty() => return Readiness::NeedsLogin,
-            "Running" => {}
-            "Stopped" | "NoState" => {
-                return Readiness::DaemonUnavailable(format!(
-                    "Tailscale backend is {}",
-                    self.backend_state
-                ));
-            }
-            state => {
-                return Readiness::Unsupported(format!(
-                    "unsupported Tailscale backend state {state:?}"
-                ));
-            }
-        }
-        let Some(local) = self.local else {
-            return Readiness::DaemonUnavailable(
-                "Tailscale status did not include this device".into(),
-            );
-        };
-        let mut peers = self.peers.into_values().map(RawDevice::into_device).collect::<Vec<_>>();
-        peers.sort_by_key(|peer| (!peer.online, peer.name.to_lowercase()));
-        Readiness::Ready { local: local.into_device(), peers }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::net::IpAddr;
+
     use super::*;
 
     #[test]
-    fn running_requires_an_ip_and_sorts_online_peers_first() {
-        let raw: RawStatus = serde_json::from_str(
-            r#"{"BackendState":"Running","TailscaleIPs":["100.1.2.3"],"Self":{"ID":"me","DNSName":"me.ts.net.","HostName":"me","OS":"linux","Online":true},"Peer":{"b":{"ID":"b","DNSName":"b.ts.net.","HostName":"B","OS":"macOS","Online":false},"a":{"ID":"a","DNSName":"a.ts.net.","HostName":"A","OS":"linux","Online":true}}}"#,
-        )
-        .unwrap();
-        let Readiness::Ready { local, peers } = raw.readiness() else { panic!("not ready") };
-        assert_eq!(local.dns_name, "me.ts.net");
-        assert_eq!(peers.iter().map(|peer| peer.name.as_str()).collect::<Vec<_>>(), ["A", "B"]);
-    }
-
-    #[test]
-    fn running_without_an_ip_still_needs_login() {
-        let raw: RawStatus = serde_json::from_str(r#"{"BackendState":"Running"}"#).unwrap();
-        assert_eq!(raw.readiness(), Readiness::NeedsLogin);
-    }
-
-    #[test]
-    fn stopped_backend_is_not_treated_as_a_login_request() {
-        let raw: RawStatus = serde_json::from_str(r#"{"BackendState":"Stopped"}"#).unwrap();
-        assert!(matches!(raw.readiness(), Readiness::DaemonUnavailable(_)));
+    fn shared_node_adapts_into_taildrop_device_without_transport_policy() {
+        let device = Device::from(tailscale::Node {
+            id: "peer".into(),
+            dns_name: "laptop.test.ts.net".into(),
+            host_name: "laptop".into(),
+            os: "linux".into(),
+            online: true,
+            addresses: vec!["100.64.0.2".parse::<IpAddr>().unwrap()],
+        });
+        assert_eq!(device.name, "laptop");
+        assert_eq!(device.addresses, ["100.64.0.2"]);
+        assert_eq!(device.taildrop_target, None);
     }
 }

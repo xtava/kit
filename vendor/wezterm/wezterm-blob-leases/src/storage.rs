@@ -1,11 +1,39 @@
 use crate::{ContentId, Error, LeaseId};
 use std::io::{BufRead, Seek};
 use std::sync::{Arc, Mutex};
+use wezterm_runtime_admission::RuntimeAdmission;
 
-static STORAGE: Mutex<Option<Arc<dyn BlobStorage + Send + Sync + 'static>>> = Mutex::new(None);
+static STORAGE: Mutex<Option<Arc<RegisteredStorage>>> = Mutex::new(None);
 
 pub trait BufSeekRead: BufRead + Seek {}
-pub type BoxedReader = Box<dyn BufSeekRead + Send + Sync>;
+impl<T: BufRead + Seek> BufSeekRead for T {}
+type BoxedReader = Box<dyn BufSeekRead + Send + Sync>;
+
+/// Storage-owned reader plus the exact byte length observed when it was opened.
+///
+/// The fields stay private so callers cannot bypass `BlobLease` admission. External storage
+/// implementations construct this value and the lease turns it into an admitted reader.
+pub struct BlobReaderSource {
+    pub(crate) reader: BoxedReader,
+    pub(crate) declared_len: u64,
+}
+
+impl BlobReaderSource {
+    pub fn new<R>(reader: R, declared_len: u64) -> Self
+    where
+        R: BufRead + Seek + Send + Sync + 'static,
+    {
+        Self {
+            reader: Box::new(reader),
+            declared_len,
+        }
+    }
+}
+
+pub(crate) struct RegisteredStorage {
+    pub(crate) storage: Arc<dyn BlobStorage + Send + Sync + 'static>,
+    pub(crate) read_admission: Arc<RuntimeAdmission>,
+}
 
 /// Implements the actual storage mechanism for blobs
 pub trait BlobStorage {
@@ -20,21 +48,9 @@ pub trait BlobStorage {
     /// If not found, returns Err(Error::ContentNotFound)
     fn lease_by_content(&self, content_id: ContentId, lease_id: LeaseId) -> Result<(), Error>;
 
-    /// Retrieves the data identified by content_id.
-    /// lease_id is provided in order to advise the storage system
-    /// which lease fetched it, so that it can choose to record that
-    /// information to track the liveness of a lease
-    fn get_data(&self, content_id: ContentId, lease_id: LeaseId) -> Result<Vec<u8>, Error>;
-
-    /// Retrieves the data identified by content_id as a readable+seekable
-    /// buffered handle.
-    ///
-    /// lease_id is provided in order to advise the storage system
-    /// which lease fetched it, so that it can choose to record that
-    /// information to track the liveness of a lease.
-    ///
-    /// The returned handle serves to extend the lifetime of the lease.
-    fn get_reader(&self, content_id: ContentId, lease_id: LeaseId) -> Result<BoxedReader, Error>;
+    /// Opens storage-owned bytes and reports their exact length at open time. `BlobLease` owns
+    /// admission, integrity verification and lease lifetime around this raw storage operation.
+    fn open_reader(&self, content_id: ContentId) -> Result<BlobReaderSource, Error>;
 
     /// Advises the storage manager that a particular lease has been dropped.
     fn advise_lease_dropped(&self, lease_id: LeaseId, content_id: ContentId) -> Result<(), Error>;
@@ -52,17 +68,21 @@ pub trait BlobStorage {
 
 pub fn register_storage(
     storage: Arc<dyn BlobStorage + Send + Sync + 'static>,
+    read_admission: Arc<RuntimeAdmission>,
 ) -> Result<(), Error> {
-    STORAGE.lock().unwrap().replace(storage);
+    STORAGE.lock().unwrap().replace(Arc::new(RegisteredStorage {
+        storage,
+        read_admission,
+    }));
     Ok(())
 }
 
-pub fn get_storage() -> Result<Arc<dyn BlobStorage + Send + Sync + 'static>, Error> {
+pub(crate) fn get_storage() -> Result<Arc<RegisteredStorage>, Error> {
     STORAGE
         .lock()
         .unwrap()
         .as_ref()
-        .map(|s| s.clone())
+        .cloned()
         .ok_or_else(|| Error::StorageNotInit)
 }
 

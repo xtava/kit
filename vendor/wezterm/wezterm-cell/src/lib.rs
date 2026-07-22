@@ -199,6 +199,32 @@ impl Default for CellAttributes {
 }
 
 impl CellAttributes {
+    /// Returns heap storage retained by these attributes, excluding ImageData payloads.
+    pub fn retained_heap_size_excluding_image_data(&self) -> usize {
+        let Some(fat) = &self.fat else {
+            return 0;
+        };
+
+        let mut size = core::mem::size_of::<FatAttributes>();
+        if let Some(link) = &fat.hyperlink {
+            size = size.saturating_add(link.retained_size());
+        }
+        #[cfg(feature = "use_image")]
+        {
+            size = size.saturating_add(
+                fat.image
+                    .capacity()
+                    .saturating_mul(core::mem::size_of::<Box<ImageCell>>()),
+            );
+            size = size.saturating_add(
+                fat.image
+                    .len()
+                    .saturating_mul(core::mem::size_of::<ImageCell>()),
+            );
+        }
+        size
+    }
+
     bitfield!(intensity, set_intensity, Intensity, 0b11, 0);
     bitfield!(underline, set_underline, Underline, 0b111, 2);
     bitfield!(blink, set_blink, Blink, 0b11, 5);
@@ -561,6 +587,17 @@ struct TeenyStringHeap {
 }
 
 impl TeenyString {
+    fn retained_heap_size(&self) -> usize {
+        if Self::is_marker_bit_set(self.0) {
+            0
+        } else {
+            let heap = self.0 as *const u64 as *const TeenyStringHeap;
+            unsafe {
+                core::mem::size_of::<TeenyStringHeap>().saturating_add((*heap).bytes.capacity())
+            }
+        }
+    }
+
     const fn marker_mask() -> u64 {
         if cfg!(target_endian = "little") {
             0x80000000_00000000
@@ -741,6 +778,13 @@ impl Default for Cell {
 }
 
 impl Cell {
+    /// Returns heap storage retained by this cell, excluding ImageData payloads.
+    pub fn retained_heap_size_excluding_image_data(&self) -> usize {
+        self.text
+            .retained_heap_size()
+            .saturating_add(self.attrs.retained_heap_size_excluding_image_data())
+    }
+
     /// Create a new cell holding the specified character and with the
     /// specified cell attributes.
     /// All control and movement characters are rewritten as a space.
@@ -1030,6 +1074,25 @@ mod test {
         assert_eq!(core::mem::size_of::<Vec<u8>>(), 24);
         assert_eq!(core::mem::size_of::<char>(), 4);
         assert_eq!(core::mem::size_of::<TeenyString>(), 8);
+    }
+
+    #[test]
+    fn retained_size_tracks_heap_graphemes_and_hyperlinks() {
+        let inline = Cell::new('a', CellAttributes::default());
+        assert_eq!(inline.retained_heap_size_excluding_image_data(), 0);
+
+        let heap = Cell::new_grapheme("a-long-grapheme", CellAttributes::default(), None);
+        assert!(
+            heap.retained_heap_size_excluding_image_data()
+                >= core::mem::size_of::<TeenyStringHeap>() + heap.str().len()
+        );
+
+        let mut attrs = CellAttributes::default();
+        attrs.set_hyperlink(Some(Arc::new(Hyperlink::new("https://example.com"))));
+        assert!(
+            attrs.retained_heap_size_excluding_image_data()
+                >= core::mem::size_of::<FatAttributes>() + core::mem::size_of::<Hyperlink>()
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use anyhow::anyhow;
 use clap::Parser;
 use std::ffi::OsString;
-use wezterm_client::client::Client;
+use wezterm_client::client::{Client, HeadlessConnectionLifecycle};
 
 mod activate_pane;
 mod activate_pane_direction;
@@ -166,18 +166,21 @@ Outputs the pane-id for the newly created pane on success"
 }
 
 async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()> {
-    let mut ui = mux::connui::ConnectionUI::new_headless();
+    let admission = mux::RuntimeAdmission::new(mux::RuntimeRole::Client)?;
+    let lifecycle = HeadlessConnectionLifecycle::new(admission.clone());
     let initial = true;
 
-    let client = Client::new_default_unix_domain(
+    let client = Client::new_default_unix_domain_headless(
+        admission,
+        &lifecycle,
         initial,
-        &mut ui,
         cli.no_auto_start,
         cli.prefer_mux,
         cli.class
             .as_deref()
             .unwrap_or(wezterm_gui_subcommands::DEFAULT_WINDOW_CLASS),
-    )?;
+    )
+    .await?;
 
     match cli.sub {
         CliSubCommand::ListClients(cmd) => cmd.run(client).await,

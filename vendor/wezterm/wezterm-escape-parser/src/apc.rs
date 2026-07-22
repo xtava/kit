@@ -104,6 +104,16 @@ impl core::fmt::Debug for KittyImageData {
 }
 
 impl KittyImageData {
+    /// Returns a non-allocating upper bound for heap storage owned by this payload.
+    pub fn retained_size_upper_bound(&self) -> usize {
+        match self {
+            Self::Direct(data) => data.capacity(),
+            Self::DirectBin(data) => data.capacity(),
+            Self::File { path, .. } | Self::TemporaryFile { path, .. } => path.capacity(),
+            Self::SharedMem { name, .. } => name.capacity(),
+        }
+    }
+
     fn from_keys(keys: &BTreeMap<&str, &str>, payload: &[u8]) -> Option<Self> {
         let t = get(keys, "t").unwrap_or("d");
 
@@ -174,47 +184,69 @@ impl KittyImageData {
     /// removing the underlying file or shared memory object as part
     /// of the read operaiton.
     #[cfg(feature = "kitty-shm")]
-    pub fn load_data(self) -> std::io::Result<Vec<u8>> {
+    pub fn load_data_with_limit(self, maximum: usize) -> std::io::Result<Vec<u8>> {
         use std::io::{Read, Seek};
+        fn ensure_bounded(data: Vec<u8>, maximum: usize) -> std::io::Result<Vec<u8>> {
+            if data.len() > maximum {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("kitty image data {} exceeds limit {maximum}", data.len()),
+                ))
+            } else {
+                Ok(data)
+            }
+        }
+
         fn read_from_file(
             path: &str,
             data_offset: Option<u32>,
             data_size: Option<u32>,
+            maximum: usize,
         ) -> std::io::Result<Vec<u8>> {
             let mut f = std::fs::File::open(path)?;
             if let Some(offset) = data_offset {
                 f.seek(std::io::SeekFrom::Start(offset.into()))?;
             }
             if let Some(len) = data_size {
+                if len as usize > maximum {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("kitty image data {len} exceeds limit {maximum}"),
+                    ));
+                }
                 let mut res = vec![0u8; len as usize];
                 f.read_exact(&mut res)?;
                 Ok(res)
             } else {
                 let mut res = vec![];
-                f.read_to_end(&mut res)?;
-                Ok(res)
+                f.take(maximum.saturating_add(1) as u64)
+                    .read_to_end(&mut res)?;
+                ensure_bounded(res, maximum)
             }
         }
 
         match self {
-            Self::Direct(data) => base64_decode(data).or_else(|err| {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("base64 decode: {err:#}"),
-                ))
-            }),
-            Self::DirectBin(bin) => Ok(bin),
+            Self::Direct(data) => ensure_bounded(
+                base64_decode(data).map_err(|err| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("base64 decode: {err:#}"),
+                    )
+                })?,
+                maximum,
+            ),
+            Self::DirectBin(bin) => ensure_bounded(bin, maximum),
             Self::File {
                 path,
                 data_offset,
                 data_size,
-            } => read_from_file(&path, data_offset, data_size),
+            } => read_from_file(&path, data_offset, data_size, maximum),
             Self::TemporaryFile {
                 path,
                 data_offset,
                 data_size,
             } => {
-                let data = read_from_file(&path, data_offset, data_size)?;
+                let data = read_from_file(&path, data_offset, data_size, maximum)?;
                 // need to sanity check that the path looks like a reasonable
                 // temporary directory path before blindly unlinking it here.
 
@@ -257,7 +289,7 @@ impl KittyImageData {
                 name,
                 data_offset,
                 data_size,
-            } => read_shared_memory_data(&name, data_offset, data_size),
+            } => read_shared_memory_data(&name, data_offset, data_size, maximum),
         }
     }
 }
@@ -267,6 +299,7 @@ fn read_shared_memory_data(
     name: &str,
     data_offset: Option<u32>,
     data_size: Option<u32>,
+    maximum: usize,
 ) -> std::result::Result<std::vec::Vec<u8>, std::io::Error> {
     use nix::sys::mman::{shm_open, shm_unlink};
     use std::fs::File;
@@ -289,12 +322,25 @@ fn read_shared_memory_data(
         f.seek(std::io::SeekFrom::Start(offset.into()))?;
     }
     let data = if let Some(len) = data_size {
+        if len as usize > maximum {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("kitty image data {len} exceeds limit {maximum}"),
+            ));
+        }
         let mut res = vec![0u8; len as usize];
         f.read_exact(&mut res)?;
         res
     } else {
         let mut res = vec![];
-        f.read_to_end(&mut res)?;
+        f.take(maximum.saturating_add(1) as u64)
+            .read_to_end(&mut res)?;
+        if res.len() > maximum {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("kitty image data {} exceeds limit {maximum}", res.len()),
+            ));
+        }
         res
     };
 
@@ -313,6 +359,7 @@ fn read_shared_memory_data(
     _name: &str,
     _data_offset: Option<u32>,
     _data_size: Option<u32>,
+    _maximum: usize,
 ) -> std::result::Result<std::vec::Vec<u8>, std::io::Error> {
     Err(std::io::ErrorKind::Unsupported.into())
 }
@@ -363,6 +410,7 @@ mod win {
         name: &str,
         data_offset: Option<u32>,
         data_size: Option<u32>,
+        maximum: usize,
     ) -> std::result::Result<std::vec::Vec<u8>, std::io::Error> {
         let wide_name = wide_string(&name);
 
@@ -422,6 +470,12 @@ mod win {
         size = size.saturating_sub(offset);
         if let Some(val) = data_size {
             size = size.min(val as usize);
+        }
+        if size > maximum {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("kitty image data {size} exceeds limit {maximum}"),
+            ));
         }
         let buf_slice = unsafe { std::slice::from_raw_parts(shm.buf.add(offset), size) };
         let data = buf_slice.to_vec();
@@ -1046,6 +1100,17 @@ pub enum KittyImage {
 }
 
 impl KittyImage {
+    /// Returns a non-allocating upper bound for heap storage owned below this action.
+    pub fn retained_size_upper_bound(&self) -> usize {
+        match self {
+            Self::TransmitData { transmit, .. }
+            | Self::TransmitDataAndDisplay { transmit, .. }
+            | Self::Query { transmit }
+            | Self::TransmitFrame { transmit, .. } => transmit.data.retained_size_upper_bound(),
+            Self::Display { .. } | Self::Delete { .. } | Self::ComposeFrame { .. } => 0,
+        }
+    }
+
     pub fn verbosity(&self) -> KittyImageVerbosity {
         match self {
             Self::TransmitData { verbosity, .. } => *verbosity,

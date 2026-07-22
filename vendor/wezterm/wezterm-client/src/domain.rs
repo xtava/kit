@@ -1,10 +1,16 @@
-use crate::client::Client;
+use crate::client::{
+    Client, HeadlessConnectionFailure, HeadlessConnectionLifecycle, HeadlessLifecycleError,
+};
 use crate::pane::ClientPane;
 use anyhow::{anyhow, bail};
 use async_trait::async_trait;
-use codec::{ListPanesResponse, SpawnV2, SplitPane};
-use config::keyassignment::SpawnTabDomain;
+use codec::{
+    AdmittedRpcResponse, BuildIdentity, EnvironmentFreeCommand, ListPanesResponse, SpawnV2,
+    SplitPane, SplitSpawnDomain, SplitSpawnSource, TabSpawnDomain, TabSpawnPlacement,
+};
 use config::{SshDomain, TlsDomainClient, UnixDomain};
+use lru::LruCache;
+use mux::client::ClientId;
 use mux::connui::{ConnectionUI, ConnectionUIParams};
 use mux::domain::{alloc_domain_id, Domain, DomainId, DomainState, SplitSource};
 use mux::pane::{Pane, PaneId};
@@ -14,8 +20,34 @@ use mux::{Mux, MuxNotification};
 use portable_pty::CommandBuilder;
 use promise::spawn::spawn_into_new_thread;
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
+use termwiz::image::ImageData;
+use wezterm_runtime_admission::RetainedClass;
 use wezterm_term::TerminalSize;
+
+const CLIENT_IMAGE_CACHE_ENTRIES: usize = 128;
+
+fn environment_free_command(
+    command: Option<CommandBuilder>,
+) -> anyhow::Result<(EnvironmentFreeCommand, Option<String>)> {
+    let command_dir = command
+        .as_ref()
+        .and_then(CommandBuilder::get_cwd)
+        .map(|cwd| {
+            cwd.to_str()
+                .map(str::to_string)
+                .ok_or_else(|| anyhow!("spawn command cwd is not valid UTF-8"))
+        })
+        .transpose()?;
+    let command = match command {
+        None => EnvironmentFreeCommand::DefaultLoginShell,
+        Some(command) if command.is_default_prog() => EnvironmentFreeCommand::DefaultLoginShell,
+        Some(command) => EnvironmentFreeCommand::try_from_argv(command.get_argv())
+            .map_err(anyhow::Error::from)?,
+    };
+    Ok((command, command_dir))
+}
 
 pub struct ClientInner {
     pub client: Client,
@@ -26,9 +58,40 @@ pub struct ClientInner {
     remote_to_local_tab: Mutex<HashMap<TabId, TabId>>,
     remote_to_local_pane: Mutex<HashMap<PaneId, PaneId>>,
     pub focused_remote_pane_id: Mutex<Option<PaneId>>,
+    image_cache: Mutex<LruCache<[u8; 32], Arc<ImageData>>>,
 }
 
 impl ClientInner {
+    pub(crate) fn cached_image(&self, hash: &[u8; 32]) -> Option<Arc<ImageData>> {
+        self.image_cache.lock().unwrap().get(hash).map(Arc::clone)
+    }
+
+    /// Admit a newly decoded image before making it reachable from either the
+    /// client cache or a rendered line. The lease is anchored in ImageData so
+    /// cache eviction cannot release it while ImageCell aliases remain alive.
+    pub(crate) fn retain_image(&self, data: Arc<ImageData>) -> anyhow::Result<Arc<ImageData>> {
+        let hash = data.hash();
+        let mut cache = self.image_cache.lock().unwrap();
+        if let Some(cached) = cache.get(&hash) {
+            return Ok(Arc::clone(cached));
+        }
+
+        let retained_bytes = data.retained_size();
+        let lease = self
+            .client
+            .admission()
+            .try_retained(RetainedClass::ClientImage, retained_bytes)?;
+        if let Err(lease) = data.try_set_retention_guard(lease) {
+            drop(lease);
+            bail!("newly decoded image already has a retained-memory guard");
+        }
+
+        let evicted = cache.push(hash, Arc::clone(&data));
+        drop(cache);
+        drop(evicted);
+        Ok(data)
+    }
+
     fn remote_to_local_window(&self, remote_window_id: WindowId) -> Option<WindowId> {
         let map = self.remote_to_local_window.lock().unwrap();
         map.get(&remote_window_id).cloned()
@@ -246,6 +309,9 @@ impl ClientInner {
             remote_to_local_tab: Mutex::new(HashMap::new()),
             remote_to_local_pane: Mutex::new(HashMap::new()),
             focused_remote_pane_id: Mutex::new(None),
+            image_cache: Mutex::new(LruCache::new(
+                NonZeroUsize::new(CLIENT_IMAGE_CACHE_ENTRIES).unwrap(),
+            )),
         }
     }
 }
@@ -288,16 +354,19 @@ fn mux_notify_client_domain(local_domain_id: DomainId, notif: MuxNotification) -
             if let Some(inner) = client_domain.inner() {
                 let workspaces = Mux::get().iter_workspaces();
                 if workspaces.contains(&old_workspace) {
-                    promise::spawn::spawn(async move {
+                    let future = async move {
                         inner
                             .client
                             .rename_workspace(codec::RenameWorkspace {
                                 old_workspace,
                                 new_workspace,
                             })
-                            .await
-                    })
-                    .detach();
+                            .await?;
+                        Ok(())
+                    };
+                    if let Err(err) = mux.try_spawn_client_invalidation(future) {
+                        log::error!("unable to schedule remote workspace rename: {err:#}");
+                    }
                 }
             }
         }
@@ -305,52 +374,56 @@ fn mux_notify_client_domain(local_domain_id: DomainId, notif: MuxNotification) -
             // Mux::get_window() may trigger a borrow error if called
             // immediately; defer the bulk of this work.
             // <https://github.com/wezterm/wezterm/issues/2638>
-            promise::spawn::spawn_into_main_thread(async move {
-                let mux = Mux::get();
-                let domain = match mux.get_domain(local_domain_id) {
-                    Some(domain) => domain,
-                    None => return,
-                };
-                let domain = match domain.downcast_ref::<ClientDomain>() {
-                    Some(domain) => domain,
-                    None => return,
-                };
-                if let Some(remote_window_id) = domain.local_to_remote_window_id(window_id) {
-                    if let Some(workspace) = mux
-                        .get_window(window_id)
-                        .map(|w| w.get_workspace().to_string())
-                    {
-                        promise::spawn::spawn_into_main_thread(async move {
-                            let request = codec::SetWindowWorkspace {
+            let future = async move {
+                let request = {
+                    let mux = Mux::get();
+                    let domain = match mux.get_domain(local_domain_id) {
+                        Some(domain) => domain,
+                        None => return Ok(()),
+                    };
+                    let domain = match domain.downcast_ref::<ClientDomain>() {
+                        Some(domain) => domain,
+                        None => return Ok(()),
+                    };
+                    if let Some(remote_window_id) = domain.local_to_remote_window_id(window_id) {
+                        mux.get_window(window_id)
+                            .map(|window| codec::SetWindowWorkspace {
                                 window_id: remote_window_id,
-                                workspace,
-                            };
-                            let _ = update_remote_workspace(local_domain_id, request).await;
-                        })
-                        .detach();
+                                workspace: window.get_workspace().to_string(),
+                            })
+                    } else {
+                        log::debug!(
+                            "local window id {window_id} has no known remote window \
+                            id while reconciling a local WindowWorkspaceChanged event"
+                        );
+                        None
                     }
-                } else {
-                    log::debug!(
-                        "local window id {window_id} has no known remote window \
-                        id while reconciling a local WindowWorkspaceChanged event"
-                    );
+                };
+                if let Some(request) = request {
+                    update_remote_workspace(local_domain_id, request).await?;
                 }
-            })
-            .detach();
+                Ok(())
+            };
+            if let Err(err) = mux.try_spawn_client_invalidation(future) {
+                log::error!("unable to schedule remote window workspace update: {err:#}");
+            }
         }
         MuxNotification::TabTitleChanged { tab_id, title } => {
             if let Some(remote_tab_id) = client_domain.local_to_remote_tab_id(tab_id) {
                 if let Some(inner) = client_domain.inner() {
-                    promise::spawn::spawn(async move {
+                    let future = async move {
                         inner
                             .client
                             .set_tab_title(codec::TabTitleChanged {
                                 tab_id: remote_tab_id,
                                 title,
                             })
-                            .await
-                    })
-                    .detach();
+                            .await?;
+                        Ok(())
+                    };
+                    if let Err(err) = mux.try_spawn_client_invalidation(future) {
+                        log::error!("unable to schedule remote tab title update: {err:#}");
+                    }
                 }
             }
         }
@@ -360,7 +433,7 @@ fn mux_notify_client_domain(local_domain_id: DomainId, notif: MuxNotification) -
         } => {
             if let Some(remote_window_id) = client_domain.local_to_remote_window_id(window_id) {
                 if let Some(inner) = client_domain.inner() {
-                    promise::spawn::spawn_into_main_thread(async move {
+                    let future = async move {
                         // De-bounce the title propagation.
                         // There is a bit of a race condition with these async
                         // updates that can trigger a cycle of WindowTitleChanged
@@ -385,8 +458,10 @@ fn mux_notify_client_domain(local_domain_id: DomainId, notif: MuxNotification) -
                             }
                         }
                         anyhow::Result::<()>::Ok(())
-                    })
-                    .detach();
+                    };
+                    if let Err(err) = mux.try_spawn_client_invalidation(future) {
+                        log::error!("unable to schedule remote window title update: {err:#}");
+                    }
                 }
             }
         }
@@ -416,11 +491,140 @@ impl ClientDomain {
         self.config.connect_automatically()
     }
 
+    fn lifecycle_failure(error: &HeadlessLifecycleError) -> HeadlessConnectionFailure {
+        match error {
+            HeadlessLifecycleError::Saturated => HeadlessConnectionFailure::LifecycleSaturated,
+            HeadlessLifecycleError::Closed | HeadlessLifecycleError::Empty => {
+                HeadlessConnectionFailure::LifecycleClosed
+            }
+            HeadlessLifecycleError::Admission(_) => HeadlessConnectionFailure::Runtime,
+        }
+    }
+
+    fn headless_attach_error(
+        lifecycle: &HeadlessConnectionLifecycle,
+        failure: HeadlessConnectionFailure,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        match lifecycle.publish_failed(failure) {
+            Ok(()) => error,
+            Err(publish_error) => error.context(format!(
+                "failed to publish terminal headless lifecycle state: {publish_error}"
+            )),
+        }
+    }
+
+    /// Attach without constructing a terminal-backed connection UI.
+    ///
+    /// The supplied lifecycle must be backed by this mux's admission owner;
+    /// it remains the sole observer for the initial connection and all later
+    /// reconnects.
+    pub async fn attach_with_lifecycle(
+        &self,
+        window_id: Option<WindowId>,
+        lifecycle: &HeadlessConnectionLifecycle,
+        expected_build_identity: Option<BuildIdentity>,
+        client_id: ClientId,
+    ) -> anyhow::Result<()> {
+        let mux = Mux::get();
+        let admission = mux.admission().clone();
+        if !lifecycle.uses_admission(&admission) {
+            return Err(Self::headless_attach_error(
+                lifecycle,
+                HeadlessConnectionFailure::Runtime,
+                anyhow!("headless lifecycle does not belong to this mux runtime"),
+            ));
+        }
+
+        if self.state() == DomainState::Attached {
+            if let Err(error) = lifecycle.publish_ready() {
+                return Err(Self::headless_attach_error(
+                    lifecycle,
+                    Self::lifecycle_failure(&error),
+                    error.into(),
+                ));
+            }
+            return Ok(());
+        }
+
+        if let Err(error) = lifecycle.publish_attaching() {
+            return Err(Self::headless_attach_error(
+                lifecycle,
+                Self::lifecycle_failure(&error),
+                error.into(),
+            ));
+        }
+        let client = match Client::new_headless(
+            Some(self.local_domain_id),
+            self.config.clone(),
+            admission,
+            lifecycle,
+            expected_build_identity,
+            client_id,
+            true,
+            false,
+        )
+        .await
+        {
+            Ok(client) => client,
+            // The headless constructor owns initial-connection failure
+            // publication and joins its runtime before returning an error.
+            Err(error) => return Err(error),
+        };
+
+        let panes = match client.list_panes().await {
+            Ok(panes) => panes,
+            Err(error) => {
+                let outcome = client.shutdown_and_join();
+                log::debug!("headless pane-list cleanup outcome: {outcome:?}");
+                return Err(Self::headless_attach_error(
+                    lifecycle,
+                    HeadlessConnectionFailure::Runtime,
+                    error,
+                ));
+            }
+        };
+
+        if let Err(error) = Self::finish_attach(self.local_domain_id, client, panes, window_id) {
+            let inner = self.inner.lock().unwrap().take();
+            if let Some(inner) = inner {
+                let outcome = inner.client.shutdown_and_join();
+                log::debug!("headless attach cleanup outcome: {outcome:?}");
+            }
+            mux.domain_was_detached(self.local_domain_id);
+            return Err(Self::headless_attach_error(
+                lifecycle,
+                HeadlessConnectionFailure::Runtime,
+                error,
+            ));
+        }
+
+        if let Err(error) = lifecycle.publish_ready() {
+            let failure = Self::lifecycle_failure(&error);
+            self.perform_detach();
+            return Err(Self::headless_attach_error(
+                lifecycle,
+                failure,
+                error.into(),
+            ));
+        }
+
+        Ok(())
+    }
+
     pub fn perform_detach(&self) {
         log::info!("detached domain {}", self.local_domain_id);
-        self.inner.lock().unwrap().take();
+        let inner = self.inner.lock().unwrap().take();
+        if let Some(inner) = inner {
+            let outcome = inner.client.shutdown_and_join();
+            log::debug!("client runtime detach outcome: {outcome:?}");
+        }
         let mux = Mux::get();
         mux.domain_was_detached(self.local_domain_id);
+    }
+
+    pub fn attached_client(&self) -> Option<Client> {
+        self.inner().map(|inner| inner.client.clone())
     }
 
     pub fn remote_to_local_pane_id(&self, remote_pane_id: TabId) -> Option<TabId> {
@@ -463,13 +667,12 @@ impl ClientDomain {
     /// more tabs at the time that a disconnect was detected, and
     /// it's also possible that another client connected and adjusted
     /// the set of tabs since we were connected, so we need to re-sync.
-    pub async fn reattach(domain_id: DomainId, ui: ConnectionUI) -> anyhow::Result<()> {
+    pub async fn reattach(domain_id: DomainId) -> anyhow::Result<()> {
         let inner = Self::get_client_inner_for_domain(domain_id)?;
 
         let panes = inner.client.list_panes().await?;
-        Self::process_pane_list(inner, panes, None)?;
-
-        ui.close();
+        Self::process_pane_list(Arc::clone(&inner), panes, None)?;
+        inner.client.publish_ready()?;
         Ok(())
     }
 
@@ -503,9 +706,10 @@ impl ClientDomain {
 
     fn process_pane_list(
         inner: Arc<ClientInner>,
-        panes: ListPanesResponse,
+        panes: AdmittedRpcResponse<ListPanesResponse>,
         mut primary_window_id: Option<WindowId>,
     ) -> anyhow::Result<()> {
+        let (_serial, panes, _reservation) = panes.into_parts();
         let mux = Mux::get();
         log::debug!(
             "domain {}: ListPanes result {:#?}",
@@ -564,12 +768,12 @@ impl ClientDomain {
                             inner.remove_old_tab_mapping(remote_tab_id);
                             tab = Arc::new(Tab::new(&root_size));
                             inner.record_remote_to_local_tab_mapping(remote_tab_id, tab.tab_id());
-                            mux.add_tab_no_panes(&tab);
+                            mux.add_tab_no_panes(&tab)?;
                         }
                     };
                 } else {
                     tab = Arc::new(Tab::new(&root_size));
-                    mux.add_tab_no_panes(&tab);
+                    mux.add_tab_no_panes(&tab)?;
                     inner.record_remote_to_local_tab_mapping(remote_tab_id, tab.tab_id());
                 }
 
@@ -577,6 +781,7 @@ impl ClientDomain {
 
                 log::debug!("domain: {} tree: {:#?}", inner.local_domain_id, tabroot);
                 let mut workspace = None;
+                let mut pane_registration_error = None;
                 tab.sync_with_pane_tree(root_size, tabroot, |entry| {
                     workspace.replace(entry.workspace.clone());
                     remote_panes_to_forget.remove(&entry.pane_id);
@@ -588,35 +793,46 @@ impl ClientDomain {
                                 // removed it from the mux.  Let's add it back, but
                                 // with a new id.
                                 inner.remove_old_pane_mapping(entry.pane_id);
-                                let pane: Arc<dyn Pane> = Arc::new(ClientPane::new(
+                                let client_pane = Arc::new(ClientPane::new(
                                     &inner,
                                     entry.tab_id,
                                     entry.pane_id,
                                     entry.size,
                                     &entry.title,
                                 ));
-                                mux.add_pane(&pane).expect("failed to add pane to mux");
+                                let pane: Arc<dyn Pane> = client_pane.clone();
+                                if let Err(err) =
+                                    mux.add_pane(&pane).and_then(|_| client_pane.start())
+                                {
+                                    pane_registration_error.get_or_insert(err);
+                                }
                                 pane
                             }
                         }
                     } else {
-                        let pane: Arc<dyn Pane> = Arc::new(ClientPane::new(
+                        let client_pane = Arc::new(ClientPane::new(
                             &inner,
                             entry.tab_id,
                             entry.pane_id,
                             entry.size,
                             &entry.title,
                         ));
+                        let pane: Arc<dyn Pane> = client_pane.clone();
                         log::debug!(
                             "domain: {} attaching to remote pane {:?} -> local pane_id {}",
                             inner.local_domain_id,
                             entry,
                             pane.pane_id()
                         );
-                        mux.add_pane(&pane).expect("failed to add pane to mux");
+                        if let Err(err) = mux.add_pane(&pane).and_then(|_| client_pane.start()) {
+                            pane_registration_error.get_or_insert(err);
+                        }
                         pane
                     }
                 });
+                if let Some(err) = pane_registration_error {
+                    return Err(err);
+                }
 
                 if let Some(local_window_id) = inner.remote_to_local_window(remote_window_id) {
                     let mut window = mux
@@ -698,9 +914,17 @@ impl ClientDomain {
             }
         }
         if !remote_panes_to_forget.is_empty() {
-            let mut panes = inner.remote_to_local_pane.lock().unwrap();
-            for p in remote_panes_to_forget {
-                panes.remove(&p);
+            for remote_pane_id in remote_panes_to_forget {
+                let local_pane_id = {
+                    inner
+                        .remote_to_local_pane
+                        .lock()
+                        .unwrap()
+                        .remove(&remote_pane_id)
+                };
+                if let Some(local_pane_id) = local_pane_id {
+                    mux.unregister_pane(local_pane_id);
+                }
             }
         }
 
@@ -710,7 +934,7 @@ impl ClientDomain {
     fn finish_attach(
         domain_id: DomainId,
         client: Client,
-        panes: ListPanesResponse,
+        panes: AdmittedRpcResponse<ListPanesResponse>,
         primary_window_id: Option<WindowId>,
     ) -> anyhow::Result<()> {
         let mux = Mux::get();
@@ -790,7 +1014,8 @@ impl Domain for ClientDomain {
                 window_id: remote_window_id,
                 workspace_for_new_window,
             })
-            .await?;
+            .await?
+            .into_inner();
 
         self.resync().await?;
 
@@ -825,36 +1050,44 @@ impl Domain for ClientDomain {
             .inner()
             .ok_or_else(|| anyhow!("domain is not attached"))?;
 
-        let workspace = Mux::get().active_workspace();
+        let placement = match inner.local_to_remote_window(window) {
+            Some(window_id) => TabSpawnPlacement::ExistingWindow { window_id },
+            None => TabSpawnPlacement::NewWindow {
+                size,
+                workspace: Mux::get().active_workspace(),
+            },
+        };
+        let (command, builder_command_dir) = environment_free_command(command)?;
 
         let result = inner
             .client
             .spawn_v2(SpawnV2 {
-                domain: SpawnTabDomain::DefaultDomain,
-                window_id: inner.local_to_remote_window(window),
-                size,
+                domain: TabSpawnDomain::DefaultDomain,
+                placement,
                 command,
-                command_dir,
-                workspace,
+                command_dir: command_dir.or(builder_command_dir),
             })
-            .await?;
+            .await?
+            .into_inner();
 
         inner.record_remote_to_local_window_mapping(result.window_id, window);
 
-        let pane: Arc<dyn Pane> = Arc::new(ClientPane::new(
+        let client_pane = Arc::new(ClientPane::new(
             &inner,
             result.tab_id,
             result.pane_id,
-            size,
+            result.size,
             "wezterm",
         ));
-        let tab = Arc::new(Tab::new(&size));
+        let pane: Arc<dyn Pane> = client_pane.clone();
+        let tab = Arc::new(Tab::new(&result.size));
         tab.assign_pane(&pane);
         inner.remove_old_tab_mapping(result.tab_id);
         inner.record_remote_to_local_tab_mapping(result.tab_id, tab.tab_id());
 
         let mux = Mux::get();
         mux.add_tab_and_active_pane(&tab)?;
+        client_pane.start()?;
         mux.add_tab_to_window(&tab, window)?;
 
         Ok(tab)
@@ -883,33 +1116,39 @@ impl Domain for ClientDomain {
             .downcast_ref::<ClientPane>()
             .ok_or_else(|| anyhow!("pane_id {} is not a ClientPane", pane_id))?;
 
-        let (command, command_dir, move_pane_id) = match source {
+        let source = match source {
             SplitSource::Spawn {
                 command,
                 command_dir,
-            } => (command, command_dir, None),
-            SplitSource::MovePane(move_pane_id) => (None, None, Some(move_pane_id)),
+            } => {
+                let (command, builder_command_dir) = environment_free_command(command)?;
+                SplitSpawnSource::Spawn {
+                    command,
+                    command_dir: command_dir.or(builder_command_dir),
+                }
+            }
+            SplitSource::MovePane(pane_id) => SplitSpawnSource::MovePane { pane_id },
         };
 
         let result = inner
             .client
             .split_pane(SplitPane {
-                domain: SpawnTabDomain::CurrentPaneDomain,
-                pane_id: pane.remote_pane_id,
+                domain: SplitSpawnDomain::TargetPaneDomain,
+                target_pane_id: pane.remote_pane_id,
                 split_request,
-                command,
-                command_dir,
-                move_pane_id,
+                source,
             })
-            .await?;
+            .await?
+            .into_inner();
 
-        let pane: Arc<dyn Pane> = Arc::new(ClientPane::new(
+        let client_pane = Arc::new(ClientPane::new(
             &inner,
             result.tab_id,
             result.pane_id,
             result.size,
             "wezterm",
         ));
+        let pane: Arc<dyn Pane> = client_pane.clone();
 
         let pane_index = match tab
             .iter_panes()
@@ -924,6 +1163,7 @@ impl Domain for ClientDomain {
             .ok();
 
         mux.add_pane(&pane)?;
+        client_pane.start()?;
 
         Ok(pane)
     }
@@ -936,6 +1176,7 @@ impl Domain for ClientDomain {
 
         let domain_id = self.local_domain_id;
         let config = self.config.clone();
+        let admission = Mux::get().admission().clone();
 
         let activity = mux::activity::Activity::new();
         let ui = ConnectionUI::with_params(ConnectionUIParams {
@@ -953,6 +1194,7 @@ impl Domain for ClientDomain {
                         let initial = true;
                         let no_auto_start = false;
                         Client::new_unix_domain(
+                            admission,
                             Some(domain_id),
                             unix,
                             initial,
@@ -960,19 +1202,20 @@ impl Domain for ClientDomain {
                             no_auto_start,
                         )
                     }
-                    ClientDomainConfig::Tls(tls) => Client::new_tls(domain_id, tls, &mut cloned_ui),
-                    ClientDomainConfig::Ssh(ssh) => Client::new_ssh(domain_id, ssh, &mut cloned_ui),
+                    ClientDomainConfig::Tls(tls) => {
+                        Client::new_tls(admission, domain_id, tls, &mut cloned_ui)
+                    }
+                    ClientDomainConfig::Ssh(ssh) => {
+                        Client::new_ssh(admission, domain_id, ssh, &mut cloned_ui)
+                    }
                 })
                 .await?;
 
-                ui.output_str("Checking server version\n");
-                client.verify_version_compat(&ui).await?;
-
-                ui.output_str("Version check OK!  Requesting pane list...\n");
+                ui.output_str("Requesting pane list...\n");
                 let panes = client.list_panes().await?;
                 ui.output_str(&format!(
                     "Server has {} tabs.  Attaching to local UI...\n",
-                    panes.tabs.len()
+                    panes.value().tabs.len()
                 ));
                 ClientDomain::finish_attach(domain_id, client, panes, window_id)
             }

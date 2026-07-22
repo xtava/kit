@@ -73,6 +73,65 @@ impl PartialEq for Line {
 }
 
 impl Line {
+    /// Initial heap capacity retained by the clustered storage for a blank line.
+    pub const INITIAL_CLUSTER_TEXT_CAPACITY: usize = 80;
+
+    /// Returns this line's retained footprint without shared ImageData payloads.
+    pub fn retained_size_excluding_image_data(&self) -> usize {
+        core::mem::size_of::<Self>()
+            .saturating_add(
+                self.zones
+                    .capacity()
+                    .saturating_mul(core::mem::size_of::<ZoneRange>()),
+            )
+            .saturating_add(self.cells.retained_heap_size_excluding_image_data())
+    }
+
+    /// Heap retained by this line, excluding its inline slot and shared ImageData payloads.
+    pub fn checked_retained_heap_size_excluding_image_data(&self) -> Option<usize> {
+        let retained = self.retained_size_excluding_image_data();
+        if retained == usize::MAX {
+            return None;
+        }
+        retained.checked_sub(core::mem::size_of::<Self>())
+    }
+
+    /// Conservative heap required to clone this line into materialized cells.
+    ///
+    /// This includes conservative cell-vector capacity, grapheme storage, and cloned cell
+    /// attributes, but excludes shared ImageData payloads.
+    pub fn checked_materialized_cells_size_upper_bound_excluding_image_data(
+        &self,
+    ) -> Option<usize> {
+        let cell_capacity = if self.len() == 0 {
+            0
+        } else {
+            self.len()
+                .checked_next_power_of_two()
+                .and_then(|capacity| capacity.checked_mul(2))?
+        };
+        let mut size = cell_capacity.checked_mul(core::mem::size_of::<Cell>())?;
+
+        for cell in self.visible_cells() {
+            let attrs = cell.attrs().retained_heap_size_excluding_image_data();
+            if attrs == usize::MAX {
+                return None;
+            }
+            let grapheme = if cell.str().is_empty() {
+                0
+            } else {
+                cell.str()
+                    .len()
+                    .checked_next_power_of_two()
+                    .and_then(|capacity| capacity.checked_mul(2))?
+            };
+            size = size.checked_add(grapheme)?.checked_add(attrs)?;
+            size = size.checked_add(cell.width().checked_sub(1)?.checked_mul(attrs)?)?;
+        }
+
+        Some(size)
+    }
+
     pub fn with_width_and_cell(width: usize, cell: Cell, seqno: SequenceNo) -> Self {
         let mut cells = Vec::with_capacity(width);
         cells.resize(width, cell.clone());
@@ -209,40 +268,47 @@ impl Line {
         self.invalidate_zones();
     }
 
-    /// Wrap the line so that it fits within the provided width.
-    /// Returns the list of resultant line(s)
-    pub fn wrap(self, width: usize, seqno: SequenceNo) -> Vec<Self> {
-        let mut cells: Vec<CellRef> = self.visible_cells().collect();
-        if let Some(end_idx) = cells.iter().rposition(|c| c.str() != " ") {
-            cells.truncate(end_idx + 1);
+    /// Wrap the line and emit each result without allocating temporary cell or line vectors.
+    pub fn wrap_into(self, width: usize, seqno: SequenceNo, mut emit: impl FnMut(Self)) {
+        let Some(last_non_blank_cell) = self
+            .visible_cells()
+            .filter(|cell| cell.str() != " ")
+            .map(|cell| cell.cell_index())
+            .last()
+        else {
+            emit(self);
+            return;
+        };
 
-            let mut lines: Vec<Self> = vec![];
-            let mut delta = 0;
-            for cell in cells {
-                let need_new_line = lines
-                    .last_mut()
-                    .map(|line| line.len() + cell.width() > width)
-                    .unwrap_or(true);
-                if need_new_line {
-                    lines
-                        .last_mut()
-                        .map(|line| line.set_last_cell_was_wrapped(true, seqno));
-                    lines.push(Line::new(seqno));
-                    delta = cell.cell_index();
+        let mut current: Option<Self> = None;
+        let mut delta = 0;
+        for cell in self
+            .visible_cells()
+            .take_while(|cell| cell.cell_index() <= last_non_blank_cell)
+        {
+            let need_new_line = current
+                .as_ref()
+                .map(|line| line.len() + cell.width() > width)
+                .unwrap_or(true);
+            if need_new_line {
+                if let Some(mut line) = current.take() {
+                    line.set_last_cell_was_wrapped(true, seqno);
+                    emit(line);
                 }
-                let line = lines.last_mut().unwrap();
-                line.set_cell_grapheme(
-                    cell.cell_index() - delta,
-                    cell.str(),
-                    cell.width(),
-                    (*cell.attrs()).clone(),
-                    seqno,
-                );
+                current = Some(Line::new(seqno));
+                delta = cell.cell_index();
             }
+            current.as_mut().unwrap().set_cell_grapheme(
+                cell.cell_index() - delta,
+                cell.str(),
+                cell.width(),
+                (*cell.attrs()).clone(),
+                seqno,
+            );
+        }
 
-            lines
-        } else {
-            vec![self]
+        if let Some(line) = current {
+            emit(line);
         }
     }
 

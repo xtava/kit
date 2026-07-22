@@ -13,7 +13,7 @@ use config::{
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
-use termwiz::image::{ImageData, ImageDataType};
+use termwiz::image::{EncodedBlob, ImageData, ImageDataType};
 use wezterm_term::StableRowIndex;
 
 lazy_static::lazy_static! {
@@ -204,10 +204,14 @@ impl CachedImage {
             }
         }
 
-        let data = std::fs::read(path)
-            .with_context(|| format!("Failed to load window_background_image {}", path))?;
+        let data = wezterm_blob_leases::read_file_with_limit(
+            path,
+            wezterm_runtime_admission::MAX_WIRE_BYTE_BUFFER_BYTES,
+        )
+        .with_context(|| format!("Failed to load window_background_image {}", path))?;
         log::trace!("loaded {}", path);
-        let mut data = ImageDataType::EncodedFile(data);
+        let (data, _blob_read_guard) = data.into_guarded_parts();
+        let mut data = ImageDataType::Encoded(EncodedBlob::inline(data)?);
         data.adjust_speed(speed);
         let image = Arc::new(ImageData::with_data(data));
 

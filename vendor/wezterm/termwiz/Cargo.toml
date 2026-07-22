@@ -45,6 +45,7 @@ wezterm-color-types = {workspace = true, features=["std"]}
 wezterm-dynamic = {workspace = true, features=["std"]}
 wezterm-escape-parser = {workspace = true, features=["std"]}
 wezterm-input-types.workspace = true
+wezterm-runtime-admission.workspace = true
 wezterm-surface = {workspace = true, features=["std", "appdata"]}
 
 [features]
@@ -89,4 +90,3 @@ rustdoc-args = ["--cfg", "feature=\"docs\""]
 [[bench]]
 name = "cell"
 harness = false
-

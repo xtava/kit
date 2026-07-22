@@ -4,6 +4,10 @@
 use super::*;
 use crate::color::{ColorPalette, RgbColor};
 use crate::config::{BidiMode, NewlineCanon};
+use crate::screen::{ScreenResizeGeometryPlan, ScrollbackCapacity};
+use crate::terminal::{
+    checked_geometry_add, conservative_collection_capacity, TerminalGeometryError,
+};
 use log::debug;
 use num_traits::ToPrimitive;
 use std::collections::HashMap;
@@ -22,6 +26,7 @@ use wezterm_escape_parser::csi::{
     EraseInLine, Mode, Sgr, TabulationClear, TerminalMode, TerminalModeCode, Window, XtSmGraphics,
     XtSmGraphicsAction, XtSmGraphicsItem, XtSmGraphicsStatus, XtermKeyModifierResource,
 };
+use wezterm_escape_parser::hyperlink::Hyperlink;
 use wezterm_escape_parser::{OneBased, OperatingSystemCommand, CSI};
 use wezterm_surface::{CursorShape, CursorVisibility, SequenceNo};
 
@@ -106,6 +111,24 @@ impl TabStop {
         }
     }
 
+    fn apply_bounded_resize(&mut self, screen_width: usize) {
+        if screen_width > self.tabs.len() {
+            self.tabs.reserve_exact(screen_width - self.tabs.len());
+        }
+        self.resize(screen_width);
+    }
+
+    fn retained_geometry_bytes(&self) -> Result<usize, TerminalGeometryError> {
+        self.tabs
+            .capacity()
+            .checked_add(usize::BITS as usize - 1)
+            .map(|bits| bits / usize::BITS as usize)
+            .and_then(|words| words.checked_mul(std::mem::size_of::<usize>()))
+            .ok_or(TerminalGeometryError::ArithmeticOverflow {
+                calculation: "current tab stop storage",
+            })
+    }
+
     fn clear(&mut self, to_clear: TabulationClear, col: usize, log_unknown_escape_sequences: bool) {
         match to_clear {
             TabulationClear::ClearCharacterTabStopAtActivePosition => {
@@ -150,6 +173,34 @@ struct ScreenOrAlt {
     alt_screen_is_active: bool,
 }
 
+#[derive(Debug)]
+pub(crate) struct TerminalStateResizeGeometryPlan {
+    primary: ScreenResizeGeometryPlan,
+    alternate: ScreenResizeGeometryPlan,
+    current_geometry_retained_bytes: usize,
+    settled_geometry_retained_upper_bound: usize,
+    peak_geometry_bytes: usize,
+}
+
+impl TerminalStateResizeGeometryPlan {
+    pub(crate) fn current_geometry_retained_bytes(&self) -> usize {
+        self.current_geometry_retained_bytes
+    }
+
+    pub(crate) fn settled_geometry_retained_upper_bound(&self) -> usize {
+        self.settled_geometry_retained_upper_bound
+    }
+
+    pub(crate) fn peak_geometry_bytes(&self) -> usize {
+        self.peak_geometry_bytes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn primary_line_capacity_request(&self) -> usize {
+        self.primary.settled_line_capacity_request()
+    }
+}
+
 impl Deref for ScreenOrAlt {
     type Target = Screen;
 
@@ -173,14 +224,29 @@ impl DerefMut for ScreenOrAlt {
 }
 
 impl ScreenOrAlt {
-    pub fn new(
+    fn new_with_scrollback_capacity(
         size: TerminalSize,
         config: &Arc<dyn TerminalConfiguration>,
         seqno: SequenceNo,
         bidi_mode: BidiMode,
+        scrollback_capacity: ScrollbackCapacity,
     ) -> Self {
-        let screen = Screen::new(size, config, true, seqno, bidi_mode);
-        let alt_screen = Screen::new(size, config, false, seqno, bidi_mode);
+        let screen = Screen::new_with_scrollback_capacity(
+            size,
+            config,
+            true,
+            seqno,
+            bidi_mode,
+            scrollback_capacity,
+        );
+        let alt_screen = Screen::new_with_scrollback_capacity(
+            size,
+            config,
+            false,
+            seqno,
+            bidi_mode,
+            scrollback_capacity,
+        );
 
         Self {
             screen,
@@ -199,6 +265,29 @@ impl ScreenOrAlt {
     ) -> (CursorPosition, CursorPosition) {
         let cursor_main = self.screen.resize(size, cursor_main, seqno, is_conpty);
         let cursor_alt = self.alt_screen.resize(size, cursor_alt, seqno, is_conpty);
+        (cursor_main, cursor_alt)
+    }
+
+    fn apply_bounded_resize(
+        &mut self,
+        size: TerminalSize,
+        cursor_main: CursorPosition,
+        cursor_alt: CursorPosition,
+        seqno: SequenceNo,
+        is_conpty: bool,
+        primary_plan: &ScreenResizeGeometryPlan,
+        alternate_plan: &ScreenResizeGeometryPlan,
+    ) -> (CursorPosition, CursorPosition) {
+        let cursor_main =
+            self.screen
+                .apply_bounded_resize(size, cursor_main, seqno, is_conpty, primary_plan);
+        let cursor_alt = self.alt_screen.apply_bounded_resize(
+            size,
+            cursor_alt,
+            seqno,
+            is_conpty,
+            alternate_plan,
+        );
         (cursor_main, cursor_alt)
     }
 
@@ -362,6 +451,7 @@ pub struct TerminalState {
 
     kitty_img: KittyImageState,
     seqno: SequenceNo,
+    geometry_mutation_epoch: u64,
 
     /// The unicode version that is in effect
     unicode_version: UnicodeVersion,
@@ -504,9 +594,51 @@ impl TerminalState {
         term_version: &str,
         writer: Box<dyn std::io::Write + Send>,
     ) -> TerminalState {
+        Self::new_with_scrollback_capacity(
+            size,
+            config,
+            term_program,
+            term_version,
+            writer,
+            ScrollbackCapacity::DynamicConfig,
+        )
+    }
+
+    pub(crate) fn new_with_fixed_scrollback(
+        size: TerminalSize,
+        configured_scrollback_rows: usize,
+        config: Arc<dyn TerminalConfiguration>,
+        term_program: &str,
+        term_version: &str,
+        writer: Box<dyn std::io::Write + Send>,
+    ) -> TerminalState {
+        Self::new_with_scrollback_capacity(
+            size,
+            config,
+            term_program,
+            term_version,
+            writer,
+            ScrollbackCapacity::Fixed(configured_scrollback_rows),
+        )
+    }
+
+    fn new_with_scrollback_capacity(
+        size: TerminalSize,
+        config: Arc<dyn TerminalConfiguration>,
+        term_program: &str,
+        term_version: &str,
+        writer: Box<dyn std::io::Write + Send>,
+        scrollback_capacity: ScrollbackCapacity,
+    ) -> TerminalState {
         let writer = BufWriter::new(ThreadedWriter::new(writer));
         let seqno = 1;
-        let screen = ScreenOrAlt::new(size, &config, seqno, config.bidi_mode());
+        let screen = ScreenOrAlt::new_with_scrollback_capacity(
+            size,
+            &config,
+            seqno,
+            config.bidi_mode(),
+            scrollback_capacity,
+        );
 
         let color_map = default_color_map();
 
@@ -570,6 +702,7 @@ impl TerminalState {
             user_vars: HashMap::new(),
             kitty_img: Default::default(),
             seqno,
+            geometry_mutation_epoch: 0,
             unicode_version,
             unicode_version_stack: vec![],
             suppress_initial_title_change: false,
@@ -593,8 +726,281 @@ impl TerminalState {
         self.seqno
     }
 
+    pub(crate) fn geometry_mutation_epoch(&self) -> u64 {
+        self.geometry_mutation_epoch
+    }
+
+    pub(crate) fn fixed_scrollback_rows(&self) -> Option<usize> {
+        self.screen.screen.fixed_scrollback_rows()
+    }
+
+    pub(crate) fn geometry_retained_size_excluding_image_data(
+        &self,
+    ) -> Result<usize, TerminalGeometryError> {
+        let primary = self
+            .screen
+            .screen
+            .geometry_retained_size_excluding_image_data()?;
+        let alternate = self
+            .screen
+            .alt_screen
+            .geometry_retained_size_excluding_image_data()?;
+        let screens = checked_geometry_add(primary, alternate, "current primary and alternate")?;
+        checked_geometry_add(
+            screens,
+            self.tabs.retained_geometry_bytes()?,
+            "current screens and tab stops",
+        )
+    }
+
+    pub(crate) fn retained_state_bytes_excluding_fixed(
+        &self,
+    ) -> Result<usize, TerminalGeometryError> {
+        let mut bytes = self.geometry_retained_size_excluding_image_data()?;
+        for string in IntoIterator::into_iter([
+            Some(&self.title),
+            self.icon_title.as_ref(),
+            Some(&self.term_program),
+            Some(&self.term_version),
+            self.accumulating_title.as_ref(),
+        ])
+        .flatten()
+        {
+            bytes = checked_geometry_add(bytes, string.capacity(), "terminal metadata strings")?;
+        }
+
+        bytes = checked_geometry_add(
+            bytes,
+            self.current_mouse_buttons
+                .capacity()
+                .checked_mul(std::mem::size_of::<MouseButton>())
+                .ok_or(TerminalGeometryError::ArithmeticOverflow {
+                    calculation: "current mouse button storage",
+                })?,
+            "terminal mouse state",
+        )?;
+        bytes = checked_geometry_add(
+            bytes,
+            self.unicode_version_stack
+                .capacity()
+                .checked_mul(std::mem::size_of::<UnicodeVersionStackEntry>())
+                .ok_or(TerminalGeometryError::ArithmeticOverflow {
+                    calculation: "unicode version stack storage",
+                })?,
+            "terminal unicode state",
+        )?;
+        for entry in &self.unicode_version_stack {
+            if let Some(label) = &entry.label {
+                bytes =
+                    checked_geometry_add(bytes, label.capacity(), "unicode version stack labels")?;
+            }
+        }
+
+        bytes = checked_geometry_add(
+            bytes,
+            self.user_vars
+                .capacity()
+                .checked_mul(2)
+                .ok_or(TerminalGeometryError::ArithmeticOverflow {
+                    calculation: "user variable map allocation",
+                })?
+                .checked_mul(std::mem::size_of::<(String, String)>())
+                .ok_or(TerminalGeometryError::ArithmeticOverflow {
+                    calculation: "user variable map storage",
+                })?,
+            "terminal user variable map",
+        )?;
+        for (name, value) in &self.user_vars {
+            bytes = checked_geometry_add(bytes, name.capacity(), "user variable names")?;
+            bytes = checked_geometry_add(bytes, value.capacity(), "user variable values")?;
+        }
+
+        if let Some(current_dir) = &self.current_dir {
+            bytes = checked_geometry_add(
+                bytes,
+                current_dir.as_str().len(),
+                "current directory storage",
+            )?;
+        }
+        bytes = checked_geometry_add(
+            bytes,
+            self.color_map
+                .capacity()
+                .checked_mul(2)
+                .ok_or(TerminalGeometryError::ArithmeticOverflow {
+                    calculation: "sixel color map allocation",
+                })?
+                .checked_mul(std::mem::size_of::<(u16, RgbColor)>())
+                .ok_or(TerminalGeometryError::ArithmeticOverflow {
+                    calculation: "sixel color map storage",
+                })?,
+            "terminal sixel color map",
+        )?;
+        bytes = checked_geometry_add(
+            bytes,
+            self.pen.retained_heap_size_excluding_image_data(),
+            "terminal pen attributes",
+        )?;
+        let mut hyperlinks: HashMap<usize, Arc<Hyperlink>> = HashMap::new();
+        let mut repeated_hyperlink_bytes = self
+            .screen
+            .screen
+            .collect_unique_hyperlinks(&mut hyperlinks)?;
+        repeated_hyperlink_bytes = checked_geometry_add(
+            repeated_hyperlink_bytes,
+            self.screen
+                .alt_screen
+                .collect_unique_hyperlinks(&mut hyperlinks)?,
+            "primary and alternate repeated hyperlink payloads",
+        )?;
+        if let Some(hyperlink) = self.pen.hyperlink() {
+            repeated_hyperlink_bytes = checked_geometry_add(
+                repeated_hyperlink_bytes,
+                hyperlink.retained_size(),
+                "terminal pen hyperlink payload",
+            )?;
+            hyperlinks
+                .entry(Arc::as_ptr(hyperlink) as usize)
+                .or_insert_with(|| Arc::clone(hyperlink));
+        }
+        bytes = bytes.checked_sub(repeated_hyperlink_bytes).ok_or(
+            TerminalGeometryError::ArithmeticOverflow {
+                calculation: "normalize shared hyperlink payloads",
+            },
+        )?;
+        for hyperlink in hyperlinks.values() {
+            bytes = checked_geometry_add(
+                bytes,
+                hyperlink.retained_size(),
+                "unique hyperlink payloads",
+            )?;
+        }
+        bytes = checked_geometry_add(
+            bytes,
+            self.image_cache
+                .cap()
+                .get()
+                .checked_mul(std::mem::size_of::<([u8; 32], Arc<ImageData>)>())
+                .ok_or(TerminalGeometryError::ArithmeticOverflow {
+                    calculation: "image cache entry storage",
+                })?,
+            "terminal image cache",
+        )?;
+        bytes = checked_geometry_add(
+            bytes,
+            self.kitty_img.retained_metadata_upper_bound().ok_or(
+                TerminalGeometryError::ArithmeticOverflow {
+                    calculation: "kitty image metadata storage",
+                },
+            )?,
+            "terminal kitty image metadata",
+        )?;
+
+        let mut images = HashMap::new();
+        self.screen.screen.collect_unique_image_data(&mut images);
+        self.screen
+            .alt_screen
+            .collect_unique_image_data(&mut images);
+        for (_, image) in self.image_cache.iter() {
+            images
+                .entry(Arc::as_ptr(image) as usize)
+                .or_insert_with(|| Arc::clone(image));
+        }
+        self.kitty_img.collect_unique_image_data(&mut images);
+        for image in images.values() {
+            bytes = checked_geometry_add(bytes, image.retained_size(), "unique image data")?;
+        }
+
+        Ok(bytes)
+    }
+
+    pub(crate) fn evict_unreferenced_retained_state(&mut self) {
+        self.image_cache.clear();
+        self.kitty_img.evict_unreferenced_images();
+    }
+
+    pub(crate) fn plan_bounded_resize(
+        &self,
+        target: TerminalSize,
+    ) -> Result<TerminalStateResizeGeometryPlan, TerminalGeometryError> {
+        if self.fixed_scrollback_rows().is_none() {
+            return Err(TerminalGeometryError::ResizeRequiresBoundedTerminal);
+        }
+
+        let primary = self
+            .screen
+            .screen
+            .plan_bounded_resize(target, self.enable_conpty_quirks)?;
+        let alternate = self
+            .screen
+            .alt_screen
+            .plan_bounded_resize(target, self.enable_conpty_quirks)?;
+        let current_tabs = self.tabs.retained_geometry_bytes()?;
+        let settled_tabs = if target.cols > self.tabs.tabs.len() {
+            conservative_collection_capacity(target.cols, "settled tab stop capacity")?
+                .max(std::mem::size_of::<usize>())
+        } else {
+            current_tabs
+        };
+
+        let current_screens = checked_geometry_add(
+            primary.current_geometry_retained_bytes(),
+            alternate.current_geometry_retained_bytes(),
+            "current primary and alternate geometry",
+        )?;
+        let current =
+            checked_geometry_add(current_screens, current_tabs, "current terminal geometry")?;
+        let settled_screens = checked_geometry_add(
+            primary.settled_geometry_retained_upper_bound(),
+            alternate.settled_geometry_retained_upper_bound(),
+            "settled primary and alternate geometry",
+        )?;
+        let settled =
+            checked_geometry_add(settled_screens, settled_tabs, "settled terminal geometry")?;
+
+        let primary_additional = primary
+            .peak_geometry_bytes()
+            .checked_sub(primary.current_geometry_retained_bytes())
+            .ok_or(TerminalGeometryError::ArithmeticOverflow {
+                calculation: "primary resize additional bytes",
+            })?;
+        let alternate_additional = alternate
+            .peak_geometry_bytes()
+            .checked_sub(alternate.current_geometry_retained_bytes())
+            .ok_or(TerminalGeometryError::ArithmeticOverflow {
+                calculation: "alternate resize additional bytes",
+            })?;
+        let tab_additional = if target.cols > self.tabs.tabs.len() {
+            settled_tabs
+        } else {
+            0
+        };
+        let peak = checked_geometry_add(
+            current,
+            primary_additional,
+            "terminal and primary resize coexistence",
+        )?;
+        let peak = checked_geometry_add(
+            peak,
+            alternate_additional,
+            "primary and alternate resize coexistence",
+        )?;
+        let peak = checked_geometry_add(peak, tab_additional, "tab resize coexistence")?;
+
+        Ok(TerminalStateResizeGeometryPlan {
+            primary,
+            alternate,
+            current_geometry_retained_bytes: current,
+            settled_geometry_retained_upper_bound: settled,
+            peak_geometry_bytes: peak.max(settled),
+        })
+    }
+
     pub fn increment_seqno(&mut self) {
-        self.seqno += 1;
+        self.seqno = self
+            .seqno
+            .checked_add(1)
+            .expect("terminal sequence number exhausted");
     }
 
     pub fn set_config(&mut self, config: Arc<dyn TerminalConfiguration>) {
@@ -701,6 +1107,13 @@ impl TerminalState {
     /// Returns a mutable reference to the active screen (either the primary or
     /// the alternate screen).
     pub fn screen_mut(&mut self) -> &mut Screen {
+        // Raw screen access may change line contents or retained capacities. Advance the
+        // private geometry epoch before granting the borrow so any bounded resize plan becomes
+        // stale without changing the display sequence number.
+        self.geometry_mutation_epoch = self
+            .geometry_mutation_epoch
+            .checked_add(1)
+            .expect("terminal geometry mutation epoch exhausted");
         &mut self.screen
     }
 
@@ -850,6 +1263,28 @@ impl TerminalState {
     /// We need to resize both the primary and alt screens, adjusting
     /// the cursor positions of both accordingly.
     pub fn resize(&mut self, size: TerminalSize) {
+        assert!(
+            self.fixed_scrollback_rows().is_none(),
+            "{}",
+            TerminalGeometryError::UnplannedBoundedResize
+        );
+        self.resize_impl(size, None);
+    }
+
+    pub(crate) fn apply_bounded_resize(
+        &mut self,
+        size: TerminalSize,
+        plan: TerminalStateResizeGeometryPlan,
+    ) {
+        debug_assert!(self.fixed_scrollback_rows().is_some());
+        self.resize_impl(size, Some(plan));
+    }
+
+    fn resize_impl(
+        &mut self,
+        size: TerminalSize,
+        bounded_plan: Option<TerminalStateResizeGeometryPlan>,
+    ) {
         self.increment_seqno();
         let (cursor_main, cursor_alt) = if self.screen.alt_screen_is_active {
             (
@@ -873,19 +1308,34 @@ impl TerminalState {
             )
         };
 
-        let (adjusted_cursor_main, adjusted_cursor_alt) = self.screen.resize(
-            size,
-            cursor_main,
-            cursor_alt,
-            self.seqno,
-            self.enable_conpty_quirks,
-        );
+        let (adjusted_cursor_main, adjusted_cursor_alt) = match bounded_plan.as_ref() {
+            Some(plan) => self.screen.apply_bounded_resize(
+                size,
+                cursor_main,
+                cursor_alt,
+                self.seqno,
+                self.enable_conpty_quirks,
+                &plan.primary,
+                &plan.alternate,
+            ),
+            None => self.screen.resize(
+                size,
+                cursor_main,
+                cursor_alt,
+                self.seqno,
+                self.enable_conpty_quirks,
+            ),
+        };
         self.top_and_bottom_margins = 0..size.rows as i64;
         self.left_and_right_margins = 0..size.cols;
         self.pixel_height = size.pixel_height;
         self.pixel_width = size.pixel_width;
         self.dpi = size.dpi;
-        self.tabs.resize(size.cols);
+        if bounded_plan.is_some() {
+            self.tabs.apply_bounded_resize(size.cols);
+        } else {
+            self.tabs.resize(size.cols);
+        }
 
         if self.screen.alt_screen_is_active {
             self.set_cursor_pos(
@@ -959,6 +1409,12 @@ impl TerminalState {
     /// Returns the current cell attributes of the screen
     pub fn pen(&self) -> CellAttributes {
         self.pen.clone()
+    }
+
+    pub(crate) fn pen_retained_heap_size_excluding_shared_data(&self) -> usize {
+        self.pen
+            .retained_heap_size_excluding_image_data()
+            .saturating_sub(self.pen.hyperlink().map_or(0, |link| link.retained_size()))
     }
 
     pub fn user_vars(&self) -> &HashMap<String, String> {

@@ -1121,6 +1121,10 @@ impl Pane for CopyOverlay {
         Ok(None)
     }
 
+    fn cancel_reader(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     fn writer(&self) -> MappedMutexGuard<'_, dyn std::io::Write> {
         MutexGuard::map(self.writer.lock(), |writer| {
             let w: &mut dyn std::io::Write = writer;

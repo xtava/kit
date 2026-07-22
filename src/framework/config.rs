@@ -89,6 +89,23 @@ impl ConfigStore {
         Ok(())
     }
 
+    /// Update one string inside a named table while preserving the rest of the TOML document.
+    pub fn set_table_string(&self, tool: &str, table: &str, key: &str, value: &str) -> Result<()> {
+        let writer = self.writer(tool);
+        let _lock = writer.lock()?;
+        let path = self.path(tool);
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+        };
+        let mut document =
+            raw.parse::<DocumentMut>().with_context(|| format!("parse {}", path.display()))?;
+        document[table][key] = toml_value(value);
+        writer.replace(&path, document.to_string().as_bytes())?;
+        Ok(())
+    }
+
     fn writer(&self, tool: &str) -> AtomicFileWriter {
         AtomicFileWriter::new(&self.dir, format!(".{tool}.lock"), format!(".{tool}"))
     }
@@ -152,6 +169,27 @@ mod tests {
 
         assert!(format!("{error:#}").contains("parse"));
         assert_eq!(std::fs::read_to_string(&path)?, invalid);
+        let _ = std::fs::remove_dir_all(&store.dir);
+        Ok(())
+    }
+
+    #[test]
+    fn table_string_edit_preserves_unrelated_configuration() -> Result<()> {
+        let store = store("table-string");
+        std::fs::create_dir_all(&store.dir)?;
+        let path = store.path("console");
+        std::fs::write(
+            &path,
+            "# presentation\nsidebar_split_ratio = 260\n\n[users]\nnode-old = \"alice\"\n",
+        )?;
+
+        store.set_table_string("console", "users", "node-new", "bob")?;
+        let raw = std::fs::read_to_string(&path)?;
+
+        assert!(raw.contains("# presentation"));
+        assert!(raw.contains("sidebar_split_ratio = 260"));
+        assert!(raw.contains("node-old = \"alice\""));
+        assert!(raw.contains("node-new = \"bob\""));
         let _ = std::fs::remove_dir_all(&store.dir);
         Ok(())
     }

@@ -1,0 +1,92 @@
+name: Connectivity
+
+on:
+  pull_request:
+    paths:
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - ".cargo/config.toml"
+      - "build.rs"
+      - "rustfmt.toml"
+      - "rust-toolchain.toml"
+      - "src/framework/**"
+      - "src/lib.rs"
+      - "src/main.rs"
+      - "src/tailscale/**"
+      - "src/tools/console/**"
+      - "src/tools/deploy/tui.rs"
+      - "src/tools/mod.rs"
+      - "src/tools/tail/**"
+      - "src/tui/**"
+      - "tests/console_*.rs"
+      - "tests/support/**"
+      - "vendor/varbincode/**"
+      - "vendor/wezterm/**"
+      - ".github/workflows/connectivity.yml"
+  push:
+    branches: [master]
+    paths:
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - ".cargo/config.toml"
+      - "build.rs"
+      - "rustfmt.toml"
+      - "rust-toolchain.toml"
+      - "src/framework/**"
+      - "src/lib.rs"
+      - "src/main.rs"
+      - "src/tailscale/**"
+      - "src/tools/console/**"
+      - "src/tools/deploy/tui.rs"
+      - "src/tools/mod.rs"
+      - "src/tools/tail/**"
+      - "src/tui/**"
+      - "tests/console_*.rs"
+      - "tests/support/**"
+      - "vendor/varbincode/**"
+      - "vendor/wezterm/**"
+      - ".github/workflows/connectivity.yml"
+
+concurrency:
+  group: connectivity-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  test:
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Check the connectivity build
+        run: cargo check --locked -j 2
+      - name: Lint all targets
+        run: cargo clippy --all-targets --locked -j 2 -- -D warnings
+      - name: Test reusable command fixtures
+        run: cargo test --locked --lib -j 2 framework::process::test_support
+      - name: Test platform opener construction
+        run: cargo test --locked --lib -j 2 framework::external
+      - name: Test shared Tailscale mechanics
+        run: "cargo test --locked --lib -j 2 tailscale::"
+      - name: Test Tail sharing
+        run: cargo test --locked --lib -j 2 tools::tail
+      - name: Test Console units
+        run: cargo test --locked --lib -j 2 tools::console
+      - name: Test Console native integration
+        run: >-
+          cargo test --locked -j 2
+          --test console_engine
+          --test console_live
+          --test console_tui_live

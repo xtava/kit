@@ -1,0 +1,71 @@
+format = 1
+source = "https://github.com/wezterm/wezterm.git"
+destination = "vendor/wezterm"
+revision = "76b606ec597a3c0263fa60321548637451c0a547"
+tree = "1fedb1c0d8693ed624b37398a588a66d271b1fab"
+imported_at = "2026-07-19"
+method = "git subtree add --prefix vendor/wezterm --squash from a fresh full official clone"
+import_base_commit = "a1f1165cc5461df75616dfd1caf1b172c2401c6c"
+subtree_squash_commit = "5beb22e72b85130a6eb684700a87a347b7b5b06f"
+subtree_import_commit = "c05896a310abbf529907f0e56d693b7b19bcd1fd"
+blob_count = 1842
+blob_bytes = 168985280
+gitlink_count = 4
+leaf_entry_count = 1846
+directory_count = 254
+symlink_count = 0
+lfs_pointer_count = 0
+license_notice_path_count = 26
+license_inventory_predicate = "tracked basenames beginning LICENSE or COPYING, plus licenses/*.md"
+nested_submodule_policy = "preserve gitlinks uninitialized; never run root recursive submodule update"
+maintenance_policy = "directly maintained vendored source; four Console safety groups"
+
+license_notice_paths = [
+  "LICENSE.md",
+  "assets/fonts/LICENSE_OFL.txt",
+  "assets/fonts/LICENSE_POWERLINE_EXTRA.txt",
+  "bidi/LICENSE.md",
+  "color-types/LICENSE.md",
+  "config/derive/LICENSE.md",
+  "deps/cairo/LICENSE",
+  "deps/cairo/cairo/COPYING",
+  "deps/cairo/cairo/COPYING-LGPL-2.1",
+  "deps/cairo/cairo/COPYING-MPL-1.1",
+  "deps/cairo/cairo/util/COPYING",
+  "deps/cairo/pixman/COPYING",
+  "filedescriptor/LICENSE.md",
+  "licenses/ANGLE.md",
+  "licenses/README.md",
+  "pty/LICENSE.md",
+  "tabout/LICENSE.md",
+  "term/LICENSE.md",
+  "termwiz/LICENSE.md",
+  "vtparse/LICENSE.md",
+  "wezterm-blob-leases/LICENSE.md",
+  "wezterm-dynamic/LICENSE.md",
+  "wezterm-dynamic/derive/LICENSE.md",
+  "wezterm-input-types/LICENSE.md",
+  "wezterm-ssh/LICENSE.md",
+  "window/LICENSE.md",
+]
+
+additional_attribution_paths = [
+  "deps/cairo/cairo/AUTHORS",
+  "deps/cairo/pixman/AUTHORS",
+]
+
+[[gitlink]]
+path = "deps/freetype/freetype2"
+revision = "42608f77f20749dd6ddc9e0536788eaad70ea4b5"
+
+[[gitlink]]
+path = "deps/freetype/libpng"
+revision = "f5e92d76973a7a53f517579bc95d61483bf108c0"
+
+[[gitlink]]
+path = "deps/freetype/zlib"
+revision = "51b7f2abdade71cd9bb0e7a373ef2610ec6f9daf"
+
+[[gitlink]]
+path = "deps/harfbuzz/harfbuzz"
+revision = "33a3f8de60dcad7535f14f07d6710144548853ac"

@@ -1,4 +1,4 @@
-use crate::pane::CloseReason;
+use crate::pane::{CloseReason, PaneId};
 use crate::{Mux, MuxNotification, Tab, TabId};
 use config::GuiPosition;
 use std::sync::Arc;
@@ -218,13 +218,16 @@ impl Window {
         self.tabs.iter()
     }
 
-    pub fn prune_dead_tabs(&mut self, live_tab_ids: &[TabId]) {
+    pub fn prune_dead_tabs(&mut self, live_tab_ids: &[TabId]) -> Vec<PaneId> {
         let mut invalidated = false;
+        let mut dead_pane_ids = Vec::new();
         let dead: Vec<TabId> = self
             .tabs
             .iter()
             .filter_map(|tab| {
-                if tab.prune_dead_panes() {
+                let (pruned, pane_ids) = tab.prune_dead_panes();
+                dead_pane_ids.extend(pane_ids);
+                if pruned {
                     invalidated = true;
                 }
                 if tab.is_dead() {
@@ -264,5 +267,6 @@ impl Window {
         if invalidated {
             self.invalidate();
         }
+        dead_pane_ids
     }
 }

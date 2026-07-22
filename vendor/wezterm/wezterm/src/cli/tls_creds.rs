@@ -17,14 +17,18 @@ pub struct TlsCredsCommand {
 
 impl TlsCredsCommand {
     pub async fn run(self, client: Client) -> anyhow::Result<()> {
-        let creds = client.get_tls_creds().await?;
+        let creds = client.get_tls_creds().await?.into_inner();
         if self.pem {
             println!("{}", creds.client_cert_pem);
             // RFC 4346 says that each successive cert certifies the
             // preceeding cert, so the CA should come last
             println!("{}", creds.ca_cert_pem);
         } else {
-            codec::Pdu::GetTlsCredsResponse(creds).encode(std::io::stdout().lock(), 0)?;
+            codec::Pdu::GetTlsCredsResponse(creds).encode(
+                std::io::stdout().lock(),
+                1,
+                client.admission(),
+            )?;
         }
         Ok(())
     }

@@ -7,23 +7,25 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
+use tokio::sync::{mpsc, watch};
 use zeroize::Zeroizing;
 
 use crate::framework::process::{
     CaptureOverflow, CapturePolicy, CommandSpec, ContainmentRequirement, EnvironmentBase,
-    InputPolicy, LeaderExit, LeaderExitObservation, OutputPolicy, PrivateBytes, ProcessByteEvent,
-    ProcessDeadline, ProcessEnvironment, ProcessLabel, ProcessOutputHandle, ProcessReport,
-    ProcessSpec, ProcessSupervisor, StreamPolicy, TerminationPolicy,
+    InputPolicy, LeaderExit, LeaderExitObservation, OutputPolicy, PrivateBytes, ProcessDeadline,
+    ProcessEnvironment, ProcessLabel, ProcessReport, ProcessSpec, ProcessSupervisor,
+    TerminationPolicy,
 };
-use tokio::sync::{mpsc, watch};
+use crate::tailscale::{self, TailscaleClient};
 
-use super::model::{RawStatus, Readiness};
+use super::model::Readiness;
 
 const CAPTURE_BYTES: NonZeroUsize = NonZeroUsize::new(8 * 1024 * 1024).unwrap();
 const CANCEL_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 pub struct TailClient {
+    tailscale: TailscaleClient,
     processes: ProcessSupervisor,
     working_directory: PathBuf,
     executable: OsString,
@@ -39,7 +41,8 @@ pub enum LoginEvent {
 
 impl TailClient {
     pub fn new(processes: ProcessSupervisor, working_directory: PathBuf) -> Self {
-        Self { processes, working_directory, executable: OsString::from("tailscale") }
+        let tailscale = TailscaleClient::new(processes.clone(), working_directory.clone());
+        Self { tailscale, processes, working_directory, executable: OsString::from("tailscale") }
     }
 
     #[cfg(test)]
@@ -48,41 +51,61 @@ impl TailClient {
         working_directory: PathBuf,
         executable: PathBuf,
     ) -> Self {
-        Self { processes, working_directory, executable: executable.into_os_string() }
+        let tailscale = TailscaleClient::with_executable(
+            processes.clone(),
+            working_directory.clone(),
+            &executable,
+        );
+        Self { tailscale, processes, working_directory, executable: executable.into_os_string() }
     }
 
     pub async fn readiness(&self) -> Result<Readiness> {
-        let output = self.capture("tailscale status", ["status", "--json"]).await;
-        match output {
-            Ok(bytes) => {
-                let status: RawStatus =
-                    serde_json::from_slice(&bytes).context("parse tailscale status")?;
-                let mut readiness = status.readiness();
-                if let Readiness::Ready { peers, .. } = &mut readiness {
-                    if let Ok(targets) =
-                        self.capture("list Taildrop targets", ["file", "cp", "--targets"]).await
-                    {
-                        reconcile_targets(peers, &targets);
-                    }
-                }
-                Ok(readiness)
-            }
-            Err(error) => Ok(classify_preflight_error(&error)),
-        }
+        Ok(self.enrich_readiness(self.tailscale.readiness().await?).await)
     }
 
     pub fn start_login(
         &self,
     ) -> (mpsc::Receiver<LoginEvent>, watch::Sender<bool>, tokio::task::JoinHandle<()>) {
         let (sender, receiver) = mpsc::channel(8);
-        let (cancel, cancel_receiver) = watch::channel(false);
+        let (mut shared_events, cancel, shared_task) = self.tailscale.start_login();
+        let adapter_cancel = cancel.clone();
         let client = self.clone();
         let task = tokio::spawn(async move {
-            if let Err(error) = client.run_login(sender.clone(), cancel_receiver).await {
-                let _ = sender.send(LoginEvent::Failed(format!("{error:#}"))).await;
+            while let Some(event) = shared_events.recv().await {
+                let event = match event {
+                    tailscale::LoginEvent::Url(url) => LoginEvent::Url(url.as_str().to_owned()),
+                    tailscale::LoginEvent::Ready(status) => {
+                        let readiness =
+                            client.enrich_readiness(tailscale::Readiness::Ready(status)).await;
+                        LoginEvent::Ready(readiness)
+                    }
+                    tailscale::LoginEvent::Failed(error) => LoginEvent::Failed(error),
+                    tailscale::LoginEvent::Cancelled => LoginEvent::Cancelled,
+                };
+                if sender.send(event).await.is_err() {
+                    let _ = adapter_cancel.send(true);
+                    break;
+                }
+            }
+            if let Err(error) = shared_task.await {
+                let _ = sender
+                    .send(LoginEvent::Failed(format!("Tailscale login task failed: {error}")))
+                    .await;
             }
         });
         (receiver, cancel, task)
+    }
+
+    async fn enrich_readiness(&self, readiness: tailscale::Readiness) -> Readiness {
+        let mut readiness = Readiness::from(readiness);
+        if let Readiness::Ready { peers, .. } = &mut readiness {
+            if let Ok(targets) =
+                self.capture("list Taildrop targets", ["file", "cp", "--targets"]).await
+            {
+                reconcile_targets(peers, &targets);
+            }
+        }
+        readiness
     }
 
     pub async fn send_text(
@@ -126,18 +149,15 @@ impl TailClient {
     pub async fn receive_into(
         &self,
         directory: &Path,
-        wait: bool,
         cancel: watch::Receiver<bool>,
     ) -> Result<()> {
-        let mut args = vec![
+        let args = vec![
             OsString::from("file"),
             OsString::from("get"),
             OsString::from("--conflict=rename"),
+            OsString::from("--wait"),
+            directory.as_os_str().to_owned(),
         ];
-        if wait {
-            args.push(OsString::from("--wait"));
-        }
-        args.push(directory.as_os_str().to_owned());
         self.status_cancellable("receive Taildrop files", args, InputPolicy::Closed, cancel).await
     }
 
@@ -228,99 +248,6 @@ impl TailClient {
             TerminationPolicy::new(CANCEL_GRACE),
         ))
     }
-
-    async fn run_login(
-        &self,
-        sender: mpsc::Sender<LoginEvent>,
-        mut cancel: watch::Receiver<bool>,
-    ) -> Result<()> {
-        let stream = OutputPolicy::Stream(StreamPolicy::new(NonZeroUsize::new(64 * 1024).unwrap()));
-        let spec = self.process_spec(
-            "authenticate Tailscale",
-            vec![OsString::from("login")],
-            InputPolicy::Closed,
-            stream,
-            stream,
-        )?;
-        let started = self.processes.spawn(spec).await?;
-        let mut stdout = byte_stream(started.stdout)?;
-        let mut stderr = byte_stream(started.stderr)?;
-        let control = started.session.control();
-        let wait = started.session.wait();
-        tokio::pin!(wait);
-        let mut status_tick = tokio::time::interval(Duration::from_millis(750));
-        let mut output = String::new();
-        let mut announced_url = None;
-        let mut stdout_open = true;
-        let mut stderr_open = true;
-        loop {
-            tokio::select! {
-                event = stdout.next(), if stdout_open => stdout_open = append_login_output(event?, &mut output),
-                event = stderr.next(), if stderr_open => stderr_open = append_login_output(event?, &mut output),
-                report = &mut wait => {
-                    let report = report.map_err(|failure| anyhow::anyhow!("login supervision failed: {:?}", failure.failure))?;
-                    ensure_success(&report)?;
-                    match self.readiness().await? {
-                        readiness @ Readiness::Ready { .. } => {
-                            let _ = sender.send(LoginEvent::Ready(readiness)).await;
-                            return Ok(());
-                        }
-                        _ => bail!("Tailscale login exited before the device became ready"),
-                    }
-                }
-                _ = status_tick.tick() => {
-                    if let Some(url) = login_url(&output) {
-                        if announced_url.as_deref() != Some(url.as_str()) {
-                            announced_url = Some(url.clone());
-                            let _ = sender.send(LoginEvent::Url(url)).await;
-                        }
-                    }
-                    if let readiness @ Readiness::Ready { .. } = self.readiness().await? {
-                        let _ = sender.send(LoginEvent::Ready(readiness)).await;
-                        let _ = control.cancel().await;
-                        let _ = wait.await;
-                        return Ok(());
-                    }
-                }
-                changed = cancel.changed() => {
-                    let _ = changed;
-                    control.cancel().await?;
-                    let _ = wait.await;
-                    let _ = sender.send(LoginEvent::Cancelled).await;
-                    return Ok(());
-                }
-            }
-        }
-    }
-}
-
-fn byte_stream(
-    handle: ProcessOutputHandle,
-) -> Result<crate::framework::process::ProcessByteStream> {
-    match handle {
-        ProcessOutputHandle::Stream(stream) => Ok(stream),
-        _ => bail!("login output was not streamed"),
-    }
-}
-
-fn append_login_output(event: ProcessByteEvent, output: &mut String) -> bool {
-    let ProcessByteEvent::Chunk { bytes, .. } = event else { return false };
-    output.push_str(&String::from_utf8_lossy(&bytes));
-    if output.len() > 64 * 1024 {
-        output.drain(..output.len() - 64 * 1024);
-    }
-    true
-}
-
-fn login_url(output: &str) -> Option<String> {
-    let start = output.find("https://login.tailscale.com/")?;
-    let candidate = output[start..]
-        .chars()
-        .take_while(|character| !character.is_whitespace() && !character.is_control())
-        .collect::<String>();
-    let parsed = url::Url::parse(&candidate).ok()?;
-    (parsed.scheme() == "https" && parsed.host_str() == Some("login.tailscale.com"))
-        .then_some(candidate)
 }
 
 fn capture() -> OutputPolicy {
@@ -359,18 +286,6 @@ fn reconcile_targets(peers: &mut [super::model::Device], output: &[u8]) {
     }
 }
 
-fn classify_preflight_error(error: &anyhow::Error) -> Readiness {
-    let message = format!("{error:#}");
-    let normalized = message.to_lowercase();
-    if normalized.contains("no such file") || normalized.contains("not found") {
-        Readiness::CliUnavailable(message)
-    } else if normalized.contains("permission denied") || normalized.contains("access is denied") {
-        Readiness::PermissionDenied(message)
-    } else {
-        Readiness::DaemonUnavailable(message)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
@@ -381,20 +296,6 @@ mod tests {
     use super::*;
 
     const READY_STATUS: &str = r#"{"BackendState":"Running","TailscaleIPs":["100.64.0.1"],"Self":{"ID":"me","DNSName":"desktop.test.ts.net.","HostName":"desktop","OS":"linux","Online":true,"TailscaleIPs":["100.64.0.1"]},"Peer":{"peer":{"ID":"peer","DNSName":"laptop.test.ts.net.","HostName":"laptop","OS":"linux","Online":true,"TailscaleIPs":["100.64.0.2"]}}}"#;
-    const NEEDS_LOGIN_STATUS: &str = r#"{"BackendState":"NeedsLogin"}"#;
-
-    #[test]
-    fn extracts_login_url_from_mixed_output() {
-        assert_eq!(
-            login_url("authenticate here:\nhttps://login.tailscale.com/a/abc\nwaiting"),
-            Some("https://login.tailscale.com/a/abc".to_owned())
-        );
-    }
-
-    #[test]
-    fn rejects_lookalike_login_hosts() {
-        assert_eq!(login_url("https://login.tailscale.com.evil/a"), None);
-    }
 
     #[test]
     fn reconciles_authoritative_taildrop_targets_by_ip() {
@@ -436,8 +337,12 @@ mod tests {
             fixture.executable(),
         );
 
-        let Readiness::Ready { peers, .. } = client.readiness().await.unwrap() else {
-            panic!("fake CLI was not ready")
+        let readiness = client.readiness().await.unwrap();
+        let Readiness::Ready { peers, .. } = readiness else {
+            panic!(
+                "fake CLI was not ready: {readiness:?}; invocations: {:?}",
+                fixture.invocations()
+            )
         };
         assert_eq!(peers[0].send_target(), Some("100.64.0.2"));
         let (_cancel, cancel_receiver) = watch::channel(false);
@@ -461,79 +366,6 @@ mod tests {
             })
             .unwrap();
         assert_eq!(sent.stdin, b"hello from stdin");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn fake_login_stays_alive_until_readiness_and_is_reaped() {
-        let mut fixture = CommandFixture::new().unwrap();
-        fixture
-            .respond(
-                ["login"],
-                CommandResponse::hang().stderr("https://login.tailscale.com/a/test-token\n"),
-            )
-            .unwrap();
-        fixture
-            .respond(["status", "--json"], CommandResponse::success().stdout(NEEDS_LOGIN_STATUS))
-            .unwrap();
-        fixture
-            .respond(["status", "--json"], CommandResponse::success().stdout(READY_STATUS))
-            .unwrap();
-        fixture.respond(["file", "cp", "--targets"], CommandResponse::success()).unwrap();
-        let processes = ProcessSupervisor::for_test(fixture.root().join("processes")).unwrap();
-        let client = TailClient::with_executable(
-            processes,
-            fixture.root().to_path_buf(),
-            fixture.executable(),
-        );
-        let (mut events, _cancel, task) = client.start_login();
-
-        let url =
-            tokio::time::timeout(Duration::from_secs(3), events.recv()).await.unwrap().unwrap();
-        assert!(
-            matches!(url, LoginEvent::Url(ref url) if url == "https://login.tailscale.com/a/test-token")
-        );
-        let login = fixture.wait_for_invocation(["login"], Duration::from_secs(3)).await.unwrap();
-        assert_eq!(unsafe { libc::kill(login.pid as i32, 0) }, 0);
-        let ready =
-            tokio::time::timeout(Duration::from_secs(4), events.recv()).await.unwrap().unwrap();
-        assert!(matches!(ready, LoginEvent::Ready(Readiness::Ready { .. })));
-        task.await.unwrap();
-        assert_eq!(unsafe { libc::kill(login.pid as i32, 0) }, -1);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn fake_login_cancellation_is_acknowledged_after_reaping() {
-        let mut fixture = CommandFixture::new().unwrap();
-        fixture
-            .respond(
-                ["login"],
-                CommandResponse::hang().stdout("https://login.tailscale.com/a/cancel-token\n"),
-            )
-            .unwrap();
-        fixture
-            .respond(["status", "--json"], CommandResponse::success().stdout(NEEDS_LOGIN_STATUS))
-            .unwrap();
-        let processes = ProcessSupervisor::for_test(fixture.root().join("processes")).unwrap();
-        let client = TailClient::with_executable(
-            processes,
-            fixture.root().to_path_buf(),
-            fixture.executable(),
-        );
-        let (mut events, cancel, task) = client.start_login();
-
-        let url =
-            tokio::time::timeout(Duration::from_secs(3), events.recv()).await.unwrap().unwrap();
-        assert!(matches!(url, LoginEvent::Url(_)));
-        let login = fixture.wait_for_invocation(["login"], Duration::from_secs(3)).await.unwrap();
-        assert_eq!(unsafe { libc::kill(login.pid as i32, 0) }, 0);
-        cancel.send(true).unwrap();
-        let cancelled =
-            tokio::time::timeout(Duration::from_secs(4), events.recv()).await.unwrap().unwrap();
-        assert!(matches!(cancelled, LoginEvent::Cancelled));
-        task.await.unwrap();
-        assert_eq!(unsafe { libc::kill(login.pid as i32, 0) }, -1);
     }
 
     #[cfg(unix)]

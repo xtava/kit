@@ -10,6 +10,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::thread;
 use wezterm_gui_subcommands::*;
+use wezterm_mux_server_impl::authorization::{AllowAllRequests, ServerPolicy};
 use wezterm_mux_server_impl::update_mux_domains_for_server;
 
 mod daemonize;
@@ -204,9 +205,13 @@ fn run() -> anyhow::Result<()> {
         std::env::remove_var(name);
     }
 
-    wezterm_blob_leases::register_storage(Arc::new(
-        wezterm_blob_leases::simple_tempdir::SimpleTempDir::new_in(&*config::CACHE_DIR)?,
-    ))?;
+    let admission = mux::RuntimeAdmission::new(mux::RuntimeRole::Server)?;
+    wezterm_blob_leases::register_storage(
+        Arc::new(wezterm_blob_leases::simple_tempdir::SimpleTempDir::new_in(
+            &*config::CACHE_DIR,
+        )?),
+        Arc::clone(&admission),
+    )?;
 
     let need_builder = !opts.prog.is_empty() || opts.cwd.is_some();
 
@@ -225,28 +230,43 @@ fn run() -> anyhow::Result<()> {
     };
 
     let domain: Arc<dyn Domain> = Arc::new(LocalDomain::new("local")?);
-    let mux = Arc::new(mux::Mux::new(Some(domain.clone())));
-    Mux::set_mux(&mux);
+    let executor = Arc::new(promise::spawn::SimpleExecutor::new(Arc::clone(&admission)));
+    let executor_handle = executor.handle();
+    let mux = Arc::new(mux::Mux::new_headless(
+        Some(domain.clone()),
+        Arc::clone(&admission),
+        Arc::clone(&executor),
+    ));
+    Mux::set_mux(&mux)?;
 
-    let executor = promise::spawn::SimpleExecutor::new();
-
-    spawn_listener().map_err(|e| {
-        log::error!("problem spawning listeners: {:?}", e);
-        e
-    })?;
+    let server_policy = ServerPolicy::new(
+        Arc::new(AllowAllRequests),
+        codec::BuildIdentity {
+            product: "wezterm-mux-server".to_string(),
+            version: config::wezterm_version().to_string(),
+            source_revision: option_env!("WEZTERM_GIT_HASH").map(str::to_string),
+            source_dirty: None,
+            embedded_wezterm_revision: None,
+        },
+    );
+    let _listener_threads = spawn_listener(server_policy, Arc::clone(&admission), executor_handle)
+        .map_err(|e| {
+            log::error!("problem spawning listeners: {:?}", e);
+            e
+        })?;
 
     let activity = Activity::new();
 
-    promise::spawn::spawn(async move {
+    mux.try_spawn_runtime_task_local("schedule mux server main task", async move {
         if let Err(err) = async_run(cmd).await {
             terminate_with_error(err);
         }
         drop(activity);
-    })
-    .detach();
+        Ok(())
+    })?;
 
     loop {
-        executor.tick()?;
+        mux.tick_headless()?;
     }
 }
 
@@ -264,12 +284,18 @@ async fn async_run(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
 
     update_mux_domains_for_server(&config)?;
     let _config_subscription = config::subscribe_to_config_reload(move || {
-        promise::spawn::spawn_into_main_thread(async move {
-            if let Err(err) = update_mux_domains_for_server(&config::configuration()) {
-                log::error!("Error updating mux domains: {:#}", err);
+        let Some(mux) = Mux::try_get() else {
+            return false;
+        };
+        let weak_mux = Arc::downgrade(&mux);
+        if let Err(err) = mux.try_spawn_runtime_task("schedule mux config reload", async move {
+            if weak_mux.upgrade().is_some() {
+                update_mux_domains_for_server(&config::configuration())?;
             }
-        })
-        .detach();
+            Ok(())
+        }) {
+            log::error!("failed to schedule mux config reload: {:#}", err);
+        }
         true
     });
 
@@ -307,19 +333,43 @@ fn terminate_with_error(err: anyhow::Error) -> ! {
 
 mod ossl;
 
-pub fn spawn_listener() -> anyhow::Result<()> {
+pub fn spawn_listener(
+    policy: Arc<wezterm_mux_server_impl::authorization::ServerPolicy>,
+    admission: Arc<mux::RuntimeAdmission>,
+    executor: promise::spawn::SimpleExecutorHandle,
+) -> anyhow::Result<Vec<thread::JoinHandle<()>>> {
+    let dispatch_executor = promise::spawn::MainThreadExecutorHandle::from_simple(executor);
     let config = configuration();
+    let mut listener_threads = Vec::with_capacity(
+        config
+            .unix_domains
+            .len()
+            .checked_add(config.tls_servers.len())
+            .ok_or_else(|| anyhow::anyhow!("listener count overflow"))?,
+    );
     for unix_dom in &config.unix_domains {
         std::env::set_var("WEZTERM_UNIX_SOCKET", unix_dom.socket_path());
-        let mut listener = wezterm_mux_server_impl::local::LocalListener::with_domain(unix_dom)?;
-        thread::spawn(move || {
-            listener.run();
-        });
+        let mut listener = wezterm_mux_server_impl::local::LocalListener::with_domain(
+            unix_dom,
+            policy.clone(),
+            Arc::clone(&admission),
+            dispatch_executor.clone(),
+        )?;
+        listener_threads.push(thread::spawn(move || {
+            if let Err(err) = listener.run() {
+                log::error!("local mux listener failed: {:#}", err);
+            }
+        }));
     }
 
     for tls_server in &config.tls_servers {
-        ossl::spawn_tls_listener(tls_server)?;
+        listener_threads.push(ossl::spawn_tls_listener(
+            tls_server,
+            policy.clone(),
+            Arc::clone(&admission),
+            dispatch_executor.clone(),
+        )?);
     }
 
-    Ok(())
+    Ok(listener_threads)
 }

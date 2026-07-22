@@ -27,7 +27,8 @@ use termwiz::cell::CellAttributes;
 use termwiz::surface::{Line, SEQ_ZERO};
 use unicode_normalization::UnicodeNormalization;
 use wezterm_bidi::Direction;
-use wezterm_client::domain::ClientDomain;
+use wezterm_client::client::{Client, HeadlessConnectionLifecycle};
+use wezterm_client::domain::{ClientDomain, ClientDomainConfig};
 use wezterm_font::shaper::PresentationWidth;
 use wezterm_font::FontConfiguration;
 use wezterm_gui_subcommands::*;
@@ -413,9 +414,13 @@ async fn async_run_terminal_gui(
     let unix_socket_path =
         config::RUNTIME_DIR.join(format!("gui-sock-{}", unsafe { libc::getpid() }));
     std::env::set_var("WEZTERM_UNIX_SOCKET", unix_socket_path.clone());
-    wezterm_blob_leases::register_storage(Arc::new(
-        wezterm_blob_leases::simple_tempdir::SimpleTempDir::new_in(&*config::CACHE_DIR)?,
-    ))?;
+    let mux = Mux::get();
+    wezterm_blob_leases::register_storage(
+        Arc::new(wezterm_blob_leases::simple_tempdir::SimpleTempDir::new_in(
+            &*config::CACHE_DIR,
+        )?),
+        Arc::clone(mux.admission()),
+    )?;
     if let Err(err) = spawn_mux_server(unix_socket_path, should_publish) {
         log::warn!("{:#}", err);
     }
@@ -441,8 +446,6 @@ async fn async_run_terminal_gui(
         }),
         (spawn, None) => spawn,
     };
-    let mux = Mux::get();
-
     let domain = if let Some(name) = &opts.domain {
         let domain = mux
             .get_domain_by_name(name)
@@ -534,6 +537,7 @@ impl Publish {
 
     pub fn try_spawn(
         &mut self,
+        mux: &Arc<Mux>,
         cmd: Option<CommandBuilder>,
         config: &ConfigHandle,
         workspace: Option<&str>,
@@ -546,14 +550,25 @@ impl Publish {
                 no_serve_automatically: true,
                 ..Default::default()
             };
-            let mut ui = mux::connui::ConnectionUI::new_headless();
-            match wezterm_client::client::Client::new_unix_domain(None, &dom, false, &mut ui, true)
-            {
+            let admission = mux.admission().clone();
+            let lifecycle = HeadlessConnectionLifecycle::new(admission.clone());
+            let executor = promise::spawn::ScopedExecutor::new();
+            let client = block_on(executor.run(Client::new_headless(
+                None,
+                ClientDomainConfig::Unix(dom),
+                admission,
+                &lifecycle,
+                None,
+                mux::client::ClientId::new(),
+                false,
+                true,
+            )));
+            match client {
                 Ok(client) => {
                     let executor = promise::spawn::ScopedExecutor::new();
                     let command = cmd.clone();
                     let res = block_on(executor.run(async move {
-                        let vers = client.verify_version_compat(&mut ui).await?;
+                        let vers = client.initial_server_version();
 
                         if vers.executable_path != std::env::current_exe().context("resolve executable path")? {
                             *self = Publish::NoConnectNoPublish;
@@ -571,7 +586,7 @@ impl Publish {
 
                         let window_id = if new_tab || config.prefer_to_spawn_tabs {
                             if let Ok(pane_id) = client.resolve_pane_id(None).await {
-                                let panes = client.list_panes().await?;
+                                let panes = client.list_panes().await?.into_inner();
 
                                 let mut window_id = None;
                                 'outer: for tabroot in panes.tabs {
@@ -598,22 +613,59 @@ impl Publish {
                         } else {
                             None
                         };
+                        let command_dir = command
+                            .as_ref()
+                            .and_then(CommandBuilder::get_cwd)
+                            .map(|cwd| {
+                                cwd.to_str()
+                                    .map(str::to_string)
+                                    .ok_or_else(|| anyhow!("spawn command cwd is not valid UTF-8"))
+                            })
+                            .transpose()?;
+                        let command = match command {
+                            None => codec::EnvironmentFreeCommand::DefaultLoginShell,
+                            Some(command) if command.is_default_prog() => {
+                                codec::EnvironmentFreeCommand::DefaultLoginShell
+                            }
+                            Some(command) => {
+                                codec::EnvironmentFreeCommand::try_from_argv(command.get_argv())?
+                            }
+                        };
+                        let domain = match domain {
+                            SpawnTabDomain::DefaultDomain | SpawnTabDomain::CurrentPaneDomain => {
+                                codec::TabSpawnDomain::DefaultDomain
+                            }
+                            SpawnTabDomain::DomainName(name) => {
+                                codec::TabSpawnDomain::DomainName(name)
+                            }
+                            SpawnTabDomain::DomainId(id) => codec::TabSpawnDomain::DomainId(id),
+                        };
+                        let placement = match window_id {
+                            Some(window_id) => {
+                                codec::TabSpawnPlacement::ExistingWindow { window_id }
+                            }
+                            None => codec::TabSpawnPlacement::NewWindow {
+                                size: config.initial_size(0, None),
+                                workspace: workspace
+                                    .unwrap_or(
+                                        config
+                                            .default_workspace
+                                            .as_deref()
+                                            .unwrap_or(mux::DEFAULT_WORKSPACE),
+                                    )
+                                    .to_string(),
+                            },
+                        };
 
-                        client
+                        Ok(client
                             .spawn_v2(codec::SpawnV2 {
                                 domain,
-                                window_id,
+                                placement,
                                 command,
-                                command_dir: None,
-                                size: config.initial_size(0, None),
-                                workspace: workspace.unwrap_or(
-                                    config
-                                        .default_workspace
-                                        .as_deref()
-                                        .unwrap_or(mux::DEFAULT_WORKSPACE)
-                                ).to_string(),
+                                command_dir,
                             })
-                            .await
+                            .await?
+                            .into_inner())
                     }));
 
                     match res {
@@ -649,11 +701,27 @@ impl Publish {
 }
 
 fn spawn_mux_server(unix_socket_path: PathBuf, should_publish: bool) -> anyhow::Result<()> {
-    let mut listener =
-        wezterm_mux_server_impl::local::LocalListener::with_domain(&config::UnixDomain {
+    let admission = mux::RuntimeAdmission::new(mux::RuntimeRole::Server)?;
+    let executor = promise::spawn::MainThreadExecutorHandle::from_global(Arc::clone(&admission))?;
+    let policy = wezterm_mux_server_impl::authorization::ServerPolicy::new(
+        Arc::new(wezterm_mux_server_impl::authorization::AllowAllRequests),
+        codec::BuildIdentity {
+            product: "wezterm-gui".to_string(),
+            version: config::wezterm_version().to_string(),
+            source_revision: option_env!("WEZTERM_GIT_HASH").map(str::to_string),
+            source_dirty: None,
+            embedded_wezterm_revision: None,
+        },
+    );
+    let mut listener = wezterm_mux_server_impl::local::LocalListener::with_domain(
+        &config::UnixDomain {
             socket_path: Some(unix_socket_path.clone()),
             ..Default::default()
-        })?;
+        },
+        policy,
+        admission,
+        executor,
+    )?;
     std::thread::spawn(move || {
         let name_holder;
         if should_publish {
@@ -679,8 +747,9 @@ fn setup_mux(
     default_domain_name: Option<&str>,
     default_workspace_name: Option<&str>,
 ) -> anyhow::Result<Arc<Mux>> {
-    let mux = Arc::new(mux::Mux::new(Some(local_domain.clone())));
-    Mux::set_mux(&mux);
+    let admission = mux::RuntimeAdmission::new(mux::RuntimeRole::Client)?;
+    let mux = Arc::new(mux::Mux::new(Some(local_domain.clone()), admission));
+    Mux::set_mux(&mux)?;
     let client_id = Arc::new(mux::client::ClientId::new());
     mux.register_client(client_id.clone());
     mux.replace_identity(Some(client_id));
@@ -763,6 +832,7 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
     );
     log::trace!("{:?}", publish);
     if publish.try_spawn(
+        &mux,
         cmd.clone(),
         &config,
         opts.workspace.as_deref(),

@@ -9,7 +9,7 @@ use crate::escape::osc::OperatingSystemCommand;
 use crate::escape::osc::{ITermDimension, ITermFileData, ITermProprietary};
 use crate::escape::{Esc, OneBased};
 #[cfg(feature = "use_image")]
-use crate::image::{ImageDataType, TextureCoordinate};
+use crate::image::{EncodedBlob, ImageDataType, TextureCoordinate};
 use crate::render::RenderTty;
 use crate::surface::{Change, CursorShape, CursorVisibility, LineAttribute, Position};
 use crate::Result;
@@ -586,18 +586,29 @@ impl TerminfoRenderer {
                 #[cfg(feature = "use_image")]
                 Change::Image(image) => {
                     if self.caps.iterm2_image() {
-                        let data = if image.top_left == TextureCoordinate::new_f32(0.0, 0.0)
+                        let (data, _blob_read_guard) = if image.top_left
+                            == TextureCoordinate::new_f32(0.0, 0.0)
                             && image.bottom_right == TextureCoordinate::new_f32(1.0, 1.0)
                         {
                             // The whole image is requested, so we can send the
                             // original image bytes over
-                            match &*image.image.data() {
-                                ImageDataType::EncodedFile(data) => data.to_vec(),
-                                ImageDataType::EncodedLease(lease) => lease.get_data()?,
+                            let admitted = match &*image.image.data() {
+                                ImageDataType::Encoded(EncodedBlob::Inline(data)) => {
+                                    wezterm_blob_leases::copy_bytes_with_limit(
+                                        data.as_slice(),
+                                        wezterm_runtime_admission::MAX_WIRE_BYTE_BUFFER_BYTES,
+                                    )?
+                                }
+                                ImageDataType::Encoded(EncodedBlob::Stored(lease)) => lease
+                                    .read_with_limit(
+                                        wezterm_runtime_admission::MAX_WIRE_BYTE_BUFFER_BYTES,
+                                    )?,
                                 ImageDataType::AnimRgba8 { .. } | ImageDataType::Rgba8 { .. } => {
                                     unimplemented!()
                                 }
-                            }
+                            };
+                            let (data, guard) = admitted.into_guarded_parts();
+                            (data, Some(guard))
                         } else {
                             // TODO: slice out the requested region of the image,
                             // and encode as a PNG.

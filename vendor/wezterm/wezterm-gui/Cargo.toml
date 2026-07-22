@@ -98,6 +98,7 @@ wezterm-client.workspace = true
 wezterm-dynamic.workspace = true
 wezterm-font.workspace = true
 wezterm-gui-subcommands.workspace = true
+wezterm-runtime-admission.workspace = true
 wezterm-mux-server-impl.workspace = true
 wezterm-open-url.workspace = true
 wezterm-ssh.workspace = true

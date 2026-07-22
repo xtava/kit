@@ -18,7 +18,7 @@ impl ListCommand {
         let out = std::io::stdout();
 
         let mut output_items = vec![];
-        let panes = client.list_panes().await?;
+        let panes = client.list_panes().await?.into_inner();
 
         for (tabroot, tab_title) in panes.tabs.into_iter().zip(panes.tab_titles.iter()) {
             let mut cursor = tabroot.into_tree().cursor();

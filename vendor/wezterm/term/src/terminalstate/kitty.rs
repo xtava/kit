@@ -28,6 +28,51 @@ pub struct KittyImageState {
 }
 
 impl KittyImageState {
+    pub(crate) fn collect_unique_image_data(&self, images: &mut HashMap<usize, Arc<ImageData>>) {
+        for data in self.id_to_data.values() {
+            images
+                .entry(Arc::as_ptr(data) as usize)
+                .or_insert_with(|| Arc::clone(data));
+        }
+    }
+
+    pub(crate) fn retained_metadata_upper_bound(&self) -> Option<usize> {
+        let mut bytes = self
+            .accumulator
+            .capacity()
+            .checked_mul(std::mem::size_of::<KittyImage>())?;
+        for image in &self.accumulator {
+            bytes = bytes.checked_add(image.retained_size_upper_bound())?;
+        }
+        bytes = bytes.checked_add(
+            self.number_to_id
+                .capacity()
+                .checked_mul(2)?
+                .checked_mul(std::mem::size_of::<(u32, u32)>())?,
+        )?;
+        bytes = bytes.checked_add(
+            self.id_to_data
+                .capacity()
+                .checked_mul(2)?
+                .checked_mul(std::mem::size_of::<(u32, Arc<ImageData>)>())?,
+        )?;
+        bytes.checked_add(
+            self.placements
+                .capacity()
+                .checked_mul(2)?
+                .checked_mul(std::mem::size_of::<((u32, Option<u32>), PlacementInfo)>())?,
+        )
+    }
+
+    pub(crate) fn evict_unreferenced_images(&mut self) {
+        let referenced: HashSet<u32> = self.placements.keys().map(|(id, _)| *id).collect();
+        self.id_to_data.retain(|id, _| referenced.contains(id));
+        let id_to_data = &self.id_to_data;
+        self.number_to_id
+            .retain(|_, id| id_to_data.contains_key(id));
+        self.used_memory = self.id_to_data.values().map(|data| data.len()).sum();
+    }
+
     fn remove_data_for_id(&mut self, image_id: u32) {
         if let Some(data) = self.id_to_data.remove(&image_id) {
             self.used_memory = self.used_memory.saturating_sub(data.len());
@@ -178,26 +223,28 @@ impl TerminalState {
         }
         let verbosity = img.verbosity();
         match img {
-            KittyImage::Query { transmit } => match transmit.data.load_data() {
-                Ok(_) => {
-                    self.kitty_send_response(
-                        verbosity,
-                        true,
-                        transmit.image_id,
-                        transmit.image_number,
-                        "OK".to_string(),
-                    );
+            KittyImage::Query { transmit } => {
+                match transmit.data.load_data_with_limit(MAX_DECODED_IMAGE_BYTES) {
+                    Ok(_) => {
+                        self.kitty_send_response(
+                            verbosity,
+                            true,
+                            transmit.image_id,
+                            transmit.image_number,
+                            "OK".to_string(),
+                        );
+                    }
+                    Err(err) => {
+                        self.kitty_send_response(
+                            verbosity,
+                            false,
+                            transmit.image_id,
+                            transmit.image_number,
+                            format!("ERROR:{:#}", err),
+                        );
+                    }
                 }
-                Err(err) => {
-                    self.kitty_send_response(
-                        verbosity,
-                        false,
-                        transmit.image_id,
-                        transmit.image_number,
-                        format!("ERROR:{:#}", err),
-                    );
-                }
-            },
+            }
             KittyImage::TransmitData {
                 transmit,
                 verbosity,
@@ -447,7 +494,7 @@ impl TerminalState {
 
         let mut img = img.data();
         match &mut *img {
-            ImageDataType::EncodedLease(_) | ImageDataType::EncodedFile(_) => {
+            ImageDataType::Encoded(_) => {
                 anyhow::bail!("invalid image type")
             }
             ImageDataType::Rgba8 {
@@ -602,7 +649,7 @@ impl TerminalState {
         });
 
         match &mut *anim {
-            ImageDataType::EncodedLease(_) | ImageDataType::EncodedFile(_) => {
+            ImageDataType::Encoded(_) => {
                 anyhow::bail!("Expected decoded image for image id {}", image_id)
             }
             ImageDataType::Rgba8 {
@@ -643,6 +690,7 @@ impl TerminalState {
                     }
                     Some(2) | None => {
                         // Create a second frame
+                        checked_image_allocation_bytes(*width, *height, 4, 1)?;
 
                         let mut new_frame = if base_frame.is_some() {
                             RgbaImage::from_vec(*width, *height, data.clone()).unwrap()
@@ -680,9 +728,29 @@ impl TerminalState {
                 durations,
                 hashes,
             } => {
-                let frame_no = frame.frame_number.unwrap_or(frames.len() as u32 + 1);
-                if frame_no == frames.len() as u32 + 1 {
+                anyhow::ensure!(
+                    frames.len() == durations.len() && frames.len() == hashes.len(),
+                    "animation frame metadata lengths diverged"
+                );
+                anyhow::ensure!(
+                    frames.len() <= MAX_IMAGE_ANIMATION_FRAMES,
+                    "animation has too many frames"
+                );
+                let append_frame_no = frames
+                    .len()
+                    .checked_add(1)
+                    .filter(|frame| *frame <= u32::MAX as usize)
+                    .map(|frame| frame as u32)
+                    .ok_or_else(|| anyhow::anyhow!("animation frame count overflow"))?;
+                let frame_no = frame.frame_number.unwrap_or(append_frame_no);
+                if frame_no == append_frame_no {
                     // Append a new frame
+                    anyhow::ensure!(
+                        frames.len() < MAX_IMAGE_ANIMATION_FRAMES,
+                        "animation frame limit {} reached",
+                        MAX_IMAGE_ANIMATION_FRAMES
+                    );
+                    checked_image_allocation_bytes(*width, *height, 4, 1)?;
 
                     let mut new_frame = match frame.base_frame {
                         None => RgbaImage::from_pixel(*width, *height, background_pixel),
@@ -762,18 +830,47 @@ impl TerminalState {
             }
         };
 
+        let expected_raw_len = match transmit.format.as_ref() {
+            None | Some(KittyImageFormat::Rgba) | Some(KittyImageFormat::Rgb) => {
+                let (width, height) = match (transmit.width, transmit.height) {
+                    (Some(width), Some(height)) => (width, height),
+                    _ => anyhow::bail!("missing width/height info for kitty img"),
+                };
+                check_image_dimensions(width, height)?;
+                Some(checked_image_allocation_bytes(
+                    width,
+                    height,
+                    if matches!(transmit.format.as_ref(), Some(KittyImageFormat::Rgb)) {
+                        3
+                    } else {
+                        4
+                    },
+                    1,
+                )?)
+            }
+            Some(KittyImageFormat::Png) => None,
+        };
+        let materialized_limit = expected_raw_len.unwrap_or(MAX_DECODED_IMAGE_BYTES);
         let data = transmit
             .data
-            .load_data()
+            .load_data_with_limit(materialized_limit)
             .context("data should have been materialized in coalesce_kitty_accumulation")?;
 
         let data = match transmit.compression {
             KittyImageCompression::None => data,
             KittyImageCompression::Deflate => {
-                miniz_oxide::inflate::decompress_to_vec_zlib(&data)
+                miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&data, materialized_limit)
                     .map_err(|e| anyhow::anyhow!("decompressing data: {:?}", e))?
             }
         };
+        if let Some(expected) = expected_raw_len {
+            anyhow::ensure!(
+                data.len() == expected,
+                "transmit data len is {} but expected {}",
+                data.len(),
+                expected
+            );
+        }
 
         let img = match transmit.format {
             None | Some(KittyImageFormat::Rgba) | Some(KittyImageFormat::Rgb) => {
@@ -798,21 +895,12 @@ impl TerminalState {
                     _ => data,
                 };
 
-                anyhow::ensure!(
-                    width * height * 4 == data.len() as u32,
-                    "transmit data len is {} but it doesn't match width*height*4 {}x{}x4 = {}",
-                    data.len(),
-                    width,
-                    height,
-                    width * height * 4
-                );
-
                 ImageDataType::new_single_frame(width, height, data)
             }
             Some(KittyImageFormat::Png) => {
                 let info = dimensions(&data)?;
                 check_image_dimensions(info.width, info.height)?;
-                let decoded = image::load_from_memory(&data).context("decode png")?;
+                let decoded = decode_image(&data).context("decode png")?;
                 let (width, height) = decoded.dimensions();
                 let data = decoded.into_rgba8().into_vec();
                 ImageDataType::new_single_frame(width, height, data)
@@ -893,11 +981,22 @@ impl TerminalState {
             for mut data in data.into_iter() {
                 match &mut data {
                     KittyImageData::DirectBin(b) => {
+                        let remaining = MAX_DECODED_IMAGE_BYTES
+                            .checked_sub(b64_decoded.len())
+                            .ok_or_else(|| anyhow::anyhow!("kitty accumulation too large"))?;
+                        anyhow::ensure!(
+                            b.len() <= remaining,
+                            "kitty accumulation exceeds {} bytes",
+                            MAX_DECODED_IMAGE_BYTES
+                        );
                         b64_decoded.append(b);
                     }
                     KittyImageData::Direct(b) => {
                         if !b.is_empty() {
-                            b64_decoded.append(&mut data.load_data()?);
+                            let remaining = MAX_DECODED_IMAGE_BYTES
+                                .checked_sub(b64_decoded.len())
+                                .ok_or_else(|| anyhow::anyhow!("kitty accumulation too large"))?;
+                            b64_decoded.append(&mut data.load_data_with_limit(remaining)?);
                         }
                     }
                     data => {
@@ -905,6 +1004,11 @@ impl TerminalState {
                     }
                 }
             }
+            anyhow::ensure!(
+                b64_decoded.len() <= MAX_DECODED_IMAGE_BYTES,
+                "kitty accumulation exceeds {} bytes",
+                MAX_DECODED_IMAGE_BYTES
+            );
 
             trans.data = KittyImageData::DirectBin(b64_decoded);
 

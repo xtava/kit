@@ -83,7 +83,12 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         restore_terminal();
-        restore_previous_hook(&self.previous_hook);
+        // `panic::take_hook` itself panics while a thread is unwinding. The installed hook has
+        // already restored the terminal and invoked its predecessor; the process is exiting, so
+        // there is no hook ownership to restore on this path.
+        if !std::thread::panicking() {
+            restore_previous_hook(&self.previous_hook);
+        }
     }
 }
 

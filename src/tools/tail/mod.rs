@@ -50,6 +50,6 @@ impl Tool for TailTool {
         let readiness = client.readiness().await?;
         let cache = cache::ReceiveCache::discover()?;
         let config = config::Config::load(cx.config.clone())?;
-        tui::run(client, cache, readiness, config).await
+        tui::run(cx.processes.clone(), client, cache, readiness, config).await
     }
 }

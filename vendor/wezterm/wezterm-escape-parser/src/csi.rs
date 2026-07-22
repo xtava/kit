@@ -251,6 +251,31 @@ impl Display for CSI {
     }
 }
 
+impl CSI {
+    /// Returns a non-allocating upper bound for heap storage owned by this action.
+    pub fn retained_size_upper_bound(&self) -> usize {
+        match self {
+            Self::Device(device) => {
+                core::mem::size_of::<Device>().saturating_add(device.retained_size_upper_bound())
+            }
+            Self::Window(_) => core::mem::size_of::<Window>(),
+            Self::Unspecified(unspecified) => core::mem::size_of::<Unspecified>().saturating_add(
+                unspecified
+                    .params
+                    .capacity()
+                    .saturating_mul(core::mem::size_of::<CsiParam>()),
+            ),
+            Self::Sgr(_)
+            | Self::Cursor(_)
+            | Self::Edit(_)
+            | Self::Mode(_)
+            | Self::Mouse(_)
+            | Self::Keyboard(_)
+            | Self::SelectCharacterPath(_, _) => 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive)]
 pub enum CursorStyle {
     Default = 0,
@@ -462,6 +487,37 @@ pub enum Device {
     RequestTerminalNameAndVersion,
     RequestTerminalParameters(i64),
     XtSmGraphics(XtSmGraphics),
+}
+
+impl Device {
+    fn retained_size_upper_bound(&self) -> usize {
+        match self {
+            Self::DeviceAttributes(
+                DeviceAttributes::Vt220(attributes)
+                | DeviceAttributes::Vt320(attributes)
+                | DeviceAttributes::Vt420(attributes),
+            ) => attributes
+                .attributes
+                .capacity()
+                .saturating_mul(core::mem::size_of::<DeviceAttribute>()),
+            Self::XtSmGraphics(graphics) => graphics
+                .value
+                .capacity()
+                .saturating_mul(core::mem::size_of::<i64>()),
+            Self::DeviceAttributes(
+                DeviceAttributes::Vt100WithAdvancedVideoOption
+                | DeviceAttributes::Vt101WithNoOptions
+                | DeviceAttributes::Vt102,
+            )
+            | Self::SoftReset
+            | Self::RequestPrimaryDeviceAttributes
+            | Self::RequestSecondaryDeviceAttributes
+            | Self::RequestTertiaryDeviceAttributes
+            | Self::StatusReport
+            | Self::RequestTerminalNameAndVersion
+            | Self::RequestTerminalParameters(_) => 0,
+        }
+    }
 }
 
 impl Display for Device {

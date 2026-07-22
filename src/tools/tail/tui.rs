@@ -25,7 +25,7 @@ use unicode_width::UnicodeWidthChar;
 use zeroize::Zeroizing;
 
 use crate::{
-    framework::{open_external, ExternalTarget},
+    framework::{process::ProcessSupervisor, start_external, ExternalTarget},
     tui::{
         render_split_divider, ActionId, ActionInvocation, ActionState, ActionUnavailable,
         ContextMenu, ContextMenuLayout, ContextMenuOutcome, ContextMenuStyle, EventReader,
@@ -138,6 +138,23 @@ struct FileReview {
 
 enum BackendEvent {
     SendFinished { id: u64, result: Result<(), String> },
+    ExternalOpenFinished { context: ExternalOpenContext, result: Result<(), String> },
+}
+
+enum ExternalOpenContext {
+    Item { name: String },
+    Login,
+}
+
+impl ExternalOpenContext {
+    fn notice(self, result: Result<(), String>) -> String {
+        match (self, result) {
+            (Self::Item { name }, Ok(())) => format!("Opened {name}"),
+            (Self::Item { name }, Err(error)) => format!("Could not open {name}: {error}"),
+            (Self::Login, Ok(())) => "Opened login link".into(),
+            (Self::Login, Err(error)) => format!("Could not open login link: {error}"),
+        }
+    }
 }
 
 struct ReceiverEvent {
@@ -275,16 +292,19 @@ struct App {
 
 struct ActionDispatch<'a> {
     session: &'a mut Session,
+    processes: &'a ProcessSupervisor,
     client: &'a TailClient,
     cache: &'a ReceiveCache,
     backend_tx: &'a mpsc::Sender<BackendEvent>,
     receiver_tx: &'a mpsc::Sender<ReceiverEvent>,
     operation: &'a mut Option<Operation>,
+    external_open: &'a mut Option<JoinHandle<()>>,
     receiver: &'a mut Option<Operation>,
     login: &'a mut Option<LoginOperation>,
 }
 
 pub async fn run(
+    processes: ProcessSupervisor,
     client: TailClient,
     cache: ReceiveCache,
     readiness: Readiness,
@@ -310,6 +330,7 @@ pub async fn run(
     let (backend_tx, mut backend_rx) = mpsc::channel(8);
     let (receiver_tx, mut receiver_rx) = mpsc::channel(8);
     let mut operation: Option<Operation> = None;
+    let mut external_open: Option<JoinHandle<()>> = None;
     let mut receiver: Option<Operation> = None;
     let mut refresh_task: Option<JoinHandle<Result<Readiness, String>>> = None;
     let mut login: Option<LoginOperation> = None;
@@ -344,11 +365,13 @@ pub async fn run(
                 }
                 let mut actions = ActionDispatch {
                     session: &mut session,
+                    processes: &processes,
                     client: &client,
                     cache: &cache,
                     backend_tx: &backend_tx,
                     receiver_tx: &receiver_tx,
                     operation: &mut operation,
+                    external_open: &mut external_open,
                     receiver: &mut receiver,
                     login: &mut login,
                 };
@@ -409,10 +432,19 @@ pub async fn run(
                 }
             }
             event = backend_rx.recv() => {
-                operation = None;
-                if let Some(BackendEvent::SendFinished { id, result }) = event {
-                    app.notice = app.sends.finish(id, result);
-                    start_next_send(&mut app, &client, &backend_tx, &mut operation);
+                match event {
+                    Some(BackendEvent::SendFinished { id, result }) => {
+                        operation = None;
+                        app.notice = app.sends.finish(id, result);
+                        start_next_send(&mut app, &client, &backend_tx, &mut operation);
+                    }
+                    Some(BackendEvent::ExternalOpenFinished { context, result }) => {
+                        if let Some(task) = external_open.take() {
+                            let _ = task.await;
+                        }
+                        app.notice = Some(context.notice(result));
+                    }
+                    None => {}
                 }
             }
             event = receiver_rx.recv() => {
@@ -511,6 +543,10 @@ pub async fn run(
         let _ = operation.cancel.send(true);
         let _ = operation.task.await;
     }
+    if let Some(task) = external_open {
+        task.abort();
+        let _ = task.await;
+    }
     stop_operation(&mut receiver).await;
     cancel_login(&mut login).await;
     if let Some(task) = refresh_task {
@@ -532,6 +568,22 @@ fn refresh_received_items(app: &mut App, cache: &ReceiveCache) -> Result<()> {
 fn start_device_refresh(client: &TailClient) -> JoinHandle<Result<Readiness, String>> {
     let client = client.clone();
     tokio::spawn(async move { client.readiness().await.map_err(|error| format!("{error:#}")) })
+}
+
+fn spawn_external_open(
+    processes: ProcessSupervisor,
+    target: ExternalTarget,
+    context: ExternalOpenContext,
+    sender: mpsc::Sender<BackendEvent>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let result = match start_external(&processes, target) {
+            Ok(receipt) => receipt.completion().await,
+            Err(error) => Err(error),
+        }
+        .map_err(|error| format!("{error:#}"));
+        let _ = sender.send(BackendEvent::ExternalOpenFinished { context, result }).await;
+    })
 }
 
 async fn finish_device_refresh(
@@ -1531,10 +1583,18 @@ impl ActionDispatch<'_> {
             }
             TailCommand::Open => {
                 if let Some(item) = app.selected_item().cloned() {
-                    app.notice = Some(match open_external(ExternalTarget::Path(&item.payload())) {
-                        Ok(()) => format!("Opening {}", item.name),
-                        Err(error) => format!("Could not open {}: {error:#}", item.name),
-                    });
+                    if self.external_open.is_some() {
+                        app.notice = Some("Another external target is still opening".into());
+                    } else {
+                        let name = item.name.clone();
+                        app.notice = Some(format!("Opening {name}…"));
+                        *self.external_open = Some(spawn_external_open(
+                            self.processes.clone(),
+                            ExternalTarget::Path(item.payload()),
+                            ExternalOpenContext::Item { name },
+                            self.backend_tx.clone(),
+                        ));
+                    }
                 }
             }
             TailCommand::Delete => app.mode = Mode::ConfirmDelete,
@@ -1553,9 +1613,17 @@ impl ActionDispatch<'_> {
                 });
             }
             TailCommand::OpenLogin => {
-                if let Some(url) = &app.login_url {
-                    if let Err(error) = open_external(ExternalTarget::Url(url)) {
-                        app.notice = Some(format!("Could not open login link: {error:#}"));
+                if let Some(url) = app.login_url.clone() {
+                    if self.external_open.is_some() {
+                        app.notice = Some("Another external target is still opening".into());
+                    } else {
+                        app.notice = Some("Opening login link…".into());
+                        *self.external_open = Some(spawn_external_open(
+                            self.processes.clone(),
+                            ExternalTarget::Url(url),
+                            ExternalOpenContext::Login,
+                            self.backend_tx.clone(),
+                        ));
                     }
                 }
             }
@@ -2171,7 +2239,7 @@ fn start_receiver(
             }
             let received = async {
                 let staging = cache.staging_directory()?;
-                client.receive_into(staging.path(), true, cancel_receiver.clone()).await?;
+                client.receive_into(staging.path(), cancel_receiver.clone()).await?;
                 Ok::<_, anyhow::Error>(staging)
             }
             .await;

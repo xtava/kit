@@ -219,6 +219,7 @@ impl TmuxDomainState {
             Box::new(writer.clone()),
         );
 
+        let mux = Mux::get();
         Ok(Arc::new(LocalPane::new(
             local_pane_id,
             terminal,
@@ -227,7 +228,8 @@ impl TmuxDomainState {
             Box::new(writer),
             self.domain_id,
             "tmux pane".to_string(),
-        )))
+            mux.admission(),
+        )?))
     }
 
     pub fn split_pane(
@@ -385,7 +387,7 @@ impl TmuxDomainState {
 
             let tab = Arc::new(Tab::new(&size));
             tab.set_title(&format!("{}", &window.window_name));
-            mux.add_tab_no_panes(&tab);
+            mux.add_tab_no_panes(&tab)?;
 
             let _ = self.add_attached_window(window, &tab.tab_id())?;
 
@@ -551,72 +553,80 @@ impl TmuxDomainState {
         let mux = Mux::get();
         let domain_id = self.domain_id;
         mux.subscribe(move |n| {
-            promise::spawn::spawn_into_main_thread(async move {
-                let mux = Mux::get();
-                let domain = match mux.get_domain(domain_id) {
-                    Some(d) => d,
-                    None => return,
-                };
-                let tmux_domain = match domain.downcast_ref::<TmuxDomain>() {
-                    Some(t) => t,
-                    None => return,
-                };
+            let Some(mux) = Mux::try_get() else {
+                return false;
+            };
+            let weak_mux = Arc::downgrade(&mux);
+            if let Err(err) =
+                mux.try_spawn_runtime_task("schedule tmux notification handling", async move {
+                    let Some(mux) = weak_mux.upgrade() else {
+                        return Ok(());
+                    };
+                    let Some(domain) = mux.get_domain(domain_id) else {
+                        return Ok(());
+                    };
+                    let Some(tmux_domain) = domain.downcast_ref::<TmuxDomain>() else {
+                        return Ok(());
+                    };
 
-                if *tmux_domain.inner.attach_state.lock() == AttachState::Init {
-                    return;
-                }
-
-                match n {
-                    MuxNotification::PaneFocused(pane_id) => {
-                        let tmux_pane_id = match tmux_domain
-                            .inner
-                            .remote_panes
-                            .lock()
-                            .iter()
-                            .find(|(_, p)| p.lock().local_pane_id == pane_id)
-                        {
-                            Some((_, p)) => Some(p.lock().pane_id),
-                            None => None,
-                        };
-
-                        if let Some(pane_id) = tmux_pane_id {
-                            tmux_domain
-                                .inner
-                                .cmd_queue
-                                .lock()
-                                .push_back(Box::new(SelectPane { pane_id: pane_id }));
-                            TmuxDomainState::schedule_send_next_command(domain_id);
-                        }
+                    if *tmux_domain.inner.attach_state.lock() == AttachState::Init {
+                        return Ok(());
                     }
-                    MuxNotification::WindowInvalidated(window_id) => {
-                        if let Some(window) = mux.get_window(window_id) {
-                            let Some(tab) = window.get_active() else {
-                                return;
-                            };
-                            let tmux_window_id = match tmux_domain
+
+                    match n {
+                        MuxNotification::PaneFocused(pane_id) => {
+                            let tmux_pane_id = match tmux_domain
                                 .inner
-                                .gui_tabs
+                                .remote_panes
                                 .lock()
                                 .iter()
-                                .find(|(_, t)| t.tab_id == tab.tab_id())
+                                .find(|(_, p)| p.lock().local_pane_id == pane_id)
                             {
-                                Some((_, t)) => Some(t.tmux_window_id),
+                                Some((_, p)) => Some(p.lock().pane_id),
                                 None => None,
                             };
-                            if let Some(window_id) = tmux_window_id {
-                                tmux_domain.inner.cmd_queue.lock().push_back(Box::new(
-                                    SelectWindow {
-                                        window_id: window_id,
-                                    },
-                                ));
+
+                            if let Some(pane_id) = tmux_pane_id {
+                                tmux_domain
+                                    .inner
+                                    .cmd_queue
+                                    .lock()
+                                    .push_back(Box::new(SelectPane { pane_id: pane_id }));
                                 TmuxDomainState::schedule_send_next_command(domain_id);
                             }
                         }
+                        MuxNotification::WindowInvalidated(window_id) => {
+                            if let Some(window) = mux.get_window(window_id) {
+                                let Some(tab) = window.get_active() else {
+                                    return Ok(());
+                                };
+                                let tmux_window_id = match tmux_domain
+                                    .inner
+                                    .gui_tabs
+                                    .lock()
+                                    .iter()
+                                    .find(|(_, t)| t.tab_id == tab.tab_id())
+                                {
+                                    Some((_, t)) => Some(t.tmux_window_id),
+                                    None => None,
+                                };
+                                if let Some(window_id) = tmux_window_id {
+                                    tmux_domain.inner.cmd_queue.lock().push_back(Box::new(
+                                        SelectWindow {
+                                            window_id: window_id,
+                                        },
+                                    ));
+                                    TmuxDomainState::schedule_send_next_command(domain_id);
+                                }
+                            }
+                        }
+                        _ => {}
                     }
-                    _ => {}
-                }
-            })
-            .detach();
+                    Ok(())
+                })
+            {
+                log::error!("failed to schedule tmux notification handling: {err:#}");
+            }
             true
         });
     }

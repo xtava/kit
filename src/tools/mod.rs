@@ -4,6 +4,8 @@
 pub mod build;
 #[cfg(unix)]
 pub mod cdp;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod console;
 pub mod deploy;
 pub mod diff;
 pub mod domain;
@@ -18,5 +20,6 @@ pub mod secrets;
 pub mod settings;
 pub mod stats;
 pub mod swarm;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod tail;
 pub mod update;

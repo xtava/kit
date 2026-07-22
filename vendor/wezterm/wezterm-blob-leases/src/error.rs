@@ -21,4 +21,22 @@ pub enum Error {
 
     #[error("Storage location {0} may be corrupt: {1}")]
     StorageDirIoError(PathBuf, std::io::Error),
+
+    #[error("Blob read admission rejected: {0}")]
+    ReadAdmission(#[from] wezterm_runtime_admission::AdmissionError),
+
+    #[error("Blob length {declared} exceeds maximum {maximum}")]
+    BlobTooLarge { declared: u64, maximum: usize },
+
+    #[error("Blob length {0} cannot be represented on this platform")]
+    BlobLengthOverflow(u64),
+
+    #[error("Blob length changed while reading: declared {declared}, observed {observed}")]
+    BlobLengthChanged { declared: usize, observed: u64 },
+
+    #[error("Blob content changed while reading: expected {expected}, observed {observed}")]
+    BlobContentChanged {
+        expected: ContentId,
+        observed: ContentId,
+    },
 }

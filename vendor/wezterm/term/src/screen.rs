@@ -1,10 +1,17 @@
 #![allow(clippy::range_plus_one)]
 use super::*;
 use crate::config::BidiMode;
+use crate::terminal::{
+    checked_geometry_add, checked_geometry_mul, conservative_collection_capacity,
+    TerminalGeometryError,
+};
 use log::debug;
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use termwiz::input::KeyboardEncoding;
+use wezterm_cell::image::ImageData;
+use wezterm_escape_parser::hyperlink::Hyperlink;
 use wezterm_surface::SequenceNo;
 
 /// Holds the model of a screen.  This can either be the primary screen
@@ -31,6 +38,9 @@ pub struct Screen {
     /// config so we can access Maximum number of lines of scrollback
     config: Arc<dyn TerminalConfiguration>,
 
+    /// Whether scrollback follows live configuration or a validated construction snapshot.
+    scrollback_capacity: ScrollbackCapacity,
+
     /// Whether scrollback is allowed; this is another way of saying
     /// that we're the primary rather than the alternate screen.
     allow_scrollback: bool,
@@ -46,15 +56,83 @@ pub struct Screen {
     pub(crate) saved_cursor: Option<SavedCursor>,
 }
 
-fn scrollback_size(config: &Arc<dyn TerminalConfiguration>, allow_scrollback: bool) -> usize {
-    if allow_scrollback {
-        config.scrollback_size()
-    } else {
-        0
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScrollbackCapacity {
+    DynamicConfig,
+    Fixed(usize),
+}
+
+#[derive(Debug)]
+pub(crate) struct ScreenResizeGeometryPlan {
+    replacement_line_capacity: Option<usize>,
+    settled_line_capacity_request: usize,
+    current_geometry_retained_bytes: usize,
+    settled_geometry_retained_upper_bound: usize,
+    peak_geometry_bytes: usize,
+}
+
+impl ScreenResizeGeometryPlan {
+    pub(crate) fn current_geometry_retained_bytes(&self) -> usize {
+        self.current_geometry_retained_bytes
+    }
+
+    pub(crate) fn settled_geometry_retained_upper_bound(&self) -> usize {
+        self.settled_geometry_retained_upper_bound
+    }
+
+    pub(crate) fn peak_geometry_bytes(&self) -> usize {
+        self.peak_geometry_bytes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn settled_line_capacity_request(&self) -> usize {
+        self.settled_line_capacity_request
     }
 }
 
 impl Screen {
+    pub(crate) fn collect_unique_image_data(&self, images: &mut HashMap<usize, Arc<ImageData>>) {
+        for line in &self.lines {
+            for cell in line.visible_cells() {
+                let Some(cell_images) = cell.attrs().images() else {
+                    continue;
+                };
+                for image in cell_images {
+                    let data = Arc::clone(image.image_data());
+                    images.entry(Arc::as_ptr(&data) as usize).or_insert(data);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn collect_unique_hyperlinks(
+        &self,
+        hyperlinks: &mut HashMap<usize, Arc<Hyperlink>>,
+    ) -> Result<usize, TerminalGeometryError> {
+        let mut repeated_payload_bytes = 0usize;
+        for line in &self.lines {
+            for cell in line.visible_cells() {
+                let Some(hyperlink) = cell.attrs().hyperlink() else {
+                    continue;
+                };
+                repeated_payload_bytes = checked_geometry_add(
+                    repeated_payload_bytes,
+                    hyperlink.retained_size(),
+                    "repeated hyperlink payloads",
+                )?;
+                hyperlinks
+                    .entry(Arc::as_ptr(hyperlink) as usize)
+                    .or_insert_with(|| Arc::clone(hyperlink));
+            }
+        }
+        Ok(repeated_payload_bytes)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn line_capacity(&self) -> usize {
+        self.lines.capacity()
+    }
+
     /// Create a new Screen with the specified dimensions.
     /// The Cells in the viewable portion of the screen are set to the
     /// default cell attributes.
@@ -65,11 +143,36 @@ impl Screen {
         seqno: SequenceNo,
         bidi_mode: BidiMode,
     ) -> Screen {
+        Self::new_with_scrollback_capacity(
+            size,
+            config,
+            allow_scrollback,
+            seqno,
+            bidi_mode,
+            ScrollbackCapacity::DynamicConfig,
+        )
+    }
+
+    pub(crate) fn new_with_scrollback_capacity(
+        size: TerminalSize,
+        config: &Arc<dyn TerminalConfiguration>,
+        allow_scrollback: bool,
+        seqno: SequenceNo,
+        bidi_mode: BidiMode,
+        scrollback_capacity: ScrollbackCapacity,
+    ) -> Screen {
         let physical_rows = size.rows.max(1);
         let physical_cols = size.cols.max(1);
 
-        let mut lines =
-            VecDeque::with_capacity(physical_rows + scrollback_size(config, allow_scrollback));
+        let configured_scrollback_rows = if allow_scrollback {
+            match scrollback_capacity {
+                ScrollbackCapacity::DynamicConfig => config.scrollback_size(),
+                ScrollbackCapacity::Fixed(rows) => rows,
+            }
+        } else {
+            0
+        };
+        let mut lines = VecDeque::with_capacity(physical_rows + configured_scrollback_rows);
         for _ in 0..physical_rows {
             let mut line = Line::new(seqno);
             bidi_mode.apply_to_line(&mut line, seqno);
@@ -79,6 +182,7 @@ impl Screen {
         Screen {
             lines,
             config: Arc::clone(config),
+            scrollback_capacity,
             allow_scrollback,
             physical_rows,
             physical_cols,
@@ -94,7 +198,359 @@ impl Screen {
     }
 
     fn scrollback_size(&self) -> usize {
-        scrollback_size(&self.config, self.allow_scrollback)
+        if !self.allow_scrollback {
+            return 0;
+        }
+
+        match self.scrollback_capacity {
+            ScrollbackCapacity::DynamicConfig => self.config.scrollback_size(),
+            ScrollbackCapacity::Fixed(rows) => rows,
+        }
+    }
+
+    pub(crate) fn fixed_scrollback_rows(&self) -> Option<usize> {
+        match self.scrollback_capacity {
+            ScrollbackCapacity::DynamicConfig => None,
+            ScrollbackCapacity::Fixed(rows) if self.allow_scrollback => Some(rows),
+            ScrollbackCapacity::Fixed(_) => Some(0),
+        }
+    }
+
+    pub(crate) fn geometry_retained_size_excluding_image_data(
+        &self,
+    ) -> Result<usize, TerminalGeometryError> {
+        let line_slots = checked_geometry_mul(
+            self.lines.capacity(),
+            std::mem::size_of::<Line>(),
+            "current screen line slots",
+        )?;
+        self.lines.iter().try_fold(line_slots, |total, line| {
+            let retained = line
+                .checked_retained_heap_size_excluding_image_data()
+                .ok_or(TerminalGeometryError::ArithmeticOverflow {
+                    calculation: "current retained line heap",
+                })?;
+            checked_geometry_add(total, retained, "current retained screen lines")
+        })
+    }
+
+    fn logical_group_output_lines(
+        &self,
+        start: usize,
+        end: usize,
+        target_cols: usize,
+    ) -> Result<usize, TerminalGeometryError> {
+        let logical_width = (start..end).try_fold(0usize, |width, idx| {
+            checked_geometry_add(width, self.lines[idx].len(), "logical wrapped line width")
+        })?;
+        if logical_width <= target_cols {
+            return Ok(1);
+        }
+
+        let mut last_non_blank = None;
+        for line_idx in start..end {
+            for cell in self.lines[line_idx].visible_cells() {
+                if cell.str() != " " {
+                    last_non_blank = Some((line_idx, cell.cell_index()));
+                }
+            }
+        }
+        let Some((last_line_idx, last_cell_idx)) = last_non_blank else {
+            return Ok(1);
+        };
+
+        let mut output_lines = 0usize;
+        let mut output_width = 0usize;
+        for line_idx in start..=last_line_idx {
+            for cell in self.lines[line_idx].visible_cells() {
+                if line_idx == last_line_idx && cell.cell_index() > last_cell_idx {
+                    break;
+                }
+                let next_width = output_width.checked_add(cell.width()).ok_or(
+                    TerminalGeometryError::ArithmeticOverflow {
+                        calculation: "rewrapped output line width",
+                    },
+                )?;
+                if output_lines == 0 || next_width > target_cols {
+                    output_lines = output_lines.checked_add(1).ok_or(
+                        TerminalGeometryError::ArithmeticOverflow {
+                            calculation: "rewrapped output line count",
+                        },
+                    )?;
+                    output_width = cell.width();
+                } else {
+                    output_width = next_width;
+                }
+            }
+        }
+        Ok(output_lines.max(1))
+    }
+
+    fn logical_group_materialized_upper_bound(
+        &self,
+        start: usize,
+        end: usize,
+    ) -> Result<usize, TerminalGeometryError> {
+        let mut total_cells = 0usize;
+        let mut retained = 0usize;
+        for idx in start..end {
+            let line = &self.lines[idx];
+            total_cells =
+                checked_geometry_add(total_cells, line.len(), "logical group materialized cells")?;
+            let line_bound = line
+                .checked_materialized_cells_size_upper_bound_excluding_image_data()
+                .ok_or(TerminalGeometryError::ArithmeticOverflow {
+                    calculation: "logical group cloned cell heap",
+                })?;
+            retained =
+                checked_geometry_add(retained, line_bound, "logical group cloned line heaps")?;
+            let current_line_heap = line
+                .checked_retained_heap_size_excluding_image_data()
+                .ok_or(TerminalGeometryError::ArithmeticOverflow {
+                    calculation: "logical group retained line metadata",
+                })?;
+            retained = checked_geometry_add(
+                retained,
+                current_line_heap,
+                "logical group retained line metadata",
+            )?;
+        }
+        let group_cell_capacity = conservative_collection_capacity(
+            total_cells,
+            "logical group intermediate cell capacity",
+        )?;
+        let group_cell_slots = checked_geometry_mul(
+            group_cell_capacity,
+            std::mem::size_of::<Cell>(),
+            "logical group intermediate cell slots",
+        )?;
+        checked_geometry_add(
+            retained,
+            group_cell_slots,
+            "logical group intermediate retained bytes",
+        )
+    }
+
+    pub(crate) fn plan_bounded_resize(
+        &self,
+        target: TerminalSize,
+        is_conpty: bool,
+    ) -> Result<ScreenResizeGeometryPlan, TerminalGeometryError> {
+        let current = self.geometry_retained_size_excluding_image_data()?;
+        let target_rows = target.rows;
+        let target_cols = target.cols;
+        let line_capacity_floor = target_rows.checked_add(self.scrollback_size()).ok_or(
+            TerminalGeometryError::ArithmeticOverflow {
+                calculation: "resize rows plus fixed scrollback",
+            },
+        )?;
+
+        if self.allow_scrollback && target_cols != self.physical_cols {
+            let mut output_lines = 0usize;
+            let mut maximum_output_lines = 0usize;
+            let mut output_heap_upper = 0usize;
+            let mut largest_intermediate_group = 0usize;
+            let mut start = 0usize;
+
+            while start < self.lines.len() {
+                let mut end = start + 1;
+                while end < self.lines.len() && self.lines[end - 1].last_cell_was_wrapped() {
+                    end += 1;
+                }
+
+                let group_output_lines =
+                    self.logical_group_output_lines(start, end, target_cols)?;
+                output_lines = checked_geometry_add(
+                    output_lines,
+                    group_output_lines,
+                    "primary rewrapped output lines",
+                )?;
+                let group_maximum_output_lines = (start..end)
+                    .try_fold(0usize, |width, idx| {
+                        checked_geometry_add(
+                            width,
+                            self.lines[idx].len(),
+                            "primary maximum output lines",
+                        )
+                    })?
+                    .max(1);
+                maximum_output_lines = checked_geometry_add(
+                    maximum_output_lines,
+                    group_maximum_output_lines,
+                    "primary maximum output line count",
+                )?;
+                let group_materialized = self.logical_group_materialized_upper_bound(start, end)?;
+                largest_intermediate_group = largest_intermediate_group.max(group_materialized);
+                let output_blank_heaps = checked_geometry_mul(
+                    group_maximum_output_lines,
+                    Line::INITIAL_CLUSTER_TEXT_CAPACITY,
+                    "primary rewrapped blank line heaps",
+                )?;
+                output_heap_upper = checked_geometry_add(
+                    output_heap_upper,
+                    group_materialized,
+                    "primary rewrapped cloned line heaps",
+                )?;
+                output_heap_upper = checked_geometry_add(
+                    output_heap_upper,
+                    output_blank_heaps,
+                    "primary rewrapped output line heaps",
+                )?;
+                start = end;
+            }
+
+            let added_blank_lines = if target_rows > output_lines {
+                target_rows - output_lines
+            } else {
+                0
+            };
+            let added_blank_heap = checked_geometry_mul(
+                added_blank_lines,
+                Line::INITIAL_CLUSTER_TEXT_CAPACITY,
+                "primary resize added blank line heaps",
+            )?;
+            output_heap_upper = checked_geometry_add(
+                output_heap_upper,
+                added_blank_heap,
+                "primary settled line heaps",
+            )?;
+            let conpty_padding_lines = if is_conpty { target_rows } else { 0 };
+            let conpty_padding_heap = checked_geometry_mul(
+                conpty_padding_lines,
+                Line::INITIAL_CLUSTER_TEXT_CAPACITY,
+                "primary ConPTY padding line heaps",
+            )?;
+            output_heap_upper = checked_geometry_add(
+                output_heap_upper,
+                conpty_padding_heap,
+                "primary settled ConPTY line heaps",
+            )?;
+            let maximum_settled_lines = checked_geometry_add(
+                maximum_output_lines,
+                conpty_padding_lines,
+                "primary settled ConPTY line count",
+            )?;
+            let replacement_line_capacity = maximum_settled_lines.max(line_capacity_floor);
+            let settled_capacity = conservative_collection_capacity(
+                replacement_line_capacity,
+                "primary settled line capacity",
+            )?;
+            let settled_slots = checked_geometry_mul(
+                settled_capacity,
+                std::mem::size_of::<Line>(),
+                "primary settled line slots",
+            )?;
+            let settled =
+                checked_geometry_add(settled_slots, output_heap_upper, "primary settled geometry")?;
+            let peak = checked_geometry_add(current, settled, "primary resize coexistence")?;
+            let peak = checked_geometry_add(
+                peak,
+                largest_intermediate_group,
+                "primary append intermediate coexistence",
+            )?;
+            return Ok(ScreenResizeGeometryPlan {
+                replacement_line_capacity: Some(replacement_line_capacity),
+                settled_line_capacity_request: replacement_line_capacity,
+                current_geometry_retained_bytes: current,
+                settled_geometry_retained_upper_bound: settled,
+                peak_geometry_bytes: peak,
+            });
+        }
+
+        let mut settled_heap = 0usize;
+        let mut largest_materialization = 0usize;
+        for line in &self.lines {
+            let current_line_heap = line
+                .checked_retained_heap_size_excluding_image_data()
+                .ok_or(TerminalGeometryError::ArithmeticOverflow {
+                    calculation: "resize current line heap",
+                })?;
+            let settled_line_heap = if !self.allow_scrollback && target_cols < self.physical_cols {
+                let materialized = line
+                    .checked_materialized_cells_size_upper_bound_excluding_image_data()
+                    .ok_or(TerminalGeometryError::ArithmeticOverflow {
+                        calculation: "alternate materialized line heap",
+                    })?;
+                let materialized_cells = conservative_collection_capacity(
+                    line.len().max(target_cols),
+                    "alternate materialized cell capacity",
+                )?;
+                let materialized_slots = checked_geometry_mul(
+                    materialized_cells,
+                    std::mem::size_of::<Cell>(),
+                    "alternate materialized cell slots",
+                )?;
+                let materialized = checked_geometry_add(
+                    materialized,
+                    materialized_slots,
+                    "alternate materialized line retained bytes",
+                )?;
+                largest_materialization = largest_materialization.max(materialized);
+                current_line_heap.max(materialized)
+            } else {
+                current_line_heap
+            };
+            settled_heap =
+                checked_geometry_add(settled_heap, settled_line_heap, "settled screen line heaps")?;
+        }
+
+        let conpty_padding_lines = if is_conpty { target_rows } else { 0 };
+        let settled_line_count = checked_geometry_add(
+            self.lines.len().max(target_rows),
+            conpty_padding_lines,
+            "settled ConPTY line count",
+        )?;
+        let added_blank_lines = if target_rows > self.lines.len() {
+            target_rows - self.lines.len()
+        } else {
+            0
+        };
+        let added_blank_heap = checked_geometry_mul(
+            added_blank_lines,
+            Line::INITIAL_CLUSTER_TEXT_CAPACITY,
+            "resize added blank line heaps",
+        )?;
+        settled_heap = checked_geometry_add(
+            settled_heap,
+            added_blank_heap,
+            "settled screen blank line heaps",
+        )?;
+        let conpty_padding_heap = checked_geometry_mul(
+            conpty_padding_lines,
+            Line::INITIAL_CLUSTER_TEXT_CAPACITY,
+            "settled ConPTY padding line heaps",
+        )?;
+        settled_heap = checked_geometry_add(
+            settled_heap,
+            conpty_padding_heap,
+            "settled screen ConPTY line heaps",
+        )?;
+        let settled_capacity_request = settled_line_count.max(line_capacity_floor);
+        let settled_capacity = conservative_collection_capacity(
+            settled_capacity_request,
+            "settled screen line capacity",
+        )?
+        .max(self.lines.capacity());
+        let settled_slots = checked_geometry_mul(
+            settled_capacity,
+            std::mem::size_of::<Line>(),
+            "settled screen line slots",
+        )?;
+        let settled = checked_geometry_add(settled_slots, settled_heap, "settled screen geometry")?;
+        let peak = checked_geometry_add(current, settled, "screen resize coexistence")?;
+        let peak = checked_geometry_add(
+            peak,
+            largest_materialization,
+            "screen materialization coexistence",
+        )?;
+
+        Ok(ScreenResizeGeometryPlan {
+            replacement_line_capacity: None,
+            settled_line_capacity_request: settled_capacity_request,
+            current_geometry_retained_bytes: current,
+            settled_geometry_retained_upper_bound: settled,
+            peak_geometry_bytes: peak,
+        })
     }
 
     fn rewrap_lines(
@@ -104,8 +560,9 @@ impl Screen {
         cursor_x: usize,
         cursor_y: PhysRowIndex,
         seqno: SequenceNo,
+        replacement_line_capacity: Option<usize>,
     ) -> (usize, PhysRowIndex) {
-        let mut rewrapped = VecDeque::new();
+        let mut rewrapped = VecDeque::with_capacity(replacement_line_capacity.unwrap_or(0));
         let mut logical_line: Option<Line> = None;
         let mut logical_cursor_x: Option<usize> = None;
         let mut adjusted_cursor = (cursor_x, cursor_y);
@@ -167,9 +624,9 @@ impl Screen {
             if line.len() <= physical_cols {
                 rewrapped.push_back(line);
             } else {
-                for line in line.wrap(physical_cols, seqno) {
+                line.wrap_into(physical_cols, seqno, |line| {
                     rewrapped.push_back(line);
-                }
+                });
             }
         }
         self.lines = rewrapped;
@@ -197,6 +654,28 @@ impl Screen {
         seqno: SequenceNo,
         is_conpty: bool,
     ) -> CursorPosition {
+        self.resize_impl(size, cursor, seqno, is_conpty, None)
+    }
+
+    pub(crate) fn apply_bounded_resize(
+        &mut self,
+        size: TerminalSize,
+        cursor: CursorPosition,
+        seqno: SequenceNo,
+        is_conpty: bool,
+        plan: &ScreenResizeGeometryPlan,
+    ) -> CursorPosition {
+        self.resize_impl(size, cursor, seqno, is_conpty, Some(plan))
+    }
+
+    fn resize_impl(
+        &mut self,
+        size: TerminalSize,
+        cursor: CursorPosition,
+        seqno: SequenceNo,
+        is_conpty: bool,
+        bounded_plan: Option<&ScreenResizeGeometryPlan>,
+    ) -> CursorPosition {
         let physical_rows = size.rows.max(1);
         let physical_cols = size.cols.max(1);
 
@@ -205,6 +684,14 @@ impl Screen {
             && size.dpi == self.dpi
         {
             return cursor;
+        }
+        if let Some(plan) = bounded_plan {
+            if plan.replacement_line_capacity.is_none()
+                && plan.settled_line_capacity_request > self.lines.capacity()
+            {
+                let additional = plan.settled_line_capacity_request - self.lines.len();
+                self.lines.reserve_exact(additional);
+            }
         }
         log::debug!(
             "resize screen to {physical_cols}x{physical_rows} dpi={}",
@@ -231,7 +718,14 @@ impl Screen {
             // screen (hence the check for allow_scrollback), to avoid
             // conflicting screen updates with full screen apps.
             if self.allow_scrollback {
-                self.rewrap_lines(physical_cols, physical_rows, cursor.x, cursor_phys, seqno)
+                self.rewrap_lines(
+                    physical_cols,
+                    physical_rows,
+                    cursor.x,
+                    cursor_phys,
+                    seqno,
+                    bounded_plan.and_then(|plan| plan.replacement_line_capacity),
+                )
             } else {
                 for line in &mut self.lines {
                     if physical_cols < self.physical_cols {

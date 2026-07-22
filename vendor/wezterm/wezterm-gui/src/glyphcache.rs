@@ -23,9 +23,9 @@ use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TryR
 use std::sync::{Arc, LazyLock, MutexGuard};
 use std::time::{Duration, Instant};
 use termwiz::color::RgbColor;
-use termwiz::image::{ImageData, ImageDataType};
+use termwiz::image::{EncodedBlob, ImageData, ImageDataType};
 use termwiz::surface::CursorShape;
-use wezterm_blob_leases::{BlobLease, BlobManager, BoxedReader};
+use wezterm_blob_leases::{AdmittedBlobReader, BlobLease, BlobManager};
 use wezterm_font::units::*;
 use wezterm_font::{FontConfiguration, GlyphInfo, LoadedFont, LoadedFontId};
 use wezterm_term::Underline;
@@ -205,7 +205,7 @@ impl<'a> BitmapImage for DecodedImageHandle<'a> {
         match &*self.h {
             ImageDataType::Rgba8 { data, .. } => data.as_ptr(),
             ImageDataType::AnimRgba8 { frames, .. } => frames[self.current_frame].as_ptr(),
-            ImageDataType::EncodedLease(_) | ImageDataType::EncodedFile(_) => unreachable!(),
+            ImageDataType::Encoded(_) => unreachable!(),
         }
     }
 
@@ -217,7 +217,7 @@ impl<'a> BitmapImage for DecodedImageHandle<'a> {
         match &*self.h {
             ImageDataType::Rgba8 { width, height, .. }
             | ImageDataType::AnimRgba8 { width, height, .. } => (*width as usize, *height as usize),
-            ImageDataType::EncodedLease(_) | ImageDataType::EncodedFile(_) => unreachable!(),
+            ImageDataType::Encoded(_) => unreachable!(),
         }
     }
 }
@@ -236,7 +236,9 @@ impl FrameDecoder {
     pub fn start(lease: BlobLease) -> anyhow::Result<Receiver<DecodedFrame>> {
         let (tx, rx) = sync_channel(2);
 
-        let buf_reader = lease.get_reader().context("lease.get_reader()")?;
+        let buf_reader = lease
+            .reader_with_limit(wezterm_runtime_admission::MAX_WIRE_BYTE_BUFFER_BYTES)
+            .context("lease.reader_with_limit()")?;
         let reader = image::ImageReader::new(buf_reader)
             .with_guessed_format()
             .context("guess format from lease")?;
@@ -259,7 +261,7 @@ impl FrameDecoder {
     }
 
     fn run_decoder_thread(
-        reader: image::ImageReader<BoxedReader>,
+        reader: image::ImageReader<AdmittedBlobReader>,
         format: ImageFormat,
         tx: SyncSender<DecodedFrame>,
     ) -> anyhow::Result<()> {
@@ -520,16 +522,18 @@ impl DecodedImage {
 
     fn load(image_data: &Arc<ImageData>) -> Self {
         match &*image_data.data() {
-            ImageDataType::EncodedLease(lease) => {
+            ImageDataType::Encoded(EncodedBlob::Stored(lease)) => {
                 Self::start_frame_decoder(lease.clone(), image_data)
             }
-            ImageDataType::EncodedFile(data) => match BlobManager::store(&data) {
-                Ok(lease) => Self::start_frame_decoder(lease, image_data),
-                Err(err) => {
-                    log::error!("Unable to move file data to blob manager: {err:#}");
-                    Self::placeholder()
+            ImageDataType::Encoded(EncodedBlob::Inline(data)) => {
+                match BlobManager::store(data.as_slice()) {
+                    Ok(lease) => Self::start_frame_decoder(lease, image_data),
+                    Err(err) => {
+                        log::error!("Unable to move file data to blob manager: {err:#}");
+                        Self::placeholder()
+                    }
                 }
-            },
+            }
             ImageDataType::AnimRgba8 { durations, .. } => {
                 let current_frame = if durations.len() > 1 && durations[0].as_millis() == 0 {
                     // Skip possible 0-duration root frame
@@ -990,7 +994,7 @@ impl GlyphCache {
                     LoadState::Loaded,
                 ));
             }
-            ImageDataType::EncodedLease(_) | ImageDataType::EncodedFile(_) => {
+            ImageDataType::Encoded(_) => {
                 let mut frames = decoded.frames.borrow_mut();
                 let frames = frames.as_mut().expect("to have frames");
 
@@ -1038,30 +1042,31 @@ impl GlyphCache {
                     return Ok((sprite.clone(), next, frames.load_state));
                 }
 
-                let expected_byte_size =
-                    frames.current_frame.width * frames.current_frame.height * 4;
+                let expected_byte_size = frames
+                    .current_frame
+                    .width
+                    .checked_mul(frames.current_frame.height)
+                    .and_then(|pixels| pixels.checked_mul(4))
+                    .ok_or_else(|| anyhow::anyhow!("decoded frame byte size overflow"))?;
 
-                let frame_data = match frames.current_frame.lease.get_data() {
-                    Ok(data) => {
-                        // If the size isn't right, ignore this frame and replace
-                        // it with a blank one instead. This might happen if
-                        // some process is truncating the files, or perhaps if
-                        // the disk is full.
-                        // We need to check for this because the consequence of
-                        // a mismatched size is a panic in a layer where we
-                        // cannot handle the error case.
-                        if data.len() != expected_byte_size {
-                            report_frame_error(format!("frame data is corrupted: expected size {expected_byte_size} but have {}", data.len()));
-                            vec![0u8; expected_byte_size]
-                        } else {
-                            data
+                let (frame_data, _blob_read_guard) =
+                    match frames.current_frame.lease.read_exact(expected_byte_size) {
+                        Ok(data) => {
+                            // If the size isn't right, ignore this frame and replace
+                            // it with a blank one instead. This might happen if
+                            // some process is truncating the files, or perhaps if
+                            // the disk is full.
+                            // We need to check for this because the consequence of
+                            // a mismatched size is a panic in a layer where we
+                            // cannot handle the error case.
+                            let (data, guard) = data.into_guarded_parts();
+                            (data, Some(guard))
                         }
-                    }
-                    Err(err) => {
-                        report_frame_error(format!("frame data error: {err:#}"));
-                        vec![0u8; expected_byte_size]
-                    }
-                };
+                        Err(err) => {
+                            report_frame_error(format!("frame data error: {err:#}"));
+                            (vec![0u8; expected_byte_size], None)
+                        }
+                    };
 
                 let frame = Image::from_raw(
                     frames.current_frame.width,

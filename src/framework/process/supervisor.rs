@@ -25,17 +25,17 @@ use super::{
     },
     platform::attached::{AttachedGroup, TerminationRequest},
     report::{
-        CompletionCause, DescendantDisposition, LeaderExit, LeaderExitObservation, OutputReport,
-        PartialOutputReport, ProcessFailureKind, ProcessFailureReport, ProcessReport, ProcessRunId,
-        ProcessStream, SignalNumber, TerminationDisposition,
+        leader_exit, CompletionCause, DescendantDisposition, LeaderExit, LeaderExitObservation,
+        OutputReport, PartialOutputReport, ProcessFailureKind, ProcessFailureReport, ProcessReport,
+        ProcessRunId, ProcessStream, TerminationDisposition,
     },
     session::{
         process_session, ContainmentStrength, ControlAcknowledgement, ControlRequest,
         ProcessCompletion, StartedProcess,
     },
     spec::{
-        ContainmentRequirement, EnvironmentBase, InputPolicy, OutputPolicy, ProcessDeadline,
-        ProcessSpec, TerminationPolicy,
+        CommandSpec, ContainmentRequirement, EnvironmentBase, InputPolicy, OutputPolicy,
+        ProcessDeadline, ProcessSpec, TerminationPolicy,
     },
 };
 
@@ -479,20 +479,11 @@ async fn spawn_attached(
         prepare_record_output(stderr_policy, ProcessStream::Stderr, run_directory.as_ref())?;
     let mut containment = AttachedGroup::create(spec.containment, spec.termination).await?;
     let containment_strength = containment.strength();
-    let mut command = Command::new(&spec.command.program);
+    let mut command = tokio_command(&spec.command);
     command
-        .args(&spec.command.arguments)
-        .current_dir(&spec.command.working_directory)
         .stdin(input_stdio(&input_policy))
         .stdout(output_stdio(stdout_policy))
         .stderr(output_stdio(stderr_policy));
-    if spec.command.environment.base == EnvironmentBase::Empty {
-        command.env_clear();
-    }
-    command.envs(&spec.command.environment.values);
-    for name in &spec.command.environment.removals {
-        command.env_remove(name);
-    }
     let mut child = containment.spawn(command)?;
     if let Some(stream) =
         missing_configured_pipe(&child, &input_policy, stdout_policy, stderr_policy)
@@ -1309,19 +1300,17 @@ fn validate_timing(spec: &ProcessSpec) -> Result<(), ProcessStartError> {
     Ok(())
 }
 
-fn leader_exit(status: std::process::ExitStatus) -> LeaderExit {
-    if let Some(code) = status.code() {
-        return LeaderExit::Code(code);
+pub(in crate::framework) fn tokio_command(spec: &CommandSpec) -> Command {
+    let mut command = Command::new(&spec.program);
+    command.args(&spec.arguments).current_dir(&spec.working_directory);
+    if spec.environment.base == EnvironmentBase::Empty {
+        command.env_clear();
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        LeaderExit::Signal(SignalNumber::new(status.signal().unwrap_or(libc::SIGKILL)))
+    command.envs(&spec.environment.values);
+    for name in &spec.environment.removals {
+        command.env_remove(name);
     }
-    #[cfg(not(unix))]
-    {
-        LeaderExit::Code(1)
-    }
+    command
 }
 
 fn forward_output_failures(

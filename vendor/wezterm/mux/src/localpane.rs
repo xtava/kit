@@ -5,8 +5,10 @@ use crate::pane::{
 };
 use crate::renderable::*;
 use crate::tmux::{TmuxDomain, TmuxDomainState};
-use crate::{Domain, Mux, MuxNotification};
-use anyhow::Error;
+#[cfg(unix)]
+use crate::PaneTaskKind;
+use crate::{CountClass, Domain, Mux, MuxNotification, RuntimeAdmission};
+use anyhow::{Context, Error};
 use async_trait::async_trait;
 use config::keyassignment::ScrollbackEraseMode;
 use config::{configuration, ExitBehavior, ExitBehaviorMessaging};
@@ -40,7 +42,7 @@ const PROC_INFO_CACHE_TTL: Duration = Duration::from_millis(300);
 #[derive(Debug)]
 enum ProcessState {
     Running {
-        child_waiter: Receiver<IoResult<ExitStatus>>,
+        child_waiter: ChildWaiter,
         pid: Option<u32>,
         signaller: Box<dyn ChildKiller + Sync>,
         // Whether we've explicitly killed the child
@@ -50,6 +52,35 @@ enum ProcessState {
         killed: bool,
     },
     Dead,
+}
+
+#[derive(Debug)]
+struct ChildWaiter {
+    result: Receiver<IoResult<ExitStatus>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ChildWaiter {
+    fn try_recv(&self) -> Result<IoResult<ExitStatus>, TryRecvError> {
+        self.result.try_recv()
+    }
+
+    fn join(&mut self) -> anyhow::Result<()> {
+        if let Some(worker) = self.worker.take() {
+            if worker.join().is_err() {
+                anyhow::bail!("pane child waiter panicked");
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ChildWaiter {
+    fn drop(&mut self) {
+        if let Err(err) = self.join() {
+            log::error!("pane child waiter shutdown failed: {err:#}");
+        }
+    }
 }
 
 struct CachedProcInfo {
@@ -64,9 +95,8 @@ struct CachedProcInfo {
 /// pids alone, which can easily lead to stuttering when moving the mouse
 /// over all of the tabs.
 ///
-/// This implements a cache holding that fg process and the often queried
-/// cwd and process path that allows for stale reads to proceed quickly
-/// while the writes can happen in a background thread.
+/// This cache lets stale reads proceed quickly while a headless mux refreshes through its retained
+/// pane-task owner. Interactive muxes refresh synchronously because they do not own that executor.
 #[cfg(unix)]
 #[derive(Clone)]
 struct CachedLeaderInfo {
@@ -125,7 +155,7 @@ pub struct LocalPane {
     pane_id: PaneId,
     terminal: Mutex<Terminal>,
     process: Mutex<ProcessState>,
-    pty: Mutex<Box<dyn MasterPty>>,
+    pty: Arc<Mutex<Box<dyn MasterPty>>>,
     writer: Mutex<Box<dyn Write + Send>>,
     domain_id: DomainId,
     tmux_domain: Mutex<Option<Arc<TmuxDomainState>>>,
@@ -388,7 +418,12 @@ impl Pane for LocalPane {
     }
 
     fn perform_actions(&self, actions: Vec<termwiz::escape::Action>) {
-        self.terminal.lock().perform_actions(actions)
+        if let Err(error) = self.terminal.lock().perform_actions(actions) {
+            log::warn!(
+                "rejected terminal output for pane {} before retained-state growth: {error:#}",
+                self.pane_id
+            );
+        }
     }
 
     fn mouse_event(&self, event: MouseEvent) -> Result<(), Error> {
@@ -415,13 +450,16 @@ impl Pane for LocalPane {
     }
 
     fn resize(&self, size: TerminalSize) -> Result<(), Error> {
+        let mut terminal = self.terminal.lock();
+        let prepared = terminal.prepare_server_resize(size)?;
+        let target = prepared.target_size();
         self.pty.lock().resize(PtySize {
-            rows: size.rows.try_into()?,
-            cols: size.cols.try_into()?,
-            pixel_width: size.pixel_width.try_into()?,
-            pixel_height: size.pixel_height.try_into()?,
+            rows: target.rows.try_into()?,
+            cols: target.cols.try_into()?,
+            pixel_width: target.pixel_width.try_into()?,
+            pixel_height: target.pixel_height.try_into()?,
         })?;
-        self.terminal.lock().resize(size);
+        prepared.commit();
         Ok(())
     }
 
@@ -435,6 +473,22 @@ impl Pane for LocalPane {
 
     fn reader(&self) -> anyhow::Result<Option<Box<dyn std::io::Read + Send>>> {
         Ok(Some(self.pty.lock().try_clone_reader()?))
+    }
+
+    fn cancel_reader(&self) -> anyhow::Result<()> {
+        self.pty.lock().cancel_reader()
+    }
+
+    fn join_child_waiter(&self) -> anyhow::Result<()> {
+        let mut process = self.process.lock();
+        if let ProcessState::Running { child_waiter, .. } = &mut *process {
+            child_waiter.join()?;
+        }
+        Ok(())
+    }
+
+    fn kill_process_on_unregister(&self) -> bool {
+        true
     }
 
     fn send_paste(&self, text: &str) -> Result<(), Error> {
@@ -845,14 +899,19 @@ pub(crate) fn emit_output_for_pane(pane_id: PaneId, message: &str) {
     let mut actions = vec![Action::CSI(CSI::Sgr(Sgr::Reset))];
     parser.parse(message.as_bytes(), |action| actions.push(action));
 
-    promise::spawn::spawn_into_main_thread(async move {
-        let mux = Mux::get();
-        if let Some(pane) = mux.get_pane(pane_id) {
-            pane.perform_actions(actions);
-            mux.notify(MuxNotification::PaneOutput(pane_id));
+    let mux = Mux::get();
+    let weak_mux = Arc::downgrade(&mux);
+    if let Err(err) = mux.try_spawn_runtime_task("schedule pane output emission", async move {
+        if let Some(mux) = weak_mux.upgrade() {
+            if let Some(pane) = mux.get_pane(pane_id) {
+                pane.perform_actions(actions);
+                mux.notify(MuxNotification::PaneOutput(pane_id));
+            }
         }
-    })
-    .detach();
+        Ok(())
+    }) {
+        log::error!("failed to schedule pane output emission: {err:#}");
+    }
 }
 
 impl wezterm_term::DeviceControlHandler for LocalPaneDCSHandler {
@@ -935,29 +994,34 @@ struct LocalPaneNotifHandler {
 impl AlertHandler for LocalPaneNotifHandler {
     fn alert(&mut self, alert: Alert) {
         let pane_id = self.pane_id;
-        promise::spawn::spawn_into_main_thread(async move {
-            let mux = Mux::get();
-            match &alert {
-                Alert::WindowTitleChanged(title) => {
-                    if let Some((_domain, window_id, _tab_id)) = mux.resolve_pane_id(pane_id) {
-                        if let Some(mut window) = mux.get_window_mut(window_id) {
-                            window.set_title(title);
+        let mux = Mux::get();
+        let weak_mux = Arc::downgrade(&mux);
+        if let Err(err) = mux.try_spawn_runtime_task("schedule pane alert", async move {
+            if let Some(mux) = weak_mux.upgrade() {
+                match &alert {
+                    Alert::WindowTitleChanged(title) => {
+                        if let Some((_domain, window_id, _tab_id)) = mux.resolve_pane_id(pane_id) {
+                            if let Some(mut window) = mux.get_window_mut(window_id) {
+                                window.set_title(title);
+                            }
                         }
                     }
-                }
-                Alert::TabTitleChanged(title) => {
-                    if let Some((_domain, _window_id, tab_id)) = mux.resolve_pane_id(pane_id) {
-                        if let Some(tab) = mux.get_tab(tab_id) {
-                            tab.set_title(title.as_deref().unwrap_or(""));
+                    Alert::TabTitleChanged(title) => {
+                        if let Some((_domain, _window_id, tab_id)) = mux.resolve_pane_id(pane_id) {
+                            if let Some(tab) = mux.get_tab(tab_id) {
+                                tab.set_title(title.as_deref().unwrap_or(""));
+                            }
                         }
                     }
+                    _ => {}
                 }
-                _ => {}
-            }
 
-            mux.notify(MuxNotification::Alert { pane_id, alert });
-        })
-        .detach();
+                mux.notify(MuxNotification::Alert { pane_id, alert });
+            }
+            Ok(())
+        }) {
+            log::error!("failed to schedule pane alert: {err:#}");
+        }
     }
 }
 
@@ -971,27 +1035,38 @@ impl AlertHandler for LocalPaneNotifHandler {
 /// until something else triggered the mux to prune dead processes.
 fn split_child(
     mut process: Box<dyn Child>,
-) -> (
-    Receiver<IoResult<ExitStatus>>,
-    Box<dyn ChildKiller + Sync>,
-    Option<u32>,
-) {
+    pty: Arc<Mutex<Box<dyn MasterPty>>>,
+    admission: &Arc<RuntimeAdmission>,
+    pane_id: PaneId,
+) -> anyhow::Result<(ChildWaiter, Box<dyn ChildKiller + Sync>, Option<u32>)> {
     let pid = process.process_id();
     let signaller = process.clone_killer();
+    let permit = admission
+        .try_count(CountClass::ExecutorRunnable, 1)
+        .context("admit pane child waiter")?;
 
     let (tx, rx) = bounded(1);
 
-    std::thread::spawn(move || {
-        let status = process.wait();
-        tx.try_send(status).ok();
-        promise::spawn::spawn_into_main_thread(async move {
-            let mux = Mux::get();
-            mux.prune_dead_windows();
+    let worker = std::thread::Builder::new()
+        .name(format!("mux-pane-child-{pane_id}"))
+        .spawn(move || {
+            let _permit = permit;
+            let status = process.wait();
+            tx.try_send(status).ok();
+            if let Err(err) = pty.lock().cancel_reader() {
+                log::error!("failed to wake pane reader after child exit: {err:#}");
+            }
         })
-        .detach();
-    });
+        .context("spawn pane child waiter")?;
 
-    (rx, signaller, pid)
+    Ok((
+        ChildWaiter {
+            result: rx,
+            worker: Some(worker),
+        },
+        signaller,
+        pid,
+    ))
 }
 
 impl LocalPane {
@@ -1003,8 +1078,10 @@ impl LocalPane {
         writer: Box<dyn Write + Send>,
         domain_id: DomainId,
         command_description: String,
-    ) -> Self {
-        let (process, signaller, pid) = split_child(process);
+        admission: &Arc<RuntimeAdmission>,
+    ) -> anyhow::Result<Self> {
+        let pty = Arc::new(Mutex::new(pty));
+        let (process, signaller, pid) = split_child(process, Arc::clone(&pty), admission, pane_id)?;
 
         terminal.set_device_control_handler(Box::new(LocalPaneDCSHandler {
             pane_id,
@@ -1012,7 +1089,7 @@ impl LocalPane {
         }));
         terminal.set_notification_handler(Box::new(LocalPaneNotifHandler { pane_id }));
 
-        Self {
+        Ok(Self {
             pane_id,
             terminal: Mutex::new(terminal),
             process: Mutex::new(ProcessState::Running {
@@ -1021,7 +1098,7 @@ impl LocalPane {
                 signaller,
                 killed: false,
             }),
-            pty: Mutex::new(pty),
+            pty,
             writer: Mutex::new(writer),
             domain_id,
             tmux_domain: Mutex::new(None),
@@ -1029,7 +1106,7 @@ impl LocalPane {
             #[cfg(unix)]
             leader: Arc::new(Mutex::new(None)),
             command_description,
-        }
+        })
     }
 
     #[cfg(unix)]
@@ -1039,17 +1116,30 @@ impl LocalPane {
         if policy == CachePolicy::FetchImmediate {
             leader.replace(CachedLeaderInfo::new(self.pty.lock().as_raw_fd()));
         } else if let Some(info) = leader.as_mut() {
-            // If stale, queue up some work in another thread to update.
-            // Right now, we'll return the stale data.
+            // Headless runtimes retain refresh work under this pane's worker set. Interactive
+            // runtimes have no headless task owner and refresh synchronously instead.
             if info.expired() && info.can_update() {
                 info.updating = true;
-                let leader_ref = Arc::clone(&self.leader);
-                std::thread::spawn(move || {
-                    let mut leader = leader_ref.lock();
-                    if let Some(leader) = leader.as_mut() {
-                        leader.update();
+                let mux = Mux::get();
+                if mux.is_headless_runtime() {
+                    let leader_ref = Arc::clone(&self.leader);
+                    if let Err(error) = mux.try_spawn_pane_task_local(
+                        self.pane_id,
+                        PaneTaskKind::Refresh,
+                        async move {
+                            let mut leader = leader_ref.lock();
+                            if let Some(leader) = leader.as_mut() {
+                                leader.update();
+                            }
+                            Ok(())
+                        },
+                    ) {
+                        info.updating = false;
+                        log::warn!("failed to schedule pane leader refresh: {error:#}");
                     }
-                });
+                } else {
+                    info.update();
+                }
             }
         } else {
             leader.replace(CachedLeaderInfo::new(self.pty.lock().as_raw_fd()));

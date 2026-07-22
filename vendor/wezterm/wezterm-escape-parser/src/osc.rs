@@ -54,6 +54,52 @@ pub enum OperatingSystemCommand {
     Unspecified(Vec<Vec<u8>>),
 }
 
+impl OperatingSystemCommand {
+    /// Returns a non-allocating upper bound for heap storage owned by this action.
+    pub fn retained_size_upper_bound(&self) -> usize {
+        use OperatingSystemCommand::*;
+
+        match self {
+            SetIconNameAndWindowTitle(value)
+            | SetWindowTitle(value)
+            | SetWindowTitleSun(value)
+            | SetIconName(value)
+            | SetIconNameSun(value)
+            | SetSelection(_, value)
+            | SystemNotification(value)
+            | CurrentWorkingDirectory(value) => value.capacity(),
+            SetHyperlink(Some(link)) => link.retained_size(),
+            SetHyperlink(None) | ClearSelection(_) | QuerySelection(_) | ResetDynamicColor(_)
+            | ConEmuProgress(_) => 0,
+            ITermProprietary(command) => command.retained_size_upper_bound(),
+            FinalTermSemanticPrompt(command) => command.retained_size_upper_bound(),
+            ChangeColorNumber(values) => values
+                .capacity()
+                .saturating_mul(core::mem::size_of::<ChangeColorPair>()),
+            ChangeDynamicColors(_, values) => values
+                .capacity()
+                .saturating_mul(core::mem::size_of::<ColorOrQuery>()),
+            ResetColors(values) => values.capacity(),
+            RxvtExtension(values) => {
+                string_vec_retained_size_upper_bound(values, values.capacity())
+            }
+            Unspecified(values) => values.iter().fold(
+                values
+                    .capacity()
+                    .saturating_mul(core::mem::size_of::<Vec<u8>>()),
+                |bytes, value| bytes.saturating_add(value.capacity()),
+            ),
+        }
+    }
+}
+
+fn string_vec_retained_size_upper_bound(values: &[String], capacity: usize) -> usize {
+    values.iter().fold(
+        capacity.saturating_mul(core::mem::size_of::<String>()),
+        |bytes, value| bytes.saturating_add(value.capacity()),
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromPrimitive)]
 #[repr(u8)]
 pub enum DynamicColorNumber {
@@ -745,6 +791,19 @@ pub enum FinalTermSemanticPrompt {
 }
 
 impl FinalTermSemanticPrompt {
+    fn retained_size_upper_bound(&self) -> usize {
+        match self {
+            Self::FreshLineAndStartPrompt { aid, .. }
+            | Self::MarkEndOfCommandWithFreshLine { aid, .. }
+            | Self::MarkEndOfInputAndStartOfOutput { aid }
+            | Self::CommandStatus { aid, .. } => aid.as_ref().map_or(0, String::capacity),
+            Self::FreshLine
+            | Self::StartPrompt(_)
+            | Self::MarkEndOfPromptAndStartOfInputUntilNextMarker
+            | Self::MarkEndOfPromptAndStartOfInputUntilEndOfLine => 0,
+        }
+    }
+
     fn parse(osc: &[&[u8]]) -> Result<Self> {
         ensure!(osc.len() > 1, "not enough args");
         let param = String::from_utf8_lossy(osc[1]);
@@ -935,6 +994,35 @@ pub enum ITermProprietary {
 
     /// Configure unicode version
     UnicodeVersion(ITermUnicodeVersionOp),
+}
+
+impl ITermProprietary {
+    fn retained_size_upper_bound(&self) -> usize {
+        match self {
+            Self::CurrentDir(value)
+            | Self::SetProfile(value)
+            | Self::CopyToClipboard(value)
+            | Self::Copy(value)
+            | Self::ReportVariable(value)
+            | Self::SetBadgeFormat(value) => value.capacity(),
+            Self::SetUserVar { name, value } => name.capacity().saturating_add(value.capacity()),
+            Self::File(file) => core::mem::size_of::<ITermFileData>()
+                .saturating_add(file.name.as_ref().map_or(0, String::capacity))
+                .saturating_add(file.data.capacity()),
+            Self::UnicodeVersion(ITermUnicodeVersionOp::Push(label))
+            | Self::UnicodeVersion(ITermUnicodeVersionOp::Pop(label)) => {
+                label.as_ref().map_or(0, String::capacity)
+            }
+            Self::SetMark
+            | Self::StealFocus
+            | Self::ClearScrollback
+            | Self::EndCopy
+            | Self::HighlightCursorLine(_)
+            | Self::RequestCellSize
+            | Self::ReportCellSize { .. }
+            | Self::UnicodeVersion(ITermUnicodeVersionOp::Set(_)) => 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -14,7 +14,6 @@ leb128.workspace = true
 log.workspace = true
 metrics.workspace = true
 mux.workspace = true
-portable-pty = { workspace = true, features = ["serde_support"]}
 rangeset.workspace = true
 serde = {workspace=true, features = ["rc", "derive"]}
 smol.workspace = true
@@ -22,6 +21,7 @@ termwiz.workspace = true
 thiserror.workspace = true
 varbincode.workspace = true
 wezterm-term = { workspace=true, features=["use_serde"] }
+wezterm-runtime-admission.workspace = true
 zstd.workspace = true
 
 [dev-dependencies]

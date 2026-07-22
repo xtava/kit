@@ -2,13 +2,102 @@ use crate::error::{Error, Result};
 use byteorder::{LittleEndian, ReadBytesExt};
 use serde::de::IntoDeserializer;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DecodeLimits {
+    pub max_owned_payload_bytes: usize,
+    pub max_string_bytes: usize,
+    pub max_byte_buffer_bytes: usize,
+    pub max_sequence_items: usize,
+    pub max_map_entries: usize,
+    pub max_containers: usize,
+    pub max_nesting_depth: usize,
+}
+
+#[derive(Debug)]
+struct DecodeBudget {
+    limits: DecodeLimits,
+    owned_payload_bytes: usize,
+    sequence_items: usize,
+    map_entries: usize,
+    containers: usize,
+    nesting_depth: usize,
+}
+
+impl DecodeBudget {
+    fn new(limits: DecodeLimits) -> Self {
+        Self {
+            limits,
+            owned_payload_bytes: 0,
+            sequence_items: 0,
+            map_entries: 0,
+            containers: 0,
+            nesting_depth: 0,
+        }
+    }
+
+    fn debit(used: &mut usize, amount: usize, limit: usize, kind: &'static str) -> Result<()> {
+        let next = used.checked_add(amount).ok_or(Error::LimitExceeded { kind, limit })?;
+        if next > limit {
+            return Err(Error::LimitExceeded { kind, limit });
+        }
+        *used = next;
+        Ok(())
+    }
+
+    fn debit_payload(&mut self, bytes: usize, per_value_limit: usize) -> Result<()> {
+        if bytes > per_value_limit {
+            return Err(Error::LimitExceeded { kind: "owned value bytes", limit: per_value_limit });
+        }
+        Self::debit(
+            &mut self.owned_payload_bytes,
+            bytes,
+            self.limits.max_owned_payload_bytes,
+            "owned payload bytes",
+        )
+    }
+
+    fn debit_sequence(&mut self, items: usize) -> Result<()> {
+        Self::debit(
+            &mut self.sequence_items,
+            items,
+            self.limits.max_sequence_items,
+            "sequence items",
+        )
+    }
+
+    fn debit_map(&mut self, entries: usize) -> Result<()> {
+        Self::debit(&mut self.map_entries, entries, self.limits.max_map_entries, "map entries")
+    }
+
+    fn enter_container(&mut self) -> Result<()> {
+        Self::debit(&mut self.containers, 1, self.limits.max_containers, "containers")?;
+        let depth = self.nesting_depth.checked_add(1).ok_or(Error::LimitExceeded {
+            kind: "nesting depth",
+            limit: self.limits.max_nesting_depth,
+        })?;
+        if depth > self.limits.max_nesting_depth {
+            return Err(Error::LimitExceeded {
+                kind: "nesting depth",
+                limit: self.limits.max_nesting_depth,
+            });
+        }
+        self.nesting_depth = depth;
+        Ok(())
+    }
+
+    fn leave_container(&mut self) {
+        self.nesting_depth -= 1;
+    }
+}
+
 pub struct Deserializer<'a> {
-    reader: &'a mut std::io::Read,
+    reader: &'a mut dyn std::io::Read,
+    budget: DecodeBudget,
 }
 
 impl<'a> Deserializer<'a> {
-    pub fn new(reader: &'a mut std::io::Read) -> Self {
-        Self { reader }
+    pub fn new(reader: &'a mut dyn std::io::Read, limits: DecodeLimits) -> Self {
+        Self { reader, budget: DecodeBudget::new(limits) }
     }
 
     fn read_signed(&mut self) -> Result<i64> {
@@ -19,16 +108,26 @@ impl<'a> Deserializer<'a> {
         leb128::read::unsigned(&mut self.reader).map_err(Into::into)
     }
 
-    fn read_vec(&mut self) -> Result<Vec<u8>> {
+    fn read_vec(&mut self, per_value_limit: usize) -> Result<Vec<u8>> {
         let len: usize = serde::Deserialize::deserialize(&mut *self)?;
-        let mut result = vec![0u8; len];
+        self.budget.debit_payload(len, per_value_limit)?;
+        let mut result = Vec::new();
+        result.try_reserve_exact(len).map_err(|_| Error::AllocationFailed { requested: len })?;
+        result.resize(len, 0);
         self.reader.read_exact(&mut result)?;
         Ok(result)
     }
 
     fn read_string(&mut self) -> Result<String> {
-        let vec = self.read_vec()?;
+        let vec = self.read_vec(self.budget.limits.max_string_bytes)?;
         String::from_utf8(vec).map_err(|e| Error::InvalidUtf8Encoding(e.utf8_error()))
+    }
+
+    fn visit_container<T>(&mut self, visit: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        self.budget.enter_container()?;
+        let result = visit(self);
+        self.budget.leave_container();
+        result
     }
 }
 
@@ -36,7 +135,8 @@ macro_rules! impl_uint {
     ($ty:ty, $dser_method:ident, $visitor_method:ident, $reader_method:ident) => {
         #[inline]
         fn $dser_method<V>(self, visitor: V) -> Result<V::Value>
-            where V: serde::de::Visitor<'de>,
+        where
+            V: serde::de::Visitor<'de>,
         {
             let value = self.$reader_method()?;
             if value > <$ty>::max_value() as u64 {
@@ -45,14 +145,15 @@ macro_rules! impl_uint {
                 visitor.$visitor_method(value as $ty)
             }
         }
-    }
+    };
 }
 
 macro_rules! impl_int {
     ($ty:ty, $dser_method:ident, $visitor_method:ident, $reader_method:ident) => {
         #[inline]
         fn $dser_method<V>(self, visitor: V) -> Result<V::Value>
-            where V: serde::de::Visitor<'de>,
+        where
+            V: serde::de::Visitor<'de>,
         {
             let value = self.$reader_method()?;
             if value < <$ty>::min_value() as i64 || value > <$ty>::max_value() as i64 {
@@ -61,18 +162,19 @@ macro_rules! impl_int {
                 visitor.$visitor_method(value as $ty)
             }
         }
-    }
+    };
 }
 macro_rules! impl_float {
     ($dser_method:ident, $visitor_method:ident, $reader_method:ident) => {
         #[inline]
         fn $dser_method<V>(self, visitor: V) -> Result<V::Value>
-            where V: serde::de::Visitor<'de>,
+        where
+            V: serde::de::Visitor<'de>,
         {
             let value = self.reader.$reader_method::<LittleEndian>()?;
             visitor.$visitor_method(value)
         }
-    }
+    };
 }
 
 impl<'de, 'a, 'b> serde::Deserializer<'de> for &'a mut Deserializer<'b> {
@@ -161,14 +263,14 @@ impl<'de, 'a, 'b> serde::Deserializer<'de> for &'a mut Deserializer<'b> {
     where
         V: serde::de::Visitor<'de>,
     {
-        visitor.visit_byte_buf(self.read_vec()?)
+        visitor.visit_byte_buf(self.read_vec(self.budget.limits.max_byte_buffer_bytes)?)
     }
 
     fn deserialize_byte_buf<V>(self, visitor: V) -> Result<V::Value>
     where
         V: serde::de::Visitor<'de>,
     {
-        visitor.visit_byte_buf(self.read_vec()?)
+        visitor.visit_byte_buf(self.read_vec(self.budget.limits.max_byte_buffer_bytes)?)
     }
 
     fn deserialize_enum<V>(
@@ -180,29 +282,29 @@ impl<'de, 'a, 'b> serde::Deserializer<'de> for &'a mut Deserializer<'b> {
     where
         V: serde::de::Visitor<'de>,
     {
-        visitor.visit_enum(self)
+        self.visit_container(|deserializer| visitor.visit_enum(deserializer))
     }
 
     fn deserialize_tuple<V>(self, len: usize, visitor: V) -> Result<V::Value>
     where
         V: serde::de::Visitor<'de>,
     {
-        visitor.visit_seq(Access {
-            deserializer: self,
-            len,
-        })
+        self.budget.debit_sequence(len)?;
+        self.visit_container(|deserializer| visitor.visit_seq(Access { deserializer, len }))
     }
 
     fn deserialize_option<V>(self, visitor: V) -> Result<V::Value>
     where
         V: serde::de::Visitor<'de>,
     {
-        let value: u8 = serde::de::Deserialize::deserialize(&mut *self)?;
-        match value {
-            0 => visitor.visit_none(),
-            1 => visitor.visit_some(&mut *self),
-            v => Err(Error::InvalidTagEncoding(v as usize)),
-        }
+        self.visit_container(|deserializer| {
+            let value: u8 = serde::de::Deserialize::deserialize(&mut *deserializer)?;
+            match value {
+                0 => visitor.visit_none(),
+                1 => visitor.visit_some(&mut *deserializer),
+                v => Err(Error::InvalidTagEncoding(v as usize)),
+            }
+        })
     }
 
     fn deserialize_seq<V>(self, visitor: V) -> Result<V::Value>
@@ -210,7 +312,6 @@ impl<'de, 'a, 'b> serde::Deserializer<'de> for &'a mut Deserializer<'b> {
         V: serde::de::Visitor<'de>,
     {
         let len = serde::Deserialize::deserialize(&mut *self)?;
-
         self.deserialize_tuple(len, visitor)
     }
 
@@ -220,10 +321,8 @@ impl<'de, 'a, 'b> serde::Deserializer<'de> for &'a mut Deserializer<'b> {
     {
         let len = serde::Deserialize::deserialize(&mut *self)?;
 
-        visitor.visit_map(Access {
-            deserializer: self,
-            len,
-        })
+        self.budget.debit_map(len)?;
+        self.visit_container(|deserializer| visitor.visit_map(Access { deserializer, len }))
     }
 
     fn deserialize_struct<V>(
@@ -249,7 +348,7 @@ impl<'de, 'a, 'b> serde::Deserializer<'de> for &'a mut Deserializer<'b> {
     where
         V: serde::de::Visitor<'de>,
     {
-        visitor.visit_newtype_struct(self)
+        self.visit_container(|deserializer| visitor.visit_newtype_struct(deserializer))
     }
 
     fn deserialize_unit_struct<V>(self, _name: &'static str, visitor: V) -> Result<V::Value>
@@ -305,7 +404,7 @@ impl<'de, 'a, 'b> serde::de::SeqAccess<'de> for Access<'a, 'b> {
     }
 
     fn size_hint(&self) -> Option<usize> {
-        Some(self.len)
+        None
     }
 }
 
@@ -334,7 +433,7 @@ impl<'de, 'a, 'b> serde::de::MapAccess<'de> for Access<'a, 'b> {
     }
 
     fn size_hint(&self) -> Option<usize> {
-        Some(self.len)
+        None
     }
 }
 

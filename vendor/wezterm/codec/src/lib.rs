@@ -18,14 +18,15 @@ use mux::pane::PaneId;
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
 use mux::tab::{PaneNode, SerdeUrl, SplitRequest, TabId};
 use mux::window::WindowId;
-use portable_pty::CommandBuilder;
 use rangeset::*;
 use serde::{Deserialize, Serialize};
 use smol::io::AsyncWriteExt;
 use smol::prelude::*;
 use std::collections::HashMap;
-use std::convert::TryInto;
-use std::io::Cursor;
+use std::convert::{TryFrom, TryInto};
+use std::ffi::OsStr;
+use std::io::{Cursor, Read as _};
+use std::num::NonZeroU64;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -33,6 +34,15 @@ use termwiz::hyperlink::Hyperlink;
 use termwiz::image::{ImageData, TextureCoordinate};
 use termwiz::surface::{Line, SequenceNo};
 use thiserror::Error;
+use wezterm_runtime_admission::{
+    ByteClass, BytePermit, RuntimeAdmission, MAX_DECODE_HEAP_ENVELOPE_BYTES_PER_PDU,
+    MAX_DECODE_METADATA_HEAP_ENVELOPE_BYTES_PER_PDU,
+    MAX_DECODE_NOTIFICATION_HEAP_ENVELOPE_BYTES_PER_PDU, MAX_DECOMPRESSED_PDU_BYTES,
+    MAX_SINGLE_PDU_COMPRESSED_BYTES, MAX_SINGLE_PDU_SERIALIZED_BYTES, MAX_WIRE_BYTE_BUFFER_BYTES,
+    MAX_WIRE_CONTAINERS_PER_PDU, MAX_WIRE_FRAME_BYTES, MAX_WIRE_MAP_ENTRIES_PER_PDU,
+    MAX_WIRE_NESTING_DEPTH, MAX_WIRE_OWNED_PAYLOAD_BYTES_PER_PDU, MAX_WIRE_SEQUENCE_ITEMS_PER_PDU,
+    MAX_WIRE_STRING_BYTES,
+};
 use wezterm_term::color::ColorPalette;
 use wezterm_term::{Alert, ClipboardSelection, StableRowIndex, TerminalSize};
 
@@ -57,13 +67,55 @@ fn encoded_length(value: u64) -> usize {
 
 const COMPRESSED_MASK: u64 = 1 << 63;
 
+struct LimitedWriter<W> {
+    inner: W,
+    written: usize,
+    limit: usize,
+}
+
+impl<W> LimitedWriter<W> {
+    fn new(inner: W, limit: usize) -> Self {
+        Self {
+            inner,
+            written: 0,
+            limit,
+        }
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for LimitedWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let next = self
+            .written
+            .checked_add(buf.len())
+            .filter(|next| *next <= self.limit)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "serialized PDU exceeds its finite envelope",
+                )
+            })?;
+        self.inner.write_all(buf)?;
+        self.written = next;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 fn encode_raw_as_vec(
     ident: u64,
     serial: u64,
     data: &[u8],
     is_compressed: bool,
 ) -> anyhow::Result<Vec<u8>> {
-    let len = data.len() + encoded_length(ident) + encoded_length(serial);
+    let len = data
+        .len()
+        .checked_add(encoded_length(ident))
+        .and_then(|len| len.checked_add(encoded_length(serial)))
+        .ok_or_else(|| CorruptResponse("encoded PDU length overflow".to_string()))?;
     let masked_len = if is_compressed {
         (len as u64) | COMPRESSED_MASK
     } else {
@@ -73,7 +125,13 @@ fn encode_raw_as_vec(
     // Double-buffer the data; since we run with nodelay enabled, it is
     // desirable for the write to be a single packet (or at least, for
     // the header portion to go out in a single packet)
-    let mut buffer = Vec::with_capacity(len + encoded_length(masked_len));
+    let frame_len = len
+        .checked_add(encoded_length(masked_len))
+        .ok_or_else(|| CorruptResponse("encoded frame length overflow".to_string()))?;
+    if frame_len > MAX_WIRE_FRAME_BYTES {
+        bail!("encoded PDU exceeds the wire frame limit");
+    }
+    let mut buffer = Vec::with_capacity(frame_len);
 
     leb128::write::unsigned(&mut buffer, masked_len).context("writing pdu len")?;
     leb128::write::unsigned(&mut buffer, serial).context("writing pdu serial")?;
@@ -121,13 +179,22 @@ async fn encode_raw_async<W: Unpin + AsyncWriteExt>(
     Ok(buffer.len())
 }
 
-/// Read a single leb128 encoded value from the stream
-async fn read_u64_async<R>(r: &mut R) -> anyhow::Result<u64>
+#[derive(Clone, Copy, Debug)]
+struct EncodedU64 {
+    value: u64,
+    encoded_len: usize,
+}
+
+/// Read a single leb128 encoded value from the stream.
+async fn read_u64_async<R>(r: &mut R, max_bytes: usize) -> anyhow::Result<EncodedU64>
 where
     R: Unpin + AsyncRead + std::fmt::Debug,
 {
     let mut buf = vec![];
     loop {
+        if buf.len() >= max_bytes {
+            bail!("leb128 value extends beyond its admitted header field");
+        }
         let mut byte = [0u8];
         let nread = r.read(&mut byte).await?;
         if nread == 0 {
@@ -141,7 +208,10 @@ where
 
         match leb128::read::unsigned(&mut buf.as_slice()) {
             Ok(n) => {
-                return Ok(n);
+                return Ok(EncodedU64 {
+                    value: n,
+                    encoded_len: buf.len(),
+                });
             }
             Err(leb128::read::Error::IoError(_)) => continue,
             Err(leb128::read::Error::Overflow) => anyhow::bail!("leb128 is too large"),
@@ -149,159 +219,481 @@ where
     }
 }
 
-/// Read a single leb128 encoded value from the stream
-fn read_u64<R: std::io::Read>(mut r: R) -> anyhow::Result<u64> {
-    leb128::read::unsigned(&mut r)
-        .map_err(|err| match err {
-            leb128::read::Error::IoError(ioerr) => anyhow::Error::new(ioerr),
-            err => anyhow::Error::new(err),
-        })
-        .context("reading leb128")
+/// Read a single leb128 encoded value from the stream.
+fn read_u64<R: std::io::Read>(r: &mut R, max_bytes: usize) -> anyhow::Result<EncodedU64> {
+    let mut buf = Vec::new();
+    loop {
+        if buf.len() >= max_bytes {
+            bail!("leb128 value extends beyond its admitted header field");
+        }
+        let mut byte = [0u8];
+        r.read_exact(&mut byte).context("reading leb128")?;
+        buf.push(byte[0]);
+        match leb128::read::unsigned(&mut buf.as_slice()) {
+            Ok(value) => {
+                return Ok(EncodedU64 {
+                    value,
+                    encoded_len: buf.len(),
+                });
+            }
+            Err(leb128::read::Error::IoError(_)) => continue,
+            Err(leb128::read::Error::Overflow) => bail!("leb128 is too large"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DecodeDirection {
+    ClientToServer,
+    ServerToClient,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClientRequestPhase {
+    Bootstrap,
+    Established,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DecodeCorrelation {
+    Request { phase: ClientRequestPhase },
+    Notification,
+    Response { expected: Option<PduTag> },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DecodeContext {
+    direction: DecodeDirection,
+    correlation: DecodeCorrelation,
+}
+
+impl DecodeContext {
+    pub fn client_to_server_request(phase: ClientRequestPhase) -> Self {
+        Self {
+            direction: DecodeDirection::ClientToServer,
+            correlation: DecodeCorrelation::Request { phase },
+        }
+    }
+
+    pub fn server_to_client_notification() -> Self {
+        Self {
+            direction: DecodeDirection::ServerToClient,
+            correlation: DecodeCorrelation::Notification,
+        }
+    }
+
+    pub fn server_to_client_response(expected: Option<PduTag>) -> Self {
+        Self {
+            direction: DecodeDirection::ServerToClient,
+            correlation: DecodeCorrelation::Response { expected },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PduHeaderPolicy {
+    Request { response: PduTag },
+    Response,
+    Notification,
+    RequestOrNotification { response: PduTag },
+}
+
+impl PduHeaderPolicy {
+    fn allows_notification(self) -> bool {
+        matches!(
+            self,
+            Self::Notification | Self::RequestOrNotification { .. }
+        )
+    }
+
+    fn expected_response(self) -> Option<PduTag> {
+        match self {
+            Self::Request { response } | Self::RequestOrNotification { response } => Some(response),
+            Self::Response | Self::Notification => None,
+        }
+    }
 }
 
 #[derive(Debug)]
-struct Decoded {
-    ident: u64,
+pub struct StagedPduHeader {
     serial: u64,
-    data: Vec<u8>,
+    tag: PduTag,
+    body_len: usize,
     is_compressed: bool,
 }
 
-/// Decode a frame.
-/// See encode_raw() for the frame format.
-async fn decode_raw_async<R: Unpin + AsyncRead + std::fmt::Debug>(
-    r: &mut R,
-    max_serial: Option<u64>,
-) -> anyhow::Result<Decoded> {
-    let len = read_u64_async(r)
-        .await
-        .context("decode_raw_async failed to read PDU length")?;
-    let (len, is_compressed) = if (len & COMPRESSED_MASK) != 0 {
-        (len & !COMPRESSED_MASK, true)
-    } else {
-        (len, false)
-    };
-    let serial = read_u64_async(r)
-        .await
-        .context("decode_raw_async failed to read PDU serial")?;
-    if let Some(max_serial) = max_serial {
-        if serial > max_serial && max_serial > 0 {
-            return Err(CorruptResponse(format!(
-                "decode_raw_async: serial {serial} is implausibly large \
-                (bigger than {max_serial})"
-            ))
-            .into());
-        }
+impl StagedPduHeader {
+    pub fn serial(&self) -> u64 {
+        self.serial
     }
-    let ident = read_u64_async(r)
-        .await
-        .context("decode_raw_async failed to read PDU ident")?;
-    let data_len =
-        match (len as usize).overflowing_sub(encoded_length(ident) + encoded_length(serial)) {
-            (_, true) => {
-                return Err(CorruptResponse(format!(
-                    "decode_raw_async: sizes don't make sense: \
-                    len:{len} serial:{serial} (enc={}) ident:{ident} (enc={})",
-                    encoded_length(serial),
-                    encoded_length(ident)
-                ))
-                .into());
+
+    pub fn tag(&self) -> PduTag {
+        self.tag
+    }
+
+    pub fn validate(
+        self,
+        context: DecodeContext,
+        admission: &RuntimeAdmission,
+    ) -> anyhow::Result<AdmittedPduBody> {
+        let policy = self.tag.header_policy();
+        match (context.direction, context.correlation) {
+            (DecodeDirection::ClientToServer, DecodeCorrelation::Request { phase }) => {
+                if self.serial == 0 {
+                    bail!(
+                        "client request PDU {} has notification serial zero",
+                        self.tag.name()
+                    );
+                }
+                if !self.tag.allows_client_request_phase(phase) {
+                    bail!(
+                        "PDU {} is invalid for client request phase {:?}",
+                        self.tag.name(),
+                        phase
+                    );
+                }
             }
-            (data_len, false) => data_len,
-        };
-
-    if is_compressed {
-        metrics::histogram!("pdu.decode.compressed.size").record(data_len as f64);
-    } else {
-        metrics::histogram!("pdu.decode.size").record(data_len as f64);
+            (DecodeDirection::ServerToClient, DecodeCorrelation::Notification) => {
+                if self.serial != 0 {
+                    bail!(
+                        "server notification PDU {} has correlated serial {}",
+                        self.tag.name(),
+                        self.serial
+                    );
+                }
+                if !policy.allows_notification() {
+                    bail!(
+                        "PDU {} is invalid as a server notification",
+                        self.tag.name()
+                    );
+                }
+            }
+            (DecodeDirection::ServerToClient, DecodeCorrelation::Response { expected }) => {
+                if self.serial == 0 {
+                    bail!(
+                        "correlated response PDU {} has serial zero",
+                        self.tag.name()
+                    );
+                }
+                let expected = expected.ok_or_else(|| {
+                    CorruptResponse(format!(
+                        "response serial {} has no corresponding promise",
+                        self.serial
+                    ))
+                })?;
+                if self.tag != expected && self.tag != PduTag::ErrorResponse {
+                    bail!(
+                        "response serial {} expected {} but received {}",
+                        self.serial,
+                        expected.name(),
+                        self.tag.name()
+                    );
+                }
+            }
+            _ => {
+                unreachable!("DecodeContext constructors define valid direction/correlation pairs")
+            }
+        }
+        let wire = admission
+            .try_bytes(ByteClass::DecodeWorking, self.body_len)
+            .context("wire decode admission")?;
+        Ok(AdmittedPduBody {
+            serial: self.serial,
+            tag: self.tag,
+            body_len: self.body_len,
+            is_compressed: self.is_compressed,
+            wire,
+        })
     }
+}
 
-    let mut data = vec![0u8; data_len];
+#[derive(Debug)]
+pub struct AdmittedPduBody {
+    serial: u64,
+    tag: PduTag,
+    body_len: usize,
+    is_compressed: bool,
+    wire: BytePermit,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FramePrefix {
+    content_len: usize,
+    is_compressed: bool,
+}
+
+fn parse_frame_prefix(tagged_len: EncodedU64) -> anyhow::Result<FramePrefix> {
+    let (content_len, is_compressed) = if (tagged_len.value & COMPRESSED_MASK) != 0 {
+        (tagged_len.value & !COMPRESSED_MASK, true)
+    } else {
+        (tagged_len.value, false)
+    };
+    let content_len = usize::try_from(content_len)
+        .map_err(|_| CorruptResponse("wire frame length does not fit usize".to_string()))?;
+    let frame_len = tagged_len
+        .encoded_len
+        .checked_add(content_len)
+        .ok_or_else(|| CorruptResponse("wire frame length overflow".to_string()))?;
+    if frame_len > MAX_WIRE_FRAME_BYTES {
+        return Err(CorruptResponse("wire frame exceeds the finite envelope".to_string()).into());
+    }
+    if content_len < 2 {
+        return Err(CorruptResponse(
+            "wire content cannot contain both serial and identifier".to_string(),
+        )
+        .into());
+    }
+    Ok(FramePrefix {
+        content_len,
+        is_compressed,
+    })
+}
+
+fn finish_header(
+    prefix: FramePrefix,
+    serial: EncodedU64,
+    ident: EncodedU64,
+) -> anyhow::Result<StagedPduHeader> {
+    let tag = PduTag::from_ident(ident.value)
+        .ok_or_else(|| CorruptResponse(format!("unknown PDU identifier {}", ident.value)))?;
+    let header_len = serial
+        .encoded_len
+        .checked_add(ident.encoded_len)
+        .ok_or_else(|| CorruptResponse("wire header length overflow".to_string()))?;
+    let body_len = prefix.content_len.checked_sub(header_len).ok_or_else(|| {
+        CorruptResponse(format!(
+            "wire content length {} is smaller than its serial and identifier",
+            prefix.content_len
+        ))
+    })?;
+    Ok(StagedPduHeader {
+        serial: serial.value,
+        tag,
+        body_len,
+        is_compressed: prefix.is_compressed,
+    })
+}
+
+async fn read_header_async<R>(r: &mut R) -> anyhow::Result<StagedPduHeader>
+where
+    R: Unpin + AsyncRead + std::fmt::Debug,
+{
+    let tagged_len = read_u64_async(r, 10)
+        .await
+        .context("reading async PDU length")?;
+    let prefix = parse_frame_prefix(tagged_len)?;
+    let serial = read_u64_async(r, prefix.content_len - 1)
+        .await
+        .context("reading async PDU serial")?;
+    let ident = read_u64_async(r, prefix.content_len - serial.encoded_len)
+        .await
+        .context("reading async PDU identifier")?;
+    finish_header(prefix, serial, ident)
+}
+
+fn read_header<R: std::io::Read>(r: &mut R) -> anyhow::Result<StagedPduHeader> {
+    let tagged_len = read_u64(r, 10).context("reading PDU length")?;
+    let prefix = parse_frame_prefix(tagged_len)?;
+    let serial = read_u64(r, prefix.content_len - 1).context("reading PDU serial")?;
+    let ident =
+        read_u64(r, prefix.content_len - serial.encoded_len).context("reading PDU identifier")?;
+    finish_header(prefix, serial, ident)
+}
+
+async fn read_body_async<R>(r: &mut R, body: &AdmittedPduBody) -> anyhow::Result<Vec<u8>>
+where
+    R: Unpin + AsyncRead + std::fmt::Debug,
+{
+    let mut data = Vec::new();
+    data.try_reserve_exact(body.body_len)
+        .context("reserving bounded wire frame")?;
+    data.resize(body.body_len, 0);
     r.read_exact(&mut data).await.with_context(|| {
         format!(
-            "decode_raw_async failed to read {} bytes of data \
-            for PDU of length {} with serial={} ident={}",
-            data_len, len, serial, ident
+            "reading {} async body bytes for serial={} tag={}",
+            body.body_len,
+            body.serial,
+            body.tag.name()
         )
     })?;
-    Ok(Decoded {
-        ident,
-        serial,
-        data,
-        is_compressed,
-    })
+    Ok(data)
 }
 
-/// Decode a frame.
-/// See encode_raw() for the frame format.
-fn decode_raw<R: std::io::Read>(mut r: R) -> anyhow::Result<Decoded> {
-    let len = read_u64(r.by_ref()).context("reading PDU length")?;
-    let (len, is_compressed) = if (len & COMPRESSED_MASK) != 0 {
-        (len & !COMPRESSED_MASK, true)
-    } else {
-        (len, false)
-    };
-    let serial = read_u64(r.by_ref()).context("reading PDU serial")?;
-    let ident = read_u64(r.by_ref()).context("reading PDU ident")?;
-    let data_len =
-        match (len as usize).overflowing_sub(encoded_length(ident) + encoded_length(serial)) {
-            (_, true) => {
-                anyhow::bail!(
-                    "sizes don't make sense: len:{} serial:{} (enc={}) ident:{} (enc={})",
-                    len,
-                    serial,
-                    encoded_length(serial),
-                    ident,
-                    encoded_length(ident)
-                );
-            }
-            (data_len, false) => data_len,
-        };
-
-    if is_compressed {
-        metrics::histogram!("pdu.decode.compressed.size").record(data_len as f64);
-    } else {
-        metrics::histogram!("pdu.decode.size").record(data_len as f64);
-    }
-
-    let mut data = vec![0u8; data_len];
+fn read_body<R: std::io::Read>(r: &mut R, body: &AdmittedPduBody) -> anyhow::Result<Vec<u8>> {
+    let mut data = Vec::new();
+    data.try_reserve_exact(body.body_len)
+        .context("reserving bounded wire frame")?;
+    data.resize(body.body_len, 0);
     r.read_exact(&mut data).with_context(|| {
         format!(
-            "reading {} bytes of data for PDU of length {} with serial={} ident={}",
-            data_len, len, serial, ident
+            "reading {} body bytes for serial={} tag={}",
+            body.body_len,
+            body.serial,
+            body.tag.name()
         )
     })?;
-    Ok(Decoded {
-        ident,
-        serial,
-        data,
-        is_compressed,
-    })
+    Ok(data)
 }
 
-#[derive(Debug, PartialEq)]
-pub struct DecodedPdu {
-    pub serial: u64,
-    pub pdu: Pdu,
+/// A successfully decoded inbound PDU whose working-memory reservation remains live.
+///
+/// Outbound PDUs are represented directly by `Pdu` plus their serial. Keeping this
+/// type inbound-only makes it impossible to construct decoded data without the
+/// reservation that bounded its wire and heap materialization.
+#[derive(Debug)]
+pub struct AdmittedDecodedPdu {
+    serial: u64,
+    pdu: Pdu,
+    reservation: DecodeReservation,
+}
+
+#[derive(Debug)]
+pub struct DecodeReservation {
+    _wire: BytePermit,
+    _heap: BytePermit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NotificationSerial(());
+
+impl NotificationSerial {
+    pub const fn get(self) -> u64 {
+        0
+    }
+}
+
+#[derive(Debug)]
+pub struct AdmittedNotification {
+    serial: NotificationSerial,
+    pdu: Pdu,
+    reservation: DecodeReservation,
+}
+
+impl AdmittedNotification {
+    pub fn serial(&self) -> NotificationSerial {
+        self.serial
+    }
+
+    pub fn pdu(&self) -> &Pdu {
+        &self.pdu
+    }
+
+    pub fn into_parts(self) -> (NotificationSerial, Pdu, DecodeReservation) {
+        (self.serial, self.pdu, self.reservation)
+    }
+}
+
+#[derive(Debug)]
+pub struct AdmittedRpcResponse<T> {
+    serial: NonZeroU64,
+    value: T,
+    reservation: DecodeReservation,
+}
+
+impl<T> AdmittedRpcResponse<T> {
+    pub fn serial(&self) -> u64 {
+        self.serial.get()
+    }
+
+    pub fn value(&self) -> &T {
+        &self.value
+    }
+
+    pub fn into_parts(self) -> (u64, T, DecodeReservation) {
+        (self.serial.get(), self.value, self.reservation)
+    }
+
+    pub fn into_inner(self) -> T {
+        self.value
+    }
+
+    pub fn try_map<U, E>(
+        self,
+        map: impl FnOnce(T) -> Result<U, E>,
+    ) -> Result<AdmittedRpcResponse<U>, E> {
+        let Self {
+            serial,
+            value,
+            reservation,
+        } = self;
+        Ok(AdmittedRpcResponse {
+            serial,
+            value: map(value)?,
+            reservation,
+        })
+    }
+}
+
+impl PartialEq for AdmittedDecodedPdu {
+    fn eq(&self, other: &Self) -> bool {
+        self.serial == other.serial && self.pdu == other.pdu
+    }
+}
+
+impl AdmittedDecodedPdu {
+    pub fn serial(&self) -> u64 {
+        self.serial
+    }
+
+    pub fn pdu(&self) -> &Pdu {
+        &self.pdu
+    }
+
+    pub fn into_parts(self) -> (u64, Pdu, DecodeReservation) {
+        (self.serial, self.pdu, self.reservation)
+    }
+
+    pub fn into_notification(self) -> Result<AdmittedNotification, Error> {
+        let (serial, pdu, reservation) = self.into_parts();
+        if serial != 0 {
+            bail!("correlated PDU serial {serial} cannot become a notification");
+        }
+        Ok(AdmittedNotification {
+            serial: NotificationSerial(()),
+            pdu,
+            reservation,
+        })
+    }
+
+    pub fn into_rpc_response(self) -> Result<AdmittedRpcResponse<Pdu>, Error> {
+        let (serial, pdu, reservation) = self.into_parts();
+        let serial = NonZeroU64::new(serial)
+            .ok_or_else(|| CorruptResponse("notification cannot become an RPC response".into()))?;
+        Ok(AdmittedRpcResponse {
+            serial,
+            value: pdu,
+            reservation,
+        })
+    }
 }
 
 /// If the serialized size is larger than this, then we'll consider compressing it
 const COMPRESS_THRESH: usize = 32;
 
-fn serialize<T: serde::Serialize>(t: &T) -> Result<(Vec<u8>, bool), Error> {
+fn serialize<T: serde::Serialize>(
+    t: &T,
+    admission: &RuntimeAdmission,
+) -> Result<(Vec<u8>, bool, BytePermit), Error> {
+    let permit = admission.try_bytes(
+        ByteClass::EncodeWorking,
+        MAX_SINGLE_PDU_SERIALIZED_BYTES + MAX_SINGLE_PDU_COMPRESSED_BYTES,
+    )?;
     let mut uncompressed = Vec::new();
-    let mut encode = varbincode::Serializer::new(&mut uncompressed);
+    let mut bounded = LimitedWriter::new(&mut uncompressed, MAX_SINGLE_PDU_SERIALIZED_BYTES);
+    let mut encode = varbincode::Serializer::new(&mut bounded);
     t.serialize(&mut encode)?;
 
     if uncompressed.len() <= COMPRESS_THRESH {
-        return Ok((uncompressed, false));
+        return Ok((uncompressed, false, permit));
     }
     // It's a little heavy; let's try compressing it
     let mut compressed = Vec::new();
-    let mut compress = zstd::Encoder::new(&mut compressed, zstd::DEFAULT_COMPRESSION_LEVEL)?;
-    let mut encode = varbincode::Serializer::new(&mut compress);
-    t.serialize(&mut encode)?;
-    drop(encode);
+    let bounded = LimitedWriter::new(&mut compressed, MAX_SINGLE_PDU_COMPRESSED_BYTES);
+    let mut compress = zstd::Encoder::new(bounded, zstd::DEFAULT_COMPRESSION_LEVEL)?;
+    {
+        let mut encode = varbincode::Serializer::new(&mut compress);
+        t.serialize(&mut encode)?;
+    }
     compress.finish()?;
 
     log::debug!(
@@ -311,9 +703,9 @@ fn serialize<T: serde::Serialize>(t: &T) -> Result<(Vec<u8>, bool), Error> {
     );
 
     if compressed.len() < uncompressed.len() {
-        Ok((compressed, true))
+        Ok((compressed, true, permit))
     } else {
-        Ok((uncompressed, false))
+        Ok((uncompressed, false, permit))
     }
 }
 
@@ -321,18 +713,106 @@ fn deserialize<T: serde::de::DeserializeOwned, R: std::io::Read>(
     mut r: R,
     is_compressed: bool,
 ) -> Result<T, Error> {
+    let limits = varbincode::DecodeLimits {
+        max_owned_payload_bytes: MAX_WIRE_OWNED_PAYLOAD_BYTES_PER_PDU,
+        max_string_bytes: MAX_WIRE_STRING_BYTES,
+        max_byte_buffer_bytes: MAX_WIRE_BYTE_BUFFER_BYTES,
+        max_sequence_items: MAX_WIRE_SEQUENCE_ITEMS_PER_PDU,
+        max_map_entries: MAX_WIRE_MAP_ENTRIES_PER_PDU,
+        max_containers: MAX_WIRE_CONTAINERS_PER_PDU,
+        max_nesting_depth: MAX_WIRE_NESTING_DEPTH,
+    };
     if is_compressed {
         let mut decompress = zstd::Decoder::new(r)?;
-        let mut decode = varbincode::Deserializer::new(&mut decompress);
-        serde::Deserialize::deserialize(&mut decode).map_err(Into::into)
+        let mut data = Vec::new();
+        std::io::Read::take(&mut decompress, (MAX_DECOMPRESSED_PDU_BYTES + 1) as u64)
+            .read_to_end(&mut data)?;
+        if data.len() > MAX_DECOMPRESSED_PDU_BYTES {
+            bail!("decompressed PDU exceeds the finite envelope");
+        }
+        let mut data = data.as_slice();
+        let value = {
+            let mut decode = varbincode::Deserializer::new(&mut data, limits);
+            serde::Deserialize::deserialize(&mut decode)?
+        };
+        if !data.is_empty() {
+            bail!("trailing bytes after compressed PDU body");
+        }
+        Ok(value)
     } else {
-        let mut decode = varbincode::Deserializer::new(&mut r);
-        serde::Deserialize::deserialize(&mut decode).map_err(Into::into)
+        let value = {
+            let mut decode = varbincode::Deserializer::new(&mut r, limits);
+            serde::Deserialize::deserialize(&mut decode)?
+        };
+        let mut trailing = [0u8; 1];
+        if r.read(&mut trailing)? != 0 {
+            bail!("trailing bytes after PDU body");
+        }
+        Ok(value)
     }
 }
 
+macro_rules! pdu_header_policy {
+    (Request($response:ident)) => {
+        PduHeaderPolicy::Request {
+            response: PduTag::$response,
+        }
+    };
+    (Response) => {
+        PduHeaderPolicy::Response
+    };
+    (Notification) => {
+        PduHeaderPolicy::Notification
+    };
+    (RequestOrNotification($response:ident)) => {
+        PduHeaderPolicy::RequestOrNotification {
+            response: PduTag::$response,
+        }
+    };
+}
+
 macro_rules! pdu {
-    ($( $name:ident:$vers:expr),* $(,)?) => {
+    ($( $name:ident:$vers:expr => $policy:ident $(($response:ident))?),* $(,)?) => {
+        #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+        pub enum PduTag {
+            $(
+                $name,
+            )*
+        }
+
+        impl PduTag {
+            pub const ALL: &'static [Self] = &[$(Self::$name,)*];
+
+            fn from_ident(ident: u64) -> Option<Self> {
+                match ident {
+                    $( $vers => Some(Self::$name), )*
+                    _ => None,
+                }
+            }
+
+            pub fn ident(self) -> u64 {
+                match self {
+                    $( Self::$name => $vers, )*
+                }
+            }
+
+            pub fn name(self) -> &'static str {
+                match self {
+                    $( Self::$name => stringify!($name), )*
+                }
+            }
+
+            pub fn header_policy(self) -> PduHeaderPolicy {
+                match self {
+                    $( Self::$name => pdu_header_policy!($policy $(($response))?), )*
+                }
+            }
+
+            pub fn expected_response(self) -> Option<Self> {
+                self.header_policy().expected_response()
+            }
+        }
+
         #[derive(PartialEq, Debug)]
         pub enum Pdu {
             Invalid{ident: u64},
@@ -342,12 +822,17 @@ macro_rules! pdu {
         }
 
         impl Pdu {
-            pub fn encode<W: std::io::Write>(&self, w: W, serial: u64) -> Result<(), Error> {
+            pub fn encode<W: std::io::Write>(
+                &self,
+                w: W,
+                serial: u64,
+                admission: &RuntimeAdmission,
+            ) -> Result<(), Error> {
                 match self {
                     Pdu::Invalid{..} => bail!("attempted to serialize Pdu::Invalid"),
                     $(
                         Pdu::$name(s) => {
-                            let (data, is_compressed) = serialize(s)?;
+                            let (data, is_compressed, _permit) = serialize(s, admission)?;
                             let encoded_size = encode_raw($vers, serial, &data, is_compressed, w)?;
                             log::debug!("encode {} size={encoded_size}", stringify!($name));
                             metrics::histogram!("pdu.size", "pdu" => stringify!($name)).record(encoded_size as f64);
@@ -358,12 +843,17 @@ macro_rules! pdu {
                 }
             }
 
-            pub async fn encode_async<W: Unpin + AsyncWriteExt>(&self, w: &mut W, serial: u64) -> Result<(), Error> {
+            pub async fn encode_async<W: Unpin + AsyncWriteExt>(
+                &self,
+                w: &mut W,
+                serial: u64,
+                admission: &RuntimeAdmission,
+            ) -> Result<(), Error> {
                 match self {
                     Pdu::Invalid{..} => bail!("attempted to serialize Pdu::Invalid"),
                     $(
                         Pdu::$name(s) => {
-                            let (data, is_compressed) = serialize(s)?;
+                            let (data, is_compressed, _permit) = serialize(s, admission)?;
                             let encoded_size = encode_raw_async($vers, serial, &data, is_compressed, w).await?;
                             log::debug!("encode_async {} size={encoded_size}", stringify!($name));
                             metrics::histogram!("pdu.size", "pdu" => stringify!($name)).record(encoded_size as f64);
@@ -385,53 +875,108 @@ macro_rules! pdu {
                 }
             }
 
-            pub fn decode<R: std::io::Read>(r: R) -> Result<DecodedPdu, Error> {
-                let decoded = decode_raw(r).context("decoding a PDU")?;
-                match decoded.ident {
+            pub fn tag(&self) -> Option<PduTag> {
+                match self {
+                    Pdu::Invalid { .. } => None,
                     $(
-                        $vers => {
-                            metrics::histogram!("pdu.size", "pdu" => stringify!($name)).record(decoded.data.len() as f64);
-                            metrics::histogram!("pdu.size.rate", "pdu" => stringify!($name)).record(decoded.data.len() as f64);
-                            Ok(DecodedPdu {
-                                serial: decoded.serial,
-                                pdu: Pdu::$name(deserialize(decoded.data.as_slice(), decoded.is_compressed)?)
-                            })
-                        }
-                    ,)*
-                    _ => {
-                        metrics::histogram!("pdu.size", "pdu" => "??").record(decoded.data.len() as f64);
-                        metrics::histogram!("pdu.size.rate", "pdu" => "??").record(decoded.data.len() as f64);
-                        Ok(DecodedPdu {
-                            serial: decoded.serial,
-                            pdu: Pdu::Invalid{ident:decoded.ident}
-                        })
-                    }
+                        Pdu::$name(_) => Some(PduTag::$name),
+                    )*
                 }
             }
 
-            pub async fn decode_async<R>(r: &mut R, max_serial: Option<u64>) -> Result<DecodedPdu, Error>
+            pub fn expected_response_tag(&self) -> Option<PduTag> {
+                self.tag().and_then(PduTag::expected_response)
+            }
+
+            pub fn read_header<R: std::io::Read>(
+                r: &mut R,
+            ) -> Result<StagedPduHeader, Error> {
+                read_header(r)
+            }
+
+            pub async fn read_header_async<R>(
+                r: &mut R,
+            ) -> Result<StagedPduHeader, Error>
                 where R: std::marker::Unpin,
                       R: AsyncRead,
                       R: std::fmt::Debug
             {
-                let decoded = decode_raw_async(r, max_serial).await.context("decoding a PDU")?;
-                match decoded.ident {
+                read_header_async(r).await
+            }
+
+            pub fn decode<R: std::io::Read>(
+                mut r: R,
+                context: DecodeContext,
+                admission: &RuntimeAdmission,
+            ) -> Result<AdmittedDecodedPdu, Error> {
+                let header = Self::read_header(&mut r)
+                    .context("reading a PDU header")?;
+                let body = header
+                    .validate(context, admission)
+                    .context("validating a PDU header")?;
+                Self::decode_body(&mut r, body, admission)
+            }
+
+            fn decode_body<R: std::io::Read>(
+                r: &mut R,
+                body: AdmittedPduBody,
+                admission: &RuntimeAdmission,
+            ) -> Result<AdmittedDecodedPdu, Error> {
+                let data = read_body(r, &body).context("reading a PDU body")?;
+                Self::decode_admitted(body, data, admission)
+            }
+
+            pub async fn decode_body_async<R>(
+                r: &mut R,
+                body: AdmittedPduBody,
+                admission: &RuntimeAdmission,
+            ) -> Result<AdmittedDecodedPdu, Error>
+                where R: std::marker::Unpin,
+                      R: AsyncRead,
+                      R: std::fmt::Debug
+            {
+                let data = read_body_async(r, &body)
+                    .await
+                    .context("reading an async PDU body")?;
+                Self::decode_admitted(body, data, admission)
+            }
+
+            fn decode_admitted(
+                body: AdmittedPduBody,
+                data: Vec<u8>,
+                admission: &RuntimeAdmission,
+            ) -> Result<AdmittedDecodedPdu, Error> {
+                let heap_envelope = body.tag.decode_heap_envelope();
+                let heap = admission
+                    .try_bytes(ByteClass::DecodeWorking, heap_envelope)
+                    .with_context(|| {
+                        format!("reserving decoded heap envelope for {}", body.tag.name())
+                    })?;
+                let AdmittedPduBody {
+                    serial,
+                    tag,
+                    is_compressed,
+                    wire,
+                    ..
+                } = body;
+                match tag {
                     $(
-                        $vers => {
-                            metrics::histogram!("pdu.size", "pdu" => stringify!($name)).record(decoded.data.len() as f64);
-                            Ok(DecodedPdu {
-                                serial: decoded.serial,
-                                pdu: Pdu::$name(deserialize(decoded.data.as_slice(), decoded.is_compressed)?)
+                        PduTag::$name => {
+                            metrics::histogram!("pdu.size", "pdu" => stringify!($name)).record(data.len() as f64);
+                            metrics::histogram!("pdu.size.rate", "pdu" => stringify!($name)).record(data.len() as f64);
+                            Ok(AdmittedDecodedPdu {
+                                serial,
+                                pdu: Pdu::$name(deserialize(
+                                    data.as_slice(),
+                                    is_compressed,
+                                )?),
+                                reservation: DecodeReservation {
+                                    _wire: wire,
+                                    _heap: heap,
+                                },
                             })
                         }
                     ,)*
-                    _ => {
-                        metrics::histogram!("pdu.size", "pdu" => "??").record(decoded.data.len() as f64);
-                        Ok(DecodedPdu {
-                            serial: decoded.serial,
-                            pdu: Pdu::Invalid{ident:decoded.ident}
-                        })
-                    }
                 }
             }
         }
@@ -441,90 +986,442 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 45;
+pub const CODEC_VERSION: usize = 49;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
 // This allows removal of obsolete structs,
 // and defining newer structs as the protocol evolves.
 pdu! {
-    ErrorResponse: 0,
-    Ping: 1,
-    Pong: 2,
-    ListPanes: 3,
-    ListPanesResponse: 4,
-    SpawnResponse: 8,
-    WriteToPane: 9,
-    UnitResponse: 10,
-    SendKeyDown: 11,
-    SendMouseEvent: 12,
-    SendPaste: 13,
-    Resize: 14,
-    SetClipboard: 20,
-    GetLines: 22,
-    GetLinesResponse: 23,
-    GetPaneRenderChanges: 24,
-    GetPaneRenderChangesResponse: 25,
-    GetCodecVersion: 26,
-    GetCodecVersionResponse: 27,
-    GetTlsCreds: 28,
-    GetTlsCredsResponse: 29,
-    LivenessResponse: 30,
-    SearchScrollbackRequest: 31,
-    SearchScrollbackResponse: 32,
-    SetPaneZoomed: 33,
-    SplitPane: 34,
-    KillPane: 35,
-    SpawnV2: 36,
-    PaneRemoved: 37,
-    SetPalette: 38,
-    NotifyAlert: 39,
-    SetClientId: 40,
-    GetClientList: 41,
-    GetClientListResponse: 42,
-    SetWindowWorkspace: 43,
-    WindowWorkspaceChanged: 44,
-    SetFocusedPane: 45,
-    GetImageCell: 46,
-    GetImageCellResponse: 47,
-    MovePaneToNewTab: 48,
-    MovePaneToNewTabResponse: 49,
-    ActivatePaneDirection: 50,
-    GetPaneRenderableDimensions: 51,
-    GetPaneRenderableDimensionsResponse: 52,
-    PaneFocused: 53,
-    TabResized: 54,
-    TabAddedToWindow: 55,
-    TabTitleChanged: 56,
-    WindowTitleChanged: 57,
-    RenameWorkspace: 58,
-    EraseScrollbackRequest: 59,
-    GetPaneDirection: 60,
-    GetPaneDirectionResponse: 61,
-    AdjustPaneSize: 62,
+    ErrorResponse: 0 => Response,
+    Ping: 1 => Request(Pong),
+    Pong: 2 => Response,
+    ListPanes: 3 => Request(ListPanesResponse),
+    ListPanesResponse: 4 => Response,
+    SpawnResponse: 8 => Response,
+    WriteToPane: 9 => Request(UnitResponse),
+    UnitResponse: 10 => Response,
+    SendKeyDown: 11 => Request(UnitResponse),
+    SendMouseEvent: 12 => Request(UnitResponse),
+    SendPaste: 13 => Request(UnitResponse),
+    Resize: 14 => Request(UnitResponse),
+    SetClipboard: 20 => Notification,
+    GetLines: 22 => Request(GetLinesResponse),
+    GetLinesResponse: 23 => Response,
+    GetPaneRenderChanges: 24 => Request(LivenessResponse),
+    GetPaneRenderChangesResponse: 25 => Notification,
+    GetCodecVersion: 26 => Request(GetCodecVersionResponse),
+    GetCodecVersionResponse: 27 => Response,
+    GetTlsCreds: 28 => Request(GetTlsCredsResponse),
+    GetTlsCredsResponse: 29 => Response,
+    LivenessResponse: 30 => Response,
+    SearchScrollbackRequest: 31 => Request(SearchScrollbackResponse),
+    SearchScrollbackResponse: 32 => Response,
+    SetPaneZoomed: 33 => Request(UnitResponse),
+    SplitPane: 34 => Request(SpawnResponse),
+    KillPane: 35 => Request(UnitResponse),
+    SpawnV2: 36 => Request(SpawnResponse),
+    PaneRemoved: 37 => Notification,
+    SetPalette: 38 => RequestOrNotification(UnitResponse),
+    NotifyAlert: 39 => Notification,
+    SetClientId: 40 => Request(UnitResponse),
+    GetClientList: 41 => Request(GetClientListResponse),
+    GetClientListResponse: 42 => Response,
+    SetWindowWorkspace: 43 => Request(UnitResponse),
+    WindowWorkspaceChanged: 44 => Notification,
+    SetFocusedPane: 45 => Request(UnitResponse),
+    GetImageCell: 46 => Request(GetImageCellResponse),
+    GetImageCellResponse: 47 => Response,
+    MovePaneToNewTab: 48 => Request(MovePaneToNewTabResponse),
+    MovePaneToNewTabResponse: 49 => Response,
+    ActivatePaneDirection: 50 => Request(UnitResponse),
+    GetPaneRenderableDimensions: 51 => Request(GetPaneRenderableDimensionsResponse),
+    GetPaneRenderableDimensionsResponse: 52 => Response,
+    PaneFocused: 53 => Notification,
+    TabResized: 54 => Notification,
+    TabAddedToWindow: 55 => Notification,
+    TabTitleChanged: 56 => RequestOrNotification(UnitResponse),
+    WindowTitleChanged: 57 => RequestOrNotification(UnitResponse),
+    RenameWorkspace: 58 => RequestOrNotification(UnitResponse),
+    EraseScrollbackRequest: 59 => Request(UnitResponse),
+    GetPaneDirection: 60 => Request(GetPaneDirectionResponse),
+    GetPaneDirectionResponse: 61 => Response,
+    AdjustPaneSize: 62 => Request(UnitResponse),
+    GetBuildIdentity: 63 => Request(GetBuildIdentityResponse),
+    GetBuildIdentityResponse: 64 => Response,
+    ControlLeaseRequest: 65 => Request(ControlLeaseResult),
+    ControlLeaseResult: 66 => Response,
+    ControlSnapshot: 67 => Notification,
+    ControlChanged: 68 => Notification,
+    AttachRejected: 69 => Notification,
+    ServiceDrainRequest: 70 => Request(ServiceDrainResult),
+    ServiceDrainResult: 71 => Response,
+}
+
+impl PduTag {
+    fn decode_heap_envelope(self) -> usize {
+        match self {
+            Self::UnitResponse | Self::Pong | Self::AttachRejected => 0,
+            Self::SpawnResponse
+            | Self::GetPaneRenderableDimensionsResponse
+            | Self::LivenessResponse
+            | Self::GetPaneDirectionResponse
+            | Self::PaneRemoved
+            | Self::PaneFocused
+            | Self::TabResized
+            | Self::TabAddedToWindow
+            | Self::ControlLeaseResult
+            | Self::ControlSnapshot
+            | Self::ControlChanged => MAX_DECODE_METADATA_HEAP_ENVELOPE_BYTES_PER_PDU,
+            Self::ServiceDrainResult => MAX_DECODE_METADATA_HEAP_ENVELOPE_BYTES_PER_PDU,
+            Self::SetPalette
+            | Self::NotifyAlert
+            | Self::TabTitleChanged
+            | Self::WindowTitleChanged
+            | Self::WindowWorkspaceChanged => MAX_DECODE_NOTIFICATION_HEAP_ENVELOPE_BYTES_PER_PDU,
+            _ => MAX_DECODE_HEAP_ENVELOPE_BYTES_PER_PDU,
+        }
+    }
+
+    fn allows_client_request_phase(self, phase: ClientRequestPhase) -> bool {
+        match self {
+            Self::Ping | Self::GetCodecVersion | Self::GetTlsCreds | Self::GetBuildIdentity => true,
+            Self::SetClientId => phase == ClientRequestPhase::Bootstrap,
+            Self::ListPanes
+            | Self::WriteToPane
+            | Self::SendKeyDown
+            | Self::SendMouseEvent
+            | Self::SendPaste
+            | Self::Resize
+            | Self::GetLines
+            | Self::GetPaneRenderChanges
+            | Self::SearchScrollbackRequest
+            | Self::SetPaneZoomed
+            | Self::SplitPane
+            | Self::KillPane
+            | Self::SpawnV2
+            | Self::SetPalette
+            | Self::GetClientList
+            | Self::SetWindowWorkspace
+            | Self::SetFocusedPane
+            | Self::GetImageCell
+            | Self::MovePaneToNewTab
+            | Self::ActivatePaneDirection
+            | Self::GetPaneRenderableDimensions
+            | Self::TabTitleChanged
+            | Self::WindowTitleChanged
+            | Self::RenameWorkspace
+            | Self::EraseScrollbackRequest
+            | Self::GetPaneDirection
+            | Self::AdjustPaneSize
+            | Self::ControlLeaseRequest
+            | Self::ServiceDrainRequest => phase == ClientRequestPhase::Established,
+            Self::ErrorResponse
+            | Self::Pong
+            | Self::ListPanesResponse
+            | Self::SpawnResponse
+            | Self::UnitResponse
+            | Self::SetClipboard
+            | Self::GetLinesResponse
+            | Self::GetPaneRenderChangesResponse
+            | Self::GetCodecVersionResponse
+            | Self::GetTlsCredsResponse
+            | Self::LivenessResponse
+            | Self::SearchScrollbackResponse
+            | Self::PaneRemoved
+            | Self::NotifyAlert
+            | Self::GetClientListResponse
+            | Self::WindowWorkspaceChanged
+            | Self::GetImageCellResponse
+            | Self::MovePaneToNewTabResponse
+            | Self::GetPaneRenderableDimensionsResponse
+            | Self::PaneFocused
+            | Self::TabResized
+            | Self::TabAddedToWindow
+            | Self::GetPaneDirectionResponse
+            | Self::GetBuildIdentityResponse
+            | Self::ControlLeaseResult
+            | Self::ControlSnapshot
+            | Self::ControlChanged
+            | Self::AttachRejected
+            | Self::ServiceDrainResult => false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequestOperation {
+    Ping,
+    ListPanes,
+    Spawn,
+    WriteToPane,
+    SendKey,
+    SendMouse,
+    SendPaste,
+    Resize,
+    SetZoom,
+    GetLines,
+    GetRenderChanges,
+    GetCodecVersion,
+    GetBuildIdentity,
+    GetTlsCredentials,
+    SearchScrollback,
+    SplitPane,
+    KillPane,
+    RegisterClient,
+    GetClientList,
+    SetWindowWorkspace,
+    SetFocusedPane,
+    GetImageCell,
+    MovePaneToNewTab,
+    ActivatePaneDirection,
+    GetRenderableDimensions,
+    SetPalette,
+    SetTabTitle,
+    SetWindowTitle,
+    RenameWorkspace,
+    EraseScrollback,
+    GetPaneDirection,
+    AdjustPaneSize,
+    ControlLease,
+    ServiceDrain,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequestAuthority {
+    Bootstrap,
+    Observe,
+    PaneControl(PaneControlTargets),
+    ControlLease(PaneId),
+    UntargetedMutation,
+    HostSensitive,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PaneControlTargets {
+    pub primary: PaneId,
+    pub secondary: Option<PaneId>,
+}
+
+impl PaneControlTargets {
+    fn one(primary: PaneId) -> Self {
+        Self {
+            primary,
+            secondary: None,
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+#[error("PDU {pdu} is invalid in the client-to-server direction")]
+pub struct InvalidPduDirection {
+    pub pdu: &'static str,
 }
 
 impl Pdu {
+    pub fn request_operation(&self) -> Result<RequestOperation, InvalidPduDirection> {
+        let operation = match self {
+            Self::Ping(_) => RequestOperation::Ping,
+            Self::ListPanes(_) => RequestOperation::ListPanes,
+            Self::SpawnV2(_) => RequestOperation::Spawn,
+            Self::WriteToPane(_) => RequestOperation::WriteToPane,
+            Self::SendKeyDown(_) => RequestOperation::SendKey,
+            Self::SendMouseEvent(_) => RequestOperation::SendMouse,
+            Self::SendPaste(_) => RequestOperation::SendPaste,
+            Self::Resize(_) => RequestOperation::Resize,
+            Self::SetPaneZoomed(_) => RequestOperation::SetZoom,
+            Self::GetLines(_) => RequestOperation::GetLines,
+            Self::GetPaneRenderChanges(_) => RequestOperation::GetRenderChanges,
+            Self::GetCodecVersion(_) => RequestOperation::GetCodecVersion,
+            Self::GetBuildIdentity(_) => RequestOperation::GetBuildIdentity,
+            Self::GetTlsCreds(_) => RequestOperation::GetTlsCredentials,
+            Self::SearchScrollbackRequest(_) => RequestOperation::SearchScrollback,
+            Self::SplitPane(_) => RequestOperation::SplitPane,
+            Self::KillPane(_) => RequestOperation::KillPane,
+            Self::SetClientId(_) => RequestOperation::RegisterClient,
+            Self::GetClientList(_) => RequestOperation::GetClientList,
+            Self::SetWindowWorkspace(_) => RequestOperation::SetWindowWorkspace,
+            Self::SetFocusedPane(_) => RequestOperation::SetFocusedPane,
+            Self::GetImageCell(_) => RequestOperation::GetImageCell,
+            Self::MovePaneToNewTab(_) => RequestOperation::MovePaneToNewTab,
+            Self::ActivatePaneDirection(_) => RequestOperation::ActivatePaneDirection,
+            Self::GetPaneRenderableDimensions(_) => RequestOperation::GetRenderableDimensions,
+            Self::SetPalette(_) => RequestOperation::SetPalette,
+            Self::TabTitleChanged(_) => RequestOperation::SetTabTitle,
+            Self::WindowTitleChanged(_) => RequestOperation::SetWindowTitle,
+            Self::RenameWorkspace(_) => RequestOperation::RenameWorkspace,
+            Self::EraseScrollbackRequest(_) => RequestOperation::EraseScrollback,
+            Self::GetPaneDirection(_) => RequestOperation::GetPaneDirection,
+            Self::AdjustPaneSize(_) => RequestOperation::AdjustPaneSize,
+            Self::ControlLeaseRequest(_) => RequestOperation::ControlLease,
+            Self::ServiceDrainRequest(_) => RequestOperation::ServiceDrain,
+            Self::Invalid { .. }
+            | Self::ErrorResponse(_)
+            | Self::Pong(_)
+            | Self::ListPanesResponse(_)
+            | Self::SpawnResponse(_)
+            | Self::UnitResponse(_)
+            | Self::SetClipboard(_)
+            | Self::GetLinesResponse(_)
+            | Self::GetPaneRenderChangesResponse(_)
+            | Self::GetCodecVersionResponse(_)
+            | Self::GetBuildIdentityResponse(_)
+            | Self::GetTlsCredsResponse(_)
+            | Self::LivenessResponse(_)
+            | Self::SearchScrollbackResponse(_)
+            | Self::PaneRemoved(_)
+            | Self::NotifyAlert(_)
+            | Self::WindowWorkspaceChanged(_)
+            | Self::GetClientListResponse(_)
+            | Self::GetImageCellResponse(_)
+            | Self::MovePaneToNewTabResponse(_)
+            | Self::GetPaneRenderableDimensionsResponse(_)
+            | Self::PaneFocused(_)
+            | Self::TabResized(_)
+            | Self::TabAddedToWindow(_)
+            | Self::GetPaneDirectionResponse(_)
+            | Self::ControlLeaseResult(_)
+            | Self::ServiceDrainResult(_)
+            | Self::ControlSnapshot(_)
+            | Self::ControlChanged(_)
+            | Self::AttachRejected(_) => {
+                return Err(InvalidPduDirection {
+                    pdu: self.pdu_name(),
+                })
+            }
+        };
+        Ok(operation)
+    }
+
+    /// Exhaustive server-side authority required before dispatching an inbound request.
+    pub fn request_authority(&self) -> Result<RequestAuthority, InvalidPduDirection> {
+        let authority = match self {
+            Self::Ping(_)
+            | Self::GetCodecVersion(_)
+            | Self::GetBuildIdentity(_)
+            | Self::SetClientId(_) => RequestAuthority::Bootstrap,
+            Self::ListPanes(_)
+            | Self::GetLines(_)
+            | Self::GetPaneRenderChanges(_)
+            | Self::SearchScrollbackRequest(_)
+            | Self::GetImageCell(_)
+            | Self::GetPaneRenderableDimensions(_)
+            | Self::GetPaneDirection(_) => RequestAuthority::Observe,
+            Self::WriteToPane(request) => {
+                RequestAuthority::PaneControl(PaneControlTargets::one(request.pane_id))
+            }
+            Self::SendKeyDown(request) => {
+                RequestAuthority::PaneControl(PaneControlTargets::one(request.pane_id))
+            }
+            Self::SendMouseEvent(request) => {
+                RequestAuthority::PaneControl(PaneControlTargets::one(request.pane_id))
+            }
+            Self::SendPaste(request) => {
+                RequestAuthority::PaneControl(PaneControlTargets::one(request.pane_id))
+            }
+            Self::Resize(request) => {
+                RequestAuthority::PaneControl(PaneControlTargets::one(request.pane_id))
+            }
+            Self::SetPaneZoomed(request) => {
+                RequestAuthority::PaneControl(PaneControlTargets::one(request.pane_id))
+            }
+            Self::SplitPane(request) => RequestAuthority::PaneControl(PaneControlTargets {
+                primary: request.target_pane_id,
+                secondary: match &request.source {
+                    SplitSpawnSource::Spawn { .. } => None,
+                    SplitSpawnSource::MovePane { pane_id } => Some(*pane_id),
+                },
+            }),
+            Self::KillPane(request) => {
+                RequestAuthority::PaneControl(PaneControlTargets::one(request.pane_id))
+            }
+            Self::SetFocusedPane(request) => {
+                RequestAuthority::PaneControl(PaneControlTargets::one(request.pane_id))
+            }
+            Self::MovePaneToNewTab(request) => {
+                RequestAuthority::PaneControl(PaneControlTargets::one(request.pane_id))
+            }
+            Self::ActivatePaneDirection(request) => {
+                RequestAuthority::PaneControl(PaneControlTargets::one(request.pane_id))
+            }
+            Self::EraseScrollbackRequest(request) => {
+                RequestAuthority::PaneControl(PaneControlTargets::one(request.pane_id))
+            }
+            Self::AdjustPaneSize(request) => {
+                RequestAuthority::PaneControl(PaneControlTargets::one(request.pane_id))
+            }
+            Self::ControlLeaseRequest(request) => RequestAuthority::ControlLease(request.pane_id),
+            Self::ServiceDrainRequest(_) => RequestAuthority::HostSensitive,
+            Self::SpawnV2(_)
+            | Self::SetWindowWorkspace(_)
+            | Self::TabTitleChanged(_)
+            | Self::WindowTitleChanged(_)
+            | Self::RenameWorkspace(_) => RequestAuthority::UntargetedMutation,
+            Self::GetTlsCreds(_) | Self::GetClientList(_) | Self::SetPalette(_) => {
+                RequestAuthority::HostSensitive
+            }
+            Self::Invalid { .. }
+            | Self::ErrorResponse(_)
+            | Self::Pong(_)
+            | Self::ListPanesResponse(_)
+            | Self::SpawnResponse(_)
+            | Self::UnitResponse(_)
+            | Self::SetClipboard(_)
+            | Self::GetLinesResponse(_)
+            | Self::GetPaneRenderChangesResponse(_)
+            | Self::GetCodecVersionResponse(_)
+            | Self::GetBuildIdentityResponse(_)
+            | Self::GetTlsCredsResponse(_)
+            | Self::LivenessResponse(_)
+            | Self::SearchScrollbackResponse(_)
+            | Self::PaneRemoved(_)
+            | Self::NotifyAlert(_)
+            | Self::WindowWorkspaceChanged(_)
+            | Self::GetClientListResponse(_)
+            | Self::GetImageCellResponse(_)
+            | Self::MovePaneToNewTabResponse(_)
+            | Self::GetPaneRenderableDimensionsResponse(_)
+            | Self::PaneFocused(_)
+            | Self::TabResized(_)
+            | Self::TabAddedToWindow(_)
+            | Self::GetPaneDirectionResponse(_)
+            | Self::ControlLeaseResult(_)
+            | Self::ControlSnapshot(_)
+            | Self::ControlChanged(_)
+            | Self::AttachRejected(_)
+            | Self::ServiceDrainResult(_) => {
+                return Err(InvalidPduDirection {
+                    pdu: self.pdu_name(),
+                })
+            }
+        };
+        Ok(authority)
+    }
+
     /// Returns true if this type of Pdu represents action taken
     /// directly by a user, rather than background traffic on
     /// a live connection
     pub fn is_user_input(&self) -> bool {
-        match self {
+        matches!(
+            self,
             Self::WriteToPane(_)
-            | Self::SendKeyDown(_)
-            | Self::SendMouseEvent(_)
-            | Self::SendPaste(_)
-            | Self::Resize(_)
-            | Self::SetClipboard(_)
-            | Self::SetPaneZoomed(_)
-            | Self::SpawnV2(_) => true,
-            _ => false,
-        }
+                | Self::SendKeyDown(_)
+                | Self::SendMouseEvent(_)
+                | Self::SendPaste(_)
+                | Self::Resize(_)
+                | Self::SetClipboard(_)
+                | Self::SetPaneZoomed(_)
+                | Self::SpawnV2(_)
+        )
     }
 
-    pub fn stream_decode(buffer: &mut Vec<u8>) -> anyhow::Result<Option<DecodedPdu>> {
+    pub fn stream_decode(
+        buffer: &mut Vec<u8>,
+        context: DecodeContext,
+        admission: &RuntimeAdmission,
+    ) -> anyhow::Result<Option<AdmittedDecodedPdu>> {
         let mut cursor = Cursor::new(buffer.as_slice());
-        match Self::decode(&mut cursor) {
+        match Self::decode(&mut cursor, context, admission) {
             Ok(decoded) => {
                 let consumed = cursor.position() as usize;
                 let remain = buffer.len() - consumed;
@@ -560,10 +1457,12 @@ impl Pdu {
     pub fn try_read_and_decode<R: std::io::Read>(
         r: &mut R,
         buffer: &mut Vec<u8>,
-    ) -> anyhow::Result<Option<DecodedPdu>> {
+        context: DecodeContext,
+        admission: &RuntimeAdmission,
+    ) -> anyhow::Result<Option<AdmittedDecodedPdu>> {
         loop {
-            if let Some(decoded) =
-                Self::stream_decode(buffer).context("stream_decode of buffer for PDU")?
+            if let Some(decoded) = Self::stream_decode(buffer, context, admission)
+                .context("stream_decode of buffer for PDU")?
             {
                 return Ok(Some(decoded));
             }
@@ -604,6 +1503,13 @@ impl Pdu {
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
 pub struct UnitResponse {}
 
+/// A content-free server notification emitted when a newly accepted transport cannot be admitted.
+///
+/// It is sent with notification serial zero before the server closes the transport. Keeping this
+/// payload empty prevents the pre-bootstrap rejection path from disclosing server state.
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct AttachRejected {}
+
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
 pub struct ErrorResponse {
     pub reason: String,
@@ -618,6 +1524,107 @@ pub struct GetCodecVersionResponse {
     pub version_string: String,
     pub executable_path: PathBuf,
     pub config_file_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq, Debug)]
+pub struct BuildIdentity {
+    pub product: String,
+    pub version: String,
+    pub source_revision: Option<String>,
+    pub source_dirty: Option<bool>,
+    pub embedded_wezterm_revision: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct GetBuildIdentity {}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct GetBuildIdentityResponse {
+    pub identity: BuildIdentity,
+}
+
+/// Opaque identity issued by the server for one authenticated connection.
+///
+/// No client request accepts this value as authority. Clients may only compare identities
+/// projected by control snapshots and changes.
+#[derive(Clone, Copy, Deserialize, Serialize, Eq, Hash, Ord, PartialEq, PartialOrd, Debug)]
+pub struct ConnectionIdentity(NonZeroU64);
+
+impl ConnectionIdentity {
+    pub fn from_server_sequence(sequence: NonZeroU64) -> Self {
+        Self(sequence)
+    }
+
+    pub fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize, Eq, PartialEq, Debug)]
+pub enum ControlLeaseAction {
+    Acquire,
+    Take,
+    Release,
+}
+
+#[derive(Clone, Deserialize, Serialize, Eq, PartialEq, Debug)]
+pub struct ControlLeaseRequest {
+    pub pane_id: PaneId,
+    pub action: ControlLeaseAction,
+}
+
+#[derive(Clone, Deserialize, Serialize, Eq, PartialEq, Debug)]
+pub struct ActiveControlLease {
+    pub pane_id: PaneId,
+    pub controller: ConnectionIdentity,
+}
+
+#[derive(Clone, Deserialize, Serialize, Eq, PartialEq, Debug)]
+pub struct ControlLeaseState {
+    pub sequence: u64,
+    pub active: Vec<ActiveControlLease>,
+}
+
+#[derive(Clone, Deserialize, Serialize, Eq, PartialEq, Debug)]
+pub enum ControlLeaseResult {
+    Acquired(ControlLeaseState),
+    AlreadyController(ControlLeaseState),
+    Observing(ControlLeaseState),
+    Taken(ControlLeaseState),
+    Released(ControlLeaseState),
+    NotController(ControlLeaseState),
+    Overloaded,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize, Eq, PartialEq, Debug)]
+pub enum ServiceDrainAction {
+    Begin,
+    Cancel,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize, Eq, PartialEq, Debug)]
+pub struct ServiceDrainRequest {
+    pub action: ServiceDrainAction,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize, Eq, PartialEq, Debug)]
+pub struct ServiceDrainResult {
+    pub draining: bool,
+}
+
+#[derive(Clone, Deserialize, Serialize, Eq, PartialEq, Debug)]
+pub struct ControlSnapshot {
+    /// Identity of the attachment receiving this snapshot.
+    ///
+    /// This is comparison-only client state: no client request accepts a
+    /// `ConnectionIdentity` as authority.
+    pub attachment_identity: ConnectionIdentity,
+    pub state: ControlLeaseState,
+}
+
+#[derive(Clone, Deserialize, Serialize, Eq, PartialEq, Debug)]
+pub struct ControlChanged {
+    pub state: ControlLeaseState,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
@@ -649,16 +1656,121 @@ pub struct ListPanesResponse {
     pub window_titles: HashMap<WindowId, String>,
 }
 
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum SpawnCommandError {
+    #[error("spawn command argv must contain a program")]
+    EmptyArgv,
+    #[error("spawn command program must not be empty")]
+    EmptyProgram,
+    #[error("spawn command argument {index} is not valid UTF-8")]
+    NonUtf8Argument { index: usize },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct NonEmptyProgram(String);
+
+impl NonEmptyProgram {
+    pub fn new(program: String) -> Result<Self, SpawnCommandError> {
+        if program.is_empty() {
+            Err(SpawnCommandError::EmptyProgram)
+        } else {
+            Ok(Self(program))
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for NonEmptyProgram {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let program = String::deserialize(deserializer)?;
+        Self::new(program).map_err(serde::de::Error::custom)
+    }
+}
+
+/// A command description that cannot carry process environment, umask, or tty policy.
+#[derive(Clone, Deserialize, Serialize, PartialEq, Debug)]
+pub enum EnvironmentFreeCommand {
+    DefaultLoginShell,
+    Program {
+        program: NonEmptyProgram,
+        args: Vec<String>,
+    },
+}
+
+impl EnvironmentFreeCommand {
+    pub fn try_from_argv<I, S>(argv: I) -> Result<Self, SpawnCommandError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let mut argv = argv.into_iter().enumerate();
+        let (_, program) = argv.next().ok_or(SpawnCommandError::EmptyArgv)?;
+        let program = program
+            .as_ref()
+            .to_str()
+            .ok_or(SpawnCommandError::NonUtf8Argument { index: 0 })?;
+        let program = NonEmptyProgram::new(program.to_string())?;
+        let args = argv
+            .map(|(index, arg)| {
+                arg.as_ref()
+                    .to_str()
+                    .map(str::to_string)
+                    .ok_or(SpawnCommandError::NonUtf8Argument { index })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self::Program { program, args })
+    }
+}
+
+/// A tab spawn cannot inherit an implicit current-pane domain.
+#[derive(Clone, Deserialize, Serialize, PartialEq, Debug)]
+pub enum TabSpawnDomain {
+    DefaultDomain,
+    DomainName(String),
+    DomainId(usize),
+}
+
+/// Existing-window spawns carry no ignored size/workspace fields; new windows require both.
+#[derive(Clone, Deserialize, Serialize, PartialEq, Debug)]
+pub enum TabSpawnPlacement {
+    ExistingWindow {
+        window_id: WindowId,
+    },
+    NewWindow {
+        size: TerminalSize,
+        workspace: String,
+    },
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Debug)]
+pub enum SplitSpawnDomain {
+    TargetPaneDomain,
+}
+
+#[derive(Clone, Deserialize, Serialize, PartialEq, Debug)]
+pub enum SplitSpawnSource {
+    Spawn {
+        command: EnvironmentFreeCommand,
+        command_dir: Option<String>,
+    },
+    MovePane {
+        pane_id: PaneId,
+    },
+}
+
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
 pub struct SplitPane {
-    pub pane_id: PaneId,
+    pub target_pane_id: PaneId,
     pub split_request: SplitRequest,
-    pub command: Option<CommandBuilder>,
-    pub command_dir: Option<String>,
-    pub domain: config::keyassignment::SpawnTabDomain,
-    /// Instead of spawning a command, move the specified
-    /// pane into the new split target
-    pub move_pane_id: Option<PaneId>,
+    pub domain: SplitSpawnDomain,
+    pub source: SplitSpawnSource,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
@@ -676,13 +1788,10 @@ pub struct MovePaneToNewTabResponse {
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
 pub struct SpawnV2 {
-    pub domain: config::keyassignment::SpawnTabDomain,
-    /// If None, create a new window for this new tab
-    pub window_id: Option<WindowId>,
-    pub command: Option<CommandBuilder>,
+    pub domain: TabSpawnDomain,
+    pub placement: TabSpawnPlacement,
+    pub command: EnvironmentFreeCommand,
     pub command_dir: Option<String>,
-    pub size: TerminalSize,
-    pub workspace: String,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
@@ -787,7 +1896,7 @@ pub struct RenameWorkspace {
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
 pub struct SetPalette {
     pub pane_id: PaneId,
-    pub palette: ColorPalette,
+    pub palette: Box<ColorPalette>,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
@@ -1027,7 +2136,7 @@ impl From<Vec<(StableRowIndex, Line)>> for SerializedLines {
                 if let Some(link) = cell.attrs_mut().hyperlink().map(Arc::clone) {
                     cell.attrs_mut().set_hyperlink(None);
                     match current_link.as_ref() {
-                        Some(current) if Arc::ptr_eq(&current, &link) => {
+                        Some(current) if Arc::ptr_eq(current, &link) => {
                             // Continue the current streak
                             current_range = range_union(current_range, x..x + 1);
                         }
@@ -1146,72 +2255,186 @@ pub struct GetImageCellResponse {
 mod test {
     use super::*;
 
+    struct HeaderThenPoison {
+        header: Cursor<Vec<u8>>,
+        body_reads: usize,
+    }
+
+    impl std::io::Read for HeaderThenPoison {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.header.position() < self.header.get_ref().len() as u64 {
+                std::io::Read::read(&mut self.header, buf)
+            } else {
+                self.body_reads += 1;
+                Err(std::io::Error::other("poison body was read"))
+            }
+        }
+    }
+
+    fn header_only(tag: PduTag, serial: u64, body_len: usize) -> Vec<u8> {
+        let content_len = encoded_length(serial)
+            .checked_add(encoded_length(tag.ident()))
+            .and_then(|len| len.checked_add(body_len))
+            .unwrap();
+        let mut header = Vec::new();
+        leb128::write::unsigned(&mut header, content_len as u64).unwrap();
+        leb128::write::unsigned(&mut header, serial).unwrap();
+        leb128::write::unsigned(&mut header, tag.ident()).unwrap();
+        header
+    }
+
+    fn content_len_for_complete_frame(frame_len: usize) -> usize {
+        (1..=10)
+            .find_map(|prefix_len| {
+                let content_len = frame_len.checked_sub(prefix_len)?;
+                (encoded_length(content_len as u64) == prefix_len).then_some(content_len)
+            })
+            .expect("frame length must have a matching leb128 prefix")
+    }
+
+    fn admission() -> Arc<RuntimeAdmission> {
+        RuntimeAdmission::new(wezterm_runtime_admission::RuntimeRole::Client).unwrap()
+    }
+
+    #[test]
+    fn environment_free_command_requires_an_explicit_nonempty_program() {
+        assert_eq!(
+            EnvironmentFreeCommand::try_from_argv(Vec::<String>::new()).unwrap_err(),
+            SpawnCommandError::EmptyArgv
+        );
+        assert_eq!(
+            EnvironmentFreeCommand::try_from_argv([""]).unwrap_err(),
+            SpawnCommandError::EmptyProgram
+        );
+        assert_eq!(
+            EnvironmentFreeCommand::try_from_argv(["bash", "-lc", "echo ready"]).unwrap(),
+            EnvironmentFreeCommand::Program {
+                program: NonEmptyProgram::new("bash".to_string()).unwrap(),
+                args: vec!["-lc".to_string(), "echo ready".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn hostile_empty_program_fails_during_deserialization() {
+        let admission = admission();
+        let (encoded, compressed, _permit) = serialize(&String::new(), &admission).unwrap();
+        let error = deserialize::<NonEmptyProgram, _>(encoded.as_slice(), compressed).unwrap_err();
+        assert!(error.to_string().contains("program must not be empty"));
+    }
+
+    fn assert_decoded(decoded: AdmittedDecodedPdu, serial: u64, pdu: Pdu) {
+        assert_eq!(decoded.serial(), serial);
+        assert_eq!(decoded.pdu(), &pdu);
+    }
+
     #[test]
     fn test_frame() {
         let mut encoded = Vec::new();
-        encode_raw(0x81, 0x42, b"hello", false, &mut encoded).unwrap();
-        assert_eq!(&encoded, b"\x08\x42\x81\x01hello");
-        let decoded = decode_raw(encoded.as_slice()).unwrap();
-        assert_eq!(decoded.ident, 0x81);
-        assert_eq!(decoded.serial, 0x42);
-        assert_eq!(decoded.data, b"hello");
+        encode_raw(1, 0x42, b"hello", false, &mut encoded).unwrap();
+        assert_eq!(&encoded, b"\x07\x42\x01hello");
+        let admission = admission();
+        let mut encoded = encoded.as_slice();
+        let header = Pdu::read_header(&mut encoded).unwrap();
+        assert_eq!(header.tag(), PduTag::Ping);
+        assert_eq!(header.serial(), 0x42);
+        let body = header
+            .validate(
+                DecodeContext::client_to_server_request(ClientRequestPhase::Established),
+                &admission,
+            )
+            .unwrap();
+        assert_eq!(read_body(&mut encoded, &body).unwrap(), b"hello");
     }
 
     #[test]
     fn test_frame_lengths() {
-        let mut serial = 1;
-        for target_len in &[128, 247, 256, 65536, 16777216] {
+        for (serial, target_len) in (1..).zip([128, 247, 256, 65536, 16777216].iter()) {
             let mut payload = Vec::with_capacity(*target_len);
             payload.resize(*target_len, b'a');
             let mut encoded = Vec::new();
-            encode_raw(0x42, serial, payload.as_slice(), false, &mut encoded).unwrap();
-            let decoded = decode_raw(encoded.as_slice()).unwrap();
-            assert_eq!(decoded.ident, 0x42);
-            assert_eq!(decoded.serial, serial);
-            assert_eq!(decoded.data, payload);
-            serial += 1;
+            encode_raw(1, serial, payload.as_slice(), false, &mut encoded).unwrap();
+            let admission = admission();
+            let mut encoded = encoded.as_slice();
+            let header = Pdu::read_header(&mut encoded).unwrap();
+            assert_eq!(header.tag(), PduTag::Ping);
+            assert_eq!(header.serial(), serial);
+            let body = header
+                .validate(
+                    DecodeContext::client_to_server_request(ClientRequestPhase::Established),
+                    &admission,
+                )
+                .unwrap();
+            assert_eq!(read_body(&mut encoded, &body).unwrap(), payload);
         }
     }
 
     #[test]
     fn test_pdu_ping() {
         let mut encoded = Vec::new();
-        Pdu::Ping(Ping {}).encode(&mut encoded, 0x40).unwrap();
+        let admission = admission();
+        Pdu::Ping(Ping {})
+            .encode(&mut encoded, 0x40, &admission)
+            .unwrap();
         assert_eq!(&encoded, &[2, 0x40, 1]);
-        assert_eq!(
-            DecodedPdu {
-                serial: 0x40,
-                pdu: Pdu::Ping(Ping {})
-            },
-            Pdu::decode(encoded.as_slice()).unwrap()
+        assert_decoded(
+            Pdu::decode(
+                encoded.as_slice(),
+                DecodeContext::client_to_server_request(ClientRequestPhase::Established),
+                &admission,
+            )
+            .unwrap(),
+            0x40,
+            Pdu::Ping(Ping {}),
         );
     }
 
     #[test]
     fn stream_decode() {
         let mut encoded = Vec::new();
-        Pdu::Ping(Ping {}).encode(&mut encoded, 0x1).unwrap();
-        Pdu::Pong(Pong {}).encode(&mut encoded, 0x2).unwrap();
+        let admission = admission();
+        Pdu::Ping(Ping {})
+            .encode(&mut encoded, 0x1, &admission)
+            .unwrap();
+        Pdu::Pong(Pong {})
+            .encode(&mut encoded, 0x2, &admission)
+            .unwrap();
         assert_eq!(encoded.len(), 6);
 
         let mut cursor = Cursor::new(encoded.as_slice());
         let mut read_buffer = Vec::new();
 
-        assert_eq!(
-            Pdu::try_read_and_decode(&mut cursor, &mut read_buffer).unwrap(),
-            Some(DecodedPdu {
-                serial: 1,
-                pdu: Pdu::Ping(Ping {})
-            })
+        assert_decoded(
+            Pdu::try_read_and_decode(
+                &mut cursor,
+                &mut read_buffer,
+                DecodeContext::client_to_server_request(ClientRequestPhase::Established),
+                &admission,
+            )
+            .unwrap()
+            .unwrap(),
+            1,
+            Pdu::Ping(Ping {}),
         );
-        assert_eq!(
-            Pdu::try_read_and_decode(&mut cursor, &mut read_buffer).unwrap(),
-            Some(DecodedPdu {
-                serial: 2,
-                pdu: Pdu::Pong(Pong {})
-            })
+        assert_decoded(
+            Pdu::try_read_and_decode(
+                &mut cursor,
+                &mut read_buffer,
+                DecodeContext::server_to_client_response(Some(PduTag::Pong)),
+                &admission,
+            )
+            .unwrap()
+            .unwrap(),
+            2,
+            Pdu::Pong(Pong {}),
         );
-        let err = Pdu::try_read_and_decode(&mut cursor, &mut read_buffer).unwrap_err();
+        let err = Pdu::try_read_and_decode(
+            &mut cursor,
+            &mut read_buffer,
+            DecodeContext::server_to_client_response(Some(PduTag::Pong)),
+            &admission,
+        )
+        .unwrap_err();
         assert_eq!(
             err.downcast_ref::<std::io::Error>().unwrap().kind(),
             std::io::ErrorKind::UnexpectedEof
@@ -1221,32 +2444,44 @@ mod test {
     #[test]
     fn test_pdu_ping_base91() {
         let mut encoded = Vec::new();
+        let admission = admission();
         {
             let mut encoder = base91::Base91Encoder::new(&mut encoded);
-            Pdu::Ping(Ping {}).encode(&mut encoder, 0x41).unwrap();
+            Pdu::Ping(Ping {})
+                .encode(&mut encoder, 0x41, &admission)
+                .unwrap();
         }
         assert_eq!(&encoded, &[60, 67, 75, 65]);
         let decoded = base91::decode(&encoded);
-        assert_eq!(
-            DecodedPdu {
-                serial: 0x41,
-                pdu: Pdu::Ping(Ping {})
-            },
-            Pdu::decode(decoded.as_slice()).unwrap()
+        assert_decoded(
+            Pdu::decode(
+                decoded.as_slice(),
+                DecodeContext::client_to_server_request(ClientRequestPhase::Established),
+                &admission,
+            )
+            .unwrap(),
+            0x41,
+            Pdu::Ping(Ping {}),
         );
     }
 
     #[test]
     fn test_pdu_pong() {
         let mut encoded = Vec::new();
-        Pdu::Pong(Pong {}).encode(&mut encoded, 0x42).unwrap();
+        let admission = admission();
+        Pdu::Pong(Pong {})
+            .encode(&mut encoded, 0x42, &admission)
+            .unwrap();
         assert_eq!(&encoded, &[2, 0x42, 2]);
-        assert_eq!(
-            DecodedPdu {
-                serial: 0x42,
-                pdu: Pdu::Pong(Pong {})
-            },
-            Pdu::decode(encoded.as_slice()).unwrap()
+        assert_decoded(
+            Pdu::decode(
+                encoded.as_slice(),
+                DecodeContext::server_to_client_response(Some(PduTag::Pong)),
+                &admission,
+            )
+            .unwrap(),
+            0x42,
+            Pdu::Pong(Pong {}),
         );
     }
 
@@ -1254,12 +2489,478 @@ mod test {
     fn test_bogus_pdu() {
         let mut encoded = Vec::new();
         encode_raw(0xdeadbeef, 0x42, b"hello", false, &mut encoded).unwrap();
+        let admission = admission();
+        assert!(Pdu::decode(
+            encoded.as_slice(),
+            DecodeContext::client_to_server_request(ClientRequestPhase::Established),
+            &admission,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn complete_wire_frame_boundary_is_exact() {
+        let content_len = content_len_for_complete_frame(MAX_WIRE_FRAME_BYTES);
+        let mut boundary = Vec::new();
+        leb128::write::unsigned(&mut boundary, content_len as u64).unwrap();
+        leb128::write::unsigned(&mut boundary, 1).unwrap();
+        leb128::write::unsigned(&mut boundary, PduTag::Ping.ident()).unwrap();
+        let header = Pdu::read_header(&mut boundary.as_slice()).unwrap();
+        assert_eq!(header.tag(), PduTag::Ping);
+
+        let content_len = content_len_for_complete_frame(MAX_WIRE_FRAME_BYTES + 1);
+        let mut oversized = Vec::new();
+        leb128::write::unsigned(&mut oversized, content_len as u64).unwrap();
+        leb128::write::unsigned(&mut oversized, 1).unwrap();
+        leb128::write::unsigned(&mut oversized, PduTag::Ping.ident()).unwrap();
+        let error = Pdu::read_header(&mut oversized.as_slice()).unwrap_err();
+        assert!(error.to_string().contains("wire frame exceeds"));
+    }
+
+    #[test]
+    fn unknown_identifier_is_rejected_before_body_read() {
+        let mut encoded = Vec::new();
+        let unknown_ident = 0xdead_beef;
+        let content_len = encoded_length(1) + encoded_length(unknown_ident);
+        leb128::write::unsigned(&mut encoded, content_len as u64).unwrap();
+        leb128::write::unsigned(&mut encoded, 1).unwrap();
+        leb128::write::unsigned(&mut encoded, unknown_ident).unwrap();
+        let admission = admission();
+        let error = Pdu::read_header(&mut encoded.as_slice()).unwrap_err();
+        assert!(error.to_string().contains("unknown PDU identifier"));
+        assert_eq!(admission.byte_usage(ByteClass::DecodeWorking), 0);
+    }
+
+    #[test]
+    fn wrong_direction_does_not_read_the_body() {
+        let mut reader = HeaderThenPoison {
+            header: Cursor::new(header_only(PduTag::Pong, 1, 1)),
+            body_reads: 0,
+        };
+        let admission = admission();
+        let header = Pdu::read_header(&mut reader).unwrap();
+        assert!(header
+            .validate(
+                DecodeContext::client_to_server_request(ClientRequestPhase::Established),
+                &admission,
+            )
+            .is_err());
+        assert_eq!(reader.body_reads, 0);
+    }
+
+    #[test]
+    fn phase_invalid_client_requests_fail_before_body_admission() {
+        for (tag, phase) in [
+            (PduTag::WriteToPane, ClientRequestPhase::Bootstrap),
+            (PduTag::SetClientId, ClientRequestPhase::Established),
+        ] {
+            let mut reader = HeaderThenPoison {
+                header: Cursor::new(header_only(tag, 1, 1)),
+                body_reads: 0,
+            };
+            let admission = admission();
+            let header = Pdu::read_header(&mut reader).unwrap();
+            let error = header
+                .validate(DecodeContext::client_to_server_request(phase), &admission)
+                .unwrap_err();
+
+            assert!(error
+                .to_string()
+                .contains("invalid for client request phase"));
+            assert_eq!(reader.body_reads, 0);
+            assert_eq!(admission.byte_usage(ByteClass::DecodeWorking), 0);
+        }
+    }
+
+    #[test]
+    fn correlated_response_rejects_zero_missing_and_wrong_tag_before_body() {
+        let admission = admission();
+        for (serial, expected, message) in [
+            (0, Some(PduTag::Pong), "serial zero"),
+            (1, None, "no corresponding promise"),
+            (1, Some(PduTag::UnitResponse), "expected UnitResponse"),
+        ] {
+            let mut reader = HeaderThenPoison {
+                header: Cursor::new(header_only(PduTag::Pong, serial, 1)),
+                body_reads: 0,
+            };
+            let header = Pdu::read_header(&mut reader).unwrap();
+            let error = header
+                .validate(
+                    DecodeContext::server_to_client_response(expected),
+                    &admission,
+                )
+                .unwrap_err();
+            let rendered = format!("{error:#}");
+            assert!(rendered.contains(message), "{}", rendered);
+            assert_eq!(reader.body_reads, 0);
+        }
+
+        let mut error_reader = HeaderThenPoison {
+            header: Cursor::new(header_only(PduTag::ErrorResponse, 1, 1)),
+            body_reads: 0,
+        };
+        let error_header = Pdu::read_header(&mut error_reader).unwrap();
+        error_header
+            .validate(
+                DecodeContext::server_to_client_response(Some(PduTag::Pong)),
+                &admission,
+            )
+            .unwrap();
+        assert_eq!(error_reader.body_reads, 0);
+    }
+
+    #[test]
+    fn render_poll_manifest_distinguishes_correlated_liveness_from_pushed_changes() {
         assert_eq!(
-            DecodedPdu {
-                serial: 0x42,
-                pdu: Pdu::Invalid { ident: 0xdeadbeef }
-            },
-            Pdu::decode(encoded.as_slice()).unwrap()
+            PduTag::GetPaneRenderChanges.expected_response(),
+            Some(PduTag::LivenessResponse)
         );
+
+        let admission = admission();
+        let pushed_changes_frame = header_only(PduTag::GetPaneRenderChangesResponse, 0, 1);
+        let mut pushed_changes = pushed_changes_frame.as_slice();
+        Pdu::read_header(&mut pushed_changes)
+            .unwrap()
+            .validate(DecodeContext::server_to_client_notification(), &admission)
+            .unwrap();
+
+        let liveness_frame = header_only(PduTag::LivenessResponse, 1, 1);
+        let mut liveness = liveness_frame.as_slice();
+        Pdu::read_header(&mut liveness)
+            .unwrap()
+            .validate(
+                DecodeContext::server_to_client_response(Some(PduTag::LivenessResponse)),
+                &admission,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn rpc_response_keeps_decode_admission_until_explicit_acceptance() {
+        let admission = admission();
+        let mut encoded = Vec::new();
+        Pdu::Pong(Pong {})
+            .encode(&mut encoded, 1, &admission)
+            .unwrap();
+
+        let decoded = Pdu::decode(
+            encoded.as_slice(),
+            DecodeContext::server_to_client_response(Some(PduTag::Pong)),
+            &admission,
+        )
+        .unwrap();
+        assert!(admission.byte_usage(ByteClass::DecodeWorking) > 0);
+
+        let response = decoded
+            .into_rpc_response()
+            .unwrap()
+            .try_map(|pdu| match pdu {
+                Pdu::Pong(pong) => Ok(pong),
+                unexpected => bail!("unexpected response {unexpected:?}"),
+            })
+            .unwrap();
+        assert_eq!(response.serial(), 1);
+        assert!(admission.byte_usage(ByteClass::DecodeWorking) > 0);
+
+        let _pong = response.into_inner();
+        assert_eq!(admission.byte_usage(ByteClass::DecodeWorking), 0);
+    }
+
+    #[test]
+    fn control_response_remains_admissible_behind_four_large_decoded_values() {
+        let admission = admission();
+        let large = (0..4)
+            .map(|_| {
+                admission
+                    .try_bytes(
+                        ByteClass::DecodeWorking,
+                        MAX_DECODE_HEAP_ENVELOPE_BYTES_PER_PDU,
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut encoded = Vec::new();
+        Pdu::ControlLeaseResult(ControlLeaseResult::Overloaded)
+            .encode(&mut encoded, 1, &admission)
+            .unwrap();
+
+        let response = Pdu::decode(
+            encoded.as_slice(),
+            DecodeContext::server_to_client_response(Some(PduTag::ControlLeaseResult)),
+            &admission,
+        )
+        .unwrap()
+        .into_rpc_response()
+        .unwrap();
+
+        assert!(matches!(
+            response.value(),
+            Pdu::ControlLeaseResult(ControlLeaseResult::Overloaded)
+        ));
+        assert!(
+            admission.byte_usage(ByteClass::DecodeWorking)
+                >= large.len() * MAX_DECODE_HEAP_ENVELOPE_BYTES_PER_PDU
+                    + MAX_DECODE_METADATA_HEAP_ENVELOPE_BYTES_PER_PDU
+        );
+        drop(response);
+        drop(large);
+        assert_eq!(admission.byte_usage(ByteClass::DecodeWorking), 0);
+    }
+
+    #[test]
+    fn alert_notification_remains_admissible_behind_four_large_decoded_values() {
+        let admission = admission();
+        let large = (0..4)
+            .map(|_| {
+                admission
+                    .try_bytes(
+                        ByteClass::DecodeWorking,
+                        MAX_DECODE_HEAP_ENVELOPE_BYTES_PER_PDU,
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut encoded = Vec::new();
+        Pdu::NotifyAlert(NotifyAlert {
+            pane_id: 7,
+            alert: Alert::Bell,
+        })
+        .encode(&mut encoded, 0, &admission)
+        .unwrap();
+
+        let notification = Pdu::decode(
+            encoded.as_slice(),
+            DecodeContext::server_to_client_notification(),
+            &admission,
+        )
+        .unwrap()
+        .into_notification()
+        .unwrap();
+
+        assert!(matches!(
+            notification.pdu(),
+            Pdu::NotifyAlert(NotifyAlert {
+                pane_id: 7,
+                alert: Alert::Bell
+            })
+        ));
+        drop(notification);
+        drop(large);
+        assert_eq!(admission.byte_usage(ByteClass::DecodeWorking), 0);
+    }
+
+    #[test]
+    fn rejected_rpc_mapping_releases_decode_admission() {
+        let admission = admission();
+        let mut encoded = Vec::new();
+        Pdu::Pong(Pong {})
+            .encode(&mut encoded, 1, &admission)
+            .unwrap();
+        let response = Pdu::decode(
+            encoded.as_slice(),
+            DecodeContext::server_to_client_response(Some(PduTag::Pong)),
+            &admission,
+        )
+        .unwrap()
+        .into_rpc_response()
+        .unwrap();
+
+        let result: anyhow::Result<AdmittedRpcResponse<()>> =
+            response.try_map(|_| bail!("reject typed response"));
+        assert!(result.is_err());
+        assert_eq!(admission.byte_usage(ByteClass::DecodeWorking), 0);
+    }
+
+    #[test]
+    fn notification_conversion_proves_zero_serial_and_retains_admission() {
+        let admission = admission();
+        let mut encoded = Vec::new();
+        Pdu::PaneRemoved(PaneRemoved { pane_id: 7 })
+            .encode(&mut encoded, 0, &admission)
+            .unwrap();
+        let notification = Pdu::decode(
+            encoded.as_slice(),
+            DecodeContext::server_to_client_notification(),
+            &admission,
+        )
+        .unwrap()
+        .into_notification()
+        .unwrap();
+
+        assert_eq!(notification.serial().get(), 0);
+        assert!(admission.byte_usage(ByteClass::DecodeWorking) > 0);
+        drop(notification);
+        assert_eq!(admission.byte_usage(ByteClass::DecodeWorking), 0);
+    }
+
+    #[test]
+    fn decoded_correlation_cannot_cross_notification_and_response_boundaries() {
+        let admission = admission();
+        let mut response = Vec::new();
+        Pdu::Pong(Pong {})
+            .encode(&mut response, 1, &admission)
+            .unwrap();
+        assert!(Pdu::decode(
+            response.as_slice(),
+            DecodeContext::server_to_client_response(Some(PduTag::Pong)),
+            &admission,
+        )
+        .unwrap()
+        .into_notification()
+        .is_err());
+        assert_eq!(admission.byte_usage(ByteClass::DecodeWorking), 0);
+
+        let mut notification = Vec::new();
+        Pdu::PaneRemoved(PaneRemoved { pane_id: 7 })
+            .encode(&mut notification, 0, &admission)
+            .unwrap();
+        assert!(Pdu::decode(
+            notification.as_slice(),
+            DecodeContext::server_to_client_notification(),
+            &admission,
+        )
+        .unwrap()
+        .into_rpc_response()
+        .is_err());
+        assert_eq!(admission.byte_usage(ByteClass::DecodeWorking), 0);
+    }
+
+    #[test]
+    fn attach_rejected_is_a_content_free_server_notification() {
+        let admission = admission();
+        let mut encoded = Vec::new();
+        Pdu::AttachRejected(AttachRejected {})
+            .encode(&mut encoded, 0, &admission)
+            .unwrap();
+
+        let decoded = Pdu::decode(
+            encoded.as_slice(),
+            DecodeContext::server_to_client_notification(),
+            &admission,
+        )
+        .unwrap()
+        .into_notification()
+        .unwrap();
+        assert!(matches!(
+            decoded.pdu(),
+            Pdu::AttachRejected(AttachRejected {})
+        ));
+        assert_eq!(decoded.serial().get(), 0);
+
+        let mut header = encoded.as_slice();
+        let header = Pdu::read_header(&mut header).unwrap();
+        assert!(header
+            .validate(
+                DecodeContext::client_to_server_request(ClientRequestPhase::Bootstrap),
+                &admission,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn every_manifest_request_targets_a_response_tag() {
+        for tag in PduTag::ALL {
+            let Some(response) = tag.expected_response() else {
+                continue;
+            };
+            assert_eq!(
+                response.header_policy(),
+                PduHeaderPolicy::Response,
+                "{} expects non-response tag {}",
+                tag.name(),
+                response.name()
+            );
+        }
+    }
+
+    #[test]
+    fn every_client_request_tag_has_phase_classification() {
+        for &tag in PduTag::ALL {
+            let is_request = matches!(
+                tag.header_policy(),
+                PduHeaderPolicy::Request { .. } | PduHeaderPolicy::RequestOrNotification { .. }
+            );
+            let expected_bootstrap = matches!(
+                tag,
+                PduTag::Ping
+                    | PduTag::GetCodecVersion
+                    | PduTag::GetBuildIdentity
+                    | PduTag::GetTlsCreds
+                    | PduTag::SetClientId
+            );
+            let expected_established = is_request && tag != PduTag::SetClientId;
+
+            assert_eq!(
+                tag.allows_client_request_phase(ClientRequestPhase::Bootstrap),
+                expected_bootstrap,
+                "{} has the wrong bootstrap classification",
+                tag.name()
+            );
+            assert_eq!(
+                tag.allows_client_request_phase(ClientRequestPhase::Established),
+                expected_established,
+                "{} has the wrong established classification",
+                tag.name()
+            );
+            assert_eq!(
+                expected_bootstrap || expected_established,
+                is_request,
+                "{} is missing a client request phase classification",
+                tag.name()
+            );
+        }
+    }
+
+    #[test]
+    fn projected_attachment_identity_is_never_client_request_authority() {
+        let identity = ConnectionIdentity::from_server_sequence(NonZeroU64::new(7).unwrap());
+        let snapshot = Pdu::ControlSnapshot(ControlSnapshot {
+            attachment_identity: identity,
+            state: ControlLeaseState {
+                sequence: 0,
+                active: vec![],
+            },
+        });
+
+        assert!(snapshot.request_operation().is_err());
+        assert!(snapshot.request_authority().is_err());
+        assert!(!PduTag::ControlSnapshot.allows_client_request_phase(ClientRequestPhase::Bootstrap));
+        assert!(
+            !PduTag::ControlSnapshot.allows_client_request_phase(ClientRequestPhase::Established)
+        );
+    }
+
+    #[test]
+    fn valid_header_reaches_the_body_reader() {
+        let mut reader = HeaderThenPoison {
+            header: Cursor::new(header_only(PduTag::Ping, 1, 1)),
+            body_reads: 0,
+        };
+        let admission = admission();
+        let header = Pdu::read_header(&mut reader).unwrap();
+        let body = header
+            .validate(
+                DecodeContext::client_to_server_request(ClientRequestPhase::Established),
+                &admission,
+            )
+            .unwrap();
+        let error = Pdu::decode_body(&mut reader, body, &admission).unwrap_err();
+        assert!(format!("{error:#}").contains("poison body was read"));
+        assert_eq!(reader.body_reads, 1);
+    }
+
+    #[test]
+    fn trailing_deserialized_body_bytes_are_rejected() {
+        let mut encoded = Vec::new();
+        encode_raw(PduTag::Ping.ident(), 1, &[0xaa], false, &mut encoded).unwrap();
+        let admission = admission();
+        let error = Pdu::decode(
+            encoded.as_slice(),
+            DecodeContext::client_to_server_request(ClientRequestPhase::Established),
+            &admission,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("trailing bytes"));
     }
 }

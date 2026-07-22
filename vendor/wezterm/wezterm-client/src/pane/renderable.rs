@@ -1,12 +1,12 @@
 use crate::domain::ClientInner;
 use crate::pane::clientpane::ClientPane;
-use anyhow::anyhow;
+use anyhow::{anyhow, Context};
 use codec::*;
 use config::{configuration, ConfigHandle};
 use lru::LruCache;
 use mux::pane::PaneId;
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
-use mux::Mux;
+use mux::{ClientPaneTaskKind, Mux};
 use promise::BrokenPromise;
 use rangeset::*;
 use ratelim::RateLimiter;
@@ -15,19 +15,20 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use termwiz::cell::{Cell, CellAttributes, Underline};
 use termwiz::color::AnsiColor;
-use termwiz::image::{ImageCell, ImageData};
+use termwiz::image::ImageCell;
 use termwiz::surface::{SequenceNo, SEQ_ZERO};
 use url::Url;
+use wezterm_runtime_admission::{RetainedClass, RetainedStateLease, RuntimeAdmission};
 use wezterm_term::{KeyCode, KeyModifiers, Line, StableRowIndex};
 
 const MAX_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const BASE_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum LineEntry {
     // Up to date wrt. server and has been rendered at least once
     Line(Line),
@@ -43,6 +44,10 @@ enum LineEntry {
 }
 
 impl LineEntry {
+    const CACHE_OVERHEAD: usize = core::mem::size_of::<StableRowIndex>()
+        + core::mem::size_of::<Self>()
+        + 6 * core::mem::size_of::<usize>();
+
     fn kind(&self) -> (&'static str, Option<Instant>) {
         match self {
             Self::Line(_) => ("Line", None),
@@ -50,6 +55,138 @@ impl LineEntry {
             Self::LineAndFetching(_, since) => ("LineAndFetching", Some(*since)),
             Self::Stale(_) => ("Stale", None),
         }
+    }
+
+    fn retained_size(&self) -> usize {
+        let payload = match self {
+            Self::Line(line) | Self::LineAndFetching(line, _) | Self::Stale(line) => line
+                .retained_size_excluding_image_data()
+                .saturating_sub(core::mem::size_of::<Line>()),
+            Self::Fetching(_) => 0,
+        };
+        Self::CACHE_OVERHEAD.saturating_add(payload)
+    }
+}
+
+struct AdmittedLineCache {
+    // Keep entries before the lease so cached state is destroyed before its
+    // admission charge during normal field teardown.
+    entries: LruCache<StableRowIndex, LineEntry>,
+    lease: Option<RetainedStateLease>,
+    admission: Arc<RuntimeAdmission>,
+}
+
+impl AdmittedLineCache {
+    fn new(admission: Arc<RuntimeAdmission>, capacity: NonZeroUsize) -> Self {
+        Self {
+            entries: LruCache::new(capacity),
+            lease: None,
+            admission,
+        }
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.lease.as_ref().map_or(0, RetainedStateLease::bytes)
+    }
+
+    fn get(&mut self, row: &StableRowIndex) -> Option<&LineEntry> {
+        self.entries.get(row)
+    }
+
+    fn peek(&self, row: &StableRowIndex) -> Option<&LineEntry> {
+        self.entries.peek(row)
+    }
+
+    fn try_grow_before_commit(&mut self, post_bytes: usize) -> anyhow::Result<()> {
+        match self.lease.as_mut() {
+            Some(lease) => lease
+                .try_resize(post_bytes)
+                .context("growing admitted client render cache"),
+            None if post_bytes == 0 => Ok(()),
+            None => {
+                self.lease = Some(
+                    self.admission
+                        .try_retained(RetainedClass::ClientRender, post_bytes)
+                        .context("admitting client render cache")?,
+                );
+                Ok(())
+            }
+        }
+    }
+
+    fn shrink_after_commit(&mut self, post_bytes: usize) {
+        if let Some(lease) = self.lease.as_mut() {
+            lease
+                .try_resize(post_bytes)
+                .expect("retained client render cache shrink must succeed");
+        }
+    }
+
+    /// Replace, insert, or remove one row transactionally. The projected
+    /// footprint includes both same-key replacement and bounded-LRU eviction.
+    fn try_replace(
+        &mut self,
+        row: StableRowIndex,
+        entry: Option<LineEntry>,
+    ) -> anyhow::Result<Option<(StableRowIndex, LineEntry)>> {
+        let current = self.retained_bytes();
+        let prior_bytes = self.entries.peek(&row).map_or(0, LineEntry::retained_size);
+        let eviction_bytes = if entry.is_some()
+            && self.entries.peek(&row).is_none()
+            && self.entries.len() == self.entries.cap().get()
+        {
+            self.entries
+                .peek_lru()
+                .map_or(0, |(_, entry)| entry.retained_size())
+        } else {
+            0
+        };
+        let post_bytes = current
+            .checked_sub(prior_bytes)
+            .and_then(|bytes| bytes.checked_sub(eviction_bytes))
+            .and_then(|bytes| {
+                entry.as_ref().map_or(Some(bytes), |entry| {
+                    bytes.checked_add(entry.retained_size())
+                })
+            })
+            .ok_or_else(|| anyhow!("client render cache footprint overflow"))?;
+
+        if post_bytes > current {
+            self.try_grow_before_commit(post_bytes)?;
+        }
+
+        let removed = match entry {
+            Some(entry) => self.entries.push(row, entry),
+            None => self.entries.pop_entry(&row),
+        };
+        debug_assert_eq!(
+            self.entries.iter().fold(0usize, |size, (_, entry)| {
+                size.saturating_add(entry.retained_size())
+            }),
+            post_bytes
+        );
+        if post_bytes < current {
+            self.shrink_after_commit(post_bytes);
+        }
+        Ok(removed)
+    }
+
+    fn make_all_stale(&mut self) {
+        let retained_bytes = self.retained_bytes();
+        let placeholder_time = Instant::now();
+        for (_, entry) in self.entries.iter_mut() {
+            let owned = core::mem::replace(entry, LineEntry::Fetching(placeholder_time));
+            *entry = match owned {
+                LineEntry::Stale(old) | LineEntry::Line(old) => LineEntry::Stale(old),
+                entry => entry,
+            };
+        }
+        debug_assert_eq!(
+            self.entries.iter().fold(0usize, |size, (_, entry)| {
+                size.saturating_add(entry.retained_size())
+            }),
+            retained_bytes
+        );
     }
 }
 
@@ -65,7 +202,7 @@ pub struct RenderableInner {
     cursor_position: StableCursorPosition,
     pub dimensions: RenderableDimensions,
 
-    lines: LruCache<StableRowIndex, LineEntry>,
+    lines: AdmittedLineCache,
     pub title: String,
     pub working_dir: Option<Url>,
     pub seqno: SequenceNo,
@@ -105,7 +242,8 @@ impl RenderableInner {
             poll_interval: BASE_POLL_INTERVAL,
             cursor_position: StableCursorPosition::default(),
             dimensions,
-            lines: LruCache::new(
+            lines: AdmittedLineCache::new(
+                Arc::clone(client.client.admission()),
                 NonZeroUsize::new(configuration().scrollback_lines.max(128)).unwrap(),
             ),
             title: title.to_string(),
@@ -148,9 +286,10 @@ impl RenderableInner {
     /// Open questions:
     /// how do we tell if the intent is to suppress local echo during eg:
     ///  * password prompt?  One option is to look back and see if the line
-    ///                      looks like a password prompt.
+    ///    looks like a password prompt.
     ///  * normal mode in vim: letter presses are typically movement or
-    ///                        other editor commands
+    ///    other editor commands
+    ///
     /// There are bound to be a number of other edge cases that we should
     /// handle.
     fn apply_prediction(&mut self, c: KeyCode, line: &mut Line) {
@@ -230,20 +369,21 @@ impl RenderableInner {
         }
 
         let row = self.cursor_position.y;
-        match self.lines.pop(&row) {
+        let replacement = match self.lines.peek(&row).cloned() {
             Some(LineEntry::Stale(mut line)) | Some(LineEntry::Line(mut line)) => {
                 self.apply_prediction(c, &mut line);
-                self.lines.put(row, LineEntry::Line(line));
+                Some(LineEntry::Line(line))
             }
             Some(LineEntry::LineAndFetching(mut line, instant)) => {
                 self.apply_prediction(c, &mut line);
-                self.lines
-                    .put(row, LineEntry::LineAndFetching(line, instant));
+                Some(LineEntry::LineAndFetching(line, instant))
             }
-            Some(entry) => {
-                self.lines.put(row, entry);
+            entry => entry,
+        };
+        if let Some(entry) = replacement {
+            if let Err(err) = self.lines.try_replace(row, Some(entry)) {
+                log::warn!("unable to admit predicted line {row}: {err:#}");
             }
-            None => {}
         }
     }
 
@@ -278,20 +418,21 @@ impl RenderableInner {
         for (idx, paste_line) in lines.iter().enumerate() {
             let row = self.cursor_position.y + idx as StableRowIndex;
 
-            match self.lines.pop(&row) {
+            let replacement = match self.lines.peek(&row).cloned() {
                 Some(LineEntry::Stale(mut line)) | Some(LineEntry::Line(mut line)) => {
                     self.apply_paste_prediction(idx, paste_line, &mut line);
-                    self.lines.put(row, LineEntry::Line(line));
+                    Some(LineEntry::Line(line))
                 }
                 Some(LineEntry::LineAndFetching(mut line, instant)) => {
                     self.apply_paste_prediction(idx, paste_line, &mut line);
-                    self.lines
-                        .put(row, LineEntry::LineAndFetching(line, instant));
+                    Some(LineEntry::LineAndFetching(line, instant))
                 }
-                Some(entry) => {
-                    self.lines.put(row, entry);
+                entry => entry,
+            };
+            if let Some(entry) = replacement {
+                if let Err(err) = self.lines.try_replace(row, Some(entry)) {
+                    log::warn!("unable to admit predicted paste line {row}: {err:#}");
                 }
-                None => {}
             }
         }
         self.cursor_position.y += lines.len().saturating_sub(1) as StableRowIndex;
@@ -306,7 +447,7 @@ impl RenderableInner {
         &mut self,
         delta: GetPaneRenderChangesResponse,
         bonus_lines: Vec<(StableRowIndex, Line)>,
-    ) {
+    ) -> anyhow::Result<()> {
         log::trace!(
             "apply_changes_to_surface local={} remote={}",
             self.local_pane_id,
@@ -363,7 +504,7 @@ impl RenderableInner {
         let config = configuration();
         for (stable_row, line) in bonus_lines {
             log::trace!("bonus line {} seqno={}", stable_row, line.current_seqno());
-            self.put_line(stable_row, line, &config, None);
+            self.put_line(stable_row, line, &config, None)?;
             dirty.remove(stable_row);
         }
 
@@ -382,11 +523,11 @@ impl RenderableInner {
                 // If it is outside that region, remove it from our cache
                 // so that we'll fetch it on demand later.
                 let fetchable = stable_row >= delta.dimensions.physical_top;
-                let prior = self.lines.pop(&stable_row);
+                let prior = self.lines.peek(&stable_row).cloned();
                 let prior_kind = prior.as_ref().map(|e| e.kind());
                 if !fetchable {
                     log::trace!("make {} stale bcos not fetchable", stable_row);
-                    self.make_stale(stable_row);
+                    self.lines.try_replace(stable_row, None)?;
                     continue;
                 }
                 to_fetch.add(stable_row);
@@ -402,7 +543,7 @@ impl RenderableInner {
                     prior_kind,
                     entry.kind()
                 );
-                self.lines.put(stable_row, entry);
+                self.lines.try_replace(stable_row, Some(entry))?;
             }
         }
         if !to_fetch.is_empty() {
@@ -415,34 +556,33 @@ impl RenderableInner {
                 );
                 for r in to_fetch.iter() {
                     for stable_row in r.clone() {
-                        self.make_stale(stable_row);
+                        self.make_stale(stable_row)?;
                     }
                 }
             }
         }
+        Ok(())
     }
 
     pub fn make_all_stale(&mut self) {
-        let mut lines = LruCache::unbounded();
-        while let Some((stable_row, entry)) = self.lines.pop_lru() {
-            let entry = match entry {
-                LineEntry::Stale(old) | LineEntry::Line(old) => LineEntry::Stale(old),
-                entry => entry,
-            };
-            lines.put(stable_row, entry);
-        }
-        self.lines = lines;
+        self.lines.make_all_stale();
     }
 
-    fn make_stale(&mut self, stable_row: StableRowIndex) {
-        match self.lines.pop(&stable_row) {
+    fn make_stale(&mut self, stable_row: StableRowIndex) -> anyhow::Result<()> {
+        let replacement = match self.lines.peek(&stable_row).cloned() {
             Some(LineEntry::Stale(old))
             | Some(LineEntry::Line(old))
-            | Some(LineEntry::LineAndFetching(old, _)) => {
-                self.lines.put(stable_row, LineEntry::Stale(old));
+            | Some(LineEntry::LineAndFetching(old, _)) => Some(LineEntry::Stale(old)),
+            Some(LineEntry::Fetching(_)) => {
+                self.lines.try_replace(stable_row, None)?;
+                return Ok(());
             }
-            Some(LineEntry::Fetching(_)) | None => {}
+            None => None,
+        };
+        if let Some(entry) = replacement {
+            self.lines.try_replace(stable_row, Some(entry))?;
         }
+        Ok(())
     }
 
     fn put_line(
@@ -451,7 +591,7 @@ impl RenderableInner {
         mut line: Line,
         config: &ConfigHandle,
         fetch_start: Option<Instant>,
-    ) {
+    ) -> anyhow::Result<()> {
         line.scan_and_create_hyperlinks(&config.hyperlink_rules);
 
         let entry = if let Some(fetch_start) = fetch_start {
@@ -460,9 +600,9 @@ impl RenderableInner {
             // tagged that way, then someone came along after us and changed
             // the state, so we should leave it alone
 
-            match self.lines.pop(&stable_row) {
+            match self.lines.peek(&stable_row) {
                 Some(LineEntry::LineAndFetching(_, then)) | Some(LineEntry::Fetching(then))
-                    if fetch_start == then =>
+                    if fetch_start == *then =>
                 {
                     log::trace!(
                         "row {} fetch done -> Line seq={} vs self.seq={}",
@@ -481,15 +621,20 @@ impl RenderableInner {
                         e.kind(),
                         fetch_start
                     );
-                    self.lines.put(stable_row, e);
-                    return;
+                    return Ok(());
                 }
-                None => return,
+                None => return Ok(()),
             }
         } else {
             LineEntry::Line(line)
         };
-        self.lines.put(stable_row, entry);
+        if let Err(err) = self.lines.try_replace(stable_row, Some(entry)) {
+            if let Some(fetch_start) = fetch_start {
+                self.revert_fetch_row(stable_row, fetch_start)?;
+            }
+            return Err(err).with_context(|| format!("admitting line {stable_row}"));
+        }
+        Ok(())
     }
 
     fn schedule_fetch_lines(&mut self, to_fetch: RangeSet<StableRowIndex>, now: Instant) {
@@ -508,26 +653,65 @@ impl RenderableInner {
         let client = Arc::clone(&self.client);
         let remote_pane_id = self.remote_pane_id;
 
-        promise::spawn::spawn(async move {
+        let scheduled_fetch = to_fetch.clone();
+        let future = async move {
             let result = client
                 .client
                 .get_lines(GetLines {
                     pane_id: remote_pane_id,
-                    lines: to_fetch.clone().into(),
+                    lines: scheduled_fetch.clone().into(),
                 })
                 .await;
 
+            let mut decode_reservation = None;
             let result = match result {
                 Ok(result) => {
+                    let (_serial, result, reservation) = result.into_parts();
+                    decode_reservation = Some(reservation);
                     let lines =
                         hydrate_lines(Arc::clone(&client), remote_pane_id, result.lines).await;
                     Ok(lines)
                 }
                 Err(err) => Err(err),
             };
-            Self::apply_lines(local_pane_id, result, to_fetch, now)
-        })
-        .detach();
+            let result = Self::apply_lines(local_pane_id, result, scheduled_fetch, now);
+            drop(decode_reservation);
+            result
+        };
+
+        if let Err(err) =
+            Mux::get().try_spawn_client_pane_task(local_pane_id, ClientPaneTaskKind::Fetch, future)
+        {
+            log::error!("unable to schedule client line fetch: {err:#}");
+            if let Err(revert_err) = self.revert_fetch(&to_fetch, now) {
+                log::error!("unable to revert unscheduled line fetch: {revert_err:#}");
+            }
+        }
+    }
+
+    fn revert_fetch_row(&mut self, stable_row: StableRowIndex, now: Instant) -> anyhow::Result<()> {
+        let entry = match self.lines.peek(&stable_row).cloned() {
+            Some(LineEntry::Fetching(then)) if then == now => None,
+            Some(LineEntry::LineAndFetching(line, then)) if then == now => {
+                Some(LineEntry::Line(line))
+            }
+            _ => return Ok(()),
+        };
+        self.lines.try_replace(stable_row, entry)?;
+        Ok(())
+    }
+
+    fn revert_fetch(
+        &mut self,
+        to_fetch: &RangeSet<StableRowIndex>,
+        now: Instant,
+    ) -> anyhow::Result<()> {
+        for r in to_fetch.iter() {
+            for stable_row in r.clone() {
+                self.revert_fetch_row(stable_row, now)?;
+            }
+        }
+        Ok(())
     }
 
     fn apply_lines(
@@ -550,28 +734,14 @@ impl RenderableInner {
 
                     log::trace!("fetch complete for {:?} at {:?}", to_fetch, now);
                     for (stable_row, line) in lines.into_iter() {
-                        inner.put_line(stable_row, line, &config, Some(now));
+                        if let Err(err) = inner.put_line(stable_row, line, &config, Some(now)) {
+                            log::error!("unable to retain fetched line: {err:#}");
+                        }
                     }
                 }
                 Err(err) => {
                     log::error!("get_lines failed: {}", err);
-                    for r in to_fetch.iter() {
-                        for stable_row in r.clone() {
-                            let entry = match inner.lines.pop(&stable_row) {
-                                Some(LineEntry::Fetching(then)) if then == now => {
-                                    // leave it popped
-                                    continue;
-                                }
-                                Some(LineEntry::LineAndFetching(line, then)) if then == now => {
-                                    // revert to just a line
-                                    LineEntry::Line(line)
-                                }
-                                Some(entry) => entry,
-                                None => continue,
-                            };
-                            inner.lines.put(stable_row, entry);
-                        }
-                    }
+                    inner.revert_fetch(&to_fetch, now)?;
                 }
             }
         }
@@ -602,7 +772,7 @@ impl RenderableInner {
         let remote_pane_id = self.remote_pane_id;
         let local_pane_id = self.local_pane_id;
         let client = Arc::clone(&self.client);
-        promise::spawn::spawn(async move {
+        let future = async move {
             let alive = match client
                 .client
                 .get_pane_render_changes(GetPaneRenderChanges {
@@ -610,7 +780,7 @@ impl RenderableInner {
                 })
                 .await
             {
-                Ok(resp) => resp.is_alive,
+                Ok(resp) => resp.into_inner().is_alive,
                 // if we got a timeout on a reconnectable, don't
                 // consider the tab to be dead; that helps to
                 // avoid having a tab get shuffled around
@@ -630,14 +800,15 @@ impl RenderableInner {
                 inner.poll_in_progress.store(false, Ordering::SeqCst);
             }
             Ok::<(), anyhow::Error>(())
-        })
-        .detach();
+        };
+        if let Err(err) =
+            Mux::get().try_spawn_client_pane_task(local_pane_id, ClientPaneTaskKind::Poll, future)
+        {
+            self.poll_in_progress.store(false, Ordering::SeqCst);
+            log::error!("unable to schedule remote pane poll: {err:#}");
+        }
         Ok(())
     }
-}
-
-lazy_static::lazy_static! {
-    static ref IMAGE_LRU: Mutex<LruCache<[u8;32], Arc<ImageData>>> = Mutex::new(LruCache::new(NonZeroUsize::new(128).unwrap()));
 }
 
 pub(crate) async fn hydrate_lines(
@@ -654,8 +825,8 @@ pub(crate) async fn hydrate_lines(
     let mut requests = HashMap::new();
     let mut data_by_hash = HashMap::new();
     for im in &image_cells {
-        if let Some(data) = IMAGE_LRU.lock().unwrap().get(&im.data_hash) {
-            data_by_hash.insert(im.data_hash, Arc::clone(data));
+        if let Some(data) = client.cached_image(&im.data_hash) {
+            data_by_hash.insert(im.data_hash, data);
         } else {
             requests
                 .entry(&im.data_hash)
@@ -668,21 +839,28 @@ pub(crate) async fn hydrate_lines(
         }
     }
 
+    let mut decode_reservations = Vec::new();
     for (_, request) in requests {
         match client.client.get_image_cell(request).await {
-            Ok(GetImageCellResponse {
-                data: Some(data), ..
-            }) => {
-                IMAGE_LRU
-                    .lock()
-                    .unwrap()
-                    .put(data.hash(), Arc::clone(&data));
-                data_by_hash.insert(data.hash(), data);
+            Ok(response) => {
+                let (_serial, response, reservation) = response.into_parts();
+                decode_reservations.push(reservation);
+                match response {
+                    GetImageCellResponse {
+                        data: Some(data), ..
+                    } => match client.retain_image(data) {
+                        Ok(data) => {
+                            data_by_hash.insert(data.hash(), data);
+                        }
+                        Err(err) => {
+                            log::error!("unable to retain image data: {err:#}");
+                        }
+                    },
+                    GetImageCellResponse { data: None, .. } => {
+                        log::error!("no image data!");
+                    }
+                }
             }
-            Ok(GetImageCellResponse { data: None, .. }) => {
-                log::error!("no image data!");
-            }
-
             Err(err) => {
                 log::error!("failed to retrieve image {err:#}");
             }
@@ -716,7 +894,9 @@ pub(crate) async fn hydrate_lines(
         }
     }
 
-    line_by_idx.into_iter().collect()
+    let lines = line_by_idx.into_iter().collect();
+    drop(decode_reservations);
+    lines
 }
 
 impl RenderableState {
@@ -731,7 +911,7 @@ impl RenderableState {
         let now = Instant::now();
 
         for idx in lines.clone() {
-            let entry = match inner.lines.pop(&idx) {
+            let entry = match inner.lines.peek(&idx).cloned() {
                 Some(LineEntry::Line(line)) => {
                     result.push(line.clone());
                     if line.changed_since(inner.seqno) {
@@ -761,30 +941,33 @@ impl RenderableState {
                 }
             };
 
-            if inner.client.overlay_lag_indicator && idx == inner.dimensions.physical_top {
-                if inner.is_tardy() {
-                    let status = format!(
-                        "wezterm: {:.0?}⏳since last response",
-                        inner.last_recv_time.elapsed()
-                    );
-                    // Right align it in the tab
-                    let col = inner
-                        .dimensions
-                        .cols
-                        .saturating_sub(wezterm_term::unicode_column_width(&status, None));
+            if inner.client.overlay_lag_indicator
+                && idx == inner.dimensions.physical_top
+                && inner.is_tardy()
+            {
+                let status = format!(
+                    "wezterm: {:.0?}⏳since last response",
+                    inner.last_recv_time.elapsed()
+                );
+                // Right align it in the tab
+                let col = inner
+                    .dimensions
+                    .cols
+                    .saturating_sub(wezterm_term::unicode_column_width(&status, None));
 
-                    let mut attr = CellAttributes::default();
-                    attr.set_foreground(AnsiColor::White);
-                    attr.set_background(AnsiColor::Blue);
+                let mut attr = CellAttributes::default();
+                attr.set_foreground(AnsiColor::White);
+                attr.set_background(AnsiColor::Blue);
 
-                    result
-                        .last_mut()
-                        .unwrap()
-                        .overlay_text_with_attribute(col, &status, attr, SEQ_ZERO);
-                }
+                result
+                    .last_mut()
+                    .unwrap()
+                    .overlay_text_with_attribute(col, &status, attr, SEQ_ZERO);
             }
 
-            inner.lines.put(idx, entry);
+            if let Err(err) = inner.lines.try_replace(idx, Some(entry)) {
+                log::error!("unable to update admitted line cache row {idx}: {err:#}");
+            }
         }
 
         log::trace!(
@@ -856,5 +1039,106 @@ impl RenderableState {
 
     pub fn get_dimensions(&self) -> RenderableDimensions {
         self.inner.borrow().dimensions
+    }
+}
+
+#[cfg(test)]
+mod retained_state_tests {
+    use super::*;
+    use termwiz::image::{ImageData, ImageDataType};
+    use wezterm_runtime_admission::{RuntimeRole, MAX_CLIENT_RENDER_STATE_BYTES_TOTAL};
+
+    fn cache(capacity: usize) -> (Arc<RuntimeAdmission>, AdmittedLineCache) {
+        let admission = RuntimeAdmission::new(RuntimeRole::Client).unwrap();
+        let cache =
+            AdmittedLineCache::new(Arc::clone(&admission), NonZeroUsize::new(capacity).unwrap());
+        (admission, cache)
+    }
+
+    #[test]
+    fn admitted_line_cache_accounts_replacement_and_eviction() {
+        let (admission, mut cache) = cache(2);
+        let first = Line::with_width(4, SEQ_ZERO);
+        let second = Line::with_width(8, SEQ_ZERO);
+        let replacement = Line::with_width(16, SEQ_ZERO);
+        let third = Line::with_width(32, SEQ_ZERO);
+
+        cache.try_replace(1, Some(LineEntry::Line(first))).unwrap();
+        cache.try_replace(2, Some(LineEntry::Line(second))).unwrap();
+        cache
+            .try_replace(2, Some(LineEntry::Line(replacement)))
+            .unwrap();
+        cache.try_replace(3, Some(LineEntry::Line(third))).unwrap();
+
+        assert!(cache.peek(&1).is_none());
+        let expected = cache
+            .entries
+            .iter()
+            .map(|(_, entry)| entry.retained_size())
+            .sum::<usize>();
+        assert_eq!(cache.retained_bytes(), expected);
+        assert_eq!(
+            admission.retained_usage(RetainedClass::ClientRender),
+            expected
+        );
+    }
+
+    #[test]
+    fn admitted_line_cache_rejection_preserves_prior_entry() {
+        let (admission, mut cache) = cache(2);
+        let now = Instant::now();
+        cache
+            .try_replace(1, Some(LineEntry::Fetching(now)))
+            .unwrap();
+        let _blocker = admission
+            .try_retained(
+                RetainedClass::ClientRender,
+                MAX_CLIENT_RENDER_STATE_BYTES_TOTAL - cache.retained_bytes(),
+            )
+            .unwrap();
+
+        assert!(cache
+            .try_replace(1, Some(LineEntry::Line(Line::with_width(8, SEQ_ZERO))))
+            .is_err());
+        assert!(matches!(cache.peek(&1), Some(LineEntry::Fetching(then)) if *then == now));
+    }
+
+    #[test]
+    fn make_all_stale_preserves_capacity_and_charge() {
+        let (_admission, mut cache) = cache(2);
+        cache
+            .try_replace(1, Some(LineEntry::Line(Line::with_width(4, SEQ_ZERO))))
+            .unwrap();
+        let retained = cache.retained_bytes();
+
+        cache.make_all_stale();
+
+        assert_eq!(cache.entries.cap().get(), 2);
+        assert_eq!(cache.retained_bytes(), retained);
+        assert!(matches!(cache.peek(&1), Some(LineEntry::Stale(_))));
+    }
+
+    #[test]
+    fn image_lease_follows_final_arc_alias() {
+        let admission = RuntimeAdmission::new(RuntimeRole::Client).unwrap();
+        let image = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+            1,
+            1,
+            vec![0; 4],
+        )));
+        let retained = image.retained_size();
+        let lease = admission
+            .try_retained(RetainedClass::ClientImage, retained)
+            .unwrap();
+        image.try_set_retention_guard(lease).unwrap();
+        let alias = Arc::clone(&image);
+
+        drop(image);
+        assert_eq!(
+            admission.retained_usage(RetainedClass::ClientImage),
+            retained
+        );
+        drop(alias);
+        assert_eq!(admission.retained_usage(RetainedClass::ClientImage), 0);
     }
 }

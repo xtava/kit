@@ -3,11 +3,12 @@
 //! reduced size of the encoded data.
 pub mod de;
 pub mod error;
+#[allow(bare_trait_objects)]
 pub mod ser;
 #[cfg(test)]
 mod test;
 
-pub use de::Deserializer;
+pub use de::{DecodeLimits, Deserializer};
 pub use ser::Serializer;
 
 /// A convenience function for serializing a value as a byte vector
@@ -23,7 +24,8 @@ pub fn serialize<T: serde::Serialize>(t: &T) -> Result<Vec<u8>, error::Error> {
 /// See also `de::Deserializer`.
 pub fn deserialize<T: serde::de::DeserializeOwned, R: std::io::Read>(
     mut r: R,
+    limits: DecodeLimits,
 ) -> Result<T, error::Error> {
-    let mut d = Deserializer::new(&mut r);
+    let mut d = Deserializer::new(&mut r, limits);
     serde::Deserialize::deserialize(&mut d)
 }

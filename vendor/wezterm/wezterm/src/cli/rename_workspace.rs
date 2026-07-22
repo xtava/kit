@@ -24,7 +24,7 @@ pub struct RenameWorkspace {
 
 impl RenameWorkspace {
     pub async fn run(self, client: Client) -> anyhow::Result<()> {
-        let panes = client.list_panes().await?;
+        let panes = client.list_panes().await?.into_inner();
 
         let mut pane_id_to_workspace = HashMap::new();
 

@@ -1,10 +1,8 @@
 use crate::cli::resolve_relative_cwd;
 use clap::{Parser, ValueHint};
-use config::keyassignment::SpawnTabDomain;
 use config::ConfigHandle;
 use mux::pane::PaneId;
 use mux::window::WindowId;
-use portable_pty::cmdbuilder::CommandBuilder;
 use std::ffi::OsString;
 use wezterm_client::client::Client;
 
@@ -60,7 +58,7 @@ impl SpawnCommand {
                 None => {
                     let pane_id = client.resolve_pane_id(self.pane_id).await?;
 
-                    let panes = client.list_panes().await?;
+                    let panes = client.list_panes().await?.into_inner();
                     let mut window_id = None;
                     'outer: for tabroot in panes.tabs {
                         let mut cursor = tabroot.into_tree().cursor();
@@ -83,38 +81,41 @@ impl SpawnCommand {
             }
         };
 
-        let workspace = self
-            .workspace
-            .as_deref()
-            .unwrap_or(
-                config
-                    .default_workspace
+        let placement = match window_id {
+            Some(window_id) => codec::TabSpawnPlacement::ExistingWindow { window_id },
+            None => codec::TabSpawnPlacement::NewWindow {
+                size: config.initial_size(0, None),
+                workspace: self
+                    .workspace
                     .as_deref()
-                    .unwrap_or(mux::DEFAULT_WORKSPACE),
-            )
-            .to_string();
-
-        let size = config.initial_size(0, None);
+                    .unwrap_or(
+                        config
+                            .default_workspace
+                            .as_deref()
+                            .unwrap_or(mux::DEFAULT_WORKSPACE),
+                    )
+                    .to_string(),
+            },
+        };
+        let command = if self.prog.is_empty() {
+            codec::EnvironmentFreeCommand::DefaultLoginShell
+        } else {
+            codec::EnvironmentFreeCommand::try_from_argv(self.prog)?
+        };
 
         let spawned = client
             .spawn_v2(codec::SpawnV2 {
                 domain: self
                     .domain_name
-                    .map_or(SpawnTabDomain::DefaultDomain, |name| {
-                        SpawnTabDomain::DomainName(name)
+                    .map_or(codec::TabSpawnDomain::DefaultDomain, |name| {
+                        codec::TabSpawnDomain::DomainName(name)
                     }),
-                window_id,
-                command: if self.prog.is_empty() {
-                    None
-                } else {
-                    let builder = CommandBuilder::from_argv(self.prog);
-                    Some(builder)
-                },
+                placement,
+                command,
                 command_dir: resolve_relative_cwd(self.cwd)?,
-                size,
-                workspace,
             })
-            .await?;
+            .await?
+            .into_inner();
 
         log::debug!("{:?}", spawned);
         println!("{}", spawned.pane_id);

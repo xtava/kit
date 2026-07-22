@@ -1,15 +1,17 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use kit::framework::Registry;
 use kit::tools::{
     build, deploy, diff, domain, monitor, ops, process, record, render, secrets, settings, stats,
-    swarm, tail, update,
+    swarm, update,
 };
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use kit::tools::{console, tail};
 
 #[cfg(unix)]
 use kit::tools::{cdp, scout};
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     // Behave like a normal Unix filter under a closed pipe (`… | head`): exit on SIGPIPE instead of
     // panicking on EPIPE. Rust ignores SIGPIPE by default.
     #[cfg(unix)]
@@ -17,6 +19,19 @@ async fn main() -> Result<()> {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let Some(result) = console::run_hidden_entry_if_requested() {
+        return result;
+    }
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("starting the Kit application runtime")?
+        .block_on(run())
+}
+
+async fn run() -> Result<()> {
     if let Some(code) = kit::framework::process::run_detached_io_host_entry().await {
         std::process::exit(code);
     }
@@ -38,8 +53,9 @@ async fn main() -> Result<()> {
         .register(secrets::tool())
         .register(stats::tool())
         .register(swarm::tool())
-        .register(tail::tool())
         .register(update::tool());
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let registry = registry.register(tail::tool()).register(console::tool());
     #[cfg(unix)]
     let registry = registry.register(scout::tool()).register(cdp::tool());
     registry.register_settings(settings::tool).dispatch().await

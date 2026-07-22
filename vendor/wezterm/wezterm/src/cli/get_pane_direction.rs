@@ -25,7 +25,8 @@ impl GetPaneDirection {
                 pane_id,
                 direction: self.direction,
             })
-            .await?;
+            .await?
+            .into_inner();
         if let Some(pane_id) = response.pane_id {
             println!("{pane_id}");
         }

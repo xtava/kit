@@ -11,7 +11,7 @@ impl BlobManager {
         let lease_id = LeaseId::new();
         let content_id = ContentId::for_bytes(data);
 
-        storage.store(content_id, data, lease_id)?;
+        storage.storage.store(content_id, data, lease_id)?;
 
         Ok(BlobLease::make_lease(content_id, lease_id))
     }
@@ -21,7 +21,7 @@ impl BlobManager {
         let storage = get_storage()?;
 
         let lease_id = LeaseId::new();
-        storage.lease_by_content(content_id, lease_id)?;
+        storage.storage.lease_by_content(content_id, lease_id)?;
 
         Ok(BlobLease::make_lease(content_id, lease_id))
     }

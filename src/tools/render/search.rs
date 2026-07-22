@@ -145,7 +145,7 @@ fn discover_entries(root: &Path) -> Vec<FileEntry> {
         entries.push(FileEntry::new(root, path, true));
     }
 
-    entries.sort_by(|left, right| left.display.to_lowercase().cmp(&right.display.to_lowercase()));
+    entries.sort_by_key(|entry| entry.display.to_lowercase());
     entries
 }
 

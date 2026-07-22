@@ -24,7 +24,7 @@ pub struct SetWindowTitle {
 
 impl SetWindowTitle {
     pub async fn run(self, client: Client) -> anyhow::Result<()> {
-        let panes = client.list_panes().await?;
+        let panes = client.list_panes().await?.into_inner();
 
         let mut pane_id_to_window_id = HashMap::new();
 

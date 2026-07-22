@@ -347,7 +347,7 @@ fn parse_unmerged(record: &[u8]) -> Result<StatusEntry> {
 fn parse_untracked(record: &[u8]) -> Result<StatusEntry> {
     let fields = split_fields(record, 2, "untracked")?;
     Ok(StatusEntry {
-        status: [b'?', b'?'],
+        status: *b"??",
         submodule: "N...".to_owned(),
         head_oid: None,
         index_oid: None,
@@ -641,7 +641,7 @@ mod tests {
     #[test]
     fn represents_submodule_status_without_reading_nested_content() {
         let entry = StatusEntry {
-            status: [b'.', b'M'],
+            status: *b".M",
             submodule: "S.MU".to_owned(),
             head_oid: None,
             index_oid: None,

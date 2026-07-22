@@ -30,6 +30,7 @@ url.workspace = true
 wezterm-client.workspace = true
 wezterm-term = { workspace=true, features=["use_serde"] }
 wezterm-uds.workspace = true
+wezterm-runtime-admission.workspace = true
 
 [target."cfg(windows)".dependencies]
 winapi = { workspace=true, features = [ "winuser" ]}

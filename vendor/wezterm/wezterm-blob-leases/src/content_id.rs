@@ -18,6 +18,10 @@ impl ContentId {
     pub fn as_hash_bytes(&self) -> [u8; 32] {
         self.0
     }
+
+    pub(crate) fn from_hash_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
 }
 
 impl std::fmt::Display for ContentId {

@@ -266,10 +266,8 @@ fn render_system_band(frame: &mut Frame<'_>, app: &StatsApp, area: Rect, regions
     core_spans.push(Span::styled(busy_summary, Style::default().fg(summary_color)));
     let core_line = Rect::new(inner.x, inner.y + 1, inner.width, 1);
     frame.render_widget(Paragraph::new(Line::from(core_spans)), core_line);
-    let mut x = core_line.x + CORE_MAP_LABEL.len() as u16;
-    for cpu in cells {
+    for (x, cpu) in (core_line.x + CORE_MAP_LABEL.len() as u16..).zip(cells) {
         regions.cores.push((Rect::new(x, core_line.y, 1, 1), cpu.logical_index));
-        x += 1;
     }
 
     let source_limit = if inner.width >= 120 {

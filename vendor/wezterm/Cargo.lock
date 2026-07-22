@@ -868,13 +868,13 @@ dependencies = [
  "log",
  "metrics",
  "mux",
- "portable-pty",
  "rangeset",
  "serde",
  "smol",
  "termwiz",
  "thiserror 1.0.69",
  "varbincode",
+ "wezterm-runtime-admission",
  "wezterm-term",
  "zstd",
 ]
@@ -3558,6 +3558,7 @@ dependencies = [
  "thiserror 1.0.69",
  "url",
  "wezterm-dynamic",
+ "wezterm-runtime-admission",
  "wezterm-ssh",
  "wezterm-term",
  "winapi",
@@ -4539,6 +4540,7 @@ dependencies = [
  "flume",
  "lazy_static",
  "thiserror 1.0.69",
+ "wezterm-runtime-admission",
 ]
 
 [[package]]
@@ -5876,6 +5878,7 @@ dependencies = [
  "wezterm-dynamic",
  "wezterm-escape-parser",
  "wezterm-input-types",
+ "wezterm-runtime-admission",
  "wezterm-surface",
  "winapi",
 ]
@@ -6461,8 +6464,6 @@ dependencies = [
 [[package]]
 name = "varbincode"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b712fa900b441e2d5226a094ca37ca70c0d26d26b79822a5cf34a853a9e26f9f"
 dependencies = [
  "byteorder",
  "leb128",
@@ -6844,6 +6845,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "uuid",
+ "wezterm-runtime-admission",
 ]
 
 [[package]]
@@ -6862,6 +6864,7 @@ dependencies = [
  "wezterm-color-types",
  "wezterm-dynamic",
  "wezterm-escape-parser",
+ "wezterm-runtime-admission",
 ]
 
 [[package]]
@@ -6905,6 +6908,7 @@ dependencies = [
  "umask",
  "url",
  "wezterm-dynamic",
+ "wezterm-runtime-admission",
  "wezterm-ssh",
  "wezterm-term",
  "wezterm-uds",
@@ -7097,6 +7101,7 @@ dependencies = [
  "wezterm-gui-subcommands",
  "wezterm-mux-server-impl",
  "wezterm-open-url",
+ "wezterm-runtime-admission",
  "wezterm-ssh",
  "wezterm-term",
  "wezterm-toast-notification",
@@ -7133,6 +7138,7 @@ dependencies = [
  "async_ossl",
  "cc",
  "clap",
+ "codec",
  "config",
  "embed-resource",
  "env-bootstrap",
@@ -7175,6 +7181,7 @@ dependencies = [
  "termwiz",
  "url",
  "wezterm-client",
+ "wezterm-runtime-admission",
  "wezterm-term",
  "wezterm-uds",
  "winapi",
@@ -7185,6 +7192,13 @@ name = "wezterm-open-url"
 version = "0.1.0"
 dependencies = [
  "winapi",
+]
+
+[[package]]
+name = "wezterm-runtime-admission"
+version = "0.1.0"
+dependencies = [
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -7276,6 +7290,7 @@ dependencies = [
  "wezterm-cell",
  "wezterm-dynamic",
  "wezterm-escape-parser",
+ "wezterm-runtime-admission",
  "wezterm-surface",
 ]
 

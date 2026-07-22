@@ -80,6 +80,52 @@ impl Parser {
         }
     }
 
+    /// Returns a non-allocating upper bound for heap storage retained by partial parser state.
+    pub fn retained_size_upper_bound(&self) -> usize {
+        let state = self.state.borrow();
+        let mut bytes = self.state_machine.retained_size_upper_bound();
+
+        if let Some(sixel) = &state.sixel {
+            bytes = bytes.saturating_add(
+                sixel
+                    .sixel
+                    .data
+                    .capacity()
+                    .saturating_mul(core::mem::size_of::<crate::SixelData>()),
+            );
+        }
+        if let Some(control) = &state.dcs {
+            bytes = bytes
+                .saturating_add(
+                    control
+                        .params
+                        .capacity()
+                        .saturating_mul(core::mem::size_of::<i64>()),
+                )
+                .saturating_add(control.intermediates.capacity())
+                .saturating_add(control.data.capacity());
+        }
+        if let Some(get_tcap) = &state.get_tcap {
+            bytes = get_tcap.names.iter().fold(
+                bytes
+                    .saturating_add(get_tcap.current.capacity())
+                    .saturating_add(
+                        get_tcap
+                            .names
+                            .capacity()
+                            .saturating_mul(core::mem::size_of::<String>()),
+                    ),
+                |total, name| total.saturating_add(name.capacity()),
+            );
+        }
+        #[cfg(feature = "tmux_cc")]
+        if let Some(tmux) = &state.tmux_state {
+            bytes = bytes.saturating_add(tmux.borrow().retained_size_upper_bound());
+        }
+
+        bytes
+    }
+
     /// advance with tmux parser, bypass VTParse
     #[cfg(feature = "tmux_cc")]
     fn advance_tmux_bytes(&mut self, bytes: &[u8]) -> crate::Result<Vec<Event>> {

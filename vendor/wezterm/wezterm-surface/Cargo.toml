@@ -31,9 +31,12 @@ wezterm-input-types.workspace = true
 default = []
 std = ["fancy-regex/std", "wezterm-cell/std", "wezterm-dynamic/std", "wezterm-escape-parser/std", "fixedbitset/std", "fancy-regex/perf", "fancy-regex/unicode"]
 appdata = ["std"]
-use_serde = ["serde"] #, "wezterm-color-types/use_serde", "wezterm-blob-leases/serde", "bitflags/serde", "wezterm-input-types/serde", "wezterm-escape-parser/use_serde", "wezterm-cell/use_serde"]
+use_serde = [
+    "serde",
+    "wezterm-cell/use_serde",
+    "wezterm-escape-parser/use_serde",
+]
 use_image = ["wezterm-cell/use_image"] # "image", "dep:image", "wezterm-escape-parser/use_image", "wezterm-escape-parser/kitty-shm", "wezterm-cell/use_image"]
 
 [dev-dependencies]
 k9.workspace = true
-

@@ -32,7 +32,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 systemd-zbus = { version = "5.3.2", default-features = false }
 zbus = { version = "5.7", default-features = false, features = ["tokio"] }
 
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "fs", "time", "sync", "process", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "fs", "time", "sync", "process", "signal"] }
 
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 crossterm = "0.29"
@@ -63,6 +63,17 @@ futures-util = "0.3"
 libc = "0.2"
 rustix = { version = "1.1", features = ["param", "process"] }
 
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+wezterm-config = { package = "config", path = "vendor/wezterm/config" }
+wezterm-mux = { package = "mux", path = "vendor/wezterm/mux" }
+wezterm-promise = { package = "promise", path = "vendor/wezterm/promise" }
+wezterm-client = { path = "vendor/wezterm/wezterm-client" }
+wezterm-codec = { package = "codec", path = "vendor/wezterm/codec" }
+wezterm-mux-server-impl = { path = "vendor/wezterm/wezterm-mux-server-impl" }
+wezterm-blob-leases = { path = "vendor/wezterm/wezterm-blob-leases", features = ["simple_tempdir"] }
+wezterm-term = { path = "vendor/wezterm/term", features = ["use_serde"] }
+termwiz = { path = "vendor/wezterm/termwiz", features = ["use_serde"] }
+
 [profile.dev]
 debug = "line-tables-only"
 split-debuginfo = "unpacked"
@@ -70,3 +81,7 @@ split-debuginfo = "unpacked"
 [profile.release]
 lto = true
 strip = true
+
+[dev-dependencies]
+portable-pty = { path = "vendor/wezterm/pty" }
+wezterm-runtime-admission = { path = "vendor/wezterm/wezterm-runtime-admission" }

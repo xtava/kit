@@ -4,6 +4,7 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
+    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -25,11 +26,13 @@ use unicode_width::UnicodeWidthStr as _;
 
 use super::{
     build_presentation_channel, build_runtime_availability, evidence, execute_build,
-    load_interactive_manifest, BuildControl, BuildFailureEvidence, BuildInvocation,
-    BuildRuntimeAvailability, BuildTerminal, BuildTranscriptTails, BuildUpdate,
+    load_interactive_manifest, manifest::WorkflowAction, BuildControl, BuildFailureEvidence,
+    BuildInvocation, BuildRuntimeAvailability, BuildTerminal, BuildTranscriptTails, BuildUpdate,
 };
 use crate::{
-    framework::Context,
+    framework::{
+        process::ProcessSupervisor, start_external, Context, ExternalCommand, ExternalTarget,
+    },
     tui::theme::NORD,
     tui::{EventReader, Session, SessionOptions},
 };
@@ -107,7 +110,9 @@ async fn run_active(
     input: &mut EventReader,
     app: &mut App,
 ) -> Result<ActiveExit> {
-    app.begin_run();
+    let actions = invocation.workflow.actions().to_vec();
+    let repository_root = invocation.root.as_path().to_path_buf();
+    app.begin_run(actions);
     let (updates, mut presentation) = build_presentation_channel();
     let (controls, control_receiver) = mpsc::channel(1);
     let execution = execute_build(cx, invocation, Some(updates), control_receiver, true);
@@ -119,6 +124,8 @@ async fn run_active(
     let mut input_open = true;
     let mut quit_after_terminal = false;
     let mut engine_fallback = None;
+    let (action_sender, mut action_receiver) = mpsc::channel(1);
+    let mut action_handle = None;
 
     loop {
         session.draw(|frame| render(frame, app))?;
@@ -173,6 +180,17 @@ async fn run_active(
                     Err(_) => transcript_stream_open = false,
                 }
             }
+            result = action_receiver.recv(), if action_handle.is_some() => {
+                if let Some(handle) = action_handle.take() {
+                    let _ = handle.await;
+                }
+                if let Some((label, result)) = result {
+                    app.notice = match result {
+                        Ok(()) => format!("Completed {label}"),
+                        Err(error) => format!("Could not run {label}: {error}"),
+                    };
+                }
+            }
             event = input.recv(), if input_open => {
                 let Some(event) = event else {
                     input_open = false;
@@ -200,7 +218,22 @@ async fn run_active(
                         return Ok(ActiveExit::ChooseWorkflow);
                     }
                     ActiveAction::Evidence if terminal_ready => app.open_evidence(),
-                    ActiveAction::ChooseWorkflow | ActiveAction::Evidence => {}
+                    ActiveAction::RunConfigured(index) if terminal_ready => {
+                        if action_handle.is_some() {
+                            app.notice = "Another workflow action is still running".to_owned();
+                        } else if let Some(action) = app.configured_action(index).cloned() {
+                            app.notice = format!("Running {}…", action.label.as_str());
+                            action_handle = Some(spawn_configured_action(
+                                cx.processes.clone(),
+                                repository_root.clone(),
+                                action,
+                                action_sender.clone(),
+                            ));
+                        }
+                    }
+                    ActiveAction::ChooseWorkflow
+                    | ActiveAction::Evidence
+                    | ActiveAction::RunConfigured(_) => {}
                 }
             }
         }
@@ -247,6 +280,30 @@ fn request_cancel(controls: &mpsc::Sender<BuildControl>, app: &mut App) {
     }
 }
 
+fn spawn_configured_action(
+    processes: ProcessSupervisor,
+    repository_root: PathBuf,
+    action: WorkflowAction,
+    sender: mpsc::Sender<(String, Result<(), String>)>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let label = action.label.as_str().to_owned();
+        let result = match start_external(
+            &processes,
+            ExternalTarget::Command(ExternalCommand {
+                program: action.command.program,
+                arguments: action.command.arguments,
+                working_directory: repository_root,
+            }),
+        ) {
+            Ok(receipt) => receipt.completion().await,
+            Err(error) => Err(error),
+        }
+        .map_err(|error| format!("{error:#}"));
+        let _ = sender.send((label, result)).await;
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ActiveExit {
     Quit,
@@ -268,6 +325,7 @@ enum ActiveAction {
     Quit,
     ChooseWorkflow,
     Evidence,
+    RunConfigured(usize),
 }
 
 #[derive(Clone, Debug)]
@@ -423,6 +481,7 @@ struct App {
     terminal_scroll: ScrollState,
     notice: String,
     terminal: Option<BuildTerminal>,
+    configured_actions: Vec<WorkflowAction>,
     exit_failure: Option<String>,
     evidence: Vec<evidence::TuiEvidenceRecord>,
     selected_evidence: usize,
@@ -468,6 +527,7 @@ impl App {
             terminal_scroll: ScrollState::at_top(),
             notice: "Select a workflow. Build eligibility is evaluated on this host.".to_owned(),
             terminal: None,
+            configured_actions: Vec::new(),
             exit_failure: None,
             evidence: Vec::new(),
             selected_evidence: 0,
@@ -482,7 +542,7 @@ impl App {
         self.terminal = None;
     }
 
-    fn begin_run(&mut self) {
+    fn begin_run(&mut self, configured_actions: Vec<WorkflowAction>) {
         self.view = View::Running;
         self.run_started = Some(Instant::now());
         self.run_id.clear();
@@ -499,6 +559,7 @@ impl App {
         self.terminal_scroll = ScrollState::at_top();
         self.notice = "preparing private workspace and supervisor".to_owned();
         self.terminal = None;
+        self.configured_actions = configured_actions;
     }
 
     fn tick(&mut self) {}
@@ -581,6 +642,10 @@ impl App {
             KeyCode::Char('e') if terminal_ready => ActiveAction::Evidence,
             KeyCode::Char('r') if terminal_ready => ActiveAction::ChooseWorkflow,
             KeyCode::Esc if terminal_ready => ActiveAction::ChooseWorkflow,
+            KeyCode::Char(key) if terminal_ready => self
+                .configured_action_index(key)
+                .map(ActiveAction::RunConfigured)
+                .unwrap_or(ActiveAction::None),
             _ => ActiveAction::None,
         }
     }
@@ -830,6 +895,34 @@ impl App {
         let run_id = run_id.clone();
         self.evidence_mode = EvidenceMode::List;
         Some(EvidenceAction::Forget(run_id))
+    }
+
+    fn configured_action(&self, index: usize) -> Option<&WorkflowAction> {
+        self.terminal.as_ref()?;
+        self.configured_actions.get(index)
+    }
+
+    fn configured_action_index(&self, key: char) -> Option<usize> {
+        self.terminal.as_ref()?;
+        self.configured_actions.iter().position(|action| action.key == key)
+    }
+
+    fn terminal_controls(&self) -> String {
+        let mut controls = vec![
+            "Tab/h/l focus".to_owned(),
+            "j/k or PgUp/PgDn scroll".to_owned(),
+            "r workflows".to_owned(),
+            "e evidence".to_owned(),
+        ];
+        if self.terminal.is_some() {
+            controls.extend(
+                self.configured_actions
+                    .iter()
+                    .map(|action| format!("{} {}", action.key, action.label.as_str())),
+            );
+        }
+        controls.push("q quit".to_owned());
+        controls.join("  ")
     }
 
     fn elapsed(&self) -> String {
@@ -1165,9 +1258,9 @@ fn render_run(frame: &mut Frame<'_>, app: &mut App) {
     );
 
     let help = if app.view == View::Running {
-        "Tab/h/l focus  j/k or PgUp/PgDn scroll  c cancel  q cancel and quit"
+        "Tab/h/l focus  j/k or PgUp/PgDn scroll  c cancel  q cancel and quit".to_owned()
     } else {
-        "Tab/h/l focus  j/k or PgUp/PgDn scroll  r workflows  e evidence  q quit"
+        app.terminal_controls()
     };
     frame.render_widget(Paragraph::new(help).block(block("Controls")), controls_area);
 }

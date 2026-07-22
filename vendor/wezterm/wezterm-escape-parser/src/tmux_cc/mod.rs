@@ -129,6 +129,56 @@ pub enum Event {
     },
 }
 
+impl Event {
+    pub(crate) fn retained_size_upper_bound(&self) -> usize {
+        match self {
+            Self::Guarded(guarded) => guarded.output.capacity(),
+            Self::ClientDetached { client_name } => client_name.capacity(),
+            Self::ClientSessionChanged {
+                client_name,
+                session_name,
+                ..
+            } => client_name
+                .capacity()
+                .saturating_add(session_name.capacity()),
+            Self::ConfigError { error } => error.capacity(),
+            Self::ExtendedOutput { text, .. } | Self::Output { text, .. } => text.capacity(),
+            Self::Exit { reason } => reason.as_ref().map_or(0, String::capacity),
+            Self::LayoutChange {
+                layout,
+                visible_layout,
+                raw_flags,
+                ..
+            } => layout
+                .capacity()
+                .saturating_add(visible_layout.as_ref().map_or(0, String::capacity))
+                .saturating_add(raw_flags.as_ref().map_or(0, String::capacity)),
+            Self::Message { message } => message.capacity(),
+            Self::PasteBufferChanged { buffer } | Self::PasteBufferDeleted { buffer } => {
+                buffer.capacity()
+            }
+            Self::SessionChanged { name, .. }
+            | Self::SessionRenamed { name }
+            | Self::WindowRenamed { name, .. } => name.capacity(),
+            Self::Begin { .. }
+            | Self::End { .. }
+            | Self::Error { .. }
+            | Self::Continue { .. }
+            | Self::PaneModeChanged { .. }
+            | Self::Pause { .. }
+            | Self::SessionsChanged
+            | Self::SessionWindowChanged { .. }
+            | Self::SubscriptionChanged
+            | Self::UnlinkedWindowAdd { .. }
+            | Self::UnlinkedWindowClose { .. }
+            | Self::UnlinkedWindowRenamed { .. }
+            | Self::WindowAdd { .. }
+            | Self::WindowClose { .. }
+            | Self::WindowPaneChanged { .. } => 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct PaneLayout {
     pub pane_id: TmuxPaneId,
@@ -847,6 +897,14 @@ impl Parser {
             buffer: vec![],
             begun: None,
         }
+    }
+
+    pub(crate) fn retained_size_upper_bound(&self) -> usize {
+        self.buffer.capacity().saturating_add(
+            self.begun
+                .as_ref()
+                .map_or(0, |guarded| guarded.output.capacity()),
+        )
     }
 
     pub fn advance_byte(&mut self, c: u8) -> Result<Option<Event>> {

@@ -40,7 +40,8 @@ impl GetText {
 
         let info = client
             .get_dimensions(codec::GetPaneRenderableDimensions { pane_id })
-            .await?;
+            .await?
+            .into_inner();
 
         let start_line = match self.start_line {
             None => info.dimensions.physical_top,
@@ -73,7 +74,8 @@ impl GetText {
                 pane_id: pane_id.into(),
                 lines: vec![start_line..end_line + 1],
             })
-            .await?;
+            .await?
+            .into_inner();
 
         let lines = lines
             .lines

@@ -1,5 +1,5 @@
 use clap::Parser;
-use codec::{Pdu, SetClientId};
+use codec::{DecodeContext, Pdu, PduTag, SetClientId};
 use config::ConfigHandle;
 use mux::activity::Activity;
 use mux::client::ClientId;
@@ -24,8 +24,9 @@ impl ProxyCommand {
             anyhow::bail!("expected client to have connected to a unix domain");
         };
 
-        let mux = Arc::new(mux::Mux::new(None));
-        Mux::set_mux(&mux);
+        let admission = mux::RuntimeAdmission::new(mux::RuntimeRole::Client)?;
+        let mux = Arc::new(mux::Mux::new(None, admission));
+        Mux::set_mux(&mux)?;
 
         let target = unix_dom.target();
         let mut stream = unix_connect_with_retry(&target, false, None)?;
@@ -35,8 +36,12 @@ impl ProxyCommand {
             is_proxy: true,
         });
         let serial = 1;
-        pdu.encode(&mut stream, serial)?;
-        Pdu::decode(&mut stream)?;
+        pdu.encode(&mut stream, serial, mux.admission())?;
+        Pdu::decode(
+            &mut stream,
+            DecodeContext::server_to_client_response(Some(PduTag::UnitResponse)),
+            mux.admission(),
+        )?;
 
         // Spawn a thread to pull data from the socket and write
         // it to stdout

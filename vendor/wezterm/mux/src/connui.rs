@@ -1,5 +1,5 @@
 use crate::termwiztermtab;
-use anyhow::{anyhow, bail, Context as _};
+use anyhow::{bail, Context as _};
 use crossbeam::channel::{unbounded, Receiver, Sender};
 use finl_unicode::grapheme_clusters::Graphemes;
 use promise::spawn::block_on;
@@ -202,39 +202,6 @@ impl ConnectionUIImpl {
     }
 }
 
-struct HeadlessImpl {
-    rx: Receiver<UIRequest>,
-}
-
-impl HeadlessImpl {
-    fn run(&mut self) -> anyhow::Result<()> {
-        loop {
-            match self.rx.recv_timeout(Duration::from_millis(200)) {
-                Ok(UIRequest::Close) => break,
-                Ok(UIRequest::Output(changes)) => {
-                    log::trace!("Output: {:?}", changes);
-                }
-                Ok(UIRequest::Input { mut respond, .. }) => {
-                    respond.result(Err(anyhow!("Input requested from headless context")));
-                }
-                Ok(UIRequest::Sleep {
-                    mut respond,
-                    reason,
-                    duration,
-                }) => {
-                    log::error!("{} (sleeping for {:?})", reason, duration);
-                    std::thread::sleep(duration);
-                    respond.result(Ok(()));
-                }
-                Err(err) if err.is_timeout() => {}
-                Err(err) => bail!("recv_timeout: {}", err),
-            }
-        }
-
-        Ok(())
-    }
-}
-
 #[derive(Default, Clone, Copy, Debug)]
 pub struct ConnectionUIParams {
     pub size: TerminalSize,
@@ -245,6 +212,25 @@ pub struct ConnectionUIParams {
 #[derive(Clone)]
 pub struct ConnectionUI {
     tx: Sender<UIRequest>,
+}
+
+/// The minimal connection presentation capability used by the SSH and client
+/// connection shells.
+///
+/// Interactive callers use [`ConnectionUI`]. Other hosts provide their own
+/// implementation without constructing a terminal surface.
+pub trait ConnectionUi: Send + Sync {
+    fn output(&self, changes: Vec<Change>);
+
+    fn input(&self, prompt: &str) -> anyhow::Result<String>;
+
+    fn password(&self, prompt: &str) -> anyhow::Result<String>;
+
+    fn report_error(&self, error: &anyhow::Error);
+
+    fn output_str(&self, text: &str) {
+        self.output(vec![Change::Text(text.replace('\n', "\r\n"))]);
+    }
 }
 
 impl ConnectionUI {
@@ -286,24 +272,13 @@ impl ConnectionUI {
         })
     }
 
-    pub fn new_headless() -> Self {
-        let (tx, rx) = unbounded();
-        std::thread::spawn(move || {
-            let mut ui = HeadlessImpl { rx };
-            ui.run()
-        });
-        Self { tx }
-    }
-
     pub fn run_and_log_error<T, F>(&self, f: F) -> anyhow::Result<T>
     where
         F: FnOnce() -> anyhow::Result<T>,
     {
         match f() {
             Err(e) => {
-                let what = format!("\r\nFailed: {:?}\r\n", e);
-                log::error!("{}", what);
-                self.output_str(&what);
+                self.report_error(&e);
                 Err(e)
             }
             result => result,
@@ -316,8 +291,7 @@ impl ConnectionUI {
     {
         match f.await {
             Err(e) => {
-                let what = format!("\r\nFailed: {:?}\r\n", e);
-                self.output_str(&what);
+                self.report_error(&e);
                 Err(e)
             }
             result => result,
@@ -419,6 +393,26 @@ impl ConnectionUI {
         }
         std::thread::sleep(Duration::from_millis(50));
         self.tx.send(UIRequest::Output(vec![])).is_ok()
+    }
+}
+
+impl ConnectionUi for ConnectionUI {
+    fn output(&self, changes: Vec<Change>) {
+        ConnectionUI::output(self, changes);
+    }
+
+    fn input(&self, prompt: &str) -> anyhow::Result<String> {
+        ConnectionUI::input(self, prompt)
+    }
+
+    fn password(&self, prompt: &str) -> anyhow::Result<String> {
+        ConnectionUI::password(self, prompt)
+    }
+
+    fn report_error(&self, error: &anyhow::Error) {
+        let message = format!("\r\nFailed: {error:?}\r\n");
+        log::error!("{message}");
+        ConnectionUI::output_str(self, &message);
     }
 }
 

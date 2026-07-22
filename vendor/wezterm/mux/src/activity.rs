@@ -27,10 +27,21 @@ impl Drop for Activity {
     fn drop(&mut self) {
         COUNT.fetch_sub(1, Ordering::SeqCst);
 
-        promise::spawn::spawn_into_main_thread(async move {
-            let mux = Mux::get();
+        let Some(mux) = Mux::try_get() else {
+            return;
+        };
+        if mux.is_main_thread() {
             mux.prune_dead_windows();
-        })
-        .detach();
+            return;
+        }
+        let weak_mux = std::sync::Arc::downgrade(&mux);
+        if let Err(err) = mux.try_spawn_runtime_task("schedule activity cleanup", async move {
+            if let Some(mux) = weak_mux.upgrade() {
+                mux.prune_dead_windows();
+            }
+            Ok(())
+        }) {
+            log::error!("failed to schedule activity cleanup: {err:#}");
+        }
     }
 }

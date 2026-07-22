@@ -478,6 +478,21 @@ impl VTParser {
         self.state == State::Ground
     }
 
+    /// Returns a non-allocating upper bound for heap storage retained by partial strings.
+    pub fn retained_size_upper_bound(&self) -> usize {
+        #[cfg(any(feature = "std", feature = "alloc"))]
+        {
+            self.osc
+                .buffer
+                .capacity()
+                .saturating_add(self.apc_data.capacity())
+        }
+        #[cfg(not(any(feature = "std", feature = "alloc")))]
+        {
+            0
+        }
+    }
+
     fn as_integer_params(&self) -> [i64; MAX_PARAMS] {
         let mut res = [0i64; MAX_PARAMS];
         let mut i = 0;
@@ -764,6 +779,31 @@ mod test {
         let mut actor = CollectingVTActor::default();
         parser.parse(bytes, &mut actor);
         actor.into_vec()
+    }
+
+    #[test]
+    fn retained_size_tracks_partial_osc_and_releases_completed_osc() {
+        let mut parser = VTParser::new();
+        let mut actor = CollectingVTActor::default();
+        assert_eq!(parser.retained_size_upper_bound(), 0);
+
+        parser.parse(b"\x1b]2;a partial title", &mut actor);
+        assert!(parser.retained_size_upper_bound() >= b"2;a partial title".len());
+
+        parser.parse(b"\x1b\\", &mut actor);
+        assert_eq!(parser.retained_size_upper_bound(), 0);
+    }
+
+    #[test]
+    fn retained_size_tracks_partial_apc_and_releases_completed_apc() {
+        let mut parser = VTParser::new();
+        let mut actor = CollectingVTActor::default();
+
+        parser.parse(b"\x1b_Ga=T;a partial kitty payload", &mut actor);
+        assert!(parser.retained_size_upper_bound() >= b"Ga=T;a partial kitty payload".len());
+
+        parser.parse(b"\x1b\\", &mut actor);
+        assert_eq!(parser.retained_size_upper_bound(), 0);
     }
 
     #[test]

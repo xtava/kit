@@ -56,6 +56,9 @@ pub use supervisor::{
     ProcessWorkspace, ProcessWorkspaceError,
 };
 
+pub(in crate::framework) use report::leader_exit;
+pub(in crate::framework) use supervisor::tokio_command;
+
 #[cfg(target_os = "linux")]
 #[doc(hidden)]
 pub use detached_host::run_detached_io_host_entry;

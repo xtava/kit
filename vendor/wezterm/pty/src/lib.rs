@@ -101,6 +101,15 @@ pub trait MasterPty: Downcast + Send {
     /// It is invalid to take the writer more than once.
     fn take_writer(&self) -> Result<Box<dyn std::io::Write + Send>, Error>;
 
+    /// Interrupt readers previously returned by [`MasterPty::try_clone_reader`].
+    ///
+    /// Native Unix PTYs implement this as an idempotent, one-way shutdown signal. Other PTY
+    /// implementations may reject the operation when they cannot guarantee that a blocked read is
+    /// woken. Callers that require joined shutdown must treat that rejection as a lifecycle error.
+    fn cancel_reader(&self) -> Result<(), Error> {
+        anyhow::bail!("this PTY cannot interrupt a blocked reader")
+    }
+
     /// If applicable to the type of the tty, return the local process id
     /// of the process group or session leader
     #[cfg(unix)]

@@ -3,7 +3,7 @@ use crate::TerminalState;
 use ::image::imageops::FilterType;
 use ::image::ImageFormat;
 use log::error;
-use wezterm_cell::image::ImageDataType;
+use wezterm_cell::image::{EncodedBlob, ImageDataType};
 use wezterm_escape_parser::osc::ITermFileData;
 
 impl TerminalState {
@@ -109,16 +109,28 @@ impl TerminalState {
             | (false, _) => {
                 // Don't resample things that might be animations,
                 // or things that don't need resampling
-                ImageDataType::EncodedFile(image.data)
+                EncodedBlob::inline(image.data).map(ImageDataType::Encoded)
             }
-            (true, _) => match ::image::load_from_memory(&image.data) {
+            (true, _) => match decode_image(&image.data) {
                 Ok(im) => {
                     let im = im.resize_exact(width as u32, height as u32, FilterType::CatmullRom);
                     let data = im.into_rgba8().into_vec();
-                    ImageDataType::new_single_frame(width as u32, height as u32, data)
+                    Ok(ImageDataType::new_single_frame(
+                        width as u32,
+                        height as u32,
+                        data,
+                    ))
                 }
-                Err(_) => ImageDataType::EncodedFile(image.data),
+                Err(_) => EncodedBlob::inline(image.data).map(ImageDataType::Encoded),
             },
+        };
+
+        let data = match data {
+            Ok(data) => data,
+            Err(error) => {
+                log::error!("error admitting encoded image data: {error:#}");
+                return;
+            }
         };
 
         let image_data = match self.raw_image_to_image_data(data) {

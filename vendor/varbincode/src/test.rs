@@ -1,13 +1,26 @@
-use super::{deserialize, serialize};
+use super::{deserialize, serialize, DecodeLimits};
 use serde::Serialize;
 use serde_derive::*;
 use std::collections::HashMap;
+use std::fmt;
 
 fn same<'de, T: serde::de::DeserializeOwned + Serialize + std::fmt::Debug + PartialEq>(a: T) {
     let encoded = serialize(&a).unwrap();
-    let decoded: T = deserialize(encoded.as_slice()).unwrap();
+    let decoded: T = deserialize(encoded.as_slice(), generous_limits()).unwrap();
     assert_eq!(decoded, a);
     eprintln!("{:?} encoded as {:?}", a, encoded);
+}
+
+fn generous_limits() -> DecodeLimits {
+    DecodeLimits {
+        max_owned_payload_bytes: 1 << 20,
+        max_string_bytes: 1 << 20,
+        max_byte_buffer_bytes: 1 << 20,
+        max_sequence_items: 1 << 20,
+        max_map_entries: 1 << 20,
+        max_containers: 1 << 20,
+        max_nesting_depth: 128,
+    }
 }
 
 #[test]
@@ -56,33 +69,21 @@ fn test_structs() {
         a: isize,
         b: String,
         c: bool,
-    };
+    }
 
     #[derive(Serialize, Deserialize, PartialEq, Debug)]
     struct Outer {
         inner: Struct,
         b: bool,
         second: Struct,
-    };
+    }
 
-    same(Struct {
-        a: -42,
-        b: "hello".to_string(),
-        c: true,
-    });
+    same(Struct { a: -42, b: "hello".to_string(), c: true });
 
     same(Outer {
-        inner: Struct {
-            a: 1,
-            b: "bee".to_string(),
-            c: false,
-        },
+        inner: Struct { a: 1, b: "bee".to_string(), c: false },
         b: true,
-        second: Struct {
-            a: 2,
-            b: "other".to_string(),
-            c: true,
-        },
+        second: Struct { a: 2, b: "other".to_string(), c: true },
     });
 
     #[derive(Serialize, Deserialize, PartialEq, Debug)]
@@ -138,4 +139,131 @@ fn test_fixed_size_array() {
     same([24u32; 32]);
     same([1u64, 2, 3, 4, 5, 6, 7, 8]);
     same([0u8; 19]);
+}
+
+#[test]
+fn rejects_payload_before_allocation() {
+    let encoded = serialize(&"abc".to_string()).unwrap();
+    let mut limits = generous_limits();
+    limits.max_owned_payload_bytes = 2;
+    let error = deserialize::<String, _>(encoded.as_slice(), limits).unwrap_err();
+    assert_eq!(error, super::error::Error::LimitExceeded { kind: "owned payload bytes", limit: 2 });
+}
+
+#[test]
+fn rejects_sequence_and_map_capacity_hints() {
+    let encoded = serialize(&vec![1u64, 2, 3]).unwrap();
+    let mut limits = generous_limits();
+    limits.max_sequence_items = 2;
+    let error = deserialize::<Vec<u64>, _>(encoded.as_slice(), limits).unwrap_err();
+    assert_eq!(error, super::error::Error::LimitExceeded { kind: "sequence items", limit: 2 });
+
+    let mut map = HashMap::new();
+    map.insert(1u64, 1u64);
+    map.insert(2u64, 2u64);
+    let encoded = serialize(&map).unwrap();
+    let mut limits = generous_limits();
+    limits.max_map_entries = 1;
+    let error = deserialize::<HashMap<u64, u64>, _>(encoded.as_slice(), limits).unwrap_err();
+    assert_eq!(error, super::error::Error::LimitExceeded { kind: "map entries", limit: 1 });
+}
+
+#[test]
+fn rejects_cumulative_containers_and_nesting() {
+    let encoded = serialize(&vec![vec![1u64], vec![2u64]]).unwrap();
+
+    let mut limits = generous_limits();
+    limits.max_containers = 2;
+    let error = deserialize::<Vec<Vec<u64>>, _>(encoded.as_slice(), limits).unwrap_err();
+    assert_eq!(error, super::error::Error::LimitExceeded { kind: "containers", limit: 2 });
+
+    let mut limits = generous_limits();
+    limits.max_nesting_depth = 1;
+    let error = deserialize::<Vec<Vec<u64>>, _>(encoded.as_slice(), limits).unwrap_err();
+    assert_eq!(error, super::error::Error::LimitExceeded { kind: "nesting depth", limit: 1 });
+}
+
+#[derive(Debug, PartialEq)]
+struct NoHintSequence(Vec<u64>);
+
+impl<'de> serde::Deserialize<'de> for NoHintSequence {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = NoHintSequence;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a sequence without an allocation hint")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                assert_eq!(sequence.size_hint(), None);
+                let mut values = Vec::new();
+                while let Some(value) = sequence.next_element()? {
+                    values.push(value);
+                }
+                Ok(NoHintSequence(values))
+            }
+        }
+
+        deserializer.deserialize_seq(Visitor)
+    }
+}
+
+#[derive(Debug, PartialEq)]
+struct NoHintMap(HashMap<u64, u64>);
+
+impl<'de> serde::Deserialize<'de> for NoHintMap {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = NoHintMap;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a map without an allocation hint")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                assert_eq!(map.size_hint(), None);
+                let mut values = HashMap::new();
+                while let Some((key, value)) = map.next_entry()? {
+                    values.insert(key, value);
+                }
+                Ok(NoHintMap(values))
+            }
+        }
+
+        deserializer.deserialize_map(Visitor)
+    }
+}
+
+#[test]
+fn hides_attacker_controlled_collection_capacity_hints() {
+    let encoded = serialize(&vec![1u64, 2, 3]).unwrap();
+    assert_eq!(
+        deserialize::<NoHintSequence, _>(encoded.as_slice(), generous_limits()).unwrap(),
+        NoHintSequence(vec![1, 2, 3])
+    );
+
+    let mut values = HashMap::new();
+    values.insert(1u64, 2u64);
+    let encoded = serialize(&values).unwrap();
+    assert_eq!(
+        deserialize::<NoHintMap, _>(encoded.as_slice(), generous_limits()).unwrap(),
+        NoHintMap(values)
+    );
 }

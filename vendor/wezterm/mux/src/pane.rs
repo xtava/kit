@@ -237,6 +237,24 @@ pub trait Pane: Downcast + Send + Sync {
     }
     fn send_paste(&self, text: &str) -> anyhow::Result<()>;
     fn reader(&self) -> anyhow::Result<Option<Box<dyn std::io::Read + Send>>>;
+    /// Interrupt a reader returned by [`Pane::reader`] during joined pane shutdown.
+    ///
+    /// Every pane must state its cancellation behavior explicitly. Panes that return `None` from
+    /// [`Pane::reader`] may return `Ok(())`; panes with a blocking reader must wake that reader.
+    fn cancel_reader(&self) -> anyhow::Result<()>;
+    /// Join the pane-owned child waiter after [`Pane::kill`] has requested process shutdown.
+    ///
+    /// Remote and synthetic panes without a local child may keep the default no-op.
+    fn join_child_waiter(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    /// Whether unregistering this pane must terminate a locally owned child.
+    ///
+    /// Remote client panes return false so a server-originated removal never echoes `KillPane`.
+    /// Local process panes return true so unregister cannot orphan their child waiter.
+    fn kill_process_on_unregister(&self) -> bool {
+        false
+    }
     fn writer(&self) -> MappedMutexGuard<'_, dyn std::io::Write>;
     fn resize(&self, size: TerminalSize) -> anyhow::Result<()>;
     /// Called as a hint that the pane is being resized as part of
@@ -626,6 +644,9 @@ mod test {
         }
         fn reader(&self) -> anyhow::Result<Option<Box<dyn std::io::Read + Send>>> {
             Ok(None)
+        }
+        fn cancel_reader(&self) -> anyhow::Result<()> {
+            Ok(())
         }
         fn writer(&self) -> MappedMutexGuard<'_, dyn std::io::Write> {
             unimplemented!()

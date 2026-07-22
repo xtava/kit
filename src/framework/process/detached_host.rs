@@ -7,7 +7,6 @@ use std::{
     os::unix::{
         ffi::{OsStrExt, OsStringExt},
         fs::{MetadataExt, OpenOptionsExt},
-        process::ExitStatusExt,
     },
     path::{Path, PathBuf},
     process::Stdio,
@@ -31,12 +30,11 @@ use super::{
         PersistedDetachedLaunchIntent,
     },
     report::{
-        LeaderExitObservation, PersistedDetachedInfrastructureFailure, PersistedDetachedOutput,
-        PersistedDetachedTarget, PersistedDetachedTerminal,
+        leader_exit, LeaderExitObservation, PersistedDetachedInfrastructureFailure,
+        PersistedDetachedOutput, PersistedDetachedTarget, PersistedDetachedTerminal,
     },
     spec::{RecordLimit, RecordOverflow},
     DetachedOutputPolicy, DetachedProcessSpec, EnvironmentBase, LeaderExit, ProcessRunId,
-    SignalNumber,
 };
 
 pub(crate) const HOST_MODE: &str = "__kit-internal-detached-io-host";
@@ -914,14 +912,6 @@ fn validate_private_directory(path: &Path) -> Result<(), ()> {
         return Err(());
     }
     Ok(())
-}
-
-fn leader_exit(status: std::process::ExitStatus) -> LeaderExit {
-    if let Some(code) = status.code() {
-        LeaderExit::Code(code)
-    } else {
-        LeaderExit::Signal(SignalNumber::new(status.signal().unwrap_or(libc::SIGKILL)))
-    }
 }
 
 fn mirror_signal(signal: i32) -> i32 {

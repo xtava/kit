@@ -1,7 +1,7 @@
 //! Working with pseudo-terminals
 
 use crate::{Child, CommandBuilder, MasterPty, PtyPair, PtySize, PtySystem, SlavePty};
-use anyhow::{bail, Error};
+use anyhow::{bail, Context, Error};
 use filedescriptor::FileDescriptor;
 use libc::{self, winsize};
 use std::cell::RefCell;
@@ -12,6 +12,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::{io, mem, ptr};
 
 pub use std::os::unix::io::RawFd;
@@ -47,11 +48,15 @@ fn openpty(size: PtySize) -> anyhow::Result<(UnixMasterPty, UnixSlavePty)> {
     }
 
     let tty_name = tty_name(slave);
+    let (read_cancel_tx, read_cancel_rx) =
+        filedescriptor::socketpair().context("create PTY reader cancellation socketpair")?;
 
     let master = UnixMasterPty {
         fd: PtyFd(unsafe { FileDescriptor::from_raw_fd(master) }),
         took_writer: RefCell::new(false),
         tty_name,
+        read_cancel_tx: Mutex::new(Some(read_cancel_tx)),
+        read_cancel_rx,
     };
     let slave = UnixSlavePty {
         fd: PtyFd(unsafe { FileDescriptor::from_raw_fd(slave) }),
@@ -62,6 +67,10 @@ fn openpty(size: PtySize) -> anyhow::Result<(UnixMasterPty, UnixSlavePty)> {
     // instances so that we ensure that the Ptys get drop()'d if
     // the cloexec() functions fail (unlikely!).
     cloexec(master.fd.as_raw_fd())?;
+    cloexec(master.read_cancel_rx.as_raw_fd())?;
+    if let Some(cancel_tx) = master.read_cancel_tx.lock().unwrap().as_ref() {
+        cloexec(cancel_tx.as_raw_fd())?;
+    }
     cloexec(slave.fd.as_raw_fd())?;
 
     Ok((master, slave))
@@ -304,6 +313,8 @@ struct UnixMasterPty {
     fd: PtyFd,
     took_writer: RefCell<bool>,
     tty_name: Option<PathBuf>,
+    read_cancel_tx: Mutex<Option<FileDescriptor>>,
+    read_cancel_rx: FileDescriptor,
 }
 
 /// Represents the slave end of a pty.
@@ -351,7 +362,8 @@ impl MasterPty for UnixMasterPty {
 
     fn try_clone_reader(&self) -> Result<Box<dyn Read + Send>, Error> {
         let fd = PtyFd(self.fd.try_clone()?);
-        Ok(Box::new(fd))
+        let cancel = self.read_cancel_rx.try_clone()?;
+        Ok(Box::new(UnixMasterReader { fd, cancel }))
     }
 
     fn take_writer(&self) -> Result<Box<dyn Write + Send>, Error> {
@@ -361,6 +373,20 @@ impl MasterPty for UnixMasterPty {
         *self.took_writer.borrow_mut() = true;
         let fd = PtyFd(self.fd.try_clone()?);
         Ok(Box::new(UnixMasterWriter { fd }))
+    }
+
+    fn cancel_reader(&self) -> Result<(), Error> {
+        let cancel = self.read_cancel_tx.lock().unwrap().take();
+        if let Some(cancel) = cancel {
+            let result = unsafe { libc::shutdown(cancel.as_raw_fd(), libc::SHUT_RDWR) };
+            if result != 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ENOTCONN) {
+                    return Err(error.into());
+                }
+            }
+        }
+        Ok(())
     }
 
     fn as_raw_fd(&self) -> Option<RawFd> {
@@ -380,6 +406,53 @@ impl MasterPty for UnixMasterPty {
 
     fn get_termios(&self) -> Option<nix::sys::termios::Termios> {
         nix::sys::termios::tcgetattr(self.fd.0.as_fd()).ok()
+    }
+}
+
+/// A PTY reader that can be interrupted even when a descendant keeps the slave descriptor open.
+struct UnixMasterReader {
+    fd: PtyFd,
+    cancel: FileDescriptor,
+}
+
+impl Read for UnixMasterReader {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, io::Error> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        loop {
+            let mut descriptors = [
+                libc::pollfd {
+                    fd: self.fd.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: self.cancel.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            let result =
+                unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, -1) };
+            if result < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            if descriptors[0].revents != 0 {
+                let size = self.fd.read(buf)?;
+                if size > 0 {
+                    return Ok(size);
+                }
+            }
+            if descriptors[1].revents != 0 {
+                return Ok(0);
+            }
+        }
     }
 }
 
@@ -410,5 +483,67 @@ impl Write for UnixMasterWriter {
     }
     fn flush(&mut self) -> Result<(), io::Error> {
         self.fd.flush()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn cancel_reader_wakes_a_blocked_native_pty_read() {
+        let pair = UnixPtySystem::default()
+            .openpty(PtySize::default())
+            .unwrap();
+        let mut reader = pair.master.try_clone_reader().unwrap();
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let mut byte = [0_u8; 1];
+            result_tx.send(reader.read(&mut byte)).unwrap();
+        });
+
+        assert!(matches!(
+            result_rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        pair.master.cancel_reader().unwrap();
+        pair.master.cancel_reader().unwrap();
+        assert_eq!(
+            result_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn cancellation_drains_all_ready_reads_before_reporting_eof() {
+        let (mut data_tx, data_rx) = filedescriptor::socketpair().unwrap();
+        let (cancel_tx, cancel_rx) = filedescriptor::socketpair().unwrap();
+        let mut reader = UnixMasterReader {
+            fd: PtyFd(data_rx),
+            cancel: cancel_rx,
+        };
+
+        data_tx.write_all(b"abcdefgh").unwrap();
+        let result = unsafe { libc::shutdown(cancel_tx.as_raw_fd(), libc::SHUT_RDWR) };
+        assert_eq!(result, 0);
+
+        let mut received = Vec::new();
+        let mut chunk = [0_u8; 3];
+        loop {
+            let size = reader.read(&mut chunk).unwrap();
+            if size == 0 {
+                break;
+            }
+            received.extend_from_slice(&chunk[..size]);
+        }
+        assert_eq!(received, b"abcdefgh");
     }
 }

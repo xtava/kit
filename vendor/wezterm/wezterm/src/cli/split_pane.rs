@@ -2,7 +2,6 @@ use crate::cli::resolve_relative_cwd;
 use clap::{Parser, ValueHint};
 use mux::pane::PaneId;
 use mux::tab::{SplitDirection, SplitRequest, SplitSize};
-use portable_pty::cmdbuilder::CommandBuilder;
 use std::ffi::OsString;
 use wezterm_client::client::Client;
 
@@ -91,22 +90,27 @@ impl SplitPane {
             size,
             top_level: self.top_level,
         };
+        let source = match self.move_pane_id {
+            Some(pane_id) => codec::SplitSpawnSource::MovePane { pane_id },
+            None => codec::SplitSpawnSource::Spawn {
+                command: if self.prog.is_empty() {
+                    codec::EnvironmentFreeCommand::DefaultLoginShell
+                } else {
+                    codec::EnvironmentFreeCommand::try_from_argv(self.prog)?
+                },
+                command_dir: resolve_relative_cwd(self.cwd)?,
+            },
+        };
 
         let spawned = client
             .split_pane(codec::SplitPane {
-                pane_id,
+                target_pane_id: pane_id,
                 split_request,
-                domain: config::keyassignment::SpawnTabDomain::CurrentPaneDomain,
-                command: if self.prog.is_empty() {
-                    None
-                } else {
-                    let builder = CommandBuilder::from_argv(self.prog);
-                    Some(builder)
-                },
-                command_dir: resolve_relative_cwd(self.cwd)?,
-                move_pane_id: self.move_pane_id,
+                domain: codec::SplitSpawnDomain::TargetPaneDomain,
+                source,
             })
-            .await?;
+            .await?
+            .into_inner();
 
         log::debug!("{:?}", spawned);
         println!("{}", spawned.pane_id);

@@ -13,12 +13,13 @@ use mux::pane::{
 };
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
 use mux::tab::TabId;
-use mux::{Mux, MuxNotification};
+use mux::{ClientPaneTaskKind, Mux, MuxNotification};
 use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 use rangeset::RangeSet;
 use ratelim::RateLimiter;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::ops::Range;
 use std::sync::Arc;
 use termwiz::input::KeyEvent;
@@ -43,8 +44,7 @@ pub struct ClientPane {
     writer: Mutex<PaneWriter>,
     mouse: Arc<Mutex<MouseState>>,
     clipboard: Mutex<Option<Arc<dyn Clipboard>>>,
-    mouse_grabbed: Mutex<bool>,
-    ignore_next_kill: Mutex<bool>,
+    mouse_capture: MouseCaptureProjection,
     user_vars: Mutex<HashMap<String, String>>,
     config: Mutex<Option<Arc<dyn TerminalConfiguration>>>,
     unseen_output: Mutex<bool>,
@@ -62,10 +62,12 @@ impl ClientPane {
         let local_pane_id = alloc_pane_id();
         let writer = PaneWriter {
             client: Arc::clone(client),
+            local_pane_id,
             remote_pane_id,
         };
 
         let mouse = Arc::new(Mutex::new(MouseState::new(
+            local_pane_id,
             remote_pane_id,
             client.client.clone(),
         )));
@@ -97,22 +99,6 @@ impl ClientPane {
         let config = configuration();
         let palette: ColorPalette = config.resolved_palette.clone().into();
 
-        // Advise the server of our palette preference
-        promise::spawn::spawn({
-            let palette = palette.clone();
-            let client = Arc::clone(client);
-            async move {
-                client
-                    .client
-                    .set_configured_palette_for_pane(SetPalette {
-                        pane_id: remote_pane_id,
-                        palette,
-                    })
-                    .await
-            }
-        })
-        .detach();
-
         Self {
             client: Arc::clone(client),
             mouse,
@@ -125,8 +111,7 @@ impl ClientPane {
             configured_palette: Mutex::new(palette.clone()),
             palette: Mutex::new(palette),
             clipboard: Mutex::new(None),
-            mouse_grabbed: Mutex::new(false),
-            ignore_next_kill: Mutex::new(false),
+            mouse_capture: MouseCaptureProjection::default(),
             unseen_output: Mutex::new(false),
             user_vars: Mutex::new(HashMap::new()),
             config: Mutex::new(None),
@@ -134,10 +119,42 @@ impl ClientPane {
         }
     }
 
-    pub async fn process_unilateral(&self, pdu: Pdu) -> anyhow::Result<()> {
+    fn try_spawn_request<F, T>(&self, future: F) -> anyhow::Result<()>
+    where
+        F: Future<Output = anyhow::Result<T>> + Send + 'static,
+        T: Send + 'static,
+    {
+        Mux::get().try_spawn_client_pane_task(
+            self.local_pane_id,
+            ClientPaneTaskKind::Request,
+            async move {
+                future.await?;
+                Ok(())
+            },
+        )
+    }
+
+    /// Starts RPC producers that require this pane to be registered with Mux.
+    pub fn start(&self) -> anyhow::Result<()> {
+        let palette = self.configured_palette.lock().clone();
+        self.try_spawn_request(
+            self.client
+                .client
+                .set_configured_palette_for_pane(SetPalette {
+                    pane_id: self.remote_pane_id,
+                    palette: Box::new(palette),
+                }),
+        )
+    }
+
+    pub async fn process_unilateral(
+        &self,
+        notification: AdmittedNotification,
+    ) -> anyhow::Result<()> {
+        let (_serial, pdu, _reservation) = notification.into_parts();
         match pdu {
             Pdu::GetPaneRenderChangesResponse(mut delta) => {
-                *self.mouse_grabbed.lock() = delta.mouse_grabbed;
+                self.mouse_capture.update(delta.mouse_grabbed);
 
                 let bonus_lines = std::mem::take(&mut delta.bonus_lines);
                 let client = { Arc::clone(&self.renderable.lock().inner.borrow().client) };
@@ -147,7 +164,7 @@ impl ClientPane {
                     .lock()
                     .inner
                     .borrow_mut()
-                    .apply_changes_to_surface(delta, bonus_lines);
+                    .apply_changes_to_surface(delta, bonus_lines)?;
             }
             Pdu::SetClipboard(SetClipboard {
                 clipboard,
@@ -169,9 +186,9 @@ impl ClientPane {
                 }
             },
             Pdu::SetPalette(SetPalette { palette, .. }) => {
-                *self.application_palette.lock() = palette != *self.configured_palette.lock();
+                *self.application_palette.lock() = *palette != *self.configured_palette.lock();
 
-                *self.palette.lock() = palette;
+                *self.palette.lock() = *palette;
                 let mux = Mux::get();
                 self.renderable.lock().inner.borrow_mut().make_all_stale();
                 mux.notify(MuxNotification::Alert {
@@ -238,17 +255,6 @@ impl ClientPane {
 
     pub fn remote_pane_id(&self) -> TabId {
         self.remote_pane_id
-    }
-
-    /// Arrange to suppress the next Pane::kill call.
-    /// This is a bit of a hack that we use when closing a window;
-    /// our Domain::local_window_is_closing impl calls this for each
-    /// ClientPane in the window so that closing a window effectively
-    /// "detaches" the window so that reconnecting later will resume
-    /// from where they left off.
-    /// It isn't perfect.
-    pub fn ignore_next_kill(&self) {
-        *self.ignore_next_kill.lock() = true;
     }
 }
 
@@ -339,22 +345,20 @@ impl Pane for ClientPane {
             .predict_from_paste(text);
 
         let data = text.to_owned();
-        promise::spawn::spawn(async move {
-            client
-                .client
-                .send_paste(SendPaste {
-                    pane_id: remote_pane_id,
-                    data,
-                })
-                .await
-        })
-        .detach();
+        self.try_spawn_request(client.client.send_paste(SendPaste {
+            pane_id: remote_pane_id,
+            data,
+        }))?;
         self.renderable.lock().inner.borrow_mut().update_last_send();
         Ok(())
     }
 
     fn reader(&self) -> anyhow::Result<Option<Box<dyn std::io::Read + Send>>> {
         Ok(None)
+    }
+
+    fn cancel_reader(&self) -> anyhow::Result<()> {
+        Ok(())
     }
 
     fn writer(&self) -> MappedMutexGuard<'_, dyn std::io::Write> {
@@ -372,17 +376,13 @@ impl Pane for ClientPane {
         let remote_tab_id = self.remote_tab_id;
         // Invalidate any cached rows on a resize
         inner.make_all_stale();
-        promise::spawn::spawn(async move {
-            client
-                .client
-                .set_zoomed(SetPaneZoomed {
-                    containing_tab_id: remote_tab_id,
-                    pane_id: remote_pane_id,
-                    zoomed,
-                })
-                .await
-        })
-        .detach();
+        if let Err(err) = self.try_spawn_request(client.client.set_zoomed(SetPaneZoomed {
+            containing_tab_id: remote_tab_id,
+            pane_id: remote_pane_id,
+            zoomed,
+        })) {
+            log::error!("failed to schedule pane zoom RPC: {:#}", err);
+        }
         inner.update_last_send();
     }
 
@@ -390,8 +390,8 @@ impl Pane for ClientPane {
         let render = self.renderable.lock();
         let mut inner = render.inner.borrow_mut();
 
-        let cols = size.cols as usize;
-        let rows = size.rows as usize;
+        let cols = size.cols;
+        let rows = size.rows;
 
         if inner.dimensions.cols != cols
             || inner.dimensions.viewport_rows != rows
@@ -409,17 +409,11 @@ impl Pane for ClientPane {
             let client = Arc::clone(&self.client);
             let remote_pane_id = self.remote_pane_id;
             let remote_tab_id = self.remote_tab_id;
-            promise::spawn::spawn(async move {
-                client
-                    .client
-                    .resize(Resize {
-                        containing_tab_id: remote_tab_id,
-                        pane_id: remote_pane_id,
-                        size,
-                    })
-                    .await
-            })
-            .detach();
+            self.try_spawn_request(client.client.resize(Resize {
+                containing_tab_id: remote_tab_id,
+                pane_id: remote_pane_id,
+                size,
+            }))?;
             inner.update_last_send();
         }
         Ok(())
@@ -442,7 +436,7 @@ impl Pane for ClientPane {
             })
             .await
         {
-            Ok(SearchScrollbackResponse { results }) => Ok(results),
+            Ok(response) => Ok(response.into_inner().results),
             Err(e) => Err(e),
         }
     }
@@ -458,20 +452,14 @@ impl Pane for ClientPane {
         }
         let client = Arc::clone(&self.client);
         let remote_pane_id = self.remote_pane_id;
-        promise::spawn::spawn(async move {
-            client
-                .client
-                .key_down(SendKeyDown {
-                    pane_id: remote_pane_id,
-                    event: KeyEvent {
-                        key,
-                        modifiers: mods,
-                    },
-                    input_serial,
-                })
-                .await
-        })
-        .detach();
+        self.try_spawn_request(client.client.key_down(SendKeyDown {
+            pane_id: remote_pane_id,
+            event: KeyEvent {
+                key,
+                modifiers: mods,
+            },
+            input_serial,
+        }))?;
         self.renderable.lock().inner.borrow_mut().update_last_send();
         Ok(())
     }
@@ -482,14 +470,16 @@ impl Pane for ClientPane {
     }
 
     fn kill(&self) {
-        let mut ignore = self.ignore_next_kill.lock();
-        if *ignore {
-            *ignore = false;
-            return;
-        }
         let client = Arc::clone(&self.client);
         let remote_pane_id = self.remote_pane_id;
         let local_domain_id = self.client.local_domain_id;
+
+        // Mux::shutdown clears the process-global owner before it joins pane workers. In that
+        // state this pane is already detaching and must not echo a remote kill or require the
+        // global owner to still exist.
+        let Some(mux) = Mux::try_get() else {
+            return;
+        };
 
         // We only want to ask the server to kill the pane if the user
         // explicitly requested it to die.
@@ -500,7 +490,6 @@ impl Pane for ClientPane {
         let mut send_kill = true;
 
         {
-            let mux = Mux::get();
             if let Some(client_domain) = mux.get_domain(local_domain_id) {
                 if client_domain.state() == mux::domain::DomainState::Detached {
                     send_kill = false;
@@ -509,21 +498,24 @@ impl Pane for ClientPane {
         }
 
         if send_kill {
-            promise::spawn::spawn(async move {
-                client
-                    .client
-                    .kill_pane(KillPane {
-                        pane_id: remote_pane_id,
-                    })
-                    .await
-            })
-            .detach();
+            let future = client.client.kill_pane(KillPane {
+                pane_id: remote_pane_id,
+            });
+            if let Err(err) = mux.try_spawn_client_pane_task(
+                self.local_pane_id,
+                ClientPaneTaskKind::Close,
+                async move {
+                    future.await?;
+                    Ok(())
+                },
+            ) {
+                log::error!("failed to schedule kill-pane RPC: {:#}", err);
+            }
         }
     }
 
     fn mouse_event(&self, event: MouseEvent) -> anyhow::Result<()> {
-        self.mouse.lock().append(event);
-        if MouseState::next(Arc::clone(&self.mouse)) {
+        if MouseState::enqueue(&self.mouse, event)? {
             self.renderable.lock().inner.borrow_mut().update_last_send();
         }
         Ok(())
@@ -542,7 +534,7 @@ impl Pane for ClientPane {
     }
 
     fn is_mouse_grabbed(&self) -> bool {
-        *self.mouse_grabbed.lock()
+        self.mouse_capture.is_grabbed()
     }
 
     fn is_alt_screen_active(&self) -> bool {
@@ -564,16 +556,14 @@ impl Pane for ClientPane {
     fn erase_scrollback(&self, erase_mode: ScrollbackEraseMode) {
         let client = Arc::clone(&self.client);
         let remote_pane_id = self.remote_pane_id;
-        promise::spawn::spawn(async move {
-            client
-                .client
-                .erase_scrollback(EraseScrollbackRequest {
-                    pane_id: remote_pane_id,
-                    erase_mode,
-                })
-                .await
-        })
-        .detach();
+        if let Err(err) =
+            self.try_spawn_request(client.client.erase_scrollback(EraseScrollbackRequest {
+                pane_id: remote_pane_id,
+                erase_mode,
+            }))
+        {
+            log::error!("failed to schedule erase-scrollback RPC: {:#}", err);
+        }
     }
 
     fn advise_focus(&self) {
@@ -582,15 +572,14 @@ impl Pane for ClientPane {
             focused_pane.replace(self.remote_pane_id);
             let client = Arc::clone(&self.client);
             let remote_pane_id = self.remote_pane_id;
-            promise::spawn::spawn(async move {
-                client
-                    .client
-                    .set_focused_pane_id(SetFocusedPane {
-                        pane_id: remote_pane_id,
-                    })
-                    .await
-            })
-            .detach();
+            drop(focused_pane);
+            if let Err(err) =
+                self.try_spawn_request(client.client.set_focused_pane_id(SetFocusedPane {
+                    pane_id: remote_pane_id,
+                }))
+            {
+                log::error!("failed to schedule focused-pane RPC: {:#}", err);
+            }
         }
     }
 
@@ -623,16 +612,14 @@ impl Pane for ClientPane {
         // and now send the color palette to the server
         let client = Arc::clone(&self.client);
         let remote_pane_id = self.remote_pane_id;
-        promise::spawn::spawn(async move {
-            client
-                .client
-                .set_configured_palette_for_pane(SetPalette {
-                    pane_id: remote_pane_id,
-                    palette,
-                })
-                .await
-        })
-        .detach();
+        if let Err(err) =
+            self.try_spawn_request(client.client.set_configured_palette_for_pane(SetPalette {
+                pane_id: remote_pane_id,
+                palette: Box::new(palette),
+            }))
+        {
+            log::error!("failed to schedule palette RPC: {:#}", err);
+        }
         self.config.lock().replace(config);
     }
 
@@ -641,18 +628,58 @@ impl Pane for ClientPane {
     }
 }
 
+#[derive(Default)]
+struct MouseCaptureProjection(Mutex<bool>);
+
+impl MouseCaptureProjection {
+    fn update(&self, mouse_grabbed: bool) {
+        *self.0.lock() = mouse_grabbed;
+    }
+
+    fn is_grabbed(&self) -> bool {
+        *self.0.lock()
+    }
+}
+
+#[cfg(test)]
+mod mouse_capture_projection_tests {
+    use super::MouseCaptureProjection;
+
+    #[test]
+    fn dec_mouse_mode_updates_and_reconnect_snapshot_replace_capture() {
+        let projection = MouseCaptureProjection::default();
+        assert!(!projection.is_grabbed());
+
+        projection.update(true);
+        assert!(projection.is_grabbed());
+
+        projection.update(false);
+        assert!(!projection.is_grabbed());
+    }
+}
+
 struct PaneWriter {
     client: Arc<ClientInner>,
-    remote_pane_id: TabId,
+    local_pane_id: PaneId,
+    remote_pane_id: PaneId,
 }
 
 impl std::io::Write for PaneWriter {
     fn write(&mut self, data: &[u8]) -> Result<usize, std::io::Error> {
-        promise::spawn::block_on(self.client.client.write_to_pane(WriteToPane {
+        let future = self.client.client.write_to_pane(WriteToPane {
             pane_id: self.remote_pane_id,
             data: data.to_vec(),
-        }))
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{}", e)))?;
+        });
+        Mux::get()
+            .try_spawn_client_pane_task(
+                self.local_pane_id,
+                ClientPaneTaskKind::Request,
+                async move {
+                    future.await?;
+                    Ok(())
+                },
+            )
+            .map_err(std::io::Error::other)?;
         Ok(data.len())
     }
 

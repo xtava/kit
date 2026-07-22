@@ -38,7 +38,7 @@ impl MovePaneToNewTab {
             match self.window_id {
                 Some(w) => Some(w),
                 None => {
-                    let panes = client.list_panes().await?;
+                    let panes = client.list_panes().await?.into_inner();
                     let mut window_id = None;
                     'outer_move: for tabroot in panes.tabs {
                         let mut cursor = tabroot.into_tree().cursor();
@@ -67,7 +67,8 @@ impl MovePaneToNewTab {
                 window_id,
                 workspace_for_new_window: self.workspace.clone(),
             })
-            .await?;
+            .await?
+            .into_inner();
 
         log::debug!("{:?}", moved);
         Ok(())

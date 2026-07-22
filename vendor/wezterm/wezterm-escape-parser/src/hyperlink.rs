@@ -17,6 +17,30 @@ pub struct Hyperlink {
 }
 
 impl Hyperlink {
+    /// Returns the retained size of this hyperlink and its owned strings.
+    pub fn retained_size(&self) -> usize {
+        #[cfg(feature = "std")]
+        let params_slots = self.params.capacity();
+        #[cfg(not(feature = "std"))]
+        let params_slots = self.params.len();
+
+        self.params
+            .values()
+            .fold(
+                core::mem::size_of::<Self>()
+                    .saturating_add(self.uri.capacity())
+                    .saturating_add(
+                        params_slots.saturating_mul(core::mem::size_of::<(String, String)>()),
+                    ),
+                |size, value| size.saturating_add(value.capacity()),
+            )
+            .saturating_add(
+                self.params
+                    .keys()
+                    .fold(0usize, |size, key| size.saturating_add(key.capacity())),
+            )
+    }
+
     pub fn uri(&self) -> &str {
         &self.uri
     }

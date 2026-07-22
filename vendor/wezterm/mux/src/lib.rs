@@ -3,7 +3,7 @@ use crate::pane::{CachePolicy, Pane, PaneId};
 use crate::ssh_agent::AgentProxy;
 use crate::tab::{SplitRequest, Tab, TabId};
 use crate::window::{Window, WindowId};
-use anyhow::{anyhow, Context, Error};
+use anyhow::{anyhow, bail, Context, Error};
 use config::keyassignment::SpawnTabDomain;
 use config::{configuration, ExitBehavior, GuiPosition};
 use domain::{Domain, DomainId, DomainState, SplitSource};
@@ -19,16 +19,25 @@ use percent_encoding::percent_decode_str;
 use portable_pty::{CommandBuilder, ExitStatus, PtySize};
 use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
+use std::future::Future;
 use std::io::{Read, Write};
 #[cfg(windows)]
 use std::os::raw::c_int;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver as SyncReceiver, SyncSender, TrySendError};
 use std::sync::{Arc, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 use termwiz::escape::csi::{DecPrivateMode, DecPrivateModeCode, Device, Mode};
 use termwiz::escape::{Action, CSI};
 use thiserror::*;
+use wezterm_runtime_admission::{
+    ByteClass, BytePermit, MAX_PANE_INPUT_BYTES_PER_PANE, MAX_PANE_INPUT_ITEMS_PER_PANE,
+};
+pub use wezterm_runtime_admission::{
+    CountClass, CountPermit, PaneAdmissionPermit, RuntimeAdmission, RuntimeRole,
+    TabAdmissionPermit, MAX_PANES,
+};
 use wezterm_term::{Clipboard, ClipboardSelection, DownloadHandler, TerminalSize};
 #[cfg(windows)]
 use winapi::um::winsock2::{SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
@@ -99,7 +108,254 @@ pub enum MuxNotification {
 
 static LAST_SUBSCRIBER_ID: AtomicUsize = AtomicUsize::new(0);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PaneRemoval {
+    Kill,
+    Unregister,
+}
+
+impl PaneRemoval {
+    fn should_kill(self) -> bool {
+        self == Self::Kill
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClientPaneTaskKind {
+    Request,
+    Fetch,
+    Poll,
+    Close,
+}
+
+impl ClientPaneTaskKind {
+    fn admission_class(self) -> Option<CountClass> {
+        match self {
+            Self::Request | Self::Close => None,
+            Self::Fetch => Some(CountClass::ClientFetchJob),
+            Self::Poll => Some(CountClass::ClientPollJob),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PaneTaskKind {
+    Input { bytes: usize },
+    Write { bytes: usize },
+    Refresh,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OwnedPaneTaskKind {
+    Client(ClientPaneTaskKind),
+    Pane(PaneTaskKind),
+}
+
+impl OwnedPaneTaskKind {
+    fn cancel_on_removal(self, removal: PaneRemoval) -> bool {
+        match self {
+            Self::Client(ClientPaneTaskKind::Close) => removal == PaneRemoval::Unregister,
+            Self::Client(_) | Self::Pane(_) => true,
+        }
+    }
+}
+
+struct OwnedPaneTask {
+    kind: OwnedPaneTaskKind,
+    task: promise::spawn::AdmittedTask<anyhow::Result<()>>,
+}
+
+#[derive(Default)]
+struct PaneTaskPermits {
+    _pane_input: Option<PaneInputPermit>,
+    _input_item: Option<CountPermit>,
+    _job: Option<CountPermit>,
+    _input_bytes: Option<BytePermit>,
+}
+
+#[derive(Default)]
+struct PaneInputAdmission {
+    items: AtomicUsize,
+    bytes: AtomicUsize,
+}
+
+struct PaneInputPermit {
+    admission: Arc<PaneInputAdmission>,
+    bytes: usize,
+}
+
+impl PaneInputAdmission {
+    fn try_reserve(
+        counter: &AtomicUsize,
+        amount: usize,
+        maximum: usize,
+        name: &str,
+    ) -> anyhow::Result<()> {
+        let mut used = counter.load(Ordering::Acquire);
+        loop {
+            let next = used
+                .checked_add(amount)
+                .ok_or_else(|| anyhow!("{name} admission overflow"))?;
+            if next > maximum {
+                anyhow::bail!("{name} admission is full ({used} + {amount} > {maximum})");
+            }
+            match counter.compare_exchange_weak(used, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Ok(()),
+                Err(observed) => used = observed,
+            }
+        }
+    }
+
+    fn try_input(self: &Arc<Self>, bytes: usize) -> anyhow::Result<PaneInputPermit> {
+        Self::try_reserve(
+            &self.items,
+            1,
+            MAX_PANE_INPUT_ITEMS_PER_PANE,
+            "pane input item",
+        )?;
+        if let Err(error) = Self::try_reserve(
+            &self.bytes,
+            bytes,
+            MAX_PANE_INPUT_BYTES_PER_PANE,
+            "pane input byte",
+        ) {
+            self.items.fetch_sub(1, Ordering::AcqRel);
+            return Err(error);
+        }
+        Ok(PaneInputPermit {
+            admission: Arc::clone(self),
+            bytes,
+        })
+    }
+}
+
+impl Drop for PaneInputPermit {
+    fn drop(&mut self) {
+        let prior_items = self.admission.items.fetch_sub(1, Ordering::AcqRel);
+        let prior_bytes = self.admission.bytes.fetch_sub(self.bytes, Ordering::AcqRel);
+        debug_assert!(prior_items >= 1, "pane input item admission underflow");
+        debug_assert!(
+            prior_bytes >= self.bytes,
+            "pane input byte admission underflow"
+        );
+    }
+}
+
+impl PaneTaskPermits {
+    fn admit(
+        admission: &RuntimeAdmission,
+        pane_input: &Arc<PaneInputAdmission>,
+        kind: PaneTaskKind,
+    ) -> anyhow::Result<Self> {
+        match kind {
+            PaneTaskKind::Input { bytes } => Ok(Self {
+                _pane_input: Some(pane_input.try_input(bytes)?),
+                _input_item: Some(
+                    admission
+                        .try_count(CountClass::PaneInputItem, 1)
+                        .context("admit pane input item")?,
+                ),
+                _input_bytes: Some(
+                    admission
+                        .try_bytes(ByteClass::PaneInput, bytes)
+                        .context("admit pane input bytes")?,
+                ),
+                _job: None,
+            }),
+            PaneTaskKind::Write { bytes } => Ok(Self {
+                _pane_input: Some(pane_input.try_input(bytes)?),
+                _input_item: Some(
+                    admission
+                        .try_count(CountClass::PaneInputItem, 1)
+                        .context("admit pane write input item")?,
+                ),
+                _job: Some(
+                    admission
+                        .try_count(CountClass::PaneWriteJob, 1)
+                        .context("admit pane write job")?,
+                ),
+                _input_bytes: Some(
+                    admission
+                        .try_bytes(ByteClass::PaneInput, bytes)
+                        .context("admit pane write bytes")?,
+                ),
+            }),
+            PaneTaskKind::Refresh => Ok(Self {
+                _job: Some(
+                    admission
+                        .try_count(CountClass::PaneRefreshJob, 1)
+                        .context("admit pane refresh job")?,
+                ),
+                ..Self::default()
+            }),
+        }
+    }
+}
+
+struct RetiringPaneTasks {
+    pane_id: PaneId,
+    tasks: Vec<OwnedPaneTask>,
+    _pane_permit: PaneAdmissionPermit,
+}
+
+#[derive(Default)]
+struct HeadlessPaneOutputTasks {
+    pending: HashSet<PaneId>,
+    tasks: Vec<promise::spawn::AdmittedTask<anyhow::Result<()>>>,
+}
+
+fn retire_pane_tasks(
+    pane_id: PaneId,
+    removal: PaneRemoval,
+    tasks: Vec<OwnedPaneTask>,
+    pane_permit: PaneAdmissionPermit,
+) -> RetiringPaneTasks {
+    for owned in &tasks {
+        if owned.kind.cancel_on_removal(removal) {
+            owned.task.cancel();
+        }
+    }
+
+    RetiringPaneTasks {
+        pane_id,
+        tasks,
+        _pane_permit: pane_permit,
+    }
+}
+
+fn reap_retiring_pane_tasks(retiring: &mut Vec<RetiringPaneTasks>) -> anyhow::Result<()> {
+    let mut first_error = None;
+    let mut index = 0;
+    while index < retiring.len() {
+        if let Err(err) = reap_owned_pane_tasks(&mut retiring[index].tasks) {
+            if first_error.is_none() {
+                first_error = Some(err);
+            }
+        }
+        if retiring[index].tasks.is_empty() {
+            retiring.swap_remove(index);
+        } else {
+            index += 1;
+        }
+    }
+    match first_error {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
 pub struct Mux {
+    admission: Arc<RuntimeAdmission>,
+    headless_executor: Option<Arc<promise::spawn::SimpleExecutor>>,
+    lifecycle: Mutex<RuntimeLifecycle>,
+    tab_permits: Mutex<HashMap<TabId, TabAdmissionPermit>>,
+    pane_workers: Mutex<HashMap<PaneId, PaneWorkerSet>>,
+    retiring_pane_tasks: Mutex<Vec<RetiringPaneTasks>>,
+    headless_runtime_tasks: Mutex<Vec<promise::spawn::AdmittedTask<anyhow::Result<()>>>>,
+    client_invalidation_tasks: Mutex<Vec<promise::spawn::AdmittedTask<anyhow::Result<()>>>>,
+    headless_pane_output_tasks: Mutex<HeadlessPaneOutputTasks>,
+    headless_task_error: Mutex<Option<anyhow::Error>>,
+    pane_lifecycle: Mutex<Option<PaneLifecycleCoordinator>>,
     tabs: RwLock<HashMap<TabId, Arc<Tab>>>,
     panes: RwLock<HashMap<PaneId, Arc<dyn Pane>>>,
     windows: RwLock<HashMap<WindowId, Window>>,
@@ -115,7 +371,262 @@ pub struct Mux {
     agent: Option<AgentProxy>,
 }
 
+#[derive(Debug)]
+struct RuntimeLifecycle {
+    shutting_down: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PaneLifecycleAction {
+    Prune,
+    Remove(PaneId),
+}
+
+struct PaneLifecycleEvent {
+    action: PaneLifecycleAction,
+    _permit: CountPermit,
+}
+
+struct PaneLifecycleCoordinator {
+    sender: Option<SyncSender<PaneLifecycleEvent>>,
+    worker: Option<thread::JoinHandle<anyhow::Result<()>>>,
+}
+
+struct PaneWorkerSet {
+    pane: Arc<dyn Pane>,
+    pane_permit: Option<PaneAdmissionPermit>,
+    cancel: Arc<AtomicBool>,
+    reader: Option<thread::JoinHandle<anyhow::Result<()>>>,
+    parser: Option<thread::JoinHandle<()>>,
+    has_reader: bool,
+    input_admission: Arc<PaneInputAdmission>,
+    tasks: Vec<OwnedPaneTask>,
+    stopped: bool,
+}
+
+impl Drop for Mux {
+    fn drop(&mut self) {
+        self.shutdown_runtime();
+    }
+}
+
+impl PaneWorkerSet {
+    fn start(
+        pane: Arc<dyn Pane>,
+        banner: Option<String>,
+        reader: Option<Box<dyn std::io::Read + Send>>,
+        admission: Arc<RuntimeAdmission>,
+        lifecycle: SyncSender<PaneLifecycleEvent>,
+        pane_permit: PaneAdmissionPermit,
+    ) -> anyhow::Result<Self> {
+        let Some(reader) = reader else {
+            return Ok(Self {
+                pane,
+                pane_permit: Some(pane_permit),
+                cancel: Arc::new(AtomicBool::new(false)),
+                reader: None,
+                parser: None,
+                has_reader: false,
+                input_admission: Arc::new(PaneInputAdmission::default()),
+                tasks: Vec::new(),
+                stopped: false,
+            });
+        };
+
+        let (tx, rx) = allocate_socketpair()?;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let parser_permit = admission
+            .try_count(CountClass::ExecutorRunnable, 1)
+            .context("admit pane parser worker")?;
+        let reader_permit = admission
+            .try_count(CountClass::ExecutorRunnable, 1)
+            .context("admit pane reader worker")?;
+        let parser_cancel = Arc::clone(&cancel);
+        let parser_pane = Arc::downgrade(&pane);
+        let pane_id = pane.pane_id();
+        let parser = thread::Builder::new()
+            .name(format!("mux-pane-parser-{pane_id}"))
+            .spawn(move || {
+                let _permit = parser_permit;
+                parse_buffered_data(parser_pane, &parser_cancel, rx)
+            })
+            .context("spawn pane parser worker")?;
+
+        let reader_cancel = Arc::clone(&cancel);
+        let reader_pane = Arc::downgrade(&pane);
+        let reader_admission = Arc::clone(&admission);
+        let reader = match thread::Builder::new()
+            .name(format!("mux-pane-reader-{pane_id}"))
+            .spawn(move || {
+                let action = read_from_pane_pty(reader_pane, banner, reader, tx, reader_cancel);
+                drop(reader_permit);
+                if let Some(action) = action {
+                    if let Err(err) = enqueue_pane_lifecycle(&reader_admission, &lifecycle, action)
+                    {
+                        reader_admission.begin_shutdown();
+                        return Err(err);
+                    }
+                }
+                Ok(())
+            }) {
+            Ok(reader) => reader,
+            Err(err) => {
+                cancel.store(true, Ordering::Release);
+                if parser.join().is_err() {
+                    log::error!("pane parser worker panicked after reader spawn failure");
+                }
+                return Err(err).context("spawn pane reader worker");
+            }
+        };
+
+        Ok(Self {
+            pane,
+            pane_permit: Some(pane_permit),
+            cancel,
+            reader: Some(reader),
+            parser: Some(parser),
+            has_reader: true,
+            input_admission: Arc::new(PaneInputAdmission::default()),
+            tasks: Vec::new(),
+            stopped: false,
+        })
+    }
+
+    fn take_pane_permit(&mut self) -> PaneAdmissionPermit {
+        self.pane_permit
+            .take()
+            .expect("registered pane worker must own its admission permit")
+    }
+
+    fn shutdown(&mut self, kill_process: bool) -> anyhow::Result<()> {
+        if self.stopped {
+            return Ok(());
+        }
+        self.stopped = true;
+
+        // Mark this as an owned shutdown before killing the child. The child waiter can wake the
+        // PTY reader immediately after process exit; setting the flag first prevents that wake from
+        // being mistaken for a natural EOF that should schedule another pane-removal task.
+        self.cancel.store(true, Ordering::Release);
+        if kill_process {
+            self.pane.kill();
+        }
+
+        let mut first_error = None;
+        if self.has_reader {
+            if let Err(err) = self.pane.cancel_reader() {
+                first_error = Some(err.context("cancel pane reader"));
+            }
+        }
+        if let Some(reader) = self.reader.take() {
+            match reader.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) if first_error.is_none() => {
+                    first_error = Some(err.context("pane reader worker failed"));
+                }
+                Ok(Err(_)) => {}
+                Err(_) if first_error.is_none() => {
+                    first_error = Some(anyhow!("pane reader worker panicked"));
+                }
+                Err(_) => {}
+            }
+        }
+        if let Some(parser) = self.parser.take() {
+            if parser.join().is_err() && first_error.is_none() {
+                first_error = Some(anyhow!("pane parser worker panicked"));
+            }
+        }
+        if let Err(err) = self.pane.join_child_waiter() {
+            if first_error.is_none() {
+                first_error = Some(err.context("join pane child waiter"));
+            }
+        }
+
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for PaneWorkerSet {
+    fn drop(&mut self) {
+        debug_assert!(
+            self.tasks.is_empty(),
+            "pane tasks must be transferred to their join owner"
+        );
+        if let Err(err) = self.shutdown(true) {
+            log::error!("pane worker shutdown failed: {err:#}");
+        }
+    }
+}
+
+fn observe_owned_task(
+    task: promise::spawn::AdmittedTask<anyhow::Result<()>>,
+) -> anyhow::Result<()> {
+    match promise::spawn::block_on(task) {
+        Ok(result) => result,
+        Err(err) if err.is_cancelled() => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn reap_admitted_tasks(
+    tasks: &mut Vec<promise::spawn::AdmittedTask<anyhow::Result<()>>>,
+) -> anyhow::Result<()> {
+    let mut first_error = None;
+    let mut index = 0;
+    while index < tasks.len() {
+        if tasks[index].is_finished() {
+            let task = tasks.swap_remove(index);
+            if let Err(err) = observe_owned_task(task) {
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+        } else {
+            index += 1;
+        }
+    }
+    match first_error {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+fn reap_owned_pane_tasks(tasks: &mut Vec<OwnedPaneTask>) -> anyhow::Result<()> {
+    let mut first_error = None;
+    let mut index = 0;
+    while index < tasks.len() {
+        if tasks[index].task.is_finished() {
+            let task = tasks.swap_remove(index).task;
+            if let Err(err) = observe_owned_task(task) {
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+        } else {
+            index += 1;
+        }
+    }
+    match first_error {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
 const BUFSIZE: usize = 1024 * 1024;
+
+fn bounded_parser_buffer_size(configured: usize) -> usize {
+    configured.clamp(
+        1,
+        wezterm_runtime_admission::MAX_PANE_PARSER_INPUT_BYTES_PER_BATCH,
+    )
+}
+
+fn parser_buffer_size() -> usize {
+    bounded_parser_buffer_size(configuration().mux_output_parser_buffer_size)
+}
 
 /// This function applies parsed actions to the pane and notifies any
 /// mux subscribers about the output event
@@ -125,7 +636,7 @@ fn send_actions_to_mux(pane: &Weak<dyn Pane>, dead: &Arc<AtomicBool>, actions: V
         Some(pane) => {
             pane.perform_actions(actions);
             histogram!("send_actions_to_mux.perform_actions.latency").record(start.elapsed());
-            Mux::notify_from_any_thread(MuxNotification::PaneOutput(pane.pane_id()));
+            Mux::notify_pane_output_from_any_thread(pane.pane_id());
         }
         None => {
             // Something else removed the pane from
@@ -140,11 +651,11 @@ fn send_actions_to_mux(pane: &Weak<dyn Pane>, dead: &Arc<AtomicBool>, actions: V
 /// This is the parsing loop for the given pane.
 /// It reads all data sent to `rx` (from pane PTY) and handles all terminal events for this pane.
 fn parse_buffered_data(pane: Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut rx: FileDescriptor) {
-    let mut buf = vec![0; configuration().mux_output_parser_buffer_size];
+    let mut buf = vec![0; parser_buffer_size()];
     let mut parser = termwiz::escape::parser::Parser::new();
     let mut actions = vec![];
     let mut hold = false;
-    let mut action_size = 0;
+    let mut action_size: usize = 0;
     let mut delay = Duration::from_millis(configuration().mux_output_parser_coalesce_delay_ms);
     let mut deadline = None;
 
@@ -194,8 +705,18 @@ fn parse_buffered_data(pane: Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut rx: Fil
                         action_size = 0;
                     }
                 });
-                action_size += size;
-                if !actions.is_empty() && !hold {
+                action_size = action_size.saturating_add(size);
+                if !actions.is_empty()
+                    && action_size
+                        >= wezterm_runtime_admission::MAX_PANE_PARSER_INPUT_BYTES_PER_BATCH
+                {
+                    // Synchronized output may delay presentation, but it must not retain an
+                    // unbounded action vector. Applying a bounded chunk preserves the terminal's
+                    // synchronized-output mode while releasing parser-owned allocations.
+                    send_actions_to_mux(&pane, &dead, std::mem::take(&mut actions));
+                    deadline = None;
+                    action_size = 0;
+                } else if !actions.is_empty() && !hold {
                     // If we haven't accumulated too much data,
                     // pause for a short while to increase the chances
                     // that we coalesce a full "frame" from an unoptimized
@@ -231,7 +752,10 @@ fn parse_buffered_data(pane: Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut rx: Fil
                 }
 
                 let config = configuration();
-                buf.resize(config.mux_output_parser_buffer_size, 0);
+                buf.resize(
+                    bounded_parser_buffer_size(config.mux_output_parser_buffer_size),
+                    0,
+                );
                 delay = Duration::from_millis(config.mux_output_parser_coalesce_delay_ms);
             }
         }
@@ -276,6 +800,24 @@ fn allocate_socketpair() -> anyhow::Result<(FileDescriptor, FileDescriptor)> {
     Ok((tx, rx))
 }
 
+fn enqueue_pane_lifecycle(
+    admission: &RuntimeAdmission,
+    sender: &SyncSender<PaneLifecycleEvent>,
+    action: PaneLifecycleAction,
+) -> anyhow::Result<()> {
+    let permit = admission
+        .try_count(CountClass::PaneLifecycleEvent, 1)
+        .context("admit pane lifecycle event")?;
+    let event = PaneLifecycleEvent {
+        action,
+        _permit: permit,
+    };
+    sender.try_send(event).map_err(|err| match err {
+        TrySendError::Full(_) => anyhow!("pane lifecycle queue is saturated"),
+        TrySendError::Disconnected(_) => anyhow!("pane lifecycle coordinator is stopped"),
+    })
+}
+
 /// This function is run in a separate thread; its purpose is to perform
 /// blocking reads from the pty (non-blocking reads are not portable to
 /// all platforms and pty/tty types), parse the escape sequences and
@@ -284,46 +826,24 @@ fn read_from_pane_pty(
     pane: Weak<dyn Pane>,
     banner: Option<String>,
     mut reader: Box<dyn std::io::Read>,
-) {
+    mut tx: FileDescriptor,
+    dead: Arc<AtomicBool>,
+) -> Option<PaneLifecycleAction> {
     let mut buf = vec![0; BUFSIZE];
-
-    // This is used to signal that an error occurred either in this thread,
-    // or in the main mux thread.  If `true`, this thread will terminate.
-    let dead = Arc::new(AtomicBool::new(false));
 
     let (pane_id, exit_behavior) = match pane.upgrade() {
         Some(pane) => (pane.pane_id(), pane.exit_behavior()),
-        None => return,
+        None => return None,
     };
-
-    let (mut tx, rx) = match allocate_socketpair() {
-        Ok(pair) => pair,
-        Err(err) => {
-            log::error!("read_from_pane_pty: Unable to allocate a socketpair: {err:#}");
-            localpane::emit_output_for_pane(
-                pane_id,
-                &format!(
-                    "⚠️  wezterm: read_from_pane_pty: \
-                    Unable to allocate a socketpair: {err:#}"
-                ),
-            );
-            return;
-        }
-    };
-
-    // Spawn parser thread for this pane
-    std::thread::spawn({
-        let dead = Arc::clone(&dead);
-        move || parse_buffered_data(pane, &dead, rx)
-    });
 
     if let Some(banner) = banner {
         tx.write_all(banner.as_bytes()).ok();
     }
 
-    // Loop until the pane or the main mux thread is dead.
-    // Read data from the pane pty and send it to the parser thread via tx/rx.
-    while !dead.load(Ordering::Relaxed) {
+    // A cancellation-aware reader drains every byte that was already readable before it reports
+    // EOF. Do not stop merely because shutdown was requested: doing so would preserve only the
+    // first ready read and discard the remainder of the PTY's final output.
+    loop {
         match reader.read(&mut buf) {
             Ok(size) if size == 0 => {
                 log::trace!("read_pty EOF: pane_id {}", pane_id);
@@ -348,31 +868,28 @@ fn read_from_pane_pty(
         }
     }
 
-    match exit_behavior.unwrap_or_else(|| configuration().exit_behavior) {
-        ExitBehavior::Hold | ExitBehavior::CloseOnCleanExit => {
-            // We don't know if we can unilaterally close
-            // this pane right now, so don't!
-            promise::spawn::spawn_into_main_thread(async move {
-                let mux = Mux::get();
-                log::trace!("checking for dead windows after EOF on pane {}", pane_id);
-                mux.prune_dead_windows();
-            })
-            .detach();
-        }
-        ExitBehavior::Close => {
-            promise::spawn::spawn_into_main_thread(async move {
-                let mux = Mux::get();
-                mux.remove_pane(pane_id);
-            })
-            .detach();
-        }
+    let was_cancelled = dead.swap(true, Ordering::AcqRel);
+    drop(tx);
+    if was_cancelled {
+        return None;
     }
 
-    dead.store(true, Ordering::Relaxed);
+    Some(
+        match exit_behavior.unwrap_or_else(|| configuration().exit_behavior) {
+            ExitBehavior::Hold | ExitBehavior::CloseOnCleanExit => PaneLifecycleAction::Prune,
+            ExitBehavior::Close => PaneLifecycleAction::Remove(pane_id),
+        },
+    )
+}
+
+enum ProcessMux {
+    Vacant,
+    Active(Arc<Mux>),
+    Shutdown,
 }
 
 lazy_static::lazy_static! {
-    static ref MUX: Mutex<Option<Arc<Mux>>> = Mutex::new(None);
+    static ref MUX: Mutex<ProcessMux> = Mutex::new(ProcessMux::Vacant);
 }
 
 pub struct MuxWindowBuilder {
@@ -398,13 +915,18 @@ impl MuxWindowBuilder {
             // causes it to get confused and shutdown the connection!?
             mux.notify(MuxNotification::WindowCreated(window_id));
         } else {
-            promise::spawn::spawn_into_main_thread(async move {
-                if let Some(mux) = Mux::try_get() {
-                    mux.notify(MuxNotification::WindowCreated(window_id));
-                    drop(activity);
-                }
-            })
-            .detach();
+            let weak_mux = Arc::downgrade(&mux);
+            if let Err(err) =
+                mux.try_spawn_runtime_task("schedule window-created notification", async move {
+                    if let Some(mux) = weak_mux.upgrade() {
+                        mux.notify(MuxNotification::WindowCreated(window_id));
+                        drop(activity);
+                    }
+                    Ok(())
+                })
+            {
+                log::error!("failed to schedule window-created notification: {err:#}");
+            }
         }
     }
 }
@@ -424,7 +946,26 @@ impl std::ops::Deref for MuxWindowBuilder {
 }
 
 impl Mux {
-    pub fn new(default_domain: Option<Arc<dyn Domain>>) -> Self {
+    pub fn new(default_domain: Option<Arc<dyn Domain>>, admission: Arc<RuntimeAdmission>) -> Self {
+        Self::new_with_executor(default_domain, admission, None)
+    }
+
+    /// Construct a mux whose async lifecycle is owned by a bounded, explicitly injected executor.
+    /// GUI callers use [`Mux::new`] and their existing event-loop scheduler; headless runtimes must
+    /// use this constructor and retain the matching [`promise::spawn::SimpleExecutor`].
+    pub fn new_headless(
+        default_domain: Option<Arc<dyn Domain>>,
+        admission: Arc<RuntimeAdmission>,
+        executor: Arc<promise::spawn::SimpleExecutor>,
+    ) -> Self {
+        Self::new_with_executor(default_domain, admission, Some(executor))
+    }
+
+    fn new_with_executor(
+        default_domain: Option<Arc<dyn Domain>>,
+        admission: Arc<RuntimeAdmission>,
+        headless_executor: Option<Arc<promise::spawn::SimpleExecutor>>,
+    ) -> Self {
         let mut domains = HashMap::new();
         let mut domains_by_name = HashMap::new();
         if let Some(default_domain) = default_domain.as_ref() {
@@ -443,6 +984,19 @@ impl Mux {
         };
 
         Self {
+            admission,
+            headless_executor,
+            lifecycle: Mutex::new(RuntimeLifecycle {
+                shutting_down: false,
+            }),
+            tab_permits: Mutex::new(HashMap::new()),
+            pane_workers: Mutex::new(HashMap::new()),
+            retiring_pane_tasks: Mutex::new(Vec::new()),
+            headless_runtime_tasks: Mutex::new(Vec::new()),
+            client_invalidation_tasks: Mutex::new(Vec::new()),
+            headless_pane_output_tasks: Mutex::new(HeadlessPaneOutputTasks::default()),
+            headless_task_error: Mutex::new(None),
+            pane_lifecycle: Mutex::new(None),
             tabs: RwLock::new(HashMap::new()),
             panes: RwLock::new(HashMap::new()),
             windows: RwLock::new(HashMap::new()),
@@ -456,6 +1010,381 @@ impl Mux {
             num_panes_by_workspace: RwLock::new(HashMap::new()),
             main_thread_id: std::thread::current().id(),
             agent,
+        }
+    }
+
+    pub fn admission(&self) -> &Arc<RuntimeAdmission> {
+        &self.admission
+    }
+
+    pub fn headless_executor(&self) -> anyhow::Result<promise::spawn::SimpleExecutorHandle> {
+        self.headless_executor
+            .as_ref()
+            .map(|executor| executor.handle())
+            .ok_or_else(|| anyhow!("this mux is not owned by a headless executor"))
+    }
+
+    pub fn is_headless_runtime(&self) -> bool {
+        self.headless_executor.is_some()
+    }
+
+    pub fn try_spawn_client_pane_task<F>(
+        &self,
+        pane_id: PaneId,
+        kind: ClientPaneTaskKind,
+        future: F,
+    ) -> anyhow::Result<()>
+    where
+        F: Future<Output = anyhow::Result<()>> + Send + 'static,
+    {
+        if self.admission.is_shutting_down() {
+            anyhow::bail!("mux is shutting down");
+        }
+
+        let Some(executor) = self.headless_executor.as_ref() else {
+            promise::spawn::spawn(async move {
+                if let Err(err) = future.await {
+                    log::error!("client pane task failed: {err:#}");
+                }
+            })
+            .detach();
+            return Ok(());
+        };
+
+        if let Err(err) = self.reap_headless_tasks() {
+            log::error!("observed completed task before scheduling pane work: {err:#}");
+            self.record_headless_task_error(err);
+        }
+        let mut pane_workers = self.pane_workers.lock();
+        let workers = pane_workers
+            .get_mut(&pane_id)
+            .ok_or_else(|| anyhow!("pane {pane_id} has no registered task owner"))?;
+        if kind == ClientPaneTaskKind::Poll
+            && workers
+                .tasks
+                .iter()
+                .any(|owned| owned.kind == OwnedPaneTaskKind::Client(ClientPaneTaskKind::Poll))
+        {
+            anyhow::bail!("pane {pane_id} already has an active poll task");
+        }
+        let producer_permit = match kind.admission_class() {
+            Some(class) => Some(
+                self.admission
+                    .try_count(class, 1)
+                    .with_context(|| format!("admit {kind:?} client pane task"))?,
+            ),
+            None => None,
+        };
+        let task = executor.handle().try_spawn(async move {
+            let _producer_permit = producer_permit;
+            future.await
+        })?;
+        workers.tasks.push(OwnedPaneTask {
+            kind: OwnedPaneTaskKind::Client(kind),
+            task,
+        });
+        Ok(())
+    }
+
+    /// Schedule one admitted pane mutation or refresh on the headless owner executor.
+    ///
+    /// The pane worker set retains the task and its permits through completion, pane removal, or
+    /// runtime shutdown. Interactive runtimes deliberately use their synchronous pane path instead.
+    pub fn try_spawn_pane_task_local<F>(
+        &self,
+        pane_id: PaneId,
+        kind: PaneTaskKind,
+        future: F,
+    ) -> anyhow::Result<()>
+    where
+        F: Future<Output = anyhow::Result<()>> + 'static,
+    {
+        if self.admission.is_shutting_down() {
+            anyhow::bail!("mux is shutting down");
+        }
+        if !self.is_main_thread() {
+            anyhow::bail!("pane tasks must be scheduled on the mux owner thread");
+        }
+        let executor = self
+            .headless_executor
+            .as_ref()
+            .ok_or_else(|| anyhow!("pane task scheduling requires a headless mux runtime"))?;
+
+        if let Err(err) = self.reap_headless_tasks() {
+            self.record_headless_task_error(err);
+        }
+        let mut pane_workers = self.pane_workers.lock();
+        let workers = pane_workers
+            .get_mut(&pane_id)
+            .ok_or_else(|| anyhow!("pane {pane_id} has no registered task owner"))?;
+        if kind == PaneTaskKind::Refresh
+            && workers
+                .tasks
+                .iter()
+                .any(|owned| owned.kind == OwnedPaneTaskKind::Pane(PaneTaskKind::Refresh))
+        {
+            return Ok(());
+        }
+
+        let permits = PaneTaskPermits::admit(&self.admission, &workers.input_admission, kind)?;
+        let task = executor.handle().local().try_spawn_local(async move {
+            let _permits = permits;
+            future.await
+        })?;
+        workers.tasks.push(OwnedPaneTask {
+            kind: OwnedPaneTaskKind::Pane(kind),
+            task,
+        });
+        Ok(())
+    }
+
+    pub fn try_spawn_client_invalidation<F>(&self, future: F) -> anyhow::Result<()>
+    where
+        F: Future<Output = anyhow::Result<()>> + Send + 'static,
+    {
+        let lifecycle = self.lifecycle.lock();
+        if lifecycle.shutting_down {
+            anyhow::bail!("mux is shutting down");
+        }
+
+        let Some(executor) = self.headless_executor.as_ref() else {
+            promise::spawn::spawn_into_main_thread(async move {
+                if let Err(err) = future.await {
+                    log::error!("client invalidation task failed: {err:#}");
+                }
+            })
+            .detach();
+            return Ok(());
+        };
+
+        if let Err(err) = self.reap_headless_tasks() {
+            log::error!("observed completed client task before scheduling invalidation: {err:#}");
+            self.record_headless_task_error(err);
+        }
+        let permit = self
+            .admission
+            .try_count(CountClass::ClientInvalidation, 1)
+            .context("admit client invalidation task")?;
+        let task = executor.handle().try_spawn(async move {
+            let _permit = permit;
+            future.await
+        })?;
+        self.client_invalidation_tasks.lock().push(task);
+        Ok(())
+    }
+
+    /// Schedule mux-owner work on the configured main-thread executor. Headless runtimes retain
+    /// every task for error observation, cancellation, and shutdown join; interactive runtimes keep
+    /// using their event-loop scheduler.
+    pub fn try_spawn_runtime_task<F>(
+        &self,
+        schedule_context: &'static str,
+        future: F,
+    ) -> anyhow::Result<()>
+    where
+        F: Future<Output = anyhow::Result<()>> + Send + 'static,
+    {
+        self.try_spawn_runtime_task_with_priority(schedule_context, future, false)
+    }
+
+    pub fn try_spawn_runtime_task_low_priority<F>(
+        &self,
+        schedule_context: &'static str,
+        future: F,
+    ) -> anyhow::Result<()>
+    where
+        F: Future<Output = anyhow::Result<()>> + Send + 'static,
+    {
+        self.try_spawn_runtime_task_with_priority(schedule_context, future, true)
+    }
+
+    fn try_spawn_runtime_task_with_priority<F>(
+        &self,
+        schedule_context: &'static str,
+        future: F,
+        low_priority: bool,
+    ) -> anyhow::Result<()>
+    where
+        F: Future<Output = anyhow::Result<()>> + Send + 'static,
+    {
+        if self.lifecycle.lock().shutting_down {
+            anyhow::bail!("mux is shutting down");
+        }
+
+        let Some(executor) = self.headless_executor.as_ref() else {
+            let task = async move {
+                if let Err(err) = future.await {
+                    log::error!("mux runtime task failed: {err:#}");
+                }
+            };
+            if low_priority {
+                promise::spawn::spawn_into_main_thread_with_low_priority(task).detach();
+            } else {
+                promise::spawn::spawn_into_main_thread(task).detach();
+            }
+            return Ok(());
+        };
+
+        if let Err(err) = self.reap_headless_tasks() {
+            self.record_headless_task_error(err);
+        }
+        // The headless SimpleExecutor intentionally has one bounded FIFO: its legacy normal and
+        // low-priority schedulers already share this same queue. Interactive runtimes preserve the
+        // requested priority above through their distinct event-loop schedulers.
+        let task = match executor.handle().try_spawn(future) {
+            Ok(task) => task,
+            Err(error) => {
+                self.record_headless_task_error(
+                    anyhow::Error::new(error.clone()).context(schedule_context),
+                );
+                return Err(anyhow::Error::new(error).context(schedule_context));
+            }
+        };
+        self.headless_runtime_tasks.lock().push(task);
+        Ok(())
+    }
+
+    /// Main-thread-only variant for futures that intentionally capture non-Send GUI/Lua state.
+    pub fn try_spawn_runtime_task_local<F>(
+        &self,
+        schedule_context: &'static str,
+        future: F,
+    ) -> anyhow::Result<()>
+    where
+        F: Future<Output = anyhow::Result<()>> + 'static,
+    {
+        if self.lifecycle.lock().shutting_down {
+            anyhow::bail!("mux is shutting down");
+        }
+
+        let Some(executor) = self.headless_executor.as_ref() else {
+            promise::spawn::spawn(async move {
+                if let Err(err) = future.await {
+                    log::error!("mux runtime task failed: {err:#}");
+                }
+            })
+            .detach();
+            return Ok(());
+        };
+        if !self.is_main_thread() {
+            anyhow::bail!("local mux runtime tasks must be scheduled on the owner thread");
+        }
+
+        if let Err(err) = self.reap_headless_tasks() {
+            self.record_headless_task_error(err);
+        }
+        let task = match executor.handle().local().try_spawn_local(future) {
+            Ok(task) => task,
+            Err(error) => {
+                self.record_headless_task_error(
+                    anyhow::Error::new(error.clone()).context(schedule_context),
+                );
+                return Err(anyhow::Error::new(error).context(schedule_context));
+            }
+        };
+        self.headless_runtime_tasks.lock().push(task);
+        Ok(())
+    }
+
+    fn try_enqueue_headless_pane_output(self: &Arc<Self>, pane_id: PaneId) -> anyhow::Result<()> {
+        if self.lifecycle.lock().shutting_down {
+            anyhow::bail!("mux is shutting down");
+        }
+        let executor = self
+            .headless_executor
+            .as_ref()
+            .ok_or_else(|| anyhow!("this mux is not owned by a headless executor"))?;
+        let mut output_tasks = self.headless_pane_output_tasks.lock();
+        if !output_tasks.pending.insert(pane_id) {
+            return Ok(());
+        }
+
+        let permit = match self.admission.try_count(CountClass::PaneLifecycleEvent, 1) {
+            Ok(permit) => permit,
+            Err(err) => {
+                output_tasks.pending.remove(&pane_id);
+                return Err(err).context("admit headless pane-output notification");
+            }
+        };
+        let mux = Arc::downgrade(self);
+        let task = match executor.handle().try_spawn(async move {
+            let _permit = permit;
+            if let Some(mux) = mux.upgrade() {
+                mux.headless_pane_output_tasks
+                    .lock()
+                    .pending
+                    .remove(&pane_id);
+                mux.notify(MuxNotification::PaneOutput(pane_id));
+            }
+            Ok(())
+        }) {
+            Ok(task) => task,
+            Err(err) => {
+                output_tasks.pending.remove(&pane_id);
+                return Err(err).context("schedule headless pane-output notification");
+            }
+        };
+        output_tasks.tasks.push(task);
+        Ok(())
+    }
+
+    pub fn tick_headless(&self) -> anyhow::Result<()> {
+        if !self.is_main_thread() {
+            anyhow::bail!("headless mux executor must be ticked on its owner thread");
+        }
+        if let Some(err) = self.headless_task_error.lock().take() {
+            return Err(err.context("owned headless task failed"));
+        }
+        self.reap_headless_tasks()?;
+        self.headless_executor
+            .as_ref()
+            .ok_or_else(|| anyhow!("this mux is not owned by a headless executor"))?
+            .tick()?;
+        self.reap_headless_tasks()
+    }
+
+    fn record_headless_task_error(&self, error: anyhow::Error) {
+        let mut first = self.headless_task_error.lock();
+        if first.is_none() {
+            *first = Some(error);
+        }
+    }
+
+    fn reap_headless_tasks(&self) -> anyhow::Result<()> {
+        let mut first_error = None;
+        for workers in self.pane_workers.lock().values_mut() {
+            if let Err(err) = reap_owned_pane_tasks(&mut workers.tasks) {
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+        }
+
+        if let Err(err) = reap_retiring_pane_tasks(&mut self.retiring_pane_tasks.lock()) {
+            if first_error.is_none() {
+                first_error = Some(err);
+            }
+        }
+
+        if let Err(err) = reap_admitted_tasks(&mut self.client_invalidation_tasks.lock()) {
+            if first_error.is_none() {
+                first_error = Some(err);
+            }
+        }
+        if let Err(err) = reap_admitted_tasks(&mut self.headless_runtime_tasks.lock()) {
+            if first_error.is_none() {
+                first_error = Some(err);
+            }
+        }
+        if let Err(err) = reap_admitted_tasks(&mut self.headless_pane_output_tasks.lock().tasks) {
+            if first_error.is_none() {
+                first_error = Some(err);
+            }
+        }
+
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(()),
         }
     }
 
@@ -712,16 +1641,27 @@ impl Mux {
         subscribers.retain(|_, notify| notify(notification.clone()));
     }
 
-    pub fn notify_from_any_thread(notification: MuxNotification) {
+    fn notify_pane_output_from_any_thread(pane_id: PaneId) {
         if let Some(mux) = Mux::try_get() {
             if mux.is_main_thread() {
-                mux.notify(notification);
+                mux.notify(MuxNotification::PaneOutput(pane_id));
+                return;
+            }
+            if mux.headless_executor.is_some() {
+                if mux.lifecycle.lock().shutting_down {
+                    return;
+                }
+                if let Err(err) = mux.try_enqueue_headless_pane_output(pane_id) {
+                    mux.record_headless_task_error(
+                        err.context("queue off-thread headless pane-output notification"),
+                    );
+                }
                 return;
             }
         }
-        promise::spawn::spawn_into_main_thread(async {
+        promise::spawn::spawn_into_main_thread(async move {
             if let Some(mux) = Mux::try_get() {
-                mux.notify(notification);
+                mux.notify(MuxNotification::PaneOutput(pane_id));
             }
         })
         .detach();
@@ -755,12 +1695,211 @@ impl Mux {
             .insert(domain.domain_name().to_string(), Arc::clone(domain));
     }
 
-    pub fn set_mux(mux: &Arc<Mux>) {
-        MUX.lock().replace(Arc::clone(mux));
+    pub fn set_mux(mux: &Arc<Mux>) -> anyhow::Result<()> {
+        let mut process_mux = MUX.lock();
+        match &*process_mux {
+            ProcessMux::Vacant => {}
+            ProcessMux::Active(_) => bail!("the process-global mux is already initialized"),
+            ProcessMux::Shutdown => {
+                bail!("the process-global mux was shut down and cannot be restarted")
+            }
+        }
+
+        mux.start_pane_lifecycle()?;
+        *process_mux = ProcessMux::Active(Arc::clone(mux));
+        Ok(())
     }
 
     pub fn shutdown() {
-        MUX.lock().take();
+        let mux = {
+            let mut process_mux = MUX.lock();
+            match std::mem::replace(&mut *process_mux, ProcessMux::Shutdown) {
+                ProcessMux::Active(mux) => Some(mux),
+                ProcessMux::Vacant | ProcessMux::Shutdown => None,
+            }
+        };
+        if let Some(mux) = mux {
+            mux.shutdown_runtime();
+        }
+    }
+
+    fn shutdown_runtime(&self) {
+        let (
+            mut workers,
+            mut pane_lifecycle,
+            tab_permits,
+            mut retiring,
+            mut runtime_tasks,
+            mut invalidations,
+            mut pane_output_tasks,
+        ) = {
+            let mut lifecycle = self.lifecycle.lock();
+            if lifecycle.shutting_down {
+                return;
+            }
+            lifecycle.shutting_down = true;
+
+            (
+                std::mem::take(&mut *self.pane_workers.lock()),
+                self.pane_lifecycle.lock().take(),
+                std::mem::take(&mut *self.tab_permits.lock()),
+                std::mem::take(&mut *self.retiring_pane_tasks.lock()),
+                std::mem::take(&mut *self.headless_runtime_tasks.lock()),
+                std::mem::take(&mut *self.client_invalidation_tasks.lock()),
+                std::mem::take(&mut *self.headless_pane_output_tasks.lock()),
+            )
+        };
+        if let Some(coordinator) = pane_lifecycle.as_mut() {
+            coordinator.sender.take();
+        }
+
+        for worker_set in workers.values() {
+            for owned in &worker_set.tasks {
+                owned.task.cancel();
+            }
+        }
+        for task in &invalidations {
+            task.cancel();
+        }
+        for task in &runtime_tasks {
+            task.cancel();
+        }
+        for task in &pane_output_tasks.tasks {
+            task.cancel();
+        }
+        for retired in &retiring {
+            for owned in &retired.tasks {
+                owned.task.cancel();
+            }
+        }
+
+        while !runtime_tasks.is_empty()
+            || !invalidations.is_empty()
+            || !retiring.is_empty()
+            || !pane_output_tasks.tasks.is_empty()
+            || workers
+                .values()
+                .any(|worker_set| !worker_set.tasks.is_empty())
+        {
+            if let Err(err) = reap_admitted_tasks(&mut runtime_tasks) {
+                log::error!("mux runtime task failed during shutdown: {err:#}");
+            }
+            if let Err(err) = reap_admitted_tasks(&mut invalidations) {
+                log::error!("client invalidation task failed during mux shutdown: {err:#}");
+            }
+            if let Err(err) = reap_admitted_tasks(&mut pane_output_tasks.tasks) {
+                log::error!("pane-output task failed during mux shutdown: {err:#}");
+            }
+            for (pane_id, worker_set) in &mut workers {
+                if let Err(err) = reap_owned_pane_tasks(&mut worker_set.tasks) {
+                    log::error!("pane {pane_id} task failed during mux shutdown: {err:#}");
+                }
+            }
+            let mut index = 0;
+            while index < retiring.len() {
+                if let Err(err) = reap_owned_pane_tasks(&mut retiring[index].tasks) {
+                    log::error!(
+                        "pane {} task failed during mux shutdown: {err:#}",
+                        retiring[index].pane_id
+                    );
+                }
+                if retiring[index].tasks.is_empty() {
+                    retiring.swap_remove(index);
+                } else {
+                    index += 1;
+                }
+            }
+            if runtime_tasks.is_empty()
+                && invalidations.is_empty()
+                && retiring.is_empty()
+                && pane_output_tasks.tasks.is_empty()
+                && workers
+                    .values()
+                    .all(|worker_set| worker_set.tasks.is_empty())
+            {
+                break;
+            }
+            let Some(executor) = self.headless_executor.as_ref() else {
+                log::error!("headless tasks have no executor join owner");
+                break;
+            };
+            if let Err(err) = executor.tick() {
+                log::error!("headless executor failed while joining mux tasks: {err:#}");
+            }
+        }
+
+        self.admission.begin_shutdown();
+        for (pane_id, worker_set) in &mut workers {
+            if let Err(err) = worker_set.shutdown(true) {
+                log::error!("pane {pane_id} worker shutdown failed during mux shutdown: {err:#}");
+            }
+        }
+        drop(workers);
+
+        if let Some(mut coordinator) = pane_lifecycle {
+            if let Some(worker) = coordinator.worker.take() {
+                match worker.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        log::error!("pane lifecycle coordinator failed: {err:#}");
+                    }
+                    Err(_) => log::error!("pane lifecycle coordinator panicked"),
+                }
+            }
+        }
+
+        // Pane and tab admission remains held until every corresponding worker has stopped.
+        drop(tab_permits);
+    }
+
+    fn start_pane_lifecycle(self: &Arc<Self>) -> anyhow::Result<()> {
+        let mut slot = self.pane_lifecycle.lock();
+        if slot.is_some() {
+            return Ok(());
+        }
+
+        let coordinator_permit = self
+            .admission
+            .try_count(CountClass::ExecutorRunnable, 1)
+            .context("admit pane lifecycle coordinator")?;
+        let (sender, receiver): (
+            SyncSender<PaneLifecycleEvent>,
+            SyncReceiver<PaneLifecycleEvent>,
+        ) = sync_channel(MAX_PANES);
+        let mux = Arc::downgrade(self);
+        let worker = thread::Builder::new()
+            .name("mux-pane-lifecycle".to_string())
+            .spawn(move || {
+                let _permit = coordinator_permit;
+                while let Ok(event) = receiver.recv() {
+                    let Some(mux) = mux.upgrade() else {
+                        break;
+                    };
+                    if mux.admission.is_shutting_down() {
+                        continue;
+                    }
+                    match event.action {
+                        PaneLifecycleAction::Prune => mux.prune_dead_windows(),
+                        PaneLifecycleAction::Remove(pane_id) => mux.remove_pane(pane_id),
+                    }
+                }
+                Ok(())
+            })
+            .context("spawn pane lifecycle coordinator")?;
+        *slot = Some(PaneLifecycleCoordinator {
+            sender: Some(sender),
+            worker: Some(worker),
+        });
+        Ok(())
+    }
+
+    fn pane_lifecycle_sender(&self) -> anyhow::Result<SyncSender<PaneLifecycleEvent>> {
+        self.pane_lifecycle
+            .lock()
+            .as_ref()
+            .and_then(|coordinator| coordinator.sender.as_ref())
+            .cloned()
+            .ok_or_else(|| anyhow!("pane lifecycle coordinator is not running"))
     }
 
     pub fn get() -> Arc<Mux> {
@@ -768,7 +1907,10 @@ impl Mux {
     }
 
     pub fn try_get() -> Option<Arc<Mux>> {
-        MUX.lock().as_ref().map(Arc::clone)
+        match &*MUX.lock() {
+            ProcessMux::Active(mux) => Some(Arc::clone(mux)),
+            ProcessMux::Vacant | ProcessMux::Shutdown => None,
+        }
     }
 
     pub fn get_pane(&self, pane_id: PaneId) -> Option<Arc<dyn Pane>> {
@@ -780,9 +1922,27 @@ impl Mux {
     }
 
     pub fn add_pane(&self, pane: &Arc<dyn Pane>) -> Result<(), Error> {
-        if self.panes.read().contains_key(&pane.pane_id()) {
-            return Ok(());
+        let lifecycle = self.lifecycle.lock();
+        if lifecycle.shutting_down {
+            anyhow::bail!("mux is shutting down");
         }
+        let added = self.add_pane_locked(pane)?;
+        drop(lifecycle);
+
+        if added {
+            self.recompute_pane_count();
+            self.notify(MuxNotification::PaneAdded(pane.pane_id()));
+        }
+        Ok(())
+    }
+
+    /// Adds a pane while the caller holds `self.lifecycle`.
+    fn add_pane_locked(&self, pane: &Arc<dyn Pane>) -> Result<bool, Error> {
+        if self.panes.read().contains_key(&pane.pane_id()) {
+            return Ok(false);
+        }
+
+        let permit = self.admission.try_pane().context("pane admission")?;
 
         let clipboard: Arc<dyn Clipboard> = Arc::new(MuxClipboard {
             pane_id: pane.pane_id(),
@@ -792,42 +1952,153 @@ impl Mux {
         let downloader: Arc<dyn DownloadHandler> = Arc::new(MuxDownloader {});
         pane.set_download_handler(&downloader);
 
+        let reader = pane.reader()?;
+        let lifecycle = self.pane_lifecycle_sender()?;
         self.panes.write().insert(pane.pane_id(), Arc::clone(pane));
         let pane_id = pane.pane_id();
-        if let Some(reader) = pane.reader()? {
-            let banner = self.banner.read().clone();
-            let pane = Arc::downgrade(pane);
-            thread::spawn(move || read_from_pane_pty(pane, banner, reader));
+        let banner = self.banner.read().clone();
+        match PaneWorkerSet::start(
+            Arc::clone(pane),
+            banner,
+            reader,
+            Arc::clone(&self.admission),
+            lifecycle,
+            permit,
+        ) {
+            Ok(workers) => {
+                self.pane_workers.lock().insert(pane_id, workers);
+            }
+            Err(err) => {
+                self.panes.write().remove(&pane_id);
+                pane.kill();
+                if let Err(cancel_err) = pane.cancel_reader() {
+                    log::error!(
+                        "failed to cancel pane {pane_id} reader after worker startup failed: \
+                         {cancel_err:#}"
+                    );
+                }
+                if let Err(join_err) = pane.join_child_waiter() {
+                    log::error!(
+                        "failed to join pane {pane_id} child after worker startup failed: \
+                         {join_err:#}"
+                    );
+                }
+                return Err(err.context("start pane workers"));
+            }
         }
-        self.recompute_pane_count();
-        self.notify(MuxNotification::PaneAdded(pane_id));
+        Ok(true)
+    }
+
+    pub fn add_tab_no_panes(&self, tab: &Arc<Tab>) -> Result<(), Error> {
+        let lifecycle = self.lifecycle.lock();
+        if lifecycle.shutting_down {
+            anyhow::bail!("mux is shutting down");
+        }
+        let added = self.add_tab_no_panes_locked(tab)?;
+        drop(lifecycle);
+        if added {
+            self.recompute_pane_count();
+        }
         Ok(())
     }
 
-    pub fn add_tab_no_panes(&self, tab: &Arc<Tab>) {
+    /// Adds a tab while the caller holds `self.lifecycle`; returns whether this call owns it.
+    fn add_tab_no_panes_locked(&self, tab: &Arc<Tab>) -> Result<bool, Error> {
+        if self.tabs.read().contains_key(&tab.tab_id()) {
+            return Ok(false);
+        }
+        let permit = self.admission.try_tab().context("tab admission")?;
         self.tabs.write().insert(tab.tab_id(), Arc::clone(tab));
-        self.recompute_pane_count();
+        self.tab_permits.lock().insert(tab.tab_id(), permit);
+        Ok(true)
     }
 
     pub fn add_tab_and_active_pane(&self, tab: &Arc<Tab>) -> Result<(), Error> {
-        self.tabs.write().insert(tab.tab_id(), Arc::clone(tab));
-        let pane = tab
-            .get_active_pane()
-            .ok_or_else(|| anyhow!("tab MUST have an active pane"))?;
-        self.add_pane(&pane)
+        let lifecycle = self.lifecycle.lock();
+        if lifecycle.shutting_down {
+            anyhow::bail!("mux is shutting down");
+        }
+        let added_tab = self.add_tab_no_panes_locked(tab)?;
+        let pane = match tab.get_active_pane() {
+            Some(pane) => pane,
+            None => {
+                if added_tab {
+                    self.tabs.write().remove(&tab.tab_id());
+                    self.tab_permits.lock().remove(&tab.tab_id());
+                }
+                anyhow::bail!("tab MUST have an active pane");
+            }
+        };
+        let added_pane = match self.add_pane_locked(&pane) {
+            Ok(added) => added,
+            Err(err) => {
+                if added_tab {
+                    self.tabs.write().remove(&tab.tab_id());
+                    self.tab_permits.lock().remove(&tab.tab_id());
+                }
+                return Err(err);
+            }
+        };
+        drop(lifecycle);
+
+        self.recompute_pane_count();
+        if added_pane {
+            self.notify(MuxNotification::PaneAdded(pane.pane_id()));
+        }
+        Ok(())
     }
 
-    fn remove_pane_internal(&self, pane_id: PaneId) {
+    fn remove_pane_internal(&self, pane_id: PaneId, removal: PaneRemoval) {
         log::debug!("removing pane {}", pane_id);
+        let lifecycle = self.lifecycle.lock();
+        let mut pane_workers = self.pane_workers.lock();
         let mut changed = false;
-        if let Some(pane) = self.panes.write().remove(&pane_id).clone() {
-            log::debug!("killing pane {}", pane_id);
-            pane.kill();
-            self.notify(MuxNotification::PaneRemoved(pane_id));
+        let mut worker_to_stop = None;
+        let mut orphaned_pane = None;
+        // Bind the lookup before entering the branch so its read guard is released before removal.
+        // An `if let` scrutinee temporary lives through the body in Rust 2021.
+        let pane = self.panes.read().get(&pane_id).cloned();
+        if let Some(pane) = pane {
+            let kill_process = removal.should_kill() || pane.kill_process_on_unregister();
+            if kill_process {
+                pane.kill();
+            }
+            self.panes.write().remove(&pane_id);
+            if let Some(mut workers) = pane_workers.remove(&pane_id) {
+                let pane_tasks = std::mem::take(&mut workers.tasks);
+                let retiring_tasks =
+                    retire_pane_tasks(pane_id, removal, pane_tasks, workers.take_pane_permit());
+                self.retiring_pane_tasks.lock().push(retiring_tasks);
+                worker_to_stop = Some(workers);
+            } else if kill_process {
+                orphaned_pane = Some(pane);
+            }
             changed = true;
         }
 
+        drop(lifecycle);
+        drop(pane_workers);
+
+        // Pane workers can publish their final parsed output while stopping. Join them only after
+        // releasing the lifecycle locks needed by that notification path.
+        if let Some(mut workers) = worker_to_stop {
+            if let Err(err) = workers.shutdown(false) {
+                log::error!("pane {pane_id} worker shutdown failed: {err:#}");
+            }
+        } else if let Some(pane) = orphaned_pane {
+            log::debug!("joining pane {} without a registered worker set", pane_id);
+            if let Err(err) = pane.join_child_waiter() {
+                log::error!("pane {pane_id} child-waiter join failed: {err:#}");
+            }
+        }
+
         if changed {
+            self.notify(MuxNotification::PaneRemoved(pane_id));
+            if let Err(err) = reap_retiring_pane_tasks(&mut self.retiring_pane_tasks.lock()) {
+                self.record_headless_task_error(
+                    err.context("reap pane cleanup after removal publication"),
+                );
+            }
             self.recompute_pane_count();
         }
     }
@@ -849,8 +2120,9 @@ impl Mux {
         }
         log::debug!("panes to remove: {pane_ids:?}");
         for pane_id in pane_ids {
-            self.remove_pane_internal(pane_id);
+            self.remove_pane_internal(pane_id, PaneRemoval::Kill);
         }
+        self.tab_permits.lock().remove(&tab_id);
         self.recompute_pane_count();
 
         Some(tab)
@@ -892,7 +2164,12 @@ impl Mux {
     }
 
     pub fn remove_pane(&self, pane_id: PaneId) {
-        self.remove_pane_internal(pane_id);
+        self.remove_pane_internal(pane_id, PaneRemoval::Kill);
+        self.prune_dead_windows();
+    }
+
+    pub fn unregister_pane(&self, pane_id: PaneId) {
+        self.remove_pane_internal(pane_id, PaneRemoval::Unregister);
         self.prune_dead_windows();
     }
 
@@ -909,6 +2186,7 @@ impl Mux {
         }
         let live_tab_ids: Vec<TabId> = self.tabs.read().keys().cloned().collect();
         let mut dead_windows = vec![];
+        let mut dead_pane_ids = vec![];
         let dead_tab_ids: Vec<TabId>;
 
         {
@@ -921,7 +2199,7 @@ impl Mux {
                 }
             };
             for (window_id, win) in windows.iter_mut() {
-                win.prune_dead_tabs(&live_tab_ids);
+                dead_pane_ids.extend(win.prune_dead_tabs(&live_tab_ids));
                 if win.is_empty() {
                     log::trace!("prune_dead_windows: window is now empty");
                     dead_windows.push(*window_id);
@@ -934,6 +2212,10 @@ impl Mux {
                 .iter()
                 .filter_map(|(&id, tab)| if tab.is_dead() { Some(id) } else { None })
                 .collect();
+        }
+
+        for pane_id in dead_pane_ids {
+            self.remove_pane_internal(pane_id, PaneRemoval::Kill);
         }
 
         for tab_id in dead_tab_ids {
@@ -1111,7 +2393,7 @@ impl Mux {
 
         log::info!("domain detached panes: {:?}", dead_panes);
         for pane_id in dead_panes {
-            self.remove_pane_internal(pane_id);
+            self.remove_pane_internal(pane_id, PaneRemoval::Unregister);
         }
 
         self.prune_dead_windows();
@@ -1471,5 +2753,411 @@ impl wezterm_term::DownloadHandler for MuxDownloader {
                 data: Arc::new(data),
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod pane_removal_tests {
+    use super::*;
+    use std::sync::Barrier;
+
+    #[test]
+    fn parser_buffer_size_is_never_zero_or_larger_than_its_retained_batch_bound() {
+        let maximum = wezterm_runtime_admission::MAX_PANE_PARSER_INPUT_BYTES_PER_BATCH;
+        assert_eq!(bounded_parser_buffer_size(0), 1);
+        assert_eq!(bounded_parser_buffer_size(1), 1);
+        assert_eq!(bounded_parser_buffer_size(maximum), maximum);
+        assert_eq!(bounded_parser_buffer_size(maximum + 1), maximum);
+        assert_eq!(bounded_parser_buffer_size(usize::MAX), maximum);
+    }
+
+    #[test]
+    fn pane_task_permits_charge_the_real_input_write_and_refresh_pools_until_drop() {
+        let admission = RuntimeAdmission::new(RuntimeRole::Server).unwrap();
+        let pane_input = Arc::new(PaneInputAdmission::default());
+
+        let input =
+            PaneTaskPermits::admit(&admission, &pane_input, PaneTaskKind::Input { bytes: 17 })
+                .unwrap();
+        assert_eq!(admission.count_usage(CountClass::PaneInputItem), 1);
+        assert_eq!(admission.byte_usage(ByteClass::PaneInput), 17);
+        drop(input);
+        assert_eq!(admission.count_usage(CountClass::PaneInputItem), 0);
+        assert_eq!(admission.byte_usage(ByteClass::PaneInput), 0);
+
+        let write =
+            PaneTaskPermits::admit(&admission, &pane_input, PaneTaskKind::Write { bytes: 23 })
+                .unwrap();
+        assert_eq!(admission.count_usage(CountClass::PaneInputItem), 1);
+        assert_eq!(admission.count_usage(CountClass::PaneWriteJob), 1);
+        assert_eq!(admission.byte_usage(ByteClass::PaneInput), 23);
+        drop(write);
+        assert_eq!(admission.count_usage(CountClass::PaneInputItem), 0);
+        assert_eq!(admission.count_usage(CountClass::PaneWriteJob), 0);
+        assert_eq!(admission.byte_usage(ByteClass::PaneInput), 0);
+
+        let refresh =
+            PaneTaskPermits::admit(&admission, &pane_input, PaneTaskKind::Refresh).unwrap();
+        assert_eq!(admission.count_usage(CountClass::PaneRefreshJob), 1);
+        drop(refresh);
+        assert_eq!(admission.count_usage(CountClass::PaneRefreshJob), 0);
+
+        let item_permits = (0..MAX_PANE_INPUT_ITEMS_PER_PANE)
+            .map(|_| {
+                PaneTaskPermits::admit(&admission, &pane_input, PaneTaskKind::Input { bytes: 0 })
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            PaneTaskPermits::admit(&admission, &pane_input, PaneTaskKind::Input { bytes: 0 })
+                .is_err()
+        );
+        drop(item_permits);
+
+        let too_large = MAX_PANE_INPUT_BYTES_PER_PANE + 1;
+        assert!(PaneTaskPermits::admit(
+            &admission,
+            &pane_input,
+            PaneTaskKind::Write { bytes: too_large }
+        )
+        .is_err());
+        assert_eq!(admission.count_usage(CountClass::PaneInputItem), 0);
+        assert_eq!(admission.count_usage(CountClass::PaneWriteJob), 0);
+        assert_eq!(admission.byte_usage(ByteClass::PaneInput), 0);
+    }
+
+    fn test_mux() -> Arc<Mux> {
+        let admission = RuntimeAdmission::new(RuntimeRole::Server).unwrap();
+        let mux = Arc::new(Mux::new(None, admission));
+        mux.start_pane_lifecycle().unwrap();
+        mux
+    }
+
+    fn headless_test_mux() -> Arc<Mux> {
+        let admission = RuntimeAdmission::new(RuntimeRole::Client).unwrap();
+        let executor = Arc::new(promise::spawn::SimpleExecutor::new(Arc::clone(&admission)));
+        let mux = Arc::new(Mux::new_headless(None, admission, executor));
+        mux.start_pane_lifecycle().unwrap();
+        mux
+    }
+
+    #[test]
+    fn process_mux_cannot_be_replaced_or_restarted_after_shutdown() {
+        const HELPER: &str = "WEZTERM_MUX_SINGLETON_TEST_HELPER";
+        if std::env::var_os(HELPER).is_some() {
+            let new_mux = || {
+                Arc::new(Mux::new(
+                    None,
+                    RuntimeAdmission::new(RuntimeRole::Server).unwrap(),
+                ))
+            };
+            let active = new_mux();
+            Mux::set_mux(&active).unwrap();
+
+            let replacement = new_mux();
+            assert!(Mux::set_mux(&replacement)
+                .unwrap_err()
+                .to_string()
+                .contains("already initialized"));
+
+            Mux::shutdown();
+            let restarted = new_mux();
+            assert!(Mux::set_mux(&restarted)
+                .unwrap_err()
+                .to_string()
+                .contains("cannot be restarted"));
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "pane_removal_tests::process_mux_cannot_be_replaced_or_restarted_after_shutdown",
+                "--nocapture",
+            ])
+            .env(HELPER, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "singleton subprocess failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn stale_client_pane_unregister_never_requests_remote_kill() {
+        assert!(!PaneRemoval::Unregister.should_kill());
+        assert!(PaneRemoval::Kill.should_kill());
+    }
+
+    #[test]
+    fn tab_without_active_pane_rolls_back_only_the_insertion_it_owns() {
+        let mux = test_mux();
+        let new_tab = Arc::new(Tab::new(&TerminalSize::default()));
+        assert!(mux.add_tab_and_active_pane(&new_tab).is_err());
+        assert!(mux.get_tab(new_tab.tab_id()).is_none());
+
+        let existing_tab = Arc::new(Tab::new(&TerminalSize::default()));
+        mux.add_tab_no_panes(&existing_tab).unwrap();
+        assert!(mux.add_tab_and_active_pane(&existing_tab).is_err());
+        assert!(mux.get_tab(existing_tab.tab_id()).is_some());
+        mux.shutdown_runtime();
+    }
+
+    #[test]
+    fn duplicate_tab_add_is_atomic_and_shutdown_closes_registration() {
+        let mux = test_mux();
+        let tab = Arc::new(Tab::new(&TerminalSize::default()));
+        let barrier = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let mux = Arc::clone(&mux);
+            let tab = Arc::clone(&tab);
+            let barrier = Arc::clone(&barrier);
+            workers.push(thread::spawn(move || {
+                barrier.wait();
+                mux.add_tab_no_panes(&tab)
+            }));
+        }
+        barrier.wait();
+        for worker in workers {
+            worker.join().unwrap().unwrap();
+        }
+        assert!(mux.get_tab(tab.tab_id()).is_some());
+
+        mux.shutdown_runtime();
+        let after_shutdown = Arc::new(Tab::new(&TerminalSize::default()));
+        assert!(mux.add_tab_no_panes(&after_shutdown).is_err());
+        assert!(mux.get_tab(after_shutdown.tab_id()).is_none());
+        assert_eq!(mux.admission.count_usage(CountClass::ExecutorRunnable), 0);
+    }
+
+    #[test]
+    fn headless_invalidation_is_reaped_by_the_mux_executor_owner() {
+        let mux = headless_test_mux();
+        mux.try_spawn_client_invalidation(async { Ok(()) }).unwrap();
+        assert_eq!(mux.admission.count_usage(CountClass::ClientInvalidation), 1);
+        assert_eq!(mux.admission.count_usage(CountClass::ExecutorRunnable), 2);
+
+        mux.tick_headless().unwrap();
+        assert_eq!(mux.admission.count_usage(CountClass::ClientInvalidation), 0);
+        assert_eq!(mux.admission.count_usage(CountClass::ExecutorRunnable), 1);
+        mux.shutdown_runtime();
+        assert_eq!(mux.admission.count_usage(CountClass::ExecutorRunnable), 0);
+    }
+
+    #[test]
+    fn headless_runtime_task_is_retained_reaped_and_joined() {
+        let mux = headless_test_mux();
+        let completed = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&completed);
+        mux.try_spawn_runtime_task("schedule headless runtime task test", async move {
+            observed.fetch_add(1, Ordering::Release);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(mux.headless_runtime_tasks.lock().len(), 1);
+        assert_eq!(mux.admission.count_usage(CountClass::ExecutorRunnable), 2);
+        mux.tick_headless().unwrap();
+        assert_eq!(completed.load(Ordering::Acquire), 1);
+        assert!(mux.headless_runtime_tasks.lock().is_empty());
+        assert_eq!(mux.admission.count_usage(CountClass::ExecutorRunnable), 1);
+
+        mux.try_spawn_runtime_task(
+            "schedule pending headless runtime task test",
+            std::future::pending::<anyhow::Result<()>>(),
+        )
+        .unwrap();
+        mux.shutdown_runtime();
+        assert!(mux.headless_runtime_tasks.lock().is_empty());
+        assert_eq!(mux.admission.count_usage(CountClass::ExecutorRunnable), 0);
+    }
+
+    #[test]
+    fn headless_pane_output_is_coalesced_reaped_and_joined_on_shutdown() {
+        let mux = headless_test_mux();
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&notifications);
+        mux.subscribe(move |notification| {
+            if matches!(notification, MuxNotification::PaneOutput(42)) {
+                observed.fetch_add(1, Ordering::Relaxed);
+            }
+            true
+        });
+
+        mux.try_enqueue_headless_pane_output(42).unwrap();
+        mux.try_enqueue_headless_pane_output(42).unwrap();
+        assert_eq!(mux.headless_pane_output_tasks.lock().pending.len(), 1);
+        assert_eq!(mux.headless_pane_output_tasks.lock().tasks.len(), 1);
+        assert_eq!(mux.admission.count_usage(CountClass::PaneLifecycleEvent), 1);
+        assert_eq!(mux.admission.count_usage(CountClass::ExecutorRunnable), 2);
+
+        mux.tick_headless().unwrap();
+        assert_eq!(notifications.load(Ordering::Relaxed), 1);
+        assert!(mux.headless_pane_output_tasks.lock().pending.is_empty());
+        assert!(mux.headless_pane_output_tasks.lock().tasks.is_empty());
+        assert_eq!(mux.admission.count_usage(CountClass::PaneLifecycleEvent), 0);
+        assert_eq!(mux.admission.count_usage(CountClass::ExecutorRunnable), 1);
+
+        mux.try_enqueue_headless_pane_output(42).unwrap();
+        mux.shutdown_runtime();
+        assert_eq!(notifications.load(Ordering::Relaxed), 1);
+        assert!(mux.admission.is_shutting_down());
+        assert_eq!(mux.admission.count_usage(CountClass::PaneLifecycleEvent), 0);
+        assert_eq!(mux.admission.count_usage(CountClass::ExecutorRunnable), 0);
+    }
+
+    #[test]
+    fn pane_kill_retires_close_after_cancelling_sibling_tasks_and_retains_admission() {
+        fn pending_task(
+            executor: &promise::spawn::SimpleExecutorHandle,
+            kind: ClientPaneTaskKind,
+            producer_permit: Option<CountPermit>,
+        ) -> OwnedPaneTask {
+            let task = executor
+                .try_spawn(async move {
+                    let _producer_permit = producer_permit;
+                    std::future::pending::<()>().await;
+                    Ok(())
+                })
+                .unwrap();
+            OwnedPaneTask {
+                kind: OwnedPaneTaskKind::Client(kind),
+                task,
+            }
+        }
+
+        let mux = headless_test_mux();
+        let admission = Arc::clone(mux.admission());
+        let executor = mux.headless_executor().unwrap();
+        let pane_id = 42;
+        let request = pending_task(
+            &executor,
+            ClientPaneTaskKind::Request,
+            Some(admission.try_count(CountClass::ClientRequest, 1).unwrap()),
+        );
+        let fetch = pending_task(
+            &executor,
+            ClientPaneTaskKind::Fetch,
+            Some(admission.try_count(CountClass::ClientFetchJob, 1).unwrap()),
+        );
+        let poll = pending_task(
+            &executor,
+            ClientPaneTaskKind::Poll,
+            Some(admission.try_count(CountClass::ClientPollJob, 1).unwrap()),
+        );
+        let input_kind = PaneTaskKind::Input { bytes: 31 };
+        let pane_input = Arc::new(PaneInputAdmission::default());
+        let input_permits = PaneTaskPermits::admit(&admission, &pane_input, input_kind).unwrap();
+        let input_task = executor
+            .local()
+            .try_spawn_local(async move {
+                let _permits = input_permits;
+                std::future::pending::<()>().await;
+                Ok(())
+            })
+            .unwrap();
+        let input = OwnedPaneTask {
+            kind: OwnedPaneTaskKind::Pane(input_kind),
+            task: input_task,
+        };
+        let close_permit = admission.try_count(CountClass::ClientRequest, 1).unwrap();
+        let (close_tx, close_rx) = smol::channel::bounded(1);
+        let close_task = executor
+            .try_spawn(async move {
+                let _close_permit = close_permit;
+                close_rx.recv().await.context("await close completion")?;
+                Ok(())
+            })
+            .unwrap();
+        let close = OwnedPaneTask {
+            kind: OwnedPaneTaskKind::Client(ClientPaneTaskKind::Close),
+            task: close_task,
+        };
+
+        let retired = retire_pane_tasks(
+            pane_id,
+            PaneRemoval::Kill,
+            vec![request, fetch, poll, input, close],
+            admission.try_pane().unwrap(),
+        );
+        mux.retiring_pane_tasks.lock().push(retired);
+
+        for _ in 0..8 {
+            mux.tick_headless().unwrap();
+            if mux.retiring_pane_tasks.lock()[0].tasks.len() == 1 {
+                break;
+            }
+        }
+        let retiring = mux.retiring_pane_tasks.lock();
+        assert_eq!(retiring.len(), 1);
+        assert_eq!(retiring[0].pane_id, pane_id);
+        assert_eq!(retiring[0].tasks.len(), 1);
+        assert_eq!(
+            retiring[0].tasks[0].kind,
+            OwnedPaneTaskKind::Client(ClientPaneTaskKind::Close)
+        );
+        assert!(!retiring[0].tasks[0].task.is_finished());
+        drop(retiring);
+        assert_eq!(admission.count_usage(CountClass::ClientRequest), 1);
+        assert_eq!(admission.count_usage(CountClass::ClientFetchJob), 0);
+        assert_eq!(admission.count_usage(CountClass::ClientPollJob), 0);
+        assert_eq!(admission.count_usage(CountClass::PaneInputItem), 0);
+        assert_eq!(admission.byte_usage(ByteClass::PaneInput), 0);
+
+        let other_pane_permits = (1..MAX_PANES)
+            .map(|_| admission.try_pane().unwrap())
+            .collect::<Vec<_>>();
+        assert!(admission.try_pane().is_err());
+
+        close_tx.try_send(()).unwrap();
+        mux.tick_headless().unwrap();
+        assert!(mux.retiring_pane_tasks.lock().is_empty());
+        assert_eq!(admission.count_usage(CountClass::ClientRequest), 0);
+        let reclaimed_pane_permit = admission.try_pane().unwrap();
+        drop(reclaimed_pane_permit);
+        drop(other_pane_permits);
+
+        mux.shutdown_runtime();
+        assert!(admission.is_shutting_down());
+        assert_eq!(admission.count_usage(CountClass::ExecutorRunnable), 0);
+    }
+
+    #[test]
+    fn empty_pane_cleanup_retains_admission_until_publication_reap() {
+        let admission = RuntimeAdmission::new(RuntimeRole::Server).unwrap();
+        let mut retiring = vec![retire_pane_tasks(
+            42,
+            PaneRemoval::Unregister,
+            Vec::new(),
+            admission.try_pane().unwrap(),
+        )];
+        let other_panes = (1..MAX_PANES)
+            .map(|_| admission.try_pane().unwrap())
+            .collect::<Vec<_>>();
+
+        assert!(admission.try_pane().is_err());
+        reap_retiring_pane_tasks(&mut retiring).unwrap();
+        assert!(retiring.is_empty());
+        assert!(admission.try_pane().is_ok());
+        drop(other_panes);
+    }
+
+    #[test]
+    fn headless_shutdown_cancels_and_joins_pending_invalidations_before_admission_closes() {
+        let mux = headless_test_mux();
+        mux.try_spawn_client_invalidation(async {
+            std::future::pending::<()>().await;
+            Ok(())
+        })
+        .unwrap();
+
+        mux.shutdown_runtime();
+        assert!(mux.admission.is_shutting_down());
+        assert_eq!(mux.admission.count_usage(CountClass::ClientInvalidation), 0);
+        assert_eq!(mux.admission.count_usage(CountClass::ExecutorRunnable), 0);
     }
 }

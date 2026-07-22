@@ -15,6 +15,15 @@ pub(crate) struct VecStorage {
 }
 
 impl VecStorage {
+    pub(crate) fn retained_heap_size_excluding_image_data(&self) -> usize {
+        self.cells.iter().fold(
+            self.cells
+                .capacity()
+                .saturating_mul(core::mem::size_of::<Cell>()),
+            |size, cell| size.saturating_add(cell.retained_heap_size_excluding_image_data()),
+        )
+    }
+
     pub(crate) fn new(cells: Vec<Cell>) -> Self {
         Self { cells }
     }

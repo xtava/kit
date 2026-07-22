@@ -44,7 +44,7 @@ pub struct TreeRow {
 
 pub fn project(runs: &[RunSnapshot], collapsed: &HashSet<NodeId>) -> Vec<TreeRow> {
     let mut ordered = runs.iter().collect::<Vec<_>>();
-    ordered.sort_by(|left, right| run_number(&right.id).cmp(&run_number(&left.id)));
+    ordered.sort_by_key(|run| std::cmp::Reverse(run_number(&run.id)));
     let mut rows = Vec::new();
     for run in ordered {
         let run_id = NodeId::Run(run.id.clone());

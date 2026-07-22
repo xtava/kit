@@ -25,6 +25,21 @@ impl ProcessRunId {
     }
 }
 
+pub(crate) fn leader_exit(status: std::process::ExitStatus) -> LeaderExit {
+    if let Some(code) = status.code() {
+        return LeaderExit::Code(code);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        LeaderExit::Signal(SignalNumber::new(status.signal().unwrap_or(libc::SIGKILL)))
+    }
+    #[cfg(not(unix))]
+    {
+        LeaderExit::Code(1)
+    }
+}
+
 impl fmt::Debug for ProcessRunId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "ProcessRunId({})", self.0.hyphenated())

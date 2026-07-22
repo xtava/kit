@@ -22,11 +22,15 @@ wezterm-char-props.workspace = true
 wezterm-color-types.workspace = true
 wezterm-escape-parser.workspace = true
 wezterm-dynamic.workspace = true
+wezterm-runtime-admission.workspace = true
 
 [features]
 std = ["serde/std", "wezterm-char-props/std", "wezterm-color-types/std", "wezterm-escape-parser/std", "wezterm-dynamic/std", "finl_unicode/std"]
-use_serde = ["dep:serde", "wezterm-color-types/use_serde"]
+use_serde = [
+    "dep:serde",
+    "wezterm-color-types/use_serde",
+    "wezterm-escape-parser/use_serde",
+]
 use_image = ["dep:image", "dep:wezterm-blob-leases", "dep:log", "dep:ordered-float", "dep:sha2", "dep:thiserror"]
 
 [dev-dependencies]
-

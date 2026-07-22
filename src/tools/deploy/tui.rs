@@ -1,4 +1,4 @@
-use std::{path::Path, time::SystemTime};
+use std::{collections::HashSet, ffi::OsString, path::Path, time::SystemTime};
 
 use ::time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use anyhow::{anyhow, bail, Result};
@@ -34,8 +34,11 @@ use super::{
         VersionsState,
     },
 };
-use crate::framework::{open_external, process::ProcessSupervisor, ExternalTarget};
+use crate::framework::{
+    process::ProcessSupervisor, start_external, ExternalCommand, ExternalTarget,
+};
 use crate::onepassword::OpClient;
+use crate::tailscale::find_login_url;
 use crate::tui::{
     render_split_divider, Direction, EventReader, NavigationMap, NavigationRegion, Session,
     SessionOptions, SplitDividerStyle,
@@ -87,6 +90,8 @@ pub async fn run(startup: Startup) -> Result<Option<RunOutcome>> {
     let mut run_handle: Option<JoinHandle<()>> = None;
     let mut versions_handle: Option<JoinHandle<()>> = None;
     let mut preparation_handle: Option<(u64, JoinHandle<()>)> = None;
+    let mut external_open_handle: Option<JoinHandle<()>> = None;
+    let mut opened_tailscale_auth_urls = HashSet::new();
     let mut next_preparation_id = 0_u64;
     let mut run_active = false;
     let mut quit_after_run = false;
@@ -109,6 +114,21 @@ pub async fn run(startup: Startup) -> Result<Option<RunOutcome>> {
                 match event {
                     Some(event) => {
                         let finished = matches!(event, runner::RunEvent::Finished { .. });
+                        if let runner::RunEvent::Output { line, .. } = &event {
+                            if let Some(url) = extract_tailscale_auth_url(line) {
+                                if opened_tailscale_auth_urls.insert(url.clone())
+                                    && external_open_handle.is_none()
+                                {
+                                    app.notice = Some("Opening Tailscale authentication in Chrome…".to_owned());
+                                    external_open_handle = Some(spawn_tailscale_auth_open(
+                                        processes.clone(),
+                                        app.loaded.base_dir.clone(),
+                                        url,
+                                        backend_tx.clone(),
+                                    ));
+                                }
+                            }
+                        }
                         app.ingest(event);
                         if finished {
                             run_active = false;
@@ -173,6 +193,15 @@ pub async fn run(startup: Startup) -> Result<Option<RunOutcome>> {
                                 }
                             }
                         }
+                    }
+                    Some(BackendEvent::ExternalOpenFinished { url, result }) => {
+                        if let Some(handle) = external_open_handle.take() {
+                            let _ = handle.await;
+                        }
+                        app.notice = Some(match result {
+                            Ok(()) => format!("Opened {url}"),
+                            Err(error) => format!("Could not open {url}: {error}"),
+                        });
                     }
                     None => {}
                 }
@@ -244,10 +273,16 @@ pub async fn run(startup: Startup) -> Result<Option<RunOutcome>> {
                         }
                     }
                     UiAction::OpenUrl { url } => {
-                        app.notice = Some(match open_external(ExternalTarget::Url(&url)) {
-                            Ok(()) => format!("Opening {url}"),
-                            Err(error) => format!("Could not open {url}: {error}"),
-                        });
+                        if external_open_handle.is_some() {
+                            app.notice = Some("Another external target is still opening".into());
+                        } else {
+                            app.notice = Some(format!("Opening {url}…"));
+                            external_open_handle = Some(spawn_external_open(
+                                processes.clone(),
+                                url,
+                                backend_tx.clone(),
+                            ));
+                        }
                     }
                     UiAction::Start => {
                         match app.intent.clone() {
@@ -307,6 +342,10 @@ pub async fn run(startup: Startup) -> Result<Option<RunOutcome>> {
     if let Some((_, handle)) = preparation_handle {
         handle.abort();
     }
+    if let Some(handle) = external_open_handle {
+        handle.abort();
+        let _ = handle.await;
+    }
     let layout_exit_warning = if layout_dirty {
         layout_store
             .save(app.layout)
@@ -355,6 +394,9 @@ fn handle_event(event: Event, app: &mut App) -> UiAction {
 fn handle_mouse(mouse: MouseEvent, app: &mut App) -> UiAction {
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
+            if let Some(url) = clicked_tailscale_auth_url(mouse.column, mouse.row, app) {
+                return UiAction::OpenUrl { url };
+            }
             if !app.begin_layout_drag(mouse.column, mouse.row) {
                 if let Some(region) = navigation(app).hit_test(mouse.column, mouse.row) {
                     app.set_active_region(region);
@@ -513,7 +555,12 @@ fn handle_key(key: KeyEvent, app: &mut App) -> UiAction {
             _ => UiAction::None,
         },
         Phase::Running => {
-            if matches!(key.code, KeyCode::Up | KeyCode::Char('k')) {
+            if key.code == KeyCode::Char('o') {
+                return match tailscale_auth_url(app) {
+                    Some(url) => UiAction::OpenUrl { url },
+                    None => UiAction::None,
+                };
+            } else if matches!(key.code, KeyCode::Up | KeyCode::Char('k')) {
                 scroll_or_select(app, -1);
             } else if matches!(key.code, KeyCode::Down | KeyCode::Char('j')) {
                 scroll_or_select(app, 1);
@@ -707,6 +754,44 @@ fn spawn_run_preparation(
     })
 }
 
+fn spawn_external_open(
+    processes: ProcessSupervisor,
+    url: String,
+    sender: mpsc::Sender<BackendEvent>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let result = match start_external(&processes, ExternalTarget::Url(url.clone())) {
+            Ok(receipt) => receipt.completion().await,
+            Err(error) => Err(error),
+        }
+        .map_err(|error| format!("{error:#}"));
+        let _ = sender.send(BackendEvent::ExternalOpenFinished { url, result }).await;
+    })
+}
+
+fn spawn_tailscale_auth_open(
+    processes: ProcessSupervisor,
+    working_directory: std::path::PathBuf,
+    url: String,
+    sender: mpsc::Sender<BackendEvent>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let result = match start_external(
+            &processes,
+            ExternalTarget::Command(ExternalCommand {
+                program: OsString::from("/usr/bin/google-chrome-stable"),
+                arguments: vec![OsString::from(&url)],
+                working_directory,
+            }),
+        ) {
+            Ok(receipt) => receipt.completion().await,
+            Err(error) => Err(error),
+        }
+        .map_err(|error| format!("{error:#}"));
+        let _ = sender.send(BackendEvent::ExternalOpenFinished { url, result }).await;
+    })
+}
+
 async fn prepare_run(
     loaded: &LoadedPlan,
     intent: RunIntent,
@@ -788,6 +873,7 @@ enum BackendEvent {
     VersionsLoaded { target_id: String, result: Result<CloudflareVersions, String> },
     Deleted { short_id: String, result: Result<(), String> },
     RunPrepared { preparation_id: u64, result: Result<RunSpec, String> },
+    ExternalOpenFinished { url: String, result: Result<(), String> },
 }
 
 fn target_environment(
@@ -943,6 +1029,35 @@ fn current_git_branch(working_dir: &Path) -> Option<String> {
 
 fn summary_url(app: &App) -> Option<String> {
     app.output.iter().rev().find_map(|line| extract_deploy_url(&line.text))
+}
+
+fn tailscale_auth_url(app: &App) -> Option<String> {
+    app.output.iter().rev().find_map(|line| extract_tailscale_auth_url(&line.text))
+}
+
+fn extract_tailscale_auth_url(line: &str) -> Option<String> {
+    find_login_url(line).map(|url| url.as_str().to_owned())
+}
+
+fn clicked_tailscale_auth_url(column: u16, row: u16, app: &App) -> Option<String> {
+    if app.phase != Phase::Running {
+        return None;
+    }
+    let area = app.layout_frame.split.second;
+    if column <= area.x
+        || column >= area.x.saturating_add(area.width).saturating_sub(1)
+        || row <= area.y
+        || row >= area.y.saturating_add(area.height).saturating_sub(1)
+    {
+        return None;
+    }
+    let visible_rows = usize::from(area.height.saturating_sub(2));
+    let output_end = app.output.len().saturating_sub(usize::from(app.secondary_scroll));
+    let output_start = output_end.saturating_sub(visible_rows);
+    let visible_index = usize::from(row.saturating_sub(area.y).saturating_sub(1));
+    app.output
+        .get(output_start.saturating_add(visible_index))
+        .and_then(|line| extract_tailscale_auth_url(&line.text))
 }
 
 fn extract_deploy_url(line: &str) -> Option<String> {
@@ -1704,10 +1819,14 @@ fn render_running(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         .skip(output_start)
         .take(output_end.saturating_sub(output_start))
         .map(|line| {
-            let style = match line.stream {
+            let mut style = match line.stream {
                 OutputStream::Stdout => Style::default().fg(TEXT),
                 OutputStream::Stderr => Style::default().fg(YELLOW),
             };
+            if extract_tailscale_auth_url(&line.text).is_some() {
+                style =
+                    Style::default().fg(CYAN).add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+            }
             Line::styled(
                 truncate(&line.text, layout_frame.split.second.width.saturating_sub(4) as usize),
                 style,
@@ -1887,9 +2006,10 @@ fn modal_free_controls(app: &App) -> &'static str {
         }
         Phase::Review => "Enter run   Esc back   q quit",
         Phase::Preparing => "Esc cancel preparation   q quit",
-        Phase::Running => {
-            "↑↓ scroll   ←→/Tab region   drag resize   = reset   Ctrl-C cancel safely"
+        Phase::Running if tailscale_auth_url(app).is_some() => {
+            "click link / o open Tailscale auth   ↑↓ scroll   ←→/Tab region   Ctrl-C cancel safely"
         }
+        Phase::Running => "↑↓ scroll   ←→/Tab region   drag resize   = reset   Ctrl-C cancel safely",
         Phase::Summary => "↑↓ scroll logs   o open   Enter continue   q quit",
     }
 }
@@ -2249,6 +2369,66 @@ mod tests {
         );
         assert_eq!(extract_deploy_url("(!) see https://rolldown.rs/reference for options"), None);
         assert_eq!(extract_deploy_url("Building client environment…"), None);
+    }
+
+    #[test]
+    fn tailscale_auth_link_opens_by_key_and_click_during_run() -> Result<()> {
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend)?;
+        let mut app = test_app();
+        let target = app.loaded.plan.targets[0].clone();
+        app.begin_run(&RunSpec {
+            base_dir: PathBuf::from("."),
+            operation: RunOperation::Deploy,
+            targets: vec![RunTargetSpec {
+                target,
+                version: VersionId("version-placeholder".to_owned()),
+                branch: None,
+                environment: TargetEnvironment::default(),
+            }],
+        });
+        app.ingest(runner::RunEvent::Output {
+            stream: OutputStream::Stderr,
+            line: "Authenticate at https://login.tailscale.com/a/example-auth".to_owned(),
+        });
+        terminal.draw(|frame| render(frame, &mut app, Path::new("journal.json")))?;
+
+        match handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE), &mut app) {
+            UiAction::OpenUrl { url } => {
+                assert_eq!(url, "https://login.tailscale.com/a/example-auth")
+            }
+            _ => panic!("expected the Tailscale authentication URL to open"),
+        }
+
+        let live_output = app.layout_frame.split.second;
+        match handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: live_output.x.saturating_add(2),
+                row: live_output.y.saturating_add(1),
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut app,
+        ) {
+            UiAction::OpenUrl { url } => {
+                assert_eq!(url, "https://login.tailscale.com/a/example-auth")
+            }
+            _ => panic!("expected a click on the authentication link to open it"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn recognizes_only_tailscale_https_login_links() {
+        assert_eq!(
+            extract_tailscale_auth_url(
+                "Visit https://login.tailscale.com/a/example-auth, then return here"
+            )
+            .as_deref(),
+            Some("https://login.tailscale.com/a/example-auth")
+        );
+        assert_eq!(extract_tailscale_auth_url("https://example.com/a/example-auth"), None);
+        assert_eq!(extract_tailscale_auth_url("http://login.tailscale.com/a/example-auth"), None);
     }
 
     #[test]

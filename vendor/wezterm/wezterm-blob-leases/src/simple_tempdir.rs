@@ -1,8 +1,7 @@
 #![cfg(feature = "simple_tempdir")]
 
-use crate::{BlobStorage, BoxedReader, BufSeekRead, ContentId, Error, LeaseId};
+use crate::{BlobReaderSource, BlobStorage, ContentId, Error, LeaseId};
 use std::collections::HashMap;
-use std::fs::File;
 use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -43,10 +42,6 @@ impl SimpleTempDir {
         std::fs::create_dir_all(path.parent().unwrap())
             .map_err(|err| Error::StorageDirIoError(path.clone(), err))?;
         Ok(path)
-    }
-
-    fn add_ref(&self, content_id: ContentId) {
-        *self.refs.lock().unwrap().entry(content_id).or_insert(0) += 1;
     }
 
     fn del_ref(&self, content_id: ContentId) {
@@ -90,71 +85,27 @@ impl BlobStorage for SimpleTempDir {
     }
 
     fn lease_by_content(&self, content_id: ContentId, _lease_id: LeaseId) -> Result<(), Error> {
-        let _refs = self.refs.lock().unwrap();
+        let mut refs = self.refs.lock().unwrap();
 
         let path = self.path_for_content(content_id)?;
         if path.exists() {
-            self.add_ref(content_id);
+            *refs.entry(content_id).or_insert(0) += 1;
             Ok(())
         } else {
             Err(Error::ContentNotFound(content_id))
         }
     }
 
-    fn get_data(&self, content_id: ContentId, _lease_id: LeaseId) -> Result<Vec<u8>, Error> {
-        let _refs = self.refs.lock().unwrap();
-
+    fn open_reader(&self, content_id: ContentId) -> Result<BlobReaderSource, Error> {
         let path = self.path_for_content(content_id)?;
-        Ok(std::fs::read(&path).map_err(|err| Error::StorageDirIoError(path, err))?)
-    }
+        let file = std::fs::File::open(&path)
+            .map_err(|error| Error::StorageDirIoError(path.clone(), error))?;
+        let declared_len = file
+            .metadata()
+            .map_err(|error| Error::StorageDirIoError(path, error))?
+            .len();
 
-    fn get_reader(&self, content_id: ContentId, lease_id: LeaseId) -> Result<BoxedReader, Error> {
-        struct Reader {
-            file: BufReader<File>,
-            content_id: ContentId,
-            lease_id: LeaseId,
-        }
-
-        impl BufSeekRead for Reader {}
-
-        impl std::io::BufRead for Reader {
-            fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
-                self.file.fill_buf()
-            }
-            fn consume(&mut self, amount: usize) {
-                self.file.consume(amount)
-            }
-        }
-
-        impl std::io::Read for Reader {
-            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                self.file.read(buf)
-            }
-        }
-
-        impl std::io::Seek for Reader {
-            fn seek(&mut self, whence: std::io::SeekFrom) -> std::io::Result<u64> {
-                self.file.seek(whence)
-            }
-        }
-
-        impl Drop for Reader {
-            fn drop(&mut self) {
-                if let Ok(s) = crate::get_storage() {
-                    s.advise_lease_dropped(self.lease_id, self.content_id).ok();
-                }
-            }
-        }
-
-        let path = self.path_for_content(content_id)?;
-        let file = BufReader::new(std::fs::File::open(&path)?);
-        self.add_ref(content_id);
-
-        Ok(Box::new(Reader {
-            file,
-            content_id,
-            lease_id,
-        }))
+        Ok(BlobReaderSource::new(BufReader::new(file), declared_len))
     }
 
     fn advise_lease_dropped(&self, _lease_id: LeaseId, content_id: ContentId) -> Result<(), Error> {

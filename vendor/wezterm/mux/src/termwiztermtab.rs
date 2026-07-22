@@ -16,11 +16,13 @@ use anyhow::bail;
 use async_trait::async_trait;
 use config::keyassignment::ScrollbackEraseMode;
 use crossbeam::channel::{unbounded as channel, Receiver, Sender};
-use filedescriptor::{FileDescriptor, Pipe};
+use filedescriptor::{
+    poll, pollfd, socketpair, AsRawSocketDescriptor, FileDescriptor, Pipe, POLLIN,
+};
 use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 use portable_pty::*;
 use rangeset::RangeSet;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Read, Write};
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
@@ -93,6 +95,8 @@ pub struct TermWizTerminalPane {
     dead: Mutex<bool>,
     writer: Mutex<Vec<u8>>,
     render_rx: FileDescriptor,
+    reader_cancel_tx: Mutex<Option<FileDescriptor>>,
+    reader_cancel_rx: FileDescriptor,
 }
 
 impl TermWizTerminalPane {
@@ -102,8 +106,9 @@ impl TermWizTerminalPane {
         input_tx: Sender<InputEvent>,
         render_rx: FileDescriptor,
         term_config: Option<Arc<dyn TerminalConfiguration + Send + Sync>>,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let pane_id = alloc_pane_id();
+        let (reader_cancel_tx, reader_cancel_rx) = socketpair()?;
 
         let terminal = Mutex::new(wezterm_term::Terminal::new(
             size,
@@ -113,14 +118,61 @@ impl TermWizTerminalPane {
             Box::new(Vec::new()), // FIXME: connect to something?
         ));
 
-        Self {
+        Ok(Self {
             pane_id,
             domain_id,
             terminal,
             writer: Mutex::new(Vec::new()),
             render_rx,
+            reader_cancel_tx: Mutex::new(Some(reader_cancel_tx)),
+            reader_cancel_rx,
             input_tx,
             dead: Mutex::new(false),
+        })
+    }
+}
+
+struct TermWizPaneReader {
+    render: FileDescriptor,
+    cancel: FileDescriptor,
+}
+
+impl Read for TermWizPaneReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let mut descriptors = [
+                pollfd {
+                    fd: self.render.as_socket_descriptor(),
+                    events: POLLIN,
+                    revents: 0,
+                },
+                pollfd {
+                    fd: self.cancel.as_socket_descriptor(),
+                    events: POLLIN,
+                    revents: 0,
+                },
+            ];
+            match poll(&mut descriptors, None) {
+                Ok(_) => {}
+                Err(filedescriptor::Error::Poll(err))
+                    if err.kind() == std::io::ErrorKind::Interrupted =>
+                {
+                    continue;
+                }
+                Err(err) => return Err(std::io::Error::other(err)),
+            }
+            if descriptors[0].revents != 0 {
+                let size = self.render.read(buf)?;
+                if size > 0 {
+                    return Ok(size);
+                }
+            }
+            if descriptors[1].revents != 0 {
+                return Ok(0);
+            }
         }
     }
 }
@@ -189,7 +241,15 @@ impl Pane for TermWizTerminalPane {
     }
 
     fn reader(&self) -> anyhow::Result<Option<Box<dyn std::io::Read + Send>>> {
-        Ok(Some(Box::new(self.render_rx.try_clone()?)))
+        Ok(Some(Box::new(TermWizPaneReader {
+            render: self.render_rx.try_clone()?,
+            cancel: self.reader_cancel_rx.try_clone()?,
+        })))
+    }
+
+    fn cancel_reader(&self) -> anyhow::Result<()> {
+        self.reader_cancel_tx.lock().take();
+        Ok(())
     }
 
     fn writer(&self) -> MappedMutexGuard<'_, dyn std::io::Write> {
@@ -263,7 +323,10 @@ impl Pane for TermWizTerminalPane {
     }
 
     fn perform_actions(&self, actions: Vec<termwiz::escape::Action>) {
-        self.terminal.lock().perform_actions(actions)
+        self.terminal
+            .lock()
+            .perform_actions(actions)
+            .expect("non-server termwiz terminal actions cannot require retained-state admission");
     }
 
     fn kill(&self) {
@@ -470,7 +533,8 @@ pub fn allocate(
     };
 
     let domain_id = 0;
-    let pane = TermWizTerminalPane::new(domain_id, size, input_tx, render_pipe.read, Some(config));
+    let pane = TermWizTerminalPane::new(domain_id, size, input_tx, render_pipe.read, Some(config))
+        .expect("pane reader cancellation socket creation not to fail");
 
     // Add the tab to the mux so that the output is processed
     let pane: Arc<dyn Pane> = Arc::new(pane);
@@ -541,7 +605,7 @@ pub async fn run<
         };
 
         let pane =
-            TermWizTerminalPane::new(domain.domain_id(), size, input_tx, render_rx, term_config);
+            TermWizTerminalPane::new(domain.domain_id(), size, input_tx, render_rx, term_config)?;
         let pane: Arc<dyn Pane> = Arc::new(pane);
 
         let tab = Arc::new(Tab::new(&size));

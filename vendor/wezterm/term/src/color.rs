@@ -1,6 +1,8 @@
 //! Colors for attributes
 
 #[cfg(feature = "use_serde")]
+use serde::de::{SeqAccess, Visitor};
+#[cfg(feature = "use_serde")]
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use std::result::Result;
@@ -25,11 +27,43 @@ impl<'de> Deserialize<'de> for Palette256 {
     where
         D: Deserializer<'de>,
     {
-        let s = Vec::<SrgbaTuple>::deserialize(deserializer)?;
-        use std::convert::TryInto;
-        Ok(Self(s.try_into().map_err(|_| {
-            serde::de::Error::custom("Palette256 size mismatch")
-        })?))
+        deserializer.deserialize_seq(Palette256Visitor)
+    }
+}
+
+#[cfg(feature = "use_serde")]
+struct Palette256Visitor;
+
+#[cfg(feature = "use_serde")]
+impl<'de> Visitor<'de> for Palette256Visitor {
+    type Value = Palette256;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("exactly 256 palette colors")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        if let Some(size) = sequence.size_hint() {
+            if size != 256 {
+                return Err(serde::de::Error::invalid_length(size, &self));
+            }
+        }
+
+        let mut colors = [SrgbaTuple::default(); 256];
+        for (index, color) in colors.iter_mut().enumerate() {
+            *color = sequence
+                .next_element()?
+                .ok_or_else(|| serde::de::Error::invalid_length(index, &self))?;
+        }
+
+        if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
+            return Err(serde::de::Error::invalid_length(257, &self));
+        }
+
+        Ok(Palette256(colors))
     }
 }
 
@@ -84,6 +118,97 @@ impl ColorPalette {
             ColorAttribute::TrueColorWithPaletteFallback(color, _)
             | ColorAttribute::TrueColorWithDefaultFallback(color) => color.into(),
         }
+    }
+}
+
+#[cfg(all(test, feature = "use_serde"))]
+mod tests {
+    use std::cell::Cell;
+
+    use serde::de::value::{Error, SeqDeserializer};
+    use serde::de::{DeserializeSeed, SeqAccess, Visitor};
+
+    use super::{Palette256, Palette256Visitor};
+
+    struct HostileSequence<'a> {
+        size_hint: Option<usize>,
+        remaining: usize,
+        next_calls: &'a Cell<usize>,
+    }
+
+    impl<'de> SeqAccess<'de> for HostileSequence<'_> {
+        type Error = Error;
+
+        fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>, Self::Error>
+        where
+            T: DeserializeSeed<'de>,
+        {
+            self.next_calls.set(self.next_calls.get() + 1);
+            if self.remaining == 0 {
+                return Ok(None);
+            }
+
+            self.remaining -= 1;
+            let rgba = [0.0_f32; 4];
+            seed.deserialize(SeqDeserializer::<_, Error>::new(rgba.iter().copied()))
+                .map(Some)
+        }
+
+        fn size_hint(&self) -> Option<usize> {
+            self.size_hint
+        }
+    }
+
+    fn visit(hint: Option<usize>, values: usize) -> (Result<Palette256, Error>, usize) {
+        let next_calls = Cell::new(0);
+        let result = Palette256Visitor.visit_seq(HostileSequence {
+            size_hint: hint,
+            remaining: values,
+            next_calls: &next_calls,
+        });
+        (result, next_calls.get())
+    }
+
+    #[test]
+    fn palette_rejects_zero_size_hint_before_iteration() {
+        let (result, next_calls) = visit(Some(0), 0);
+        assert!(result.is_err());
+        assert_eq!(next_calls, 0);
+    }
+
+    #[test]
+    fn palette_rejects_255_size_hint_before_iteration() {
+        let (result, next_calls) = visit(Some(255), 255);
+        assert!(result.is_err());
+        assert_eq!(next_calls, 0);
+    }
+
+    #[test]
+    fn palette_accepts_exactly_256_colors() {
+        let (result, next_calls) = visit(Some(256), 256);
+        assert!(result.is_ok());
+        assert_eq!(next_calls, 257);
+    }
+
+    #[test]
+    fn palette_rejects_257_size_hint_before_iteration() {
+        let (result, next_calls) = visit(Some(257), 257);
+        assert!(result.is_err());
+        assert_eq!(next_calls, 0);
+    }
+
+    #[test]
+    fn palette_rejects_usize_max_size_hint_before_iteration() {
+        let (result, next_calls) = visit(Some(usize::MAX), usize::MAX);
+        assert!(result.is_err());
+        assert_eq!(next_calls, 0);
+    }
+
+    #[test]
+    fn palette_without_size_hint_reads_only_one_over_the_limit() {
+        let (result, next_calls) = visit(None, 257);
+        assert!(result.is_err());
+        assert_eq!(next_calls, 257);
     }
 }
 

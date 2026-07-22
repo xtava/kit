@@ -23,16 +23,19 @@ const NONEMPTY_NO_NUL_PATTERN: &str = r"^[^\u0000]*[^\s\u0000][^\u0000]*$";
 // generated boundary and terminal acceptance-equivalent without narrowing general ProcessLabel.
 const DISPLAY_LABEL_PATTERN: &str = r"^[ -~]*[!-~][ -~]*$";
 const NO_NUL_PATTERN: &str = r"^[^\u0000]*$";
+const ACTION_KEY_PATTERN: &str = r"^[A-Za-z0-9]$";
+const MAX_WORKFLOW_ACTIONS: usize = 8;
+const RESERVED_ACTION_KEYS: &[char] = &['c', 'e', 'h', 'j', 'k', 'l', 'q', 'r'];
 
 #[derive(Clone, Debug)]
 pub struct LoadedBuildManifest {
     pub path: PathBuf,
-    pub provider: ProviderCommand,
+    pub provider: ManifestCommand,
     workflows: Vec<Workflow>,
 }
 
 #[derive(Clone, Debug)]
-pub struct ProviderCommand {
+pub struct ManifestCommand {
     pub program: OsString,
     pub arguments: Vec<OsString>,
 }
@@ -42,6 +45,14 @@ pub struct Workflow {
     pub id: String,
     pub label: ProcessLabel,
     platforms: Vec<HostPlatform>,
+    actions: Vec<WorkflowAction>,
+}
+
+#[derive(Clone, Debug)]
+pub struct WorkflowAction {
+    pub key: char,
+    pub label: ProcessLabel,
+    pub command: ManifestCommand,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Deserialize, JsonSchema)]
@@ -57,14 +68,14 @@ enum HostPlatform {
 pub(super) struct BuildManifestDocument {
     #[schemars(extend("const" = BUILD_MANIFEST_VERSION))]
     version: u32,
-    provider: ProviderDocument,
+    provider: CommandDocument,
     #[schemars(length(min = 1))]
     workflows: Vec<WorkflowDocument>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct ProviderDocument {
+struct CommandDocument {
     #[schemars(length(min = 1), pattern(NONEMPTY_NO_NUL_PATTERN))]
     program: String,
     #[serde(default)]
@@ -81,6 +92,20 @@ struct WorkflowDocument {
     label: String,
     #[schemars(length(min = 1))]
     platforms: Vec<HostPlatform>,
+    #[serde(default)]
+    #[schemars(length(max = MAX_WORKFLOW_ACTIONS))]
+    actions: Vec<WorkflowActionDocument>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct WorkflowActionDocument {
+    #[schemars(length(equal = 1), pattern(ACTION_KEY_PATTERN))]
+    key: String,
+    #[schemars(length(min = 1, max = 32), pattern(DISPLAY_LABEL_PATTERN))]
+    label: String,
+    #[serde(flatten)]
+    command: CommandDocument,
 }
 
 impl LoadedBuildManifest {
@@ -109,8 +134,8 @@ impl LoadedBuildManifest {
                 document.version
             );
         }
-        let provider = resolve_provider(&document.provider, root.as_path())?;
-        let workflows = validate_workflows(document.workflows, &path)?;
+        let provider = resolve_command(&document.provider, root.as_path(), "provider")?;
+        let workflows = validate_workflows(document.workflows, &path, root.as_path())?;
 
         Ok(Self { path, provider, workflows })
     }
@@ -182,6 +207,10 @@ impl Workflow {
     pub(super) fn label(&self) -> &str {
         self.label.as_str()
     }
+
+    pub(super) fn actions(&self) -> &[WorkflowAction] {
+        &self.actions
+    }
 }
 
 fn nearest_manifest(root: &WorktreeRoot, start: &Path) -> Result<PathBuf> {
@@ -215,21 +244,20 @@ fn nearest_manifest(root: &WorktreeRoot, start: &Path) -> Result<PathBuf> {
     )
 }
 
-fn resolve_provider(provider: &ProviderDocument, root: &Path) -> Result<ProviderCommand> {
-    if provider.program.trim().is_empty() {
-        bail!("build manifest provider.program must not be empty");
+fn resolve_command(command: &CommandDocument, root: &Path, owner: &str) -> Result<ManifestCommand> {
+    if command.program.trim().is_empty() {
+        bail!("build manifest {owner}.program must not be empty");
     }
-    if provider.program.contains('\0')
-        || provider.args.iter().any(|argument| argument.contains('\0'))
+    if command.program.contains('\0') || command.args.iter().any(|argument| argument.contains('\0'))
     {
-        bail!("build manifest provider command must not contain a NUL byte");
+        bail!("build manifest {owner} command must not contain a NUL byte");
     }
 
-    let program_path = Path::new(&provider.program);
+    let program_path = Path::new(&command.program);
     let program = if program_path.components().count() == 1
         && matches!(program_path.components().next(), Some(Component::Normal(_)))
     {
-        OsString::from(&provider.program)
+        OsString::from(&command.program)
     } else {
         if program_path.is_absolute()
             || program_path.components().any(|component| {
@@ -240,25 +268,29 @@ fn resolve_provider(provider: &ProviderDocument, root: &Path) -> Result<Provider
             })
         {
             bail!(
-                "build manifest provider.program must be a bare executable name or a repository-relative path"
+                "build manifest {owner}.program must be a bare executable name or a repository-relative path"
             );
         }
         let resolved = root.join(program_path).canonicalize().with_context(|| {
-            format!("resolve repository-relative build provider {}", provider.program)
+            format!("resolve repository-relative build {owner} {}", command.program)
         })?;
         if !resolved.starts_with(root) {
-            bail!("build manifest provider.program escapes the canonical worktree root");
+            bail!("build manifest {owner}.program escapes the canonical worktree root");
         }
         if !resolved.is_file() {
-            bail!("build manifest provider.program must resolve to a regular file");
+            bail!("build manifest {owner}.program must resolve to a regular file");
         }
         resolved.into_os_string()
     };
 
-    Ok(ProviderCommand { program, arguments: provider.args.iter().map(OsString::from).collect() })
+    Ok(ManifestCommand { program, arguments: command.args.iter().map(OsString::from).collect() })
 }
 
-fn validate_workflows(documents: Vec<WorkflowDocument>, path: &Path) -> Result<Vec<Workflow>> {
+fn validate_workflows(
+    documents: Vec<WorkflowDocument>,
+    path: &Path,
+    root: &Path,
+) -> Result<Vec<Workflow>> {
     if documents.is_empty() {
         bail!("build manifest {} must declare at least one workflow", path.display());
     }
@@ -278,9 +310,61 @@ fn validate_workflows(documents: Vec<WorkflowDocument>, path: &Path) -> Result<V
         if document.platforms.is_empty() {
             bail!("build workflow '{}' must declare at least one platform", document.id);
         }
-        workflows.push(Workflow { id: document.id, label, platforms: document.platforms });
+        let actions = validate_workflow_actions(document.actions, &document.id, root)?;
+        workflows.push(Workflow { id: document.id, label, platforms: document.platforms, actions });
     }
     Ok(workflows)
+}
+
+fn validate_workflow_actions(
+    documents: Vec<WorkflowActionDocument>,
+    workflow_id: &str,
+    root: &Path,
+) -> Result<Vec<WorkflowAction>> {
+    if documents.len() > MAX_WORKFLOW_ACTIONS {
+        bail!(
+            "build workflow '{workflow_id}' declares {} actions; at most {MAX_WORKFLOW_ACTIONS} are allowed",
+            documents.len()
+        );
+    }
+    let mut keys = HashSet::new();
+    let mut actions = Vec::with_capacity(documents.len());
+    for document in documents {
+        let key = validate_workflow_action_key(&document.key)
+            .with_context(|| format!("validate build workflow '{workflow_id}' action key"))?;
+        if !keys.insert(key) {
+            bail!("build workflow '{workflow_id}' declares action key '{key}' more than once");
+        }
+        let label = validate_workflow_action_label(&document.label)
+            .with_context(|| format!("validate build workflow '{workflow_id}' action label"))?;
+        let command = resolve_command(
+            &document.command,
+            root,
+            &format!("workflow '{workflow_id}' action '{key}'"),
+        )?;
+        actions.push(WorkflowAction { key, label, command });
+    }
+    Ok(actions)
+}
+
+fn validate_workflow_action_key(value: &str) -> Result<char> {
+    let mut characters = value.chars();
+    let key = characters.next().filter(|key| key.is_ascii_alphanumeric());
+    let key = match (key, characters.next()) {
+        (Some(key), None) => key,
+        _ => bail!("build workflow action key must be one ASCII letter or number"),
+    };
+    if RESERVED_ACTION_KEYS.contains(&key) {
+        bail!("build workflow action key '{key}' is reserved by the Build console");
+    }
+    Ok(key)
+}
+
+fn validate_workflow_action_label(value: &str) -> Result<ProcessLabel> {
+    if value.len() > 32 {
+        bail!("build workflow action label must contain at most 32 printable ASCII characters");
+    }
+    validate_workflow_label(value)
 }
 
 pub(super) fn validate_workflow_id(value: &str) -> Result<()> {
@@ -322,3 +406,54 @@ fn current_platform() -> HostPlatform {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 compile_error!("kit build has no declared host-platform mapping for this target");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_configured_workflow_action() {
+        let documents = vec![WorkflowActionDocument {
+            key: "o".to_owned(),
+            label: "open app".to_owned(),
+            command: CommandDocument {
+                program: "gtk-launch".to_owned(),
+                args: vec!["modular-canary".to_owned()],
+            },
+        }];
+
+        let actions =
+            validate_workflow_actions(documents, "desktop-linux-production", Path::new("/"))
+                .unwrap();
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].key, 'o');
+        assert_eq!(actions[0].label.as_str(), "open app");
+        assert_eq!(actions[0].command.program, OsString::from("gtk-launch"));
+        assert_eq!(actions[0].command.arguments, [OsString::from("modular-canary")]);
+    }
+
+    #[test]
+    fn rejects_reserved_and_duplicate_workflow_action_keys() {
+        assert!(validate_workflow_action_key("q").unwrap_err().to_string().contains("reserved"));
+
+        let documents = ["first", "second"]
+            .into_iter()
+            .map(|label| WorkflowActionDocument {
+                key: "o".to_owned(),
+                label: label.to_owned(),
+                command: CommandDocument { program: "true".to_owned(), args: Vec::new() },
+            })
+            .collect();
+        let error = validate_workflow_actions(documents, "release", Path::new("/"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("more than once"));
+    }
+
+    #[test]
+    fn rejects_oversized_workflow_action_label() {
+        let error = validate_workflow_action_label(&"x".repeat(33)).unwrap_err().to_string();
+        assert!(error.contains("at most 32"));
+    }
+}

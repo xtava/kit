@@ -31,7 +31,7 @@ pub struct ZoomPane {
 
 impl ZoomPane {
     pub async fn run(&self, client: Client) -> Result<()> {
-        let panes = client.list_panes().await?;
+        let panes = client.list_panes().await?.into_inner();
 
         let mut pane_id_to_tab_id = HashMap::new();
         let mut tab_id_to_active_zoomed_pane_id = HashMap::new();

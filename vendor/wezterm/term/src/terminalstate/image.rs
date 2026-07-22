@@ -6,8 +6,12 @@ use ordered_float::NotNan;
 use std::sync::Arc;
 use wezterm_cell::image::{ImageCell, ImageDataType};
 use wezterm_cell::Cell;
+use wezterm_runtime_admission::MAX_SERVER_TERMINAL_IMAGE_MUTATION_BYTES;
 use wezterm_surface::change::ImageData;
 use wezterm_surface::TextureCoordinate;
+
+pub(crate) const MAX_DECODED_IMAGE_BYTES: usize = 100_000_000;
+pub(crate) const MAX_IMAGE_ANIMATION_FRAMES: usize = 4_096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlacementInfo {
@@ -300,22 +304,55 @@ impl TerminalState {
 }
 
 pub(crate) fn check_image_dimensions(width: u32, height: u32) -> anyhow::Result<()> {
-    const MAX_IMAGE_SIZE: u32 = 100_000_000;
-    let size = width.saturating_mul(height).saturating_mul(4);
-    if size > MAX_IMAGE_SIZE {
+    let size = checked_image_allocation_bytes(width, height, 4, 1)?;
+    if size > MAX_DECODED_IMAGE_BYTES {
         anyhow::bail!(
             "Ignoring image data for image with dimensions {}x{} \
              because required RAM {} > max allowed {}",
             width,
             height,
             SizeFormatter::new(size, DECIMAL),
-            SizeFormatter::new(MAX_IMAGE_SIZE, DECIMAL),
+            SizeFormatter::new(MAX_DECODED_IMAGE_BYTES, DECIMAL),
         );
     }
-    if size == 0 {
-        anyhow::bail!("Ignoring image with 0x0 dimensions");
-    }
     Ok(())
+}
+
+pub(crate) fn checked_image_allocation_bytes(
+    width: u32,
+    height: u32,
+    channels: usize,
+    frames: usize,
+) -> anyhow::Result<usize> {
+    anyhow::ensure!(
+        width != 0 && height != 0,
+        "Ignoring image with 0x0 dimensions"
+    );
+    anyhow::ensure!(
+        channels != 0 && frames != 0,
+        "image allocation factors must be non-zero"
+    );
+    let bytes = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(channels))
+        .and_then(|frame_bytes| frame_bytes.checked_mul(frames))
+        .ok_or_else(|| anyhow::anyhow!("image allocation size overflow for {width}x{height}"))?;
+    anyhow::ensure!(
+        bytes <= MAX_SERVER_TERMINAL_IMAGE_MUTATION_BYTES,
+        "image allocation requires {} bytes but the admitted mutation bound is {}",
+        bytes,
+        MAX_SERVER_TERMINAL_IMAGE_MUTATION_BYTES
+    );
+    Ok(bytes)
+}
+
+fn decoder_limits() -> image::Limits {
+    let max_dimension = (MAX_DECODED_IMAGE_BYTES / 4) as u32;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(max_dimension);
+    limits.max_image_height = Some(max_dimension);
+    limits.max_alloc = Some(MAX_SERVER_TERMINAL_IMAGE_MUTATION_BYTES as u64);
+    limits
 }
 
 #[derive(Debug)]
@@ -326,16 +363,36 @@ pub(crate) struct ImageInfo {
 }
 
 pub(crate) fn dimensions(data: &[u8]) -> anyhow::Result<ImageInfo> {
-    let reader = image::ImageReader::new(std::io::Cursor::new(data)).with_guessed_format()?;
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(data)).with_guessed_format()?;
+    reader.limits(decoder_limits());
     let format = reader
         .format()
         .ok_or_else(|| anyhow::anyhow!("unknown format!?"))?;
     let (width, height) = reader.into_dimensions()?;
+    check_image_dimensions(width, height)?;
     Ok(ImageInfo {
         width,
         height,
         format,
     })
+}
+
+pub(crate) fn decode_image(data: &[u8]) -> anyhow::Result<image::DynamicImage> {
+    let info = dimensions(data)?;
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(data)).with_guessed_format()?;
+    reader.limits(decoder_limits());
+    let decoded = reader.decode()?;
+    let (width, height) = (decoded.width(), decoded.height());
+    anyhow::ensure!(
+        width == info.width && height == info.height,
+        "decoded image dimensions changed from {}x{} to {}x{}",
+        info.width,
+        info.height,
+        width,
+        height
+    );
+    check_image_dimensions(width, height)?;
+    Ok(decoded)
 }
 
 /// Returns `1` if `b` is true, else `0`,
@@ -344,5 +401,30 @@ fn one_or_zero<T: Zero + One>(b: bool) -> T {
         T::one()
     } else {
         T::zero()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tiny_png_with_huge_declared_surface_is_rejected_from_header() {
+        let png = [
+            0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, b'I', b'H', b'D', b'R', 0,
+            0, 0xff, 0xff, 0, 0, 0xff, 0xff, 8, 6, 0, 0, 0, 0xb6, 0x05, 0xd9, 0x50, 0, 0, 0, 0,
+            b'I', b'E', b'N', b'D', 0xae, 0x42, 0x60, 0x82,
+        ];
+
+        assert!(png.len() < 64);
+        assert!(dimensions(&png).is_err());
+        assert!(decode_image(&png).is_err());
+    }
+
+    #[test]
+    fn checked_image_allocation_rejects_overflow_and_mutation_bound() {
+        assert!(checked_image_allocation_bytes(u32::MAX, u32::MAX, 4, usize::MAX).is_err());
+        assert!(check_image_dimensions(u32::MAX, u32::MAX).is_err());
+        assert_eq!(checked_image_allocation_bytes(1, 1, 4, 1).unwrap(), 4);
     }
 }

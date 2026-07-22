@@ -13,3 +13,4 @@ async-task.workspace = true
 flume.workspace = true
 lazy_static.workspace = true
 thiserror.workspace =true
+wezterm-runtime-admission.workspace = true

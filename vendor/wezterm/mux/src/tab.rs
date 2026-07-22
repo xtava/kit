@@ -662,12 +662,17 @@ impl Tab {
         self.inner.lock().get_pane_direction(direction, ignore_zoom)
     }
 
-    pub fn prune_dead_panes(&self) -> bool {
+    pub fn prune_dead_panes(&self) -> (bool, Vec<PaneId>) {
         self.inner.lock().prune_dead_panes()
     }
 
     pub fn kill_pane(&self, pane_id: PaneId) -> bool {
-        self.inner.lock().kill_pane(pane_id)
+        let pane_ids = self.inner.lock().kill_pane(pane_id);
+        let killed = !pane_ids.is_empty();
+        for pane_id in pane_ids {
+            Mux::get().remove_pane(pane_id);
+        }
+        killed
     }
 
     pub fn kill_panes_in_domain(&self, domain: DomainId) -> bool {
@@ -1557,51 +1562,49 @@ impl TabInner {
         None
     }
 
-    fn prune_dead_panes(&mut self) -> bool {
+    fn prune_dead_panes(&mut self) -> (bool, Vec<PaneId>) {
         let mux = Mux::get();
-        !self
-            .remove_pane_if(
-                |_, pane| {
-                    // If the pane is no longer known to the mux, then its liveness
-                    // state isn't guaranteed to be monitored or updated, so let's
-                    // consider the pane effectively dead if it isn't in the mux.
-                    // <https://github.com/wezterm/wezterm/issues/4030>
-                    let in_mux = mux.get_pane(pane.pane_id()).is_some();
-                    let dead = pane.is_dead();
-                    log::trace!(
-                        "prune_dead_panes: pane_id={} dead={} in_mux={}",
-                        pane.pane_id(),
-                        dead,
-                        in_mux
-                    );
-                    dead || !in_mux
-                },
-                true,
-            )
-            .is_empty()
+        let panes = self.remove_pane_if(|_, pane| {
+            // If the pane is no longer known to the mux, then its liveness
+            // state isn't guaranteed to be monitored or updated, so let's
+            // consider the pane effectively dead if it isn't in the mux.
+            // <https://github.com/wezterm/wezterm/issues/4030>
+            let in_mux = mux.get_pane(pane.pane_id()).is_some();
+            let dead = pane.is_dead();
+            log::trace!(
+                "prune_dead_panes: pane_id={} dead={} in_mux={}",
+                pane.pane_id(),
+                dead,
+                in_mux
+            );
+            dead || !in_mux
+        });
+        let pane_ids = panes.iter().map(|pane| pane.pane_id()).collect();
+        (!panes.is_empty(), pane_ids)
     }
 
-    fn kill_pane(&mut self, pane_id: PaneId) -> bool {
-        !self
-            .remove_pane_if(|_, pane| pane.pane_id() == pane_id, true)
-            .is_empty()
+    fn kill_pane(&mut self, pane_id: PaneId) -> Vec<PaneId> {
+        self.remove_pane_if(|_, pane| pane.pane_id() == pane_id)
+            .into_iter()
+            .map(|pane| pane.pane_id())
+            .collect()
     }
 
     fn kill_panes_in_domain(&mut self, domain: DomainId) -> bool {
         !self
-            .remove_pane_if(|_, pane| pane.domain_id() == domain, true)
+            .remove_pane_if(|_, pane| pane.domain_id() == domain)
             .is_empty()
     }
 
     fn remove_pane(&mut self, pane_id: PaneId) -> Option<Arc<dyn Pane>> {
-        let panes = self.remove_pane_if(|_, pane| pane.pane_id() == pane_id, false);
+        let panes = self.remove_pane_if(|_, pane| pane.pane_id() == pane_id);
         for pane in panes {
             return Some(pane);
         }
         None
     }
 
-    fn remove_pane_if<F>(&mut self, f: F, kill: bool) -> Vec<Arc<dyn Pane>>
+    fn remove_pane_if<F>(&mut self, f: F) -> Vec<Arc<dyn Pane>>
     where
         F: Fn(usize, &Arc<dyn Pane>) -> bool,
     {
@@ -1696,16 +1699,6 @@ impl TabInner {
             self.active = active_idx.saturating_sub(removed_indices.len());
         }
 
-        if !dead_panes.is_empty() && kill {
-            let to_kill: Vec<_> = dead_panes.iter().map(|p| p.pane_id()).collect();
-            promise::spawn::spawn_into_main_thread(async move {
-                let mux = Mux::get();
-                for pane_id in to_kill.into_iter() {
-                    mux.remove_pane(pane_id);
-                }
-            })
-            .detach();
-        }
         dead_panes
     }
 
@@ -2279,7 +2272,10 @@ mod test {
         fn reader(&self) -> anyhow::Result<Option<Box<dyn std::io::Read + Send>>> {
             Ok(None)
         }
-        fn writer(&self) -> MappedMutexGuard<dyn std::io::Write> {
+        fn cancel_reader(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn writer(&self) -> MappedMutexGuard<'_, dyn std::io::Write> {
             unimplemented!()
         }
         fn resize(&self, size: TerminalSize) -> anyhow::Result<()> {

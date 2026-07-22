@@ -22,7 +22,12 @@ use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use wezterm_term::TerminalSize;
+use wezterm_runtime_admission::{
+    RetainedClass, MAX_SERVER_TERMINAL_COLS, MAX_SERVER_TERMINAL_PIXEL_HEIGHT,
+    MAX_SERVER_TERMINAL_PIXEL_WIDTH, MAX_SERVER_TERMINAL_ROWS, MAX_SERVER_TERMINAL_SCROLLBACK_ROWS,
+    MAX_TERMINAL_STATE_BYTES_TOTAL,
+};
+use wezterm_term::{Terminal, TerminalConfiguration, TerminalGeometryLimits, TerminalSize};
 
 static DOMAIN_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUsize::new(0);
 pub type DomainId = usize;
@@ -536,6 +541,10 @@ impl portable_pty::MasterPty for FailedSpawnPty {
         self.inner.lock().take_writer()
     }
 
+    fn cancel_reader(&self) -> anyhow::Result<()> {
+        self.inner.lock().cancel_reader()
+    }
+
     #[cfg(unix)]
     fn process_group_leader(&self) -> Option<i32> {
         None
@@ -594,6 +603,26 @@ impl Domain for LocalDomain {
         command_dir: Option<String>,
     ) -> anyhow::Result<Arc<dyn Pane>> {
         let pane_id = alloc_pane_id();
+        let mux = Mux::get();
+        let admission = Arc::clone(mux.admission());
+        let terminal_config = Arc::new(config::TermConfig::new());
+        let geometry_limits = TerminalGeometryLimits {
+            max_rows: MAX_SERVER_TERMINAL_ROWS,
+            max_cols: MAX_SERVER_TERMINAL_COLS,
+            max_pixel_width: MAX_SERVER_TERMINAL_PIXEL_WIDTH,
+            max_pixel_height: MAX_SERVER_TERMINAL_PIXEL_HEIGHT,
+            max_scrollback_rows: MAX_SERVER_TERMINAL_SCROLLBACK_ROWS,
+            max_geometry_bytes: MAX_TERMINAL_STATE_BYTES_TOTAL,
+        };
+        let terminal_plan = Terminal::plan_bounded_construction(
+            size,
+            terminal_config.scrollback_size(),
+            geometry_limits,
+        )?;
+        let terminal_lease = admission.try_retained(
+            RetainedClass::ServerTerminal,
+            terminal_plan.initial_server_retained_bytes()?,
+        )?;
         let cmd = self
             .build_command(command, command_dir, pane_id)
             .await
@@ -615,19 +644,21 @@ impl Domain for LocalDomain {
             },
             self.name
         );
-        let child_result = pair.slave.spawn_command(cmd);
         let mut writer = WriterWrapper::new(pair.master.take_writer()?);
 
-        let mut terminal = wezterm_term::Terminal::new(
-            size,
-            std::sync::Arc::new(config::TermConfig::new()),
+        let mut terminal = Terminal::new_server_from_geometry_plan(
+            terminal_plan,
+            terminal_lease,
+            geometry_limits,
+            terminal_config,
             "WezTerm",
             config::wezterm_version(),
             Box::new(writer.clone()),
-        );
+        )?;
         if self.is_conpty() {
             terminal.enable_conpty_quirks();
         }
+        let child_result = pair.slave.spawn_command(cmd);
 
         let pane: Arc<dyn Pane> = match child_result {
             Ok(child) => Arc::new(LocalPane::new(
@@ -638,7 +669,8 @@ impl Domain for LocalDomain {
                 Box::new(writer),
                 self.id,
                 command_description,
-            )),
+                &admission,
+            )?),
             Err(err) => {
                 // Show the error to the user in the new pane
                 write!(writer, "{err:#}").ok();
@@ -654,11 +686,11 @@ impl Domain for LocalDomain {
                     Box::new(writer),
                     self.id,
                     command_description,
-                ))
+                    &admission,
+                )?)
             }
         };
 
-        let mux = Mux::get();
         mux.add_pane(&pane)?;
 
         Ok(pane)

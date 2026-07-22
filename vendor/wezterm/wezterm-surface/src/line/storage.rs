@@ -16,6 +16,15 @@ pub(crate) enum VisibleCellIter<'a> {
     C(ClusterLineCellIter<'a>),
 }
 
+impl CellStorage {
+    pub(crate) fn retained_heap_size_excluding_image_data(&self) -> usize {
+        match self {
+            Self::V(storage) => storage.retained_heap_size_excluding_image_data(),
+            Self::C(storage) => storage.retained_heap_size_excluding_image_data(),
+        }
+    }
+}
+
 impl<'a> Iterator for VisibleCellIter<'a> {
     type Item = CellRef<'a>;
 

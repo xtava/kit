@@ -23,17 +23,11 @@ struct Cluster {
 /// Stores line data as a contiguous string and a series of
 /// clusters of attribute data describing attributed ranges
 /// within the line
-#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "use_serde", derive(Serialize))]
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ClusteredLine {
     pub text: String,
-    #[cfg_attr(
-        feature = "use_serde",
-        serde(
-            deserialize_with = "deserialize_bitset",
-            serialize_with = "serialize_bitset"
-        )
-    )]
+    #[cfg_attr(feature = "use_serde", serde(serialize_with = "serialize_bitset"))]
     is_double_wide: Option<Box<FixedBitSet>>,
     clusters: Vec<Cluster>,
     /// Length, measured in cells
@@ -42,21 +36,15 @@ pub(crate) struct ClusteredLine {
 }
 
 #[cfg(feature = "use_serde")]
-fn deserialize_bitset<'de, D>(deserializer: D) -> Result<Option<Box<FixedBitSet>>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let wide_indices = <Vec<usize>>::deserialize(deserializer)?;
-    if wide_indices.is_empty() {
-        Ok(None)
-    } else {
-        let max_idx = wide_indices.iter().max().unwrap_or(&1);
-        let mut bitset = FixedBitSet::with_capacity(max_idx + 1);
-        for idx in wide_indices {
-            bitset.set(idx, true);
-        }
-        Ok(Some(Box::new(bitset)))
-    }
+#[derive(Deserialize)]
+#[serde(rename = "ClusteredLine")]
+struct SerializedClusteredLine {
+    text: String,
+    is_double_wide: Vec<usize>,
+    clusters: Vec<Cluster>,
+    len: u32,
+    // This is only a cache. Decode the wire value, but never trust it.
+    last_cell_width: Option<u8>,
 }
 
 /// Serialize the bitset as a vector of the indices of just the 1 bits;
@@ -77,10 +65,162 @@ where
     wide_indices.serialize(serializer)
 }
 
+#[cfg(feature = "use_serde")]
 impl ClusteredLine {
+    fn from_serialized(wire: SerializedClusteredLine) -> Result<Self, &'static str> {
+        let SerializedClusteredLine {
+            text,
+            is_double_wide: wide_indices,
+            clusters,
+            len,
+            last_cell_width: _cached_last_cell_width,
+        } = wire;
+
+        let len = len as usize;
+
+        let mut prior_wide_index = None;
+        for &wide_index in &wide_indices {
+            if wide_index >= len {
+                return Err("double-wide cell start is outside the line");
+            }
+            if matches!(prior_wide_index, Some(prior) if prior >= wide_index) {
+                return Err("double-wide cell starts must be unique and strictly increasing");
+            }
+            prior_wide_index = Some(wide_index);
+        }
+
+        let mut clustered_width = 0usize;
+        for cluster in &clusters {
+            if cluster.cell_width == 0 {
+                return Err("attribute clusters must have non-zero cell width");
+            }
+            clustered_width = clustered_width
+                .checked_add(cluster.cell_width as usize)
+                .ok_or("attribute cluster widths overflow")?;
+            if clustered_width > len {
+                return Err("attribute clusters overrun the line");
+            }
+        }
+        if clustered_width != len {
+            return Err("attribute cluster widths do not cover the line");
+        }
+
+        let mut cell_offset = 0usize;
+        let mut wide_cursor = 0usize;
+        let mut cluster_cursor = 0usize;
+        let mut cluster_end = clusters
+            .first()
+            .map_or(0, |cluster| cluster.cell_width as usize);
+        let mut final_width = None;
+
+        for _grapheme in Graphemes::new(&text) {
+            let width = match wide_indices.get(wide_cursor).copied() {
+                Some(wide_index) if wide_index < cell_offset => {
+                    return Err("double-wide cell start is not aligned to a grapheme");
+                }
+                Some(wide_index) if wide_index == cell_offset => {
+                    wide_cursor += 1;
+                    2usize
+                }
+                _ => 1usize,
+            };
+            let next_offset = cell_offset
+                .checked_add(width)
+                .ok_or("grapheme cell widths overflow")?;
+
+            if cluster_cursor >= clusters.len() || next_offset > cluster_end {
+                return Err("attribute cluster boundary splits a grapheme");
+            }
+
+            cell_offset = next_offset;
+            final_width = NonZeroU8::new(width as u8);
+
+            if cell_offset == cluster_end {
+                cluster_cursor += 1;
+                if let Some(cluster) = clusters.get(cluster_cursor) {
+                    cluster_end = cluster_end
+                        .checked_add(cluster.cell_width as usize)
+                        .ok_or("attribute cluster offsets overflow")?;
+                }
+            }
+        }
+
+        if wide_cursor != wide_indices.len() {
+            return Err("double-wide cell start does not identify a grapheme");
+        }
+        if cell_offset != len {
+            return Err("grapheme cell widths disagree with the line length");
+        }
+        if cluster_cursor != clusters.len() {
+            return Err("attribute clusters contain cells without graphemes");
+        }
+
+        let is_double_wide = if wide_indices.is_empty() {
+            None
+        } else {
+            // Every index and the complete cell layout have been validated. In
+            // particular, the bitset length comes from a validated in-range
+            // index, never from an unchecked attacker-selected maximum. Match
+            // the canonical append representation by ending at the final wide
+            // start rather than at the line's cell length.
+            let bitset_len = wide_indices
+                .last()
+                .and_then(|index| index.checked_add(1))
+                .ok_or("double-wide cell start overflows bitset length")?;
+            let mut bits = FixedBitSet::with_capacity(bitset_len);
+            for wide_index in wide_indices {
+                bits.set(wide_index, true);
+            }
+            Some(Box::new(bits))
+        };
+
+        Ok(Self {
+            text,
+            is_double_wide,
+            clusters,
+            len: len as u32,
+            last_cell_width: final_width,
+        })
+    }
+}
+
+#[cfg(feature = "use_serde")]
+impl<'de> Deserialize<'de> for ClusteredLine {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = SerializedClusteredLine::deserialize(deserializer)?;
+        Self::from_serialized(wire).map_err(<D::Error as serde::de::Error>::custom)
+    }
+}
+
+impl ClusteredLine {
+    pub(crate) fn retained_heap_size_excluding_image_data(&self) -> usize {
+        let cluster_size = self.clusters.iter().fold(
+            self.clusters
+                .capacity()
+                .saturating_mul(core::mem::size_of::<Cluster>()),
+            |size, cluster| {
+                size.saturating_add(cluster.attrs.retained_heap_size_excluding_image_data())
+            },
+        );
+        let bitset_size = self.is_double_wide.as_ref().map_or(0, |bits| {
+            core::mem::size_of::<FixedBitSet>().saturating_add(
+                bits.as_slice()
+                    .len()
+                    .saturating_mul(core::mem::size_of::<u32>()),
+            )
+        });
+        self.text
+            .capacity()
+            .saturating_add(cluster_size)
+            .saturating_add(bitset_size)
+    }
+
     pub fn new() -> Self {
         Self {
-            text: String::with_capacity(80),
+            text: String::with_capacity(crate::line::Line::INITIAL_CLUSTER_TEXT_CAPACITY),
             is_double_wide: None,
             clusters: vec![],
             len: 0,
@@ -89,7 +229,7 @@ impl ClusteredLine {
     }
 
     pub fn to_cell_vec(&self) -> Vec<Cell> {
-        let mut cells = vec![];
+        let mut cells = Vec::with_capacity(self.len as usize);
 
         for c in self.iter() {
             cells.push(c.as_cell());
@@ -373,6 +513,37 @@ impl<'a> Iterator for ClusterLineCellIter<'a> {
 mod test {
     use super::*;
 
+    #[cfg(feature = "use_serde")]
+    fn cluster(cell_width: u16) -> Cluster {
+        Cluster {
+            cell_width,
+            attrs: CellAttributes::blank(),
+        }
+    }
+
+    #[cfg(feature = "use_serde")]
+    fn wire(
+        text: &str,
+        wide_indices: Vec<usize>,
+        cluster_widths: &[u16],
+        len: u32,
+        cached_last_width: Option<u8>,
+    ) -> SerializedClusteredLine {
+        SerializedClusteredLine {
+            text: String::from(text),
+            is_double_wide: wide_indices,
+            clusters: cluster_widths.iter().copied().map(cluster).collect(),
+            len,
+            last_cell_width: cached_last_width,
+        }
+    }
+
+    #[cfg(feature = "use_serde")]
+    fn assert_invalid(wire: SerializedClusteredLine, expected: &str) {
+        let error = ClusteredLine::from_serialized(wire).unwrap_err();
+        assert_eq!(error, expected);
+    }
+
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn memory_usage() {
@@ -381,5 +552,112 @@ mod test {
         assert_eq!(core::mem::size_of::<Vec<Cluster>>(), 24);
         assert_eq!(core::mem::size_of::<Option<Box<FixedBitSet>>>(), 8);
         assert_eq!(core::mem::size_of::<Option<NonZeroU8>>(), 1);
+    }
+
+    #[test]
+    #[cfg(feature = "use_serde")]
+    fn serde_wire_valid_roundtrip_rebuilds_canonical_line() {
+        let attrs = CellAttributes::blank();
+        let mut original = ClusteredLine::new();
+        original.append_grapheme("a", 1, attrs.clone());
+        original.append_grapheme("界", 2, attrs);
+
+        let wide_indices = original
+            .is_double_wide
+            .as_ref()
+            .map(|bits| bits.ones().collect())
+            .unwrap_or_default();
+        let decoded = ClusteredLine::from_serialized(SerializedClusteredLine {
+            text: original.text.clone(),
+            is_double_wide: wide_indices,
+            clusters: original.clusters.clone(),
+            len: original.len,
+            last_cell_width: original.last_cell_width.map(NonZeroU8::get),
+        })
+        .unwrap();
+
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    #[cfg(feature = "use_serde")]
+    fn serde_wire_accepts_empty_and_wide_boundary_layouts() {
+        let empty = ClusteredLine::from_serialized(wire("", vec![], &[], 0, None)).unwrap();
+        assert_eq!(empty.len(), 0);
+        assert_eq!(empty.last_cell_width, None);
+
+        let boundary =
+            ClusteredLine::from_serialized(wire("a界", vec![1], &[1, 2], 3, Some(2))).unwrap();
+        assert_eq!(boundary.len(), 3);
+        assert!(boundary.is_double_wide(1));
+        assert_eq!(boundary.last_cell_width, NonZeroU8::new(2));
+    }
+
+    #[test]
+    #[cfg(feature = "use_serde")]
+    fn serde_wire_rejects_zero_and_overrunning_clusters() {
+        assert_invalid(
+            wire("", vec![], &[0], 0, None),
+            "attribute clusters must have non-zero cell width",
+        );
+        assert_invalid(
+            wire("a", vec![], &[2], 1, Some(1)),
+            "attribute clusters overrun the line",
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "use_serde")]
+    fn serde_wire_rejects_cluster_boundary_inside_wide_grapheme() {
+        assert_invalid(
+            wire("界", vec![0], &[1, 1], 2, Some(2)),
+            "attribute cluster boundary splits a grapheme",
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "use_serde")]
+    fn serde_wire_rejects_duplicate_or_orphan_wide_starts() {
+        assert_invalid(
+            wire("界", vec![0, 0], &[2], 2, Some(2)),
+            "double-wide cell starts must be unique and strictly increasing",
+        );
+        assert_invalid(
+            wire("ab", vec![0, 1], &[3], 3, Some(1)),
+            "double-wide cell start is not aligned to a grapheme",
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "use_serde")]
+    fn serde_wire_rejects_out_of_range_wide_start_without_allocating_for_it() {
+        assert_invalid(
+            wire("a", vec![usize::MAX], &[1], 1, Some(1)),
+            "double-wide cell start is outside the line",
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "use_serde")]
+    fn serde_wire_rejects_grapheme_and_cell_length_disagreement() {
+        assert_invalid(
+            wire("ab", vec![], &[3], 3, Some(1)),
+            "grapheme cell widths disagree with the line length",
+        );
+        assert_invalid(
+            wire("", vec![], &[1], 1, None),
+            "grapheme cell widths disagree with the line length",
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "use_serde")]
+    fn serde_wire_ignores_hostile_cached_final_width() {
+        let zero = ClusteredLine::from_serialized(wire("界", vec![0], &[2], 2, Some(0))).unwrap();
+        let unrelated =
+            ClusteredLine::from_serialized(wire("界", vec![0], &[2], 2, Some(u8::MAX))).unwrap();
+
+        assert_eq!(zero.last_cell_width, NonZeroU8::new(2));
+        assert_eq!(unrelated.last_cell_width, NonZeroU8::new(2));
     }
 }

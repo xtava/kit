@@ -6,6 +6,7 @@ mod c0;
 use bitflags::bitflags;
 mod c1;
 mod csi;
+mod geometry;
 mod image;
 // mod selection; FIXME: port to render layer
 use crate::color::ColorPalette;
@@ -92,7 +93,7 @@ impl TestTerm {
     }
 
     fn print<B: AsRef<[u8]>>(&mut self, bytes: B) {
-        self.term.advance_bytes(bytes);
+        self.term.advance_bytes(bytes).unwrap();
     }
 
     fn set_mode(&mut self, mode: &str, enable: bool) {

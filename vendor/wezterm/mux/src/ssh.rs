@@ -1,4 +1,4 @@
-use crate::connui::ConnectionUI;
+use crate::connui::ConnectionUi;
 use crate::domain::{alloc_domain_id, Domain, DomainId, DomainState, WriterWrapper};
 use crate::localpane::LocalPane;
 use crate::pane::{alloc_pane_id, Pane, PaneId};
@@ -59,10 +59,9 @@ impl LineEditorHost for PasswordPromptHost {
 
 pub fn ssh_connect_with_ui(
     ssh_config: wezterm_ssh::ConfigMap,
-    ui: &mut ConnectionUI,
+    ui: &dyn ConnectionUi,
 ) -> anyhow::Result<Session> {
-    let cloned_ui = ui.clone();
-    cloned_ui.run_and_log_error(move || {
+    let result = (|| {
         let remote_address = ssh_config
             .get("hostname")
             .expect("ssh config to always set hostname");
@@ -127,7 +126,12 @@ pub fn ssh_connect_with_ui(
             }
         }
         bail!("unable to authenticate session");
-    })
+    })();
+
+    if let Err(error) = &result {
+        ui.report_error(error);
+    }
+    result
 }
 
 fn format_host_verification_for_terminal(failed: HostVerificationFailed) -> Vec<Change> {
@@ -767,6 +771,7 @@ impl Domain for RemoteSshDomain {
             Box::new(writer.clone()),
         );
 
+        let mux = Mux::get();
         let pane: Arc<dyn Pane> = Arc::new(LocalPane::new(
             pane_id,
             terminal,
@@ -775,8 +780,8 @@ impl Domain for RemoteSshDomain {
             Box::new(writer),
             self.id,
             "RemoteSshDomain".to_string(),
-        ));
-        let mux = Mux::get();
+            mux.admission(),
+        )?);
         mux.add_pane(&pane)?;
 
         Ok(pane)
@@ -858,14 +863,21 @@ impl WrappedSshChild {
         }
 
         let (tx, rx) = bounded(1);
-        promise::spawn::spawn_into_main_thread(async move {
+        let failure_tx = tx.clone();
+        let mux = Mux::get();
+        let weak_mux = Arc::downgrade(&mux);
+        if let Err(err) = mux.try_spawn_runtime_task("schedule SSH child waiter", async move {
             if let Ok(status) = child.async_wait().await {
                 tx.send(status).await.ok();
-                let mux = Mux::get();
-                mux.prune_dead_windows();
+                if let Some(mux) = weak_mux.upgrade() {
+                    mux.prune_dead_windows();
+                }
             }
-        })
-        .detach();
+            Ok(())
+        }) {
+            log::error!("failed to schedule SSH child waiter: {err:#}");
+            let _ = failure_tx.try_send(ExitStatus::with_exit_code(1));
+        }
         self.status.replace(rx);
     }
 }

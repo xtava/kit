@@ -45,11 +45,10 @@ impl SensitiveInput {
             }
             KeyCode::Char(ch)
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
-                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+                    && self.value.insert_char(self.cursor, ch) =>
             {
-                if self.value.insert_char(self.cursor, ch) {
-                    self.cursor += ch.len_utf8();
-                }
+                self.cursor += ch.len_utf8();
             }
             _ => {}
         }

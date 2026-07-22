@@ -65,7 +65,7 @@ All notable changes to this project will be documented in this file.
 
 ### 💼 Other
 
-- :File -> EncodedLease
+- :File -> encoded blob storage
 - Update sha2
 - Plumb more modifier+state information through
 - Improve support for numpad buttons
