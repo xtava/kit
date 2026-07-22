@@ -1,8 +1,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
+    fs::DirBuilder,
     num::NonZeroUsize,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -28,7 +29,6 @@ use super::model::{
     RelayEpochFailure, RelayEpochOutcome, RelayEpochOutcomeKind, RelayTarget, RelayTargetError,
 };
 
-const RELAY_SOCKET_NAME: &str = "console-relay.sock";
 const COPY_BUFFER_BYTES: usize = 32 * 1024;
 const STREAM_BUDGET: NonZeroUsize = NonZeroUsize::new(256 * 1024).unwrap();
 const TERMINATION_GRACE: Duration = Duration::from_secs(3);
@@ -39,6 +39,12 @@ pub(crate) enum SshRelayError {
     Prepare(String),
     #[error("create private Console relay workspace: {0}")]
     Workspace(String),
+    #[error("prepare private Console relay runtime {}: {source}", path.display())]
+    Runtime {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("bind private Console relay socket {}: {source}", path.display())]
     Bind {
         path: PathBuf,
@@ -72,6 +78,21 @@ pub(crate) struct SshRelay {
     owner: Option<JoinHandle<Result<(), SshRelayError>>>,
 }
 
+struct RelaySocketLease {
+    path: PathBuf,
+}
+
+struct RelayListener {
+    listener: UnixListener,
+    socket: RelaySocketLease,
+}
+
+impl Drop for RelaySocketLease {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 impl SshRelay {
     pub(crate) async fn start(
         processes: &ProcessSupervisor,
@@ -92,11 +113,8 @@ impl SshRelay {
             .map_err(|error| SshRelayError::Workspace(error.to_string()))?;
         drop(prepared);
 
-        let socket_path = workspace.as_path().join(RELAY_SOCKET_NAME);
-        let listener = UnixListener::bind(&socket_path)
-            .map_err(|source| SshRelayError::Bind { path: socket_path.clone(), source })?;
-        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|source| SshRelayError::Protect { path: socket_path.clone(), source })?;
+        let listener = bind_relay_socket()?;
+        let socket_path = listener.socket.path.clone();
 
         let (cancel, cancel_receiver) = watch::channel(false);
         let (outcome_sender, outcomes) = watch::channel(None);
@@ -137,7 +155,7 @@ impl Drop for SshRelay {
 }
 
 async fn run_owner(
-    listener: UnixListener,
+    relay: RelayListener,
     processes: ProcessSupervisor,
     provider: Arc<dyn RelayEpochProvider>,
     program: OsString,
@@ -145,8 +163,10 @@ async fn run_owner(
     mut cancel: watch::Receiver<bool>,
     outcomes: watch::Sender<Option<RelayEpochOutcome>>,
 ) -> Result<(), SshRelayError> {
+    let RelayListener { listener, socket } = relay;
     let working_directory = workspace.as_path().to_owned();
     let _workspace = workspace;
+    let _socket = socket;
     let mut epoch = 0u64;
     loop {
         let socket = tokio::select! {
@@ -190,6 +210,48 @@ async fn run_owner(
             return Ok(());
         }
     }
+}
+
+fn bind_relay_socket() -> Result<RelayListener, SshRelayError> {
+    let runtime_dir = relay_runtime_dir()?;
+    let socket_path = runtime_dir.join(format!("r-{}.sock", uuid::Uuid::new_v4().simple()));
+    let socket = RelaySocketLease { path: socket_path.clone() };
+    let listener = UnixListener::bind(&socket_path)
+        .map_err(|source| SshRelayError::Bind { path: socket_path.clone(), source })?;
+    std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|source| SshRelayError::Protect { path: socket_path, source })?;
+    Ok(RelayListener { listener, socket })
+}
+
+fn relay_runtime_dir() -> Result<PathBuf, SshRelayError> {
+    // macOS counts the literal Unix-socket path against a 104-byte sockaddr limit. TMPDIR paths
+    // are routinely longer than that before the ProcessSupervisor workspace suffix is added, so
+    // relays use one short, predictable parent whose ownership and mode are verified below.
+    let effective_user = unsafe { libc::geteuid() };
+    let path = PathBuf::from("/tmp").join(format!("kit-console-{effective_user}"));
+    let mut builder = DirBuilder::new();
+    builder.mode(0o700);
+    match builder.create(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(source) => return Err(SshRelayError::Runtime { path, source }),
+    }
+    let metadata = std::fs::symlink_metadata(&path)
+        .map_err(|source| SshRelayError::Runtime { path: path.clone(), source })?;
+    if !metadata.file_type().is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != effective_user
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err(SshRelayError::Runtime {
+            path,
+            source: std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "relay runtime must be an owned private directory",
+            ),
+        });
+    }
+    Ok(path)
 }
 
 async fn run_epoch(
@@ -397,7 +459,7 @@ async fn cancelled(receiver: &mut watch::Receiver<bool>) {
 mod tests {
     use std::{
         net::IpAddr,
-        os::unix::fs::PermissionsExt,
+        os::unix::fs::{MetadataExt, PermissionsExt},
         sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
@@ -441,6 +503,10 @@ mod tests {
             Arc::new(StaticTarget { target, preparations: Arc::clone(&preparations) });
         let relay =
             SshRelay::start_with_program(&processes, provider, fake_ssh.into_os_string()).await?;
+        let socket_path = relay.socket_path().to_owned();
+        assert!(socket_path.as_os_str().len() < 104);
+        assert_eq!(std::fs::symlink_metadata(socket_path.parent().unwrap())?.mode() & 0o777, 0o700);
+        assert_eq!(std::fs::symlink_metadata(&socket_path)?.mode() & 0o777, 0o600);
 
         for message in [b"first epoch".as_slice(), b"second epoch".as_slice()] {
             let mut client = tokio::net::UnixStream::connect(relay.socket_path()).await?;
@@ -452,6 +518,7 @@ mod tests {
         }
 
         relay.shutdown().await?;
+        assert!(!socket_path.exists());
         assert_eq!(preparations.load(Ordering::Acquire), 2);
         let _ = std::fs::remove_dir_all(root);
         Ok(())
