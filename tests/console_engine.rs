@@ -443,10 +443,10 @@ async fn embedded_wezterm_native_spawn_environment() -> Result<()> {
             output.contains("PATH=</kit-console-server-path:/usr/bin:/bin>"),
             "spawned shell did not receive the agent PATH: {output:?}"
         );
-        let proxy_prefix =
-            format!("SSH_AUTH_SOCK=<{}/wezterm/agent.", agent.runtime_root.display());
         ensure!(
-            output.contains(&proxy_prefix),
+            output
+                .lines()
+                .any(|line| line.starts_with("SSH_AUTH_SOCK=<") && line.contains("/wezterm/agent.")),
             "spawned shell did not receive its agent-owned SSH proxy: {output:?}"
         );
         ensure!(

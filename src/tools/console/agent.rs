@@ -34,6 +34,12 @@ impl AgentControl {
 
 /// Run the Console mux on its one process-global owner thread until the service is terminated.
 pub async fn run() -> Result<()> {
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .context("installing the Console interrupt handler")?;
+    let mut broken_pipe = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::pipe())
+        .context("installing the Console broken-pipe handler")?;
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("installing the Console termination handler")?;
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
     let owner = std::thread::Builder::new()
@@ -53,27 +59,22 @@ pub async fn run() -> Result<()> {
         }
     };
 
-    let signal_result = tokio::select! {
-        result = &mut done_rx => {
-            result.context("Console runtime owner completion channel closed")?;
-            return join_owner(owner);
+    let signal_result = loop {
+        tokio::select! {
+            result = &mut done_rx => {
+                result.context("Console runtime owner completion channel closed")?;
+                return join_owner(owner);
+            }
+            _ = interrupt.recv() => break Ok(()),
+            _ = broken_pipe.recv() => continue,
+            _ = terminate.recv() => break Ok(()),
         }
-        result = shutdown_signal() => result,
     };
     let _wake = control.request_shutdown();
     let completion_result =
         done_rx.await.context("Console runtime owner completion channel closed");
     let owner_result = join_owner(owner);
     signal_result.and(completion_result).and(owner_result)
-}
-
-async fn shutdown_signal() -> Result<()> {
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .context("installing the Console termination handler")?;
-    tokio::select! {
-        result = tokio::signal::ctrl_c() => result.context("waiting for Console interrupt"),
-        _ = terminate.recv() => Ok(()),
-    }
 }
 
 fn join_owner(owner: std::thread::JoinHandle<Result<()>>) -> Result<()> {
@@ -166,9 +167,14 @@ fn run_owner(ready: tokio::sync::oneshot::Sender<AgentControl>) -> Result<()> {
         .take_fatal_error()
         .map_or(Ok(()), |error| Err(error.context("Console listener failed")));
     Mux::shutdown();
-    std::fs::remove_file(&socket_path).ok();
+    let socket_cleanup = match std::fs::remove_file(&socket_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("removing Console agent socket {}", socket_path.display())),
+    };
     wezterm_blob_leases::clear_storage();
     drop(lock);
 
-    result.and(listener_result).and(listener_error)
+    result.and(listener_result).and(listener_error).and(socket_cleanup)
 }
