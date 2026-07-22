@@ -276,20 +276,47 @@ pub async fn stop(processes: &ProcessSupervisor, force: bool) -> Result<ConsoleS
         );
     }
     if force {
-        for session in sessions {
-            client.close_session(session.id).await.with_context(|| {
-                format!("closing Console pane {} ({})", session.pane_id, session.title)
-            })?;
-        }
-        let remaining = client.snapshot(None).await?.sessions;
-        if !remaining.is_empty() {
-            bail!("Console panes remained after forced closure; service was not stopped");
+        if let Err(error) = close_all_sessions(&client, sessions).await {
+            if let Err(cancel_error) = client.cancel_service_drain().await {
+                return Err(error.context(format!(
+                    "also failed to cancel the Console service drain: {cancel_error:#}"
+                )));
+            }
+            return Err(error);
         }
     }
     native::stop(processes).await?;
     drop(client);
     remove_stale_console_socket()?;
     status_with_owner(processes, &owner).await
+}
+
+async fn close_all_sessions(
+    client: &ConsoleClient,
+    sessions: Vec<super::client::SessionView>,
+) -> Result<()> {
+    for session in sessions {
+        client.close_session(session.id).await.with_context(|| {
+            format!("closing Console pane {} ({})", session.pane_id, session.title)
+        })?;
+    }
+
+    let started = tokio::time::Instant::now();
+    loop {
+        let remaining = client.snapshot(None).await?.sessions;
+        if remaining.is_empty() {
+            return Ok(());
+        }
+        if started.elapsed() >= READY_TIMEOUT {
+            let names = remaining
+                .iter()
+                .map(|session| format!("{} (pane {})", session.title, session.pane_id))
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!("Console panes did not close within the service deadline: {names}");
+        }
+        tokio::time::sleep(READY_INTERVAL).await;
+    }
 }
 
 fn installed_executable() -> Result<std::path::PathBuf> {
