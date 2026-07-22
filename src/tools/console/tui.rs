@@ -1248,10 +1248,10 @@ fn console_actions() -> Result<ActionRegistry<ConsoleActionContext, ConsoleActio
             KeyCode::Char('n'),
             KeyModifiers::CONTROL,
             ConsoleAction::CreateSession,
-            normal as fn(&ConsoleActionContext) -> bool,
+            sidebar_normal as fn(&ConsoleActionContext) -> bool,
         ),
-        (KeyCode::Char('w'), KeyModifiers::CONTROL, ConsoleAction::CloseSession, normal),
-        (KeyCode::F(2), KeyModifiers::NONE, ConsoleAction::RenameSession, normal),
+        (KeyCode::Char('w'), KeyModifiers::CONTROL, ConsoleAction::CloseSession, sidebar_normal),
+        (KeyCode::F(2), KeyModifiers::NONE, ConsoleAction::RenameSession, sidebar_normal),
         (KeyCode::Char('r'), KeyModifiers::NONE, ConsoleAction::RenameSession, sidebar_normal),
         (KeyCode::Char('d'), KeyModifiers::NONE, ConsoleAction::ReleaseControl, sidebar_normal),
         (KeyCode::Char('t'), KeyModifiers::NONE, ConsoleAction::TakeControl, sidebar_normal),
@@ -1259,39 +1259,39 @@ fn console_actions() -> Result<ActionRegistry<ConsoleActionContext, ConsoleActio
             KeyCode::Char('C'),
             KeyModifiers::CONTROL | KeyModifiers::SHIFT,
             ConsoleAction::CopyVisibleTerminal,
-            normal,
+            sidebar_normal,
         ),
-        (KeyCode::Char('f'), KeyModifiers::CONTROL, ConsoleAction::OpenSearch, normal),
+        (KeyCode::Char('f'), KeyModifiers::CONTROL, ConsoleAction::OpenSearch, sidebar_normal),
         (KeyCode::Char('/'), KeyModifiers::NONE, ConsoleAction::OpenSearch, sidebar_normal),
-        (KeyCode::PageUp, KeyModifiers::NONE, ConsoleAction::ScrollUp, terminal_normal),
-        (KeyCode::PageDown, KeyModifiers::NONE, ConsoleAction::ScrollDown, terminal_normal),
+        (KeyCode::PageUp, KeyModifiers::NONE, ConsoleAction::ScrollUp, sidebar_normal),
+        (KeyCode::PageDown, KeyModifiers::NONE, ConsoleAction::ScrollDown, sidebar_normal),
         (KeyCode::Up, KeyModifiers::NONE, ConsoleAction::PreviousSession, sidebar_normal),
         (KeyCode::Down, KeyModifiers::NONE, ConsoleAction::NextSession, sidebar_normal),
         (KeyCode::Left, KeyModifiers::NONE, ConsoleAction::HistoryBack, sidebar_normal),
         (KeyCode::Right, KeyModifiers::NONE, ConsoleAction::HistoryForward, sidebar_normal),
-        (KeyCode::Char('b'), KeyModifiers::CONTROL, ConsoleAction::FocusSessions, normal),
-        (KeyCode::Left, KeyModifiers::CONTROL, ConsoleAction::FocusLeft, normal),
-        (KeyCode::Right, KeyModifiers::CONTROL, ConsoleAction::FocusRight, normal),
-        (KeyCode::Tab, KeyModifiers::NONE, ConsoleAction::FocusNext, normal),
-        (KeyCode::BackTab, KeyModifiers::SHIFT, ConsoleAction::FocusPrevious, normal),
+        (KeyCode::Char('b'), KeyModifiers::CONTROL, ConsoleAction::FocusSessions, terminal_normal),
+        (KeyCode::Left, KeyModifiers::CONTROL, ConsoleAction::FocusLeft, sidebar_normal),
+        (KeyCode::Right, KeyModifiers::CONTROL, ConsoleAction::FocusRight, sidebar_normal),
+        (KeyCode::Tab, KeyModifiers::NONE, ConsoleAction::FocusNext, sidebar_normal),
+        (KeyCode::BackTab, KeyModifiers::SHIFT, ConsoleAction::FocusPrevious, sidebar_normal),
         (
             KeyCode::Left,
             KeyModifiers::CONTROL | KeyModifiers::SHIFT,
             ConsoleAction::NarrowSidebar,
-            normal,
+            sidebar_normal,
         ),
         (
             KeyCode::Right,
             KeyModifiers::CONTROL | KeyModifiers::SHIFT,
             ConsoleAction::WidenSidebar,
-            normal,
+            sidebar_normal,
         ),
-        (KeyCode::Enter, KeyModifiers::NONE, ConsoleAction::Activate, not_help),
+        (KeyCode::Enter, KeyModifiers::NONE, ConsoleAction::Activate, not_terminal_normal),
         (KeyCode::Esc, KeyModifiers::NONE, ConsoleAction::Dismiss, not_normal),
-        (KeyCode::F(1), KeyModifiers::NONE, ConsoleAction::ToggleHelp, always),
+        (KeyCode::F(1), KeyModifiers::NONE, ConsoleAction::ToggleHelp, not_terminal_normal),
         (KeyCode::Char('?'), KeyModifiers::NONE, ConsoleAction::ToggleHelp, sidebar_normal),
-        (KeyCode::F(5), KeyModifiers::NONE, ConsoleAction::Refresh, always),
-        (KeyCode::Char('q'), KeyModifiers::CONTROL, ConsoleAction::Quit, always),
+        (KeyCode::F(5), KeyModifiers::NONE, ConsoleAction::Refresh, not_terminal_normal),
+        (KeyCode::Char('q'), KeyModifiers::CONTROL, ConsoleAction::Quit, not_terminal_normal),
     ] {
         builder.bind_key(KeybindingPlacement {
             chord: KeyChord::new(code, modifiers),
@@ -1315,8 +1315,8 @@ fn not_normal(context: &ConsoleActionContext) -> bool {
     context.surface != SurfaceKind::Normal
 }
 
-fn not_help(context: &ConsoleActionContext) -> bool {
-    context.surface != SurfaceKind::Help
+fn not_terminal_normal(context: &ConsoleActionContext) -> bool {
+    !terminal_normal(context)
 }
 
 fn sidebar_normal(context: &ConsoleActionContext) -> bool {
@@ -1784,6 +1784,13 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, regions: &mut UiR
                 inner,
             );
         }
+        Surface::Normal if app.active_region == ActiveRegion::Terminal => {
+            frame.render_widget(
+                Paragraph::new(" Ctrl+B Sessions   ·   keyboard → terminal")
+                    .style(Style::default().fg(NORD.text_muted)),
+                inner,
+            );
+        }
         Surface::Normal | Surface::Help => {
             let context = app.action_context(None, regions, None);
             let help = app.registry.resolve_menu(HELP_MENU, &context);
@@ -2051,6 +2058,48 @@ mod tests {
 
         assert_eq!(rename_key.action, rename_menu);
         assert_eq!(registry.command_for(&rename_key), Ok(ConsoleAction::RenameSession));
+    }
+
+    #[test]
+    fn terminal_focus_reserves_only_the_sidebar_escape_key() {
+        let registry = console_actions().unwrap();
+        let mut terminal = context(SessionControl::Controller);
+        terminal.region = ActiveRegion::Terminal;
+
+        for chord in [
+            KeyChord::new(KeyCode::Enter, KeyModifiers::NONE),
+            KeyChord::new(KeyCode::Tab, KeyModifiers::NONE),
+            KeyChord::new(KeyCode::PageUp, KeyModifiers::NONE),
+            KeyChord::new(KeyCode::Left, KeyModifiers::CONTROL),
+            KeyChord::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
+            KeyChord::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+            KeyChord::new(KeyCode::F(1), KeyModifiers::NONE),
+        ] {
+            assert!(
+                registry.resolve_keybinding(chord, terminal).is_none(),
+                "terminal key {chord} was captured by the Console shell"
+            );
+        }
+
+        let escape = registry
+            .resolve_keybinding(KeyChord::new(KeyCode::Char('b'), KeyModifiers::CONTROL), terminal)
+            .unwrap();
+        assert_eq!(registry.command_for(&escape), Ok(ConsoleAction::FocusSessions));
+    }
+
+    #[test]
+    fn sidebar_keeps_panel_navigation_keys() {
+        let registry = console_actions().unwrap();
+        let sidebar = context(SessionControl::Controller);
+
+        for (chord, expected) in [
+            (KeyChord::new(KeyCode::Enter, KeyModifiers::NONE), ConsoleAction::Activate),
+            (KeyChord::new(KeyCode::Tab, KeyModifiers::NONE), ConsoleAction::FocusNext),
+            (KeyChord::new(KeyCode::Char('q'), KeyModifiers::CONTROL), ConsoleAction::Quit),
+        ] {
+            let invocation = registry.resolve_keybinding(chord, sidebar).unwrap();
+            assert_eq!(registry.command_for(&invocation), Ok(expected));
+        }
     }
 
     #[test]
