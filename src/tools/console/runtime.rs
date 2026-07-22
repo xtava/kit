@@ -44,6 +44,21 @@ fn platform_directory() -> Result<PathBuf> {
         }
         return Ok(runtime_dir.join("kit/console"));
     }
+    let effective_user = unsafe { libc::geteuid() };
+    let system_runtime = PathBuf::from("/run/user").join(effective_user.to_string());
+    match std::fs::symlink_metadata(&system_runtime) {
+        Ok(metadata) => {
+            validate_owned_private_directory(&system_runtime, &metadata)
+                .context("validating the system user runtime directory")?;
+            return Ok(system_runtime.join("kit/console"));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("inspecting system user runtime directory {}", system_runtime.display())
+            })
+        }
+    }
     let project = ProjectDirs::from("", "", "kit").context("resolving Kit runtime directory")?;
     let base = project
         .runtime_dir()
