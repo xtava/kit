@@ -1392,9 +1392,8 @@ mod linux {
 impl super::ProcessSupervisor {
     pub async fn launch_detached(
         &self,
-        spec: super::DetachedProcessSpec,
+        _spec: super::DetachedProcessSpec,
     ) -> Result<super::DetachedLaunchTransaction, super::DetachedStartError> {
-        drop(spec);
         Err(super::DetachedStartError::Unavailable(super::DetachedUnavailable::UnsupportedPlatform))
     }
 

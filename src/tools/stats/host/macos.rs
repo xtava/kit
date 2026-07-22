@@ -171,7 +171,7 @@ fn read_thread_ids(pid: libc::c_int, mut capacity: usize) -> io::Result<Vec<u64>
             thread_ids.as_mut_ptr().cast(),
             byte_len(&thread_ids)?,
         )? as usize;
-        if written % size_of::<u64>() != 0 {
+        if !written.is_multiple_of(size_of::<u64>()) {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "unaligned thread list"));
         }
         let count = written / size_of::<u64>();
