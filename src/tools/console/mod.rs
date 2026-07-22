@@ -5,6 +5,8 @@ mod authorization;
 mod bridge;
 mod client;
 mod config;
+mod connection;
+mod interaction;
 mod remote;
 mod runtime;
 mod service;
@@ -220,8 +222,10 @@ impl Tool for ConsoleTool {
             let relay_socket = relay.socket_path().to_owned();
             let relay_status = relay.status_receiver();
             let result = async {
+                let connection_owner = client::remote_connection_owner(relay_socket)?;
                 let client =
-                    client::ConsoleClient::connect_to_relay(relay_socket, relay_status).await?;
+                    client::ConsoleClient::connect_to_relay(&connection_owner, relay_status)
+                        .await?;
                 if args.new {
                     client.create_session(120, 32).await?;
                 }
@@ -240,7 +244,8 @@ impl Tool for ConsoleTool {
             return Ok(());
         }
 
-        let client = client::ConsoleClient::connect().await?;
+        let connection_owner = client::local_connection_owner()?;
+        let client = client::ConsoleClient::connect(&connection_owner).await?;
         if args.new {
             client.create_session(120, 32).await?;
         }

@@ -711,6 +711,7 @@ dependencies = [
  "varbincode",
  "wezterm-runtime-admission",
  "wezterm-term",
+ "zeroize",
  "zstd",
 ]
 
@@ -6294,6 +6295,7 @@ dependencies = [
  "config",
  "filedescriptor 0.8.3",
  "futures",
+ "getrandom 0.3.4",
  "lazy_static",
  "libc",
  "log",

@@ -433,15 +433,6 @@ fn validate_request_semantics(
     Ok(())
 }
 
-impl Drop for SessionHandler {
-    fn drop(&mut self) {
-        if let BootstrapState::Established(identity) = &self.bootstrap {
-            let mux = Mux::get();
-            mux.unregister_client(identity.client_id());
-        }
-    }
-}
-
 impl SessionHandler {
     pub fn new(
         to_write_tx: PduSender,
@@ -498,18 +489,29 @@ impl SessionHandler {
         &mut self,
         mut client_id: ClientId,
         is_proxy: bool,
-    ) -> anyhow::Result<Option<Arc<ClientId>>> {
+        resume_token: Option<AttachmentResumeToken>,
+    ) -> anyhow::Result<(SetClientIdResponse, Option<Arc<ClientId>>)> {
         let BootstrapState::AwaitingClient { proxy } = &mut self.bootstrap else {
             anyhow::bail!("client identity is already established");
         };
 
         if is_proxy {
+            anyhow::ensure!(
+                resume_token.is_none(),
+                "proxy registration cannot resume an attachment"
+            );
             if proxy.is_some() {
                 anyhow::bail!("proxy identity is already registered");
             }
             self.policy.authorize_proxy_registration(&client_id)?;
             proxy.replace(client_id);
-            return Ok(None);
+            return Ok((
+                SetClientIdResponse {
+                    resume_token: None,
+                    control_snapshot: None,
+                },
+                None,
+            ));
         }
 
         if let Some(proxy) = proxy.as_ref() {
@@ -517,12 +519,19 @@ impl SessionHandler {
             // This presentation string is coupled with mux/src/ssh_agent.
             client_id.hostname = format!("{} (via proxy pid {})", client_id.hostname, proxy.pid);
         }
-        let identity = self.policy.issue_identity(proxy.as_ref(), client_id)?;
-        let subscription = self.policy.subscribe_control(&identity)?;
-        let issued_client_id = Arc::clone(identity.client_id());
-        self.bootstrap = BootstrapState::Established(identity);
-        self.pending_control_subscription = Some(subscription);
-        Ok(Some(issued_client_id))
+        let established =
+            self.policy
+                .establish_identity(proxy.as_ref(), client_id, resume_token)?;
+        let issued_client_id = established
+            .is_new
+            .then(|| Arc::clone(established.identity.client_id()));
+        let response = SetClientIdResponse {
+            resume_token: Some(established.resume_token),
+            control_snapshot: Some(established.control_snapshot),
+        };
+        self.bootstrap = BootstrapState::Established(established.identity);
+        self.pending_control_subscription = Some(established.subscription);
+        Ok((response, issued_client_id))
     }
 
     pub(crate) fn take_control_subscription(&mut self) -> Option<ControlSubscription> {
@@ -533,7 +542,17 @@ impl SessionHandler {
     where
         F: Future<Output = anyhow::Result<()>> + 'static,
     {
-        let task = self.executor.local().try_spawn_local(future)?;
+        let identity = match &self.bootstrap {
+            BootstrapState::Established(identity) => Some(identity.clone()),
+            BootstrapState::AwaitingClient { .. } => None,
+        };
+        let policy = Arc::clone(&self.policy);
+        let task = self.executor.local().try_spawn_local(async move {
+            if let Some(identity) = identity.as_ref() {
+                policy.ensure_current(identity)?;
+            }
+            future.await
+        })?;
         self.tasks.push(task);
         Ok(())
     }
@@ -702,6 +721,9 @@ impl SessionHandler {
         let authorized_client_id = authorized_identity
             .as_ref()
             .map(|identity| Arc::clone(identity.client_id()));
+        if let Some(identity) = authorized_identity.as_ref() {
+            self.policy.ensure_current(identity)?;
+        }
         let start = Instant::now();
         let sender = self.to_write_tx.clone();
         let pdu_name = pdu.pdu_name();
@@ -757,21 +779,23 @@ impl SessionHandler {
             Pdu::SetClientId(SetClientId {
                 client_id,
                 is_proxy,
+                resume_token,
             }) => {
-                match self.register_client(client_id, is_proxy) {
-                    Ok(Some(client_id)) => {
+                let response = match self.register_client(client_id, is_proxy, resume_token) {
+                    Ok((response, Some(client_id))) => {
                         self.schedule(async move {
                             let mux = Mux::get();
                             mux.register_client(client_id);
                             Ok(())
                         })?;
+                        response
                     }
-                    Ok(None) => {}
+                    Ok((response, None)) => response,
                     Err(err) => {
                         return send_response(Err(err.context("client registration denied")));
                     }
-                }
-                send_response(Ok(Pdu::UnitResponse(UnitResponse {})))
+                };
+                send_response(Ok(Pdu::SetClientIdResponse(response)))
             }
             Pdu::SetFocusedPane(SetFocusedPane { pane_id }) => {
                 let client_id = authorized_client_id
@@ -1417,17 +1441,20 @@ impl SessionHandler {
             Pdu::ControlLeaseRequest(ControlLeaseRequest { pane_id, action }) => {
                 let Some(identity) = authorized_identity.as_ref() else {
                     return send_response(Err(anyhow!(
-                        "control lease requires an established connection identity"
+                        "control lease requires an established attachment"
                     )));
                 };
-                let result = self.policy.apply_control(identity, pane_id, action);
-                send_response(Ok(Pdu::ControlLeaseResult(result)))
+                send_response(
+                    self.policy
+                        .apply_control(identity, pane_id, action)
+                        .map(Pdu::ControlLeaseResult),
+                )
             }
 
             Pdu::ServiceDrainRequest(ServiceDrainRequest { action }) => {
                 let Some(identity) = authorized_identity.clone() else {
                     return send_response(Err(anyhow!(
-                        "service drain requires an established connection identity"
+                        "service drain requires an established attachment"
                     )));
                 };
                 let policy = Arc::clone(&self.policy);
@@ -1466,6 +1493,7 @@ impl SessionHandler {
             | Pdu::TabAddedToWindow { .. }
             | Pdu::GetPaneRenderableDimensionsResponse { .. }
             | Pdu::ControlLeaseResult { .. }
+            | Pdu::SetClientIdResponse { .. }
             | Pdu::ControlSnapshot { .. }
             | Pdu::ControlChanged { .. }
             | Pdu::AttachRejected { .. }
@@ -2020,20 +2048,31 @@ mod owned_task_tests {
         let mut primary = ClientId::new();
         primary.hostname = "primary".to_string();
 
-        assert!(handler.register_client(proxy, true).unwrap().is_none());
+        let (proxy_response, proxy_client) = handler.register_client(proxy, true, None).unwrap();
+        assert!(proxy_client.is_none());
+        assert!(proxy_response.resume_token.is_none());
+        assert!(proxy_response.control_snapshot.is_none());
         assert_eq!(
             handler.client_request_phase(),
             ClientRequestPhase::Bootstrap
         );
-        let issued = handler.register_client(primary, false).unwrap().unwrap();
+        let token = AttachmentResumeToken::from_random_bytes([9; 32]);
+        let (response, issued) = handler
+            .register_client(primary, false, Some(token.clone()))
+            .unwrap();
+        let issued = issued.unwrap();
 
         assert_eq!(
             handler.client_request_phase(),
             ClientRequestPhase::Established
         );
+        assert_eq!(response.resume_token, Some(token));
+        assert!(response.control_snapshot.is_some());
         assert_eq!(issued.ssh_auth_sock.as_deref(), Some("proxy-agent"));
         assert_eq!(issued.hostname, "primary (via proxy pid 42)");
-        assert!(handler.register_client(ClientId::new(), false).is_err());
+        assert!(handler
+            .register_client(ClientId::new(), false, None)
+            .is_err());
 
         // This test exercises issuance only; avoid invoking mux registration
         // teardown without a process-global test mux.
@@ -2045,10 +2084,13 @@ mod owned_task_tests {
         let (_admission, _executor, mut handler) = handler();
 
         assert!(handler
-            .register_client(ClientId::new(), true)
+            .register_client(ClientId::new(), true, None)
             .unwrap()
+            .1
             .is_none());
-        assert!(handler.register_client(ClientId::new(), true).is_err());
+        assert!(handler
+            .register_client(ClientId::new(), true, None)
+            .is_err());
         assert_eq!(
             handler.client_request_phase(),
             ClientRequestPhase::Bootstrap

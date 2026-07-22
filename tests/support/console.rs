@@ -43,7 +43,7 @@ pub struct LocalConsoleHarness {
 }
 
 impl LocalConsoleHarness {
-    pub fn start() -> Result<Self> {
+    pub async fn start() -> Result<Self> {
         let runtime_root = PathBuf::from("/tmp").join(format!(
             "kc-live-{}-{}",
             std::process::id(),
@@ -66,8 +66,22 @@ impl LocalConsoleHarness {
             .spawn()
             .context("start foreground Console agent")?;
         let mut harness = Self { runtime_root, socket, log_path, child: Some(child) };
-        harness.wait_until_ready()?;
+        harness.wait_for_socket()?;
         harness.assert_socket_policy()?;
+
+        // Binding the socket precedes the server's RPC loop. Prove the complete public readiness
+        // boundary so a following client cannot lose that startup race and appear to hang before
+        // its terminal surface opens.
+        let readiness = HeadlessConsoleClient::connect(&harness).await.with_context(|| {
+            format!(
+                "Console agent socket did not become RPC-ready; log={:?}",
+                harness.diagnostics()
+            )
+        })?;
+        readiness.topology().await.with_context(|| {
+            format!("Console agent bootstrap RPC failed; log={:?}", harness.diagnostics())
+        })?;
+        drop(readiness);
         Ok(harness)
     }
 
@@ -203,7 +217,7 @@ impl LocalConsoleHarness {
         }
     }
 
-    fn wait_until_ready(&mut self) -> Result<()> {
+    fn wait_for_socket(&mut self) -> Result<()> {
         let deadline = Instant::now() + READY_TIMEOUT;
         while !self.socket.exists() {
             if let Some(status) = self

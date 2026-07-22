@@ -165,6 +165,21 @@ impl AttachmentControlTracker {
             }
         }
     }
+
+    fn reduce_authoritative_state(
+        &self,
+        incoming: ControlLeaseState,
+    ) -> Result<ControlReduction, ControlTrackingError> {
+        let mut current = self.snapshot.lock().unwrap();
+        let snapshot = current
+            .as_mut()
+            .ok_or(ControlTrackingError::ChangeBeforeSnapshot)?;
+        if incoming.sequence <= snapshot.state.sequence {
+            return Ok(ControlReduction::Discarded);
+        }
+        snapshot.state = incoming;
+        Ok(ControlReduction::Applied)
+    }
 }
 
 fn next_control_sequence(
@@ -831,6 +846,8 @@ fn prepare_client_request(
 struct ClientBootstrap {
     server_version: GetCodecVersionResponse,
     next_serial: u64,
+    resume_token: AttachmentResumeToken,
+    control_snapshot: ControlSnapshot,
 }
 
 async fn read_server_pdu_async<R, F>(
@@ -887,6 +904,7 @@ where
 async fn bootstrap_client_stream_async<R>(
     stream: &mut R,
     client_id: &ClientId,
+    resume_token: &AttachmentResumeToken,
     ui: &dyn ConnectionUi,
     admission: &RuntimeAdmission,
     permit: &CountPermit,
@@ -983,26 +1001,40 @@ where
         }
     }
 
-    bootstrap_request(
+    let registration = bootstrap_request(
         stream,
         3,
         Pdu::SetClientId(SetClientId {
             client_id: client_id.clone(),
             is_proxy: false,
+            resume_token: Some(resume_token.clone()),
         }),
         admission,
         permit,
     )
     .await?
     .try_map(|pdu| match pdu {
-        Pdu::UnitResponse(response) => Ok(response),
+        Pdu::SetClientIdResponse(response) => Ok(response),
         unexpected => bail!("unexpected response {unexpected:?}"),
-    })?;
+    })?
+    .into_inner();
+    let confirmed_resume_token = registration
+        .resume_token
+        .ok_or_else(|| anyhow!("server registration omitted the attachment resume capability"))?;
+    let control_snapshot = registration
+        .control_snapshot
+        .ok_or_else(|| anyhow!("server registration omitted the initial control snapshot"))?;
+    anyhow::ensure!(
+        confirmed_resume_token.eq(resume_token),
+        "server confirmed a different attachment resume capability"
+    );
 
     ui.output_str("Version check OK!\n");
     Ok(ClientBootstrap {
         server_version: info.into_inner(),
         next_serial: 4,
+        resume_token: confirmed_resume_token,
+        control_snapshot,
     })
 }
 
@@ -1811,6 +1843,7 @@ trait ClientRuntimeConnection: Send {
     fn bootstrap_connected_stream(
         &mut self,
         client_id: &ClientId,
+        resume_token: &AttachmentResumeToken,
         presentation: &dyn ConnectionUi,
         cancellation: &ClientCancelWaiter,
         permit: &CountPermit,
@@ -1849,6 +1882,7 @@ impl ClientRuntimeConnection for Reconnectable {
     fn bootstrap_connected_stream(
         &mut self,
         client_id: &ClientId,
+        resume_token: &AttachmentResumeToken,
         presentation: &dyn ConnectionUi,
         cancellation: &ClientCancelWaiter,
         permit: &CountPermit,
@@ -1865,6 +1899,7 @@ impl ClientRuntimeConnection for Reconnectable {
             bootstrap_client_stream_async(
                 stream,
                 client_id,
+                resume_token,
                 presentation,
                 &admission,
                 permit,
@@ -2081,6 +2116,7 @@ struct ClientRuntimeRun<'a> {
     initial_connection: Option<InitialConnectionRequest>,
     initial_ready: Sender<anyhow::Result<()>>,
     client_id: ClientId,
+    attachment_resume_token: AttachmentResumeToken,
     initial_server_version: Arc<OnceLock<GetCodecVersionResponse>>,
     bootstrap_request_permit: CountPermit,
     host: &'a dyn ClientRuntimeHost,
@@ -2100,6 +2136,7 @@ fn run_client_runtime<C: ClientRuntimeConnection>(
         initial_connection,
         initial_ready,
         client_id,
+        attachment_resume_token,
         initial_server_version,
         bootstrap_request_permit,
         host,
@@ -2151,38 +2188,119 @@ fn run_client_runtime<C: ClientRuntimeConnection>(
         );
     }
 
-    let initial_bootstrap = match connection.bootstrap_connected_stream(
-        &client_id,
-        &presentation,
-        &cancellation,
-        &bootstrap_request_permit,
-    ) {
-        Ok(bootstrap) => bootstrap,
-        Err(error) => {
-            let cancelled = error.root_cause().is::<ClientCancelled>();
-            let _ = initial_ready.try_send(Err(error));
-            if cancelled {
-                return publish_detached_and_schedule_cleanup(
-                    host,
-                    local_domain_id,
-                    &presentation,
-                    ClientRuntimeOutcome::Cancelled,
-                );
+    let initial_bootstrap = {
+        let mut attempt = 0u32;
+        let mut backoff = reconnect_backoff.initial;
+        loop {
+            match connection.bootstrap_connected_stream(
+                &client_id,
+                &attachment_resume_token,
+                &presentation,
+                &cancellation,
+                &bootstrap_request_permit,
+            ) {
+                Ok(bootstrap) => break bootstrap,
+                Err(error)
+                    if should_reconnect(&connection, &presentation, local_domain_id, &error)
+                        && !error.root_cause().is::<IncompatibleVersionError>()
+                        && !error.root_cause().is::<BuildIdentityMismatch>() =>
+                {
+                    attempt = attempt.saturating_add(1);
+                    if presentation
+                        .reconnect_attempt_limit()
+                        .is_some_and(|limit| attempt > limit.get())
+                    {
+                        let _ = initial_ready.try_send(Err(error));
+                        let domain_id =
+                            local_domain_id.expect("reconnect requires a client domain");
+                        return fail_runtime_and_schedule_cleanup(
+                            host,
+                            domain_id,
+                            &presentation,
+                            HeadlessConnectionFailure::RetryExhausted,
+                        );
+                    }
+                    if let Err(error) =
+                        presentation.publish(HeadlessConnectionState::Reconnecting { attempt })
+                    {
+                        let _ = initial_ready.try_send(Err(error.into()));
+                        let domain_id =
+                            local_domain_id.expect("reconnect requires a client domain");
+                        return fail_runtime_and_schedule_cleanup(
+                            host,
+                            domain_id,
+                            &presentation,
+                            HeadlessConnectionFailure::Runtime,
+                        );
+                    }
+                    if !wait_for_reconnect_backoff(&cancellation, backoff) {
+                        let _ = initial_ready.try_send(Err(ClientCancelled.into()));
+                        return publish_detached_and_schedule_cleanup(
+                            host,
+                            local_domain_id,
+                            &presentation,
+                            ClientRuntimeOutcome::Cancelled,
+                        );
+                    }
+                    match connection.connect_for_runtime(false, &presentation, true, &cancellation)
+                    {
+                        Ok(()) => {}
+                        Err(error) if error.root_cause().is::<ClientCancelled>() => {
+                            let _ = initial_ready.try_send(Err(error));
+                            return publish_detached_and_schedule_cleanup(
+                                host,
+                                local_domain_id,
+                                &presentation,
+                                ClientRuntimeOutcome::Cancelled,
+                            );
+                        }
+                        Err(error) if error.root_cause().is::<HeadlessPromptRequired>() => {
+                            let _ = initial_ready.try_send(Err(error));
+                            let domain_id =
+                                local_domain_id.expect("reconnect requires a client domain");
+                            return fail_runtime_and_schedule_cleanup(
+                                host,
+                                domain_id,
+                                &presentation,
+                                HeadlessConnectionFailure::PromptRequired,
+                            );
+                        }
+                        Err(_) => {}
+                    }
+                    backoff = (backoff + backoff).min(reconnect_backoff.maximum);
+                }
+                Err(error) => {
+                    let cancelled = error.root_cause().is::<ClientCancelled>();
+                    let _ = initial_ready.try_send(Err(error));
+                    if cancelled {
+                        return publish_detached_and_schedule_cleanup(
+                            host,
+                            local_domain_id,
+                            &presentation,
+                            ClientRuntimeOutcome::Cancelled,
+                        );
+                    }
+                    return match local_domain_id {
+                        Some(domain_id) => fail_runtime_and_schedule_cleanup(
+                            host,
+                            domain_id,
+                            &presentation,
+                            HeadlessConnectionFailure::Runtime,
+                        ),
+                        None => publish_terminal_failure(
+                            &presentation,
+                            HeadlessConnectionFailure::Runtime,
+                        ),
+                    };
+                }
             }
-            return match local_domain_id {
-                Some(domain_id) => fail_runtime_and_schedule_cleanup(
-                    host,
-                    domain_id,
-                    &presentation,
-                    HeadlessConnectionFailure::Runtime,
-                ),
-                None => publish_terminal_failure(&presentation, HeadlessConnectionFailure::Runtime),
-            };
         }
     };
     let ClientBootstrap {
         server_version,
         mut next_serial,
+        mut resume_token,
+        control_snapshot,
     } = initial_bootstrap;
     if initial_server_version.set(server_version).is_err() {
         let _ = initial_ready.try_send(Err(anyhow!(
@@ -2199,6 +2317,18 @@ fn run_client_runtime<C: ClientRuntimeConnection>(
         };
     }
     control.begin_connection();
+    if let Err(error) = control.reduce_snapshot(control_snapshot) {
+        let _ = initial_ready.try_send(Err(error.into()));
+        return match local_domain_id {
+            Some(domain_id) => fail_runtime_and_schedule_cleanup(
+                host,
+                domain_id,
+                &presentation,
+                HeadlessConnectionFailure::Runtime,
+            ),
+            None => publish_terminal_failure(&presentation, HeadlessConnectionFailure::Runtime),
+        };
+    }
     if initial_ready.try_send(Ok(())).is_err() {
         return publish_detached_and_schedule_cleanup(
             host,
@@ -2310,6 +2440,7 @@ fn run_client_runtime<C: ClientRuntimeConnection>(
                     }
                     let bootstrap = match connection.bootstrap_connected_stream(
                         &client_id,
+                        &resume_token,
                         &reconnect_presentation,
                         &cancellation,
                         &bootstrap_request_permit,
@@ -2338,7 +2469,16 @@ fn run_client_runtime<C: ClientRuntimeConnection>(
                         }
                     };
                     next_serial = bootstrap.next_serial;
+                    resume_token = bootstrap.resume_token;
                     control.begin_connection();
+                    if control.reduce_snapshot(bootstrap.control_snapshot).is_err() {
+                        return fail_runtime_and_schedule_cleanup(
+                            host,
+                            domain_id,
+                            &reconnect_presentation,
+                            HeadlessConnectionFailure::Runtime,
+                        );
+                    }
                     if let Err(_error) = host.schedule_reattach(
                         domain_id,
                         reconnect_presentation.clone(),
@@ -2401,6 +2541,11 @@ impl Client {
         let is_local = reconnectable.is_local();
         let (sender, receiver) = bounded(wezterm_runtime_admission::MAX_CLIENT_REQUESTS);
         let worker_client_id = client_id.clone();
+        let mut resume_token_bytes = [0u8; 32];
+        getrandom::fill(&mut resume_token_bytes)
+            .map_err(|error| anyhow!("generating attachment resume capability: {error}"))?;
+        let worker_attachment_resume_token =
+            AttachmentResumeToken::from_random_bytes(resume_token_bytes);
         let control = Arc::new(AttachmentControlTracker::default());
         let worker_control = Arc::clone(&control);
         let initial_server_version = Arc::new(OnceLock::new());
@@ -2421,6 +2566,7 @@ impl Client {
                     initial_connection,
                     initial_ready,
                     client_id: worker_client_id,
+                    attachment_resume_token: worker_attachment_resume_token,
                     initial_server_version: worker_initial_server_version,
                     bootstrap_request_permit,
                     host: &host,
@@ -2738,7 +2884,43 @@ impl Client {
     }
 
     rpc!(ping, Ping = (), Pong);
-    rpc!(control_lease, ControlLeaseRequest, ControlLeaseResult);
+    pub fn control_lease(
+        &self,
+        pdu: ControlLeaseRequest,
+    ) -> impl std::future::Future<Output = anyhow::Result<AdmittedRpcResponse<ControlLeaseResult>>>
+           + Send
+           + 'static {
+        let start = std::time::Instant::now();
+        let request = self.send_pdu(Pdu::ControlLeaseRequest(pdu));
+        let control = Arc::clone(&self.control);
+        async move {
+            let response = request.await;
+            let elapsed = start.elapsed();
+            metrics::histogram!("rpc", "method" => "control_lease").record(elapsed);
+            metrics::counter!("rpc.count", "method" => "control_lease").increment(1);
+            match response {
+                Ok(response) => response.try_map(move |pdu| match pdu {
+                    Pdu::ControlLeaseResult(result) => {
+                        let state = match &result {
+                            ControlLeaseResult::Acquired(state)
+                            | ControlLeaseResult::AlreadyController(state)
+                            | ControlLeaseResult::Observing(state)
+                            | ControlLeaseResult::Taken(state)
+                            | ControlLeaseResult::Released(state)
+                            | ControlLeaseResult::NotController(state) => Some(state),
+                            ControlLeaseResult::Overloaded => None,
+                        };
+                        if let Some(state) = state {
+                            control.reduce_authoritative_state(state.clone())?;
+                        }
+                        Ok(result)
+                    }
+                    unexpected => bail!("unexpected response {unexpected:?}"),
+                }),
+                Err(error) => Err(error),
+            }
+        }
+    }
     rpc!(service_drain, ServiceDrainRequest, ServiceDrainResult);
     rpc!(list_panes, ListPanes = (), ListPanesResponse);
     rpc!(spawn_v2, SpawnV2, SpawnResponse);
@@ -2798,13 +2980,13 @@ mod admission_tests {
     use std::sync::atomic::AtomicUsize;
     use wezterm_runtime_admission::RuntimeRole;
 
-    fn connection_identity(value: u64) -> ConnectionIdentity {
-        ConnectionIdentity::from_server_sequence(NonZeroU64::new(value).unwrap())
+    fn attachment_identity(value: u64) -> AttachmentIdentity {
+        AttachmentIdentity::from_server_sequence(NonZeroU64::new(value).unwrap())
     }
 
     fn control_state(
         sequence: u64,
-        active: impl IntoIterator<Item = (PaneId, ConnectionIdentity)>,
+        active: impl IntoIterator<Item = (PaneId, AttachmentIdentity)>,
     ) -> ControlLeaseState {
         ControlLeaseState {
             sequence,
@@ -2819,9 +3001,9 @@ mod admission_tests {
     }
 
     fn control_snapshot(
-        identity: ConnectionIdentity,
+        identity: AttachmentIdentity,
         sequence: u64,
-        active: impl IntoIterator<Item = (PaneId, ConnectionIdentity)>,
+        active: impl IntoIterator<Item = (PaneId, AttachmentIdentity)>,
     ) -> Pdu {
         Pdu::ControlSnapshot(ControlSnapshot {
             attachment_identity: identity,
@@ -2831,7 +3013,7 @@ mod admission_tests {
 
     fn control_change(
         sequence: u64,
-        active: impl IntoIterator<Item = (PaneId, ConnectionIdentity)>,
+        active: impl IntoIterator<Item = (PaneId, AttachmentIdentity)>,
     ) -> Pdu {
         Pdu::ControlChanged(ControlChanged {
             state: control_state(sequence, active),
@@ -2841,8 +3023,8 @@ mod admission_tests {
     #[test]
     fn delayed_baseline_after_live_switch_is_discarded() {
         let tracker = AttachmentControlTracker::default();
-        let first = connection_identity(1);
-        let second = connection_identity(2);
+        let first = attachment_identity(1);
+        let second = attachment_identity(2);
         tracker.begin_connection();
         assert_eq!(
             tracker.reduce(&control_snapshot(first, 5, [(7, first)])),
@@ -2862,8 +3044,8 @@ mod admission_tests {
     #[test]
     fn duplicate_control_change_is_discarded_without_replacing_state() {
         let tracker = AttachmentControlTracker::default();
-        let first = connection_identity(1);
-        let second = connection_identity(2);
+        let first = attachment_identity(1);
+        let second = attachment_identity(2);
         tracker.begin_connection();
         tracker
             .reduce(&control_snapshot(first, 1, std::iter::empty()))
@@ -2880,9 +3062,30 @@ mod admission_tests {
     }
 
     #[test]
+    fn authoritative_rpc_state_may_skip_notifications_and_discards_late_changes() {
+        let tracker = AttachmentControlTracker::default();
+        let identity = attachment_identity(1);
+        tracker.begin_connection();
+        tracker
+            .reduce(&control_snapshot(identity, 1, std::iter::empty()))
+            .unwrap();
+
+        assert_eq!(
+            tracker.reduce_authoritative_state(control_state(4, [(7, identity)])),
+            Ok(ControlReduction::Applied)
+        );
+        assert_eq!(tracker.pane_status(7), PaneControlStatus::Controller);
+        assert_eq!(
+            tracker.reduce(&control_change(2, std::iter::empty())),
+            Ok(ControlReduction::Discarded)
+        );
+        assert_eq!(tracker.pane_status(7), PaneControlStatus::Controller);
+    }
+
+    #[test]
     fn forward_control_sequence_gap_fails_the_session() {
         let tracker = AttachmentControlTracker::default();
-        let identity = connection_identity(1);
+        let identity = attachment_identity(1);
         tracker.begin_connection();
         tracker
             .reduce(&control_snapshot(identity, 10, std::iter::empty()))
@@ -2891,7 +3094,7 @@ mod admission_tests {
             tracker.reduce(&control_change(12, std::iter::empty())),
             Err(ControlTrackingError::SequenceGap {
                 expected: 11,
-                actual: 12,
+                actual: 12
             })
         );
     }
@@ -2899,7 +3102,7 @@ mod admission_tests {
     #[test]
     fn wrapped_control_sequence_fails_as_overflow() {
         let tracker = AttachmentControlTracker::default();
-        let identity = connection_identity(1);
+        let identity = attachment_identity(1);
         tracker.begin_connection();
         tracker
             .reduce(&control_snapshot(identity, u64::MAX, std::iter::empty()))
@@ -2908,7 +3111,7 @@ mod admission_tests {
             tracker.reduce(&control_change(0, std::iter::empty())),
             Err(ControlTrackingError::SequenceOverflow {
                 current: u64::MAX,
-                actual: 0,
+                actual: 0
             })
         );
     }
@@ -2916,8 +3119,8 @@ mod admission_tests {
     #[test]
     fn takeover_updates_typed_controller_status() {
         let tracker = AttachmentControlTracker::default();
-        let first = connection_identity(1);
-        let second = connection_identity(2);
+        let first = attachment_identity(1);
+        let second = attachment_identity(2);
         tracker.begin_connection();
         tracker
             .reduce(&control_snapshot(first, 0, [(7, first)]))
@@ -2932,24 +3135,19 @@ mod admission_tests {
     }
 
     #[test]
-    fn reconnect_resets_attachment_identity_even_without_sequence_advance() {
+    fn reconnect_preserves_attachment_identity_and_control() {
         let tracker = AttachmentControlTracker::default();
-        let first = connection_identity(1);
-        let reconnected = connection_identity(2);
+        let identity = attachment_identity(1);
         tracker.begin_connection();
         tracker
-            .reduce(&control_snapshot(first, 9, [(7, first)]))
+            .reduce(&control_snapshot(identity, 9, [(7, identity)]))
             .unwrap();
         assert_eq!(tracker.pane_status(7), PaneControlStatus::Controller);
 
         tracker.begin_connection();
         assert_eq!(tracker.pane_status(7), PaneControlStatus::AwaitingSnapshot);
         tracker
-            .reduce(&control_snapshot(reconnected, 9, [(7, first)]))
-            .unwrap();
-        assert_eq!(tracker.pane_status(7), PaneControlStatus::Observer);
-        tracker
-            .reduce(&control_change(10, [(7, reconnected)]))
+            .reduce(&control_snapshot(identity, 9, [(7, identity)]))
             .unwrap();
         assert_eq!(tracker.pane_status(7), PaneControlStatus::Controller);
     }
@@ -3005,6 +3203,7 @@ mod admission_tests {
 
     #[derive(Clone, Copy)]
     enum FakeSessionBehavior {
+        Complete,
         WaitForCancellation,
         EofThenComplete,
     }
@@ -3024,8 +3223,10 @@ mod admission_tests {
         bootstraps: Arc<AtomicUsize>,
         sessions: Arc<AtomicUsize>,
         bootstrap_client_ids: Arc<Mutex<Vec<ClientId>>>,
+        bootstrap_resume_tokens: Arc<Mutex<Vec<Option<AttachmentResumeToken>>>>,
         events: Arc<Mutex<Vec<RuntimeEvent>>>,
         connect_started: Option<Sender<()>>,
+        bootstrap_failures_remaining: usize,
     }
 
     impl FakeRuntimeConnection {
@@ -3040,8 +3241,10 @@ mod admission_tests {
                 bootstraps: Arc::new(AtomicUsize::new(0)),
                 sessions: Arc::new(AtomicUsize::new(0)),
                 bootstrap_client_ids: Arc::new(Mutex::new(Vec::new())),
+                bootstrap_resume_tokens: Arc::new(Mutex::new(Vec::new())),
                 events: Arc::new(Mutex::new(Vec::new())),
                 connect_started: None,
+                bootstrap_failures_remaining: 0,
             }
         }
     }
@@ -3074,6 +3277,7 @@ mod admission_tests {
         fn bootstrap_connected_stream(
             &mut self,
             client_id: &ClientId,
+            resume_token: &AttachmentResumeToken,
             _presentation: &dyn ConnectionUi,
             _cancellation: &ClientCancelWaiter,
             _permit: &CountPermit,
@@ -3083,7 +3287,15 @@ mod admission_tests {
                 .lock()
                 .unwrap()
                 .push(client_id.clone());
+            self.bootstrap_resume_tokens
+                .lock()
+                .unwrap()
+                .push(Some(resume_token.clone()));
             self.events.lock().unwrap().push(RuntimeEvent::Bootstrap);
+            if self.bootstrap_failures_remaining > 0 {
+                self.bootstrap_failures_remaining -= 1;
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+            }
             Ok(ClientBootstrap {
                 server_version: GetCodecVersionResponse {
                     codec_vers: CODEC_VERSION,
@@ -3092,6 +3304,11 @@ mod admission_tests {
                     config_file_path: None,
                 },
                 next_serial: 4,
+                resume_token: resume_token.clone(),
+                control_snapshot: ControlSnapshot {
+                    attachment_identity: attachment_identity(1),
+                    state: control_state(0, std::iter::empty()),
+                },
             })
         }
 
@@ -3107,6 +3324,7 @@ mod admission_tests {
             self.events.lock().unwrap().push(RuntimeEvent::Session);
             let session = self.sessions.fetch_add(1, Ordering::AcqRel);
             match self.session_behavior {
+                FakeSessionBehavior::Complete => Ok(()),
                 FakeSessionBehavior::WaitForCancellation => {
                     let _ = block_on(cancellation.receiver.recv());
                     Err(ClientCancelled.into())
@@ -3155,6 +3373,10 @@ mod admission_tests {
         maximum: Duration::ZERO,
     };
 
+    fn resume_token(byte: u8) -> AttachmentResumeToken {
+        AttachmentResumeToken::from_random_bytes([byte; 32])
+    }
+
     #[test]
     fn stream_bootstrap_sends_the_exact_registration_sequence_once() {
         let admission = RuntimeAdmission::new(RuntimeRole::Client).unwrap();
@@ -3179,9 +3401,16 @@ mod admission_tests {
         })
         .encode(&mut readable, 2, &admission)
         .unwrap();
-        Pdu::UnitResponse(UnitResponse {})
-            .encode(&mut readable, 3, &admission)
-            .unwrap();
+        let issued_resume_token = resume_token(11);
+        Pdu::SetClientIdResponse(SetClientIdResponse {
+            resume_token: Some(issued_resume_token.clone()),
+            control_snapshot: Some(ControlSnapshot {
+                attachment_identity: attachment_identity(1),
+                state: control_state(0, std::iter::empty()),
+            }),
+        })
+        .encode(&mut readable, 3, &admission)
+        .unwrap();
 
         let mut stream = ScriptedBootstrapStream {
             readable: Cursor::new(readable),
@@ -3194,6 +3423,7 @@ mod admission_tests {
         let bootstrap = block_on(bootstrap_client_stream_async(
             &mut stream,
             &client_id,
+            &issued_resume_token,
             &reporter,
             &admission,
             &permit,
@@ -3203,6 +3433,12 @@ mod admission_tests {
 
         assert_eq!(bootstrap.server_version.codec_vers, CODEC_VERSION);
         assert_eq!(bootstrap.next_serial, 4);
+        assert_eq!(bootstrap.resume_token, issued_resume_token);
+        assert_eq!(
+            bootstrap.control_snapshot.attachment_identity,
+            attachment_identity(1)
+        );
+        assert_eq!(bootstrap.control_snapshot.state.sequence, 0);
         let mut written = stream.written.as_slice();
         for (serial, expected_tag) in [
             (1, PduTag::GetCodecVersion),
@@ -3219,6 +3455,10 @@ mod admission_tests {
             assert_eq!(decoded.pdu().tag(), Some(expected_tag));
             if let Pdu::SetClientId(registration) = decoded.pdu() {
                 assert_eq!(registration.client_id, client_id);
+                assert_eq!(
+                    registration.resume_token.as_ref(),
+                    Some(&issued_resume_token)
+                );
             }
         }
         assert!(written.is_empty());
@@ -3242,6 +3482,7 @@ mod admission_tests {
         let error = block_on(bootstrap_client_stream_async(
             &mut stream,
             &ClientId::new(),
+            &resume_token(12),
             &reporter,
             &admission,
             &permit,
@@ -3291,6 +3532,7 @@ mod admission_tests {
         let error = block_on(bootstrap_client_stream_async(
             &mut stream,
             &ClientId::new(),
+            &resume_token(13),
             &reporter,
             &admission,
             &permit,
@@ -3349,7 +3591,9 @@ mod admission_tests {
         match prepared.message {
             ReaderMessage::SendPdu {
                 expected_response, ..
-            } => assert_eq!(expected_response, PduTag::Pong),
+            } => {
+                assert_eq!(expected_response, PduTag::Pong)
+            }
             ReaderMessage::Readable => panic!("prepared request became a readability event"),
         }
 
@@ -3415,6 +3659,61 @@ mod admission_tests {
     }
 
     #[test]
+    fn lost_initial_registration_response_retries_with_the_same_resume_capability() {
+        let admission = RuntimeAdmission::new(RuntimeRole::Client).unwrap();
+        let lifecycle = HeadlessConnectionLifecycle::new(Arc::clone(&admission));
+        let presentation = ConnectionPresentation::Headless(lifecycle.reporter());
+        let mut connection = FakeRuntimeConnection::new(
+            FakeConnectBehavior::Immediate,
+            FakeSessionBehavior::Complete,
+        );
+        connection.bootstrap_failures_remaining = 1;
+        let bootstraps = Arc::clone(&connection.bootstraps);
+        let connects = Arc::clone(&connection.connects);
+        let bootstrap_resume_tokens = Arc::clone(&connection.bootstrap_resume_tokens);
+        let host = FakeRuntimeHost::default();
+        let (_sender, receiver) = bounded(1);
+        let (_cancellation, waiter) = ClientCancellation::pair();
+        let (initial_ready, initial_ready_receiver) = bounded(1);
+        let attachment_resume_token = resume_token(20);
+        let control = Arc::new(AttachmentControlTracker::default());
+        let bootstrap_request_permit = reserve_client_request(&admission).unwrap();
+
+        assert_eq!(
+            run_client_runtime(
+                connection,
+                ClientRuntimeRun {
+                    local_domain_id: Some(1),
+                    control: Arc::clone(&control),
+                    receiver,
+                    presentation,
+                    cancellation: waiter,
+                    initial_connection: None,
+                    initial_ready,
+                    client_id: ClientId::new(),
+                    attachment_resume_token: attachment_resume_token.clone(),
+                    initial_server_version: Arc::new(OnceLock::new()),
+                    bootstrap_request_permit,
+                    host: &host,
+                    reconnect_backoff: ZERO_BACKOFF,
+                },
+            ),
+            ClientRuntimeOutcome::Completed
+        );
+        assert!(block_on(initial_ready_receiver.recv()).unwrap().is_ok());
+        assert_eq!(bootstraps.load(Ordering::Acquire), 2);
+        assert_eq!(connects.load(Ordering::Acquire), 1);
+        assert_eq!(control.pane_status(7), PaneControlStatus::Uncontrolled);
+        assert_eq!(
+            bootstrap_resume_tokens.lock().unwrap().as_slice(),
+            &[
+                Some(attachment_resume_token.clone()),
+                Some(attachment_resume_token)
+            ]
+        );
+    }
+
+    #[test]
     fn relay_eof_reconnects_once_and_schedules_one_resync() {
         let admission = RuntimeAdmission::new(RuntimeRole::Client).unwrap();
         let lifecycle = HeadlessConnectionLifecycle::new(Arc::clone(&admission));
@@ -3426,6 +3725,7 @@ mod admission_tests {
         let bootstraps = Arc::clone(&connection.bootstraps);
         let sessions = Arc::clone(&connection.sessions);
         let bootstrap_client_ids = Arc::clone(&connection.bootstrap_client_ids);
+        let bootstrap_resume_tokens = Arc::clone(&connection.bootstrap_resume_tokens);
         let events = Arc::clone(&connection.events);
         let mut host = FakeRuntimeHost::default();
         host.events = Arc::clone(&events);
@@ -3435,6 +3735,7 @@ mod admission_tests {
         let (initial_ready, initial_ready_receiver) = bounded(1);
         let initial_server_version = Arc::new(OnceLock::new());
         let client_id = ClientId::new();
+        let attachment_resume_token = resume_token(21);
         let bootstrap_request_permit = reserve_client_request(&admission).unwrap();
 
         assert_eq!(
@@ -3449,6 +3750,7 @@ mod admission_tests {
                     initial_connection: None,
                     initial_ready,
                     client_id: client_id.clone(),
+                    attachment_resume_token: attachment_resume_token.clone(),
                     initial_server_version: Arc::clone(&initial_server_version),
                     bootstrap_request_permit,
                     host: &host,
@@ -3464,6 +3766,13 @@ mod admission_tests {
         );
         assert_eq!(bootstraps.load(Ordering::Acquire), 2);
         assert_eq!(sessions.load(Ordering::Acquire), 2);
+        assert_eq!(
+            bootstrap_resume_tokens.lock().unwrap().as_slice(),
+            &[
+                Some(attachment_resume_token.clone()),
+                Some(attachment_resume_token)
+            ]
+        );
         assert_eq!(reattachments.load(Ordering::Acquire), 1);
         assert_eq!(
             bootstrap_client_ids.lock().unwrap().as_slice(),
@@ -3522,6 +3831,7 @@ mod admission_tests {
                     initial_connection: None,
                     initial_ready,
                     client_id: ClientId::new(),
+                    attachment_resume_token: resume_token(22),
                     initial_server_version: Arc::new(OnceLock::new()),
                     bootstrap_request_permit,
                     host: &host,
@@ -3580,6 +3890,7 @@ mod admission_tests {
                     }),
                     initial_ready,
                     client_id,
+                    attachment_resume_token: resume_token(23),
                     initial_server_version,
                     bootstrap_request_permit,
                     host: &host,

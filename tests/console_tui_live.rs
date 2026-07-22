@@ -15,6 +15,10 @@ use support::console::{HeadlessConsoleClient, LocalConsoleHarness};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(8);
 const EXIT_TIMEOUT: Duration = Duration::from_secs(3);
+const INITIAL_COLS: u16 = 120;
+const INITIAL_ROWS: u16 = 40;
+const RESIZED_COLS: u16 = 150;
+const RESIZED_ROWS: u16 = 48;
 
 struct PublicConsole {
     master: Box<dyn MasterPty + Send>,
@@ -27,10 +31,16 @@ struct PublicConsole {
 
 impl PublicConsole {
     fn start(harness: &LocalConsoleHarness) -> Result<Self> {
-        let config_root = harness.runtime_root().join("config");
+        let config_root =
+            harness.runtime_root().join(format!("config-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir(&config_root).context("create isolated Console config root")?;
         let pty = native_pty_system();
-        let pair = pty.openpty(PtySize { rows: 40, cols: 120, pixel_width: 0, pixel_height: 0 })?;
+        let pair = pty.openpty(PtySize {
+            rows: INITIAL_ROWS,
+            cols: INITIAL_COLS,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
         let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_kit"));
         command.arg("console");
         command.env("TERM", "xterm-256color");
@@ -38,6 +48,7 @@ impl PublicConsole {
         command.env("RUST_LOG", "wezterm_client=warn");
         command.env("KIT_CONSOLE_RUNTIME_DIR", harness.runtime_root());
         command.env("XDG_CONFIG_HOME", &config_root);
+        command.env("XDG_STATE_HOME", &config_root);
         let child = pair.slave.spawn_command(command).context("start public kit console")?;
         drop(pair.slave);
 
@@ -61,8 +72,11 @@ impl PublicConsole {
             .context("start Console PTY reader")?;
         let mut console =
             Self { master: pair.master, writer, child, reader: Some(reader), output, config_root };
-        // Crossterm probes the cursor with DSR while constructing the Ratatui terminal. A real
-        // terminal answers this; the verifier is the terminal for this PTY.
+        // Ratatui asks the terminal for its cursor position while initializing. Answer only after
+        // observing the request so the response cannot race raw-mode setup or be line-echoed.
+        console.wait_for_output(b"\x1b[6n").with_context(|| {
+            format!("Console agent startup diagnostics: {:?}", harness.diagnostics())
+        })?;
         console.send(b"\x1b[1;1R")?;
         console.wait_for_output(b"kit console")?;
         console.wait_for_output(b"\x1b[?1049h")?;
@@ -242,17 +256,17 @@ async fn public_console_drives_keyboard_mouse_history_resize_paste_and_clipboard
     wezterm_config::common_init(None, &[], true)
         .context("initialize headless WezTerm verifier config")?;
 
-    let mut harness = LocalConsoleHarness::start()?;
+    let mut harness = LocalConsoleHarness::start().await?;
     let mut console = PublicConsole::start(&harness)?;
     let nonce_source = uuid::Uuid::new_v4().simple().to_string();
     let nonce = &nonce_source[..12];
 
     console.clear_output()?;
     console.send(b"\x0e")?;
-    if console.wait_for_any_output(&[b"attached", b"observing"])? == 1 {
+    if console.wait_for_any_output(&[b"you", b"read-only"])? == 1 {
         console.clear_output()?;
         console.send(b"\x02t")?;
-        console.wait_for_output(b"attached")?;
+        console.wait_for_output(b"you")?;
     }
     let first_receipt = std::env::temp_dir().join(format!("kitc-{nonce}"));
     let first_marker = format!("KIT_TUI_FIRST_{nonce}");
@@ -264,15 +278,15 @@ async fn public_console_drives_keyboard_mouse_history_resize_paste_and_clipboard
 
     console.clear_output()?;
     console.send(b"\x02\x0e")?;
-    if console.wait_for_any_output(&[b"attached", b"observing"])? == 1 {
+    if console.wait_for_any_output(&[b"you", b"read-only"])? == 1 {
         console.clear_output()?;
         console.send(b"\x02t")?;
-        console.wait_for_output(b"attached")?;
+        console.wait_for_output(b"you")?;
     }
 
     console.clear_output()?;
     console.send(b"\x02t")?;
-    console.wait_for_any_output(&[b"attached", b"already has control"])?;
+    console.wait_for_any_output(&[b"you", b"already has control"])?;
     console.send(b"\x1bOQ")?;
     let title_suffix = format!("-{}", &nonce[..4]);
     let shell_path = std::env::var_os("SHELL").context("the Console verifier requires SHELL")?;
@@ -286,11 +300,13 @@ async fn public_console_drives_keyboard_mouse_history_resize_paste_and_clipboard
     console.wait_for_output(title_suffix.as_bytes())?;
 
     console.clear_output()?;
-    console.send(b"\x02\x1b[D")?;
+    // Rename is a sidebar-owned interaction and deliberately leaves focus in the sessions panel,
+    // so history navigation is immediately available without toggling/collapsing that panel.
+    console.send(b"\x1b[D")?;
     console.wait_for_output(first_marker.as_bytes())?;
     console.clear_output()?;
     console.send(b"t")?;
-    console.wait_for_any_output(&[b"attached", b"already has control"])?;
+    console.wait_for_any_output(&[b"you", b"already has control"])?;
     console.send(b"\x1b[1;5C")?;
     let history_back = format!("KIT_HISTORY_BACK_{nonce}");
     let history_back_receipt = std::env::temp_dir().join(format!("kitc-back-{nonce}"));
@@ -308,7 +324,7 @@ async fn public_console_drives_keyboard_mouse_history_resize_paste_and_clipboard
     console.wait_for_output(title_suffix.as_bytes())?;
     console.clear_output()?;
     console.send(b"t")?;
-    console.wait_for_any_output(&[b"attached", b"already has control"])?;
+    console.wait_for_any_output(&[b"you", b"already has control"])?;
     console.send(b"\x1b[1;5C")?;
     let history_forward = format!("KIT_HISTORY_FORWARD_{nonce}");
     let history_forward_receipt = std::env::temp_dir().join(format!("kitc-forward-{nonce}"));
@@ -319,7 +335,7 @@ async fn public_console_drives_keyboard_mouse_history_resize_paste_and_clipboard
     wait_for_file(&history_forward_receipt)?;
     std::fs::remove_file(&history_forward_receipt).context("remove history-forward receipt")?;
 
-    console.resize(150, 48)?;
+    console.resize(RESIZED_COLS, RESIZED_ROWS)?;
     thread::sleep(Duration::from_millis(150));
 
     console.send(&sgr_mouse(0, 45, 8, false))?;
@@ -335,9 +351,47 @@ async fn public_console_drives_keyboard_mouse_history_resize_paste_and_clipboard
 
     console.send(&sgr_mouse(2, 2, 3, false))?;
     thread::sleep(Duration::from_millis(100));
-    console.send(&sgr_mouse(0, 3, 11, false))?;
-    console.send(&sgr_mouse(0, 3, 11, true))?;
+    console.send(&sgr_mouse(0, 3, 10, false))?;
+    console.send(&sgr_mouse(0, 3, 10, true))?;
     console.wait_for_output(b"\x1b]52;c;")?;
+
+    // A second real TUI must remain useful while observing and must transfer control through the
+    // same keyboard/mouse action surface without entering the old dead-notice state.
+    let mut peer = PublicConsole::start(&harness)?;
+    peer.wait_for_output(b"read-only")?;
+    peer.clear_output()?;
+    peer.send(&sgr_mouse(0, 50, 8, false))?;
+    peer.send(&sgr_mouse(0, 50, 8, true))?;
+    thread::sleep(Duration::from_millis(100));
+    let peer_projection = peer.output_snapshot()?;
+    ensure!(
+        !peer_projection.contains("take control to use the mouse"),
+        "read-only terminal click regressed to the dead observer notice: {peer_projection:?}"
+    );
+
+    console.clear_output()?;
+    peer.send(b"\x02t")?;
+    peer.wait_for_output(b"you")?;
+    console.wait_for_output(b"read-only")?;
+
+    // The persistent footer takeover affordance is a real pointer target, not instructional text.
+    console.clear_output()?;
+    console.send(&sgr_mouse(0, RESIZED_COLS - 10, RESIZED_ROWS - 1, false))?;
+    console.send(&sgr_mouse(0, RESIZED_COLS - 10, RESIZED_ROWS - 1, true))?;
+    console.wait_for_output(b"you")?;
+    peer.wait_for_output(b"read-only")?;
+
+    let peer_output = peer.finish()?;
+    ensure!(peer_output.windows(b"\x1b[?1049l".len()).any(|w| w == b"\x1b[?1049l"));
+
+    console.clear_output()?;
+    console.send(b"\x02\x02")?;
+    console.wait_for_output(b"[Ctrl+B] Sessions")?;
+    console.clear_output()?;
+    console.send(&sgr_mouse(0, RESIZED_COLS - 10, 0, false))?;
+    console.send(&sgr_mouse(0, RESIZED_COLS - 10, 0, true))?;
+    console.wait_for_output(b"Hide sessions")?;
+    console.send(b"\x02")?;
 
     let output = console.finish()?;
     ensure!(output.windows(b"\x1b[?1049l".len()).any(|w| w == b"\x1b[?1049l"));

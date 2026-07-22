@@ -13,8 +13,10 @@ use anyhow::{bail, Context, Result};
 use crate::framework::process::ProcessSupervisor;
 
 use super::client::{
-    probe_console_socket, remove_stale_console_socket, ConsoleClient, ConsoleSocketProbe,
+    local_connection_owner, probe_console_socket, remove_stale_console_socket, ConsoleClient,
+    ConsoleSocketProbe,
 };
+use super::connection::ConnectionOwner;
 
 pub use model::{ConsoleServicePlatform, ConsoleStatus, NativeServiceState};
 
@@ -27,10 +29,18 @@ const READY_TIMEOUT: Duration = Duration::from_secs(10);
 const READY_INTERVAL: Duration = Duration::from_millis(100);
 
 pub async fn status(processes: &ProcessSupervisor) -> Result<ConsoleStatus> {
+    let owner = local_connection_owner()?;
+    status_with_owner(processes, &owner).await
+}
+
+async fn status_with_owner(
+    processes: &ProcessSupervisor,
+    owner: &ConnectionOwner,
+) -> Result<ConsoleStatus> {
     let platform = native::PLATFORM;
     match native::inspect(processes).await? {
-        NativeServiceState::NotInstalled => inactive_status(platform, true).await,
-        NativeServiceState::Stopped => inactive_status(platform, false).await,
+        NativeServiceState::NotInstalled => inactive_status(owner, platform, true).await,
+        NativeServiceState::Stopped => inactive_status(owner, platform, false).await,
         NativeServiceState::Failed { detail } => Ok(ConsoleStatus::ServiceFailed {
             platform,
             detail,
@@ -52,11 +62,12 @@ pub async fn status(processes: &ProcessSupervisor) -> Result<ConsoleStatus> {
                     .to_owned(),
             })
         }
-        NativeServiceState::Running => mux_status(platform).await,
+        NativeServiceState::Running => mux_status(owner, platform).await,
     }
 }
 
 async fn inactive_status(
+    owner: &ConnectionOwner,
     platform: ConsoleServicePlatform,
     not_installed: bool,
 ) -> Result<ConsoleStatus> {
@@ -67,7 +78,7 @@ async fn inactive_status(
         ConsoleSocketProbe::Missing { .. } => {
             Ok(ConsoleStatus::Stopped { platform, action: "kit console setup".to_owned() })
         }
-        ConsoleSocketProbe::Ready => match mux_status(platform).await? {
+        ConsoleSocketProbe::Ready => match mux_status(owner, platform).await? {
             ConsoleStatus::Ready { sessions, .. } => Ok(ConsoleStatus::ServiceUnavailable {
                 platform,
                 detail: format!(
@@ -102,7 +113,10 @@ async fn inactive_status(
     }
 }
 
-async fn mux_status(platform: ConsoleServicePlatform) -> Result<ConsoleStatus> {
+async fn mux_status(
+    owner: &ConnectionOwner,
+    platform: ConsoleServicePlatform,
+) -> Result<ConsoleStatus> {
     match probe_console_socket()? {
         ConsoleSocketProbe::Missing { path } => Ok(ConsoleStatus::SocketMissing {
             platform,
@@ -124,7 +138,7 @@ async fn mux_status(platform: ConsoleServicePlatform) -> Result<ConsoleStatus> {
             detail,
             action: "stop Console, remove only the rejected owned socket, and run setup".to_owned(),
         }),
-        ConsoleSocketProbe::Ready => match ConsoleClient::connect().await {
+        ConsoleSocketProbe::Ready => match ConsoleClient::connect(owner).await {
             Ok(client) => {
                 let sessions = client.snapshot(None).await?.sessions.len();
                 Ok(ConsoleStatus::Ready { platform, sessions, build: super::build_identity()? })
@@ -171,17 +185,18 @@ async fn mux_status(platform: ConsoleServicePlatform) -> Result<ConsoleStatus> {
 }
 
 pub async fn setup(processes: &ProcessSupervisor) -> Result<ConsoleStatus> {
+    let owner = local_connection_owner()?;
     let executable = installed_executable()?;
     let state = native::inspect(processes).await?;
     let definition_matches = native::definition_matches(processes, &executable).await?;
     let mut drain_client = None;
 
     if matches!(&state, NativeServiceState::Running) {
-        let current = mux_status(native::PLATFORM).await?;
+        let current = mux_status(&owner, native::PLATFORM).await?;
         if definition_matches && current.ready() {
             return Ok(current);
         }
-        let client = ConsoleClient::connect_for_service_management()
+        let client = ConsoleClient::connect_for_service_management(&owner)
             .await
             .context("attach to the running Console agent before replacing its service")?;
         client.begin_service_drain().await?;
@@ -202,9 +217,12 @@ pub async fn setup(processes: &ProcessSupervisor) -> Result<ConsoleStatus> {
     }
 
     if matches!(&state, NativeServiceState::NotInstalled | NativeServiceState::Stopped) {
-        let inactive =
-            inactive_status(native::PLATFORM, matches!(&state, NativeServiceState::NotInstalled))
-                .await?;
+        let inactive = inactive_status(
+            &owner,
+            native::PLATFORM,
+            matches!(&state, NativeServiceState::NotInstalled),
+        )
+        .await?;
         match inactive {
             ConsoleStatus::NotInstalled { .. }
             | ConsoleStatus::Stopped { .. }
@@ -221,12 +239,15 @@ pub async fn setup(processes: &ProcessSupervisor) -> Result<ConsoleStatus> {
         native::install_and_start(processes, &executable).await?;
     }
     drop(drain_client);
-    wait_until_ready(processes).await
+    wait_until_ready(processes, &owner).await
 }
 
 pub async fn stop(processes: &ProcessSupervisor, force: bool) -> Result<ConsoleStatus> {
+    let owner = local_connection_owner()?;
     match native::inspect(processes).await? {
-        NativeServiceState::NotInstalled | NativeServiceState::Stopped => return status(processes).await,
+        NativeServiceState::NotInstalled | NativeServiceState::Stopped => {
+            return status_with_owner(processes, &owner).await
+        }
         NativeServiceState::WrongOwner { path, expected_uid, actual_uid } => bail!(
             "refusing to stop foreign Console service definition {} owned by uid {}; expected uid {}",
             path.display(),
@@ -237,7 +258,7 @@ pub async fn stop(processes: &ProcessSupervisor, force: bool) -> Result<ConsoleS
         NativeServiceState::Failed { .. } | NativeServiceState::Running => {}
     }
 
-    let client = ConsoleClient::connect_for_service_management()
+    let client = ConsoleClient::connect_for_service_management(&owner)
         .await
         .context("attach to the Console agent before stopping it")?;
     client.begin_service_drain().await?;
@@ -268,7 +289,7 @@ pub async fn stop(processes: &ProcessSupervisor, force: bool) -> Result<ConsoleS
     native::stop(processes).await?;
     drop(client);
     remove_stale_console_socket()?;
-    status(processes).await
+    status_with_owner(processes, &owner).await
 }
 
 fn installed_executable() -> Result<std::path::PathBuf> {
@@ -278,10 +299,13 @@ fn installed_executable() -> Result<std::path::PathBuf> {
         .with_context(|| format!("resolving Kit executable {}", executable.display()))
 }
 
-async fn wait_until_ready(processes: &ProcessSupervisor) -> Result<ConsoleStatus> {
+async fn wait_until_ready(
+    processes: &ProcessSupervisor,
+    owner: &ConnectionOwner,
+) -> Result<ConsoleStatus> {
     let started = tokio::time::Instant::now();
     loop {
-        let current = status(processes).await?;
+        let current = status_with_owner(processes, owner).await?;
         if current.ready() {
             return Ok(current);
         }

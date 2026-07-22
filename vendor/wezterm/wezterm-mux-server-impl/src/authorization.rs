@@ -1,10 +1,13 @@
-use crate::dispatch::{ControlPublisher, ControlSubscription};
+use crate::dispatch::{
+    AttachmentFence, ControlPublisher, ControlSubscription, EstablishedAttachment,
+};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use codec::{
-    BuildIdentity, ConnectionIdentity, ControlLeaseAction, ControlLeaseResult, DecodeReservation,
-    Pdu, RequestAuthority, RequestOperation, ServiceDrainAction, ServiceDrainResult,
+    AttachmentIdentity, AttachmentResumeToken, BuildIdentity, ControlLeaseAction,
+    ControlLeaseResult, DecodeReservation, Pdu, RequestAuthority, RequestOperation,
+    ServiceDrainAction, ServiceDrainResult,
 };
 use mux::client::ClientId;
 use mux::pane::PaneId;
@@ -17,18 +20,26 @@ use wezterm_runtime_admission::{CombinedPermit, RuntimeAdmission};
 /// caller-controlled claims as proof that bootstrap completed.
 #[derive(Clone, Debug)]
 pub struct ServerIssuedIdentity {
-    connection: ConnectionIdentity,
+    fence: AttachmentFence,
     client_id: Arc<ClientId>,
 }
 
 impl ServerIssuedIdentity {
-    pub fn connection(&self) -> ConnectionIdentity {
-        self.connection
+    pub fn attachment(&self) -> AttachmentIdentity {
+        self.fence.identity
     }
 
     pub fn client_id(&self) -> &Arc<ClientId> {
         &self.client_id
     }
+}
+
+pub(crate) struct EstablishedServerIdentity {
+    pub(crate) identity: ServerIssuedIdentity,
+    pub(crate) resume_token: AttachmentResumeToken,
+    pub(crate) control_snapshot: codec::ControlSnapshot,
+    pub(crate) subscription: ControlSubscription,
+    pub(crate) is_new: bool,
 }
 
 pub trait RequestAuthorizer: Send + Sync + 'static {
@@ -120,7 +131,7 @@ pub struct ServerPolicy {
 
 #[derive(Default)]
 struct ServiceDrainState {
-    owner: Option<ConnectionIdentity>,
+    owner: Option<AttachmentIdentity>,
     spawns_in_flight: usize,
 }
 
@@ -137,12 +148,14 @@ impl Drop for SpawnDispatchPermit {
 
 impl ServerPolicy {
     pub fn new(authorizer: Arc<dyn RequestAuthorizer>, build_identity: BuildIdentity) -> Arc<Self> {
-        Arc::new(Self {
+        let policy = Arc::new(Self {
             authorizer,
             build_identity,
             control: ControlPublisher::new(),
             drain: Mutex::new(ServiceDrainState::default()),
-        })
+        });
+        policy.control.bind_policy(Arc::downgrade(&policy));
+        policy
     }
 
     pub fn bind_admission(&self, admission: &Arc<RuntimeAdmission>) -> anyhow::Result<()> {
@@ -154,18 +167,40 @@ impl ServerPolicy {
             .authorize_registration(None, client_id, true)
     }
 
-    pub fn issue_identity(
+    pub(crate) fn establish_identity(
         &self,
         proxy: Option<&ClientId>,
         client_id: ClientId,
-    ) -> anyhow::Result<ServerIssuedIdentity> {
+        resume_token: Option<AttachmentResumeToken>,
+    ) -> anyhow::Result<EstablishedServerIdentity> {
         self.authorizer
             .authorize_registration(proxy, &client_id, false)?;
-        let connection = self.control.issue_identity()?;
-        Ok(ServerIssuedIdentity {
-            connection,
-            client_id: Arc::new(client_id),
+        let resume_token = resume_token.ok_or_else(|| {
+            anyhow::anyhow!("attachment registration requires a resume capability")
+        })?;
+        let EstablishedAttachment {
+            fence,
+            client_id,
+            resume_token,
+            control_snapshot,
+            subscription,
+            is_new,
+        } = self.control.establish(Arc::new(client_id), resume_token)?;
+        Ok(EstablishedServerIdentity {
+            identity: ServerIssuedIdentity { fence, client_id },
+            resume_token,
+            control_snapshot,
+            subscription,
+            is_new,
         })
+    }
+
+    pub(crate) fn ensure_current(&self, identity: &ServerIssuedIdentity) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.control.is_current(identity.fence),
+            "attachment connection was superseded"
+        );
+        Ok(())
     }
 
     pub fn authorize_bootstrap(
@@ -182,6 +217,7 @@ impl ServerPolicy {
         operation: RequestOperation,
         request: &Pdu,
     ) -> anyhow::Result<()> {
+        self.ensure_current(identity)?;
         self.authorizer.authorize(identity, operation, request)?;
         if operation == RequestOperation::Spawn && self.drain.lock().unwrap().owner.is_some() {
             anyhow::bail!("Console service shutdown is draining new sessions");
@@ -192,12 +228,12 @@ impl ServerPolicy {
             };
             let mut drain = self.drain.lock().unwrap();
             match (request.action, drain.owner) {
-                (ServiceDrainAction::Begin, None) => drain.owner = Some(identity.connection()),
-                (ServiceDrainAction::Begin, Some(current)) if current == identity.connection() => {}
+                (ServiceDrainAction::Begin, None) => drain.owner = Some(identity.attachment()),
+                (ServiceDrainAction::Begin, Some(current)) if current == identity.attachment() => {}
                 (ServiceDrainAction::Begin, Some(_)) => {
                     anyhow::bail!("another connection owns the Console service drain")
                 }
-                (ServiceDrainAction::Cancel, Some(current)) if current == identity.connection() => {
+                (ServiceDrainAction::Cancel, Some(current)) if current == identity.attachment() => {
                 }
                 (ServiceDrainAction::Cancel, _) => {
                     anyhow::bail!("this connection does not own the Console service drain")
@@ -209,10 +245,10 @@ impl ServerPolicy {
                 for pane_id in
                     IntoIterator::into_iter([Some(targets.primary), targets.secondary]).flatten()
                 {
-                    if !self.control.is_controller(pane_id, identity.connection()) {
+                    if !self.control.is_controller(pane_id, identity.fence) {
                         anyhow::bail!(
                             "connection {} is an observer for pane {}",
-                            identity.connection().get(),
+                            identity.attachment().get(),
                             pane_id
                         );
                     }
@@ -227,33 +263,24 @@ impl ServerPolicy {
         Ok(())
     }
 
-    pub fn subscribe_control(
-        self: &Arc<Self>,
-        identity: &ServerIssuedIdentity,
-    ) -> anyhow::Result<ControlSubscription> {
-        self.control.subscribe(identity.connection())
-    }
-
     pub fn apply_control(
         &self,
         identity: &ServerIssuedIdentity,
         pane_id: PaneId,
         action: ControlLeaseAction,
-    ) -> ControlLeaseResult {
-        self.control.apply(pane_id, identity.connection(), action)
+    ) -> anyhow::Result<ControlLeaseResult> {
+        self.control.apply(pane_id, identity.fence, action)
     }
 
     pub fn remove_controlled_pane(&self, pane_id: PaneId) -> bool {
         self.control.remove_pane(pane_id)
     }
 
-    pub fn expire_control_grace(&self, identity: ConnectionIdentity) -> bool {
-        let changed = self.control.expire_grace(identity);
+    pub(crate) fn attachment_expired(&self, identity: AttachmentIdentity) {
         let mut drain = self.drain.lock().unwrap();
         if drain.owner == Some(identity) {
             drain.owner = None;
         }
-        changed
     }
 
     pub fn reserve_spawn(self: &Arc<Self>) -> anyhow::Result<SpawnDispatchPermit> {
@@ -277,9 +304,10 @@ impl ServerPolicy {
     ) -> anyhow::Result<ServiceDrainResult> {
         match action {
             ServiceDrainAction::Begin => loop {
+                self.ensure_current(identity)?;
                 let spawns_in_flight = {
                     let drain = self.drain.lock().unwrap();
-                    if drain.owner != Some(identity.connection()) {
+                    if drain.owner != Some(identity.attachment()) {
                         anyhow::bail!("this connection does not own the Console service drain");
                     }
                     drain.spawns_in_flight
@@ -290,8 +318,9 @@ impl ServerPolicy {
                 smol::Timer::after(Duration::from_millis(1)).await;
             },
             ServiceDrainAction::Cancel => {
+                self.ensure_current(identity)?;
                 let mut drain = self.drain.lock().unwrap();
-                if drain.owner != Some(identity.connection()) {
+                if drain.owner != Some(identity.attachment()) {
                     anyhow::bail!("this connection does not own the Console service drain");
                 }
                 drain.owner = None;
@@ -349,11 +378,24 @@ mod tests {
     use wezterm_term::TerminalSize;
 
     fn identity(policy: &ServerPolicy, client_id: ClientId) -> ServerIssuedIdentity {
-        policy.issue_identity(None, client_id).unwrap()
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT_TEST_TOKEN: AtomicU64 = AtomicU64::new(1);
+        let sequence = NEXT_TEST_TOKEN.fetch_add(1, Ordering::Relaxed);
+        let mut token = [0u8; 32];
+        token[..8].copy_from_slice(&sequence.to_le_bytes());
+        policy
+            .establish_identity(
+                None,
+                client_id,
+                Some(AttachmentResumeToken::from_random_bytes(token)),
+            )
+            .unwrap()
+            .identity
     }
 
     #[test]
-    fn caller_metadata_cannot_forge_the_server_connection_identity() {
+    fn caller_metadata_cannot_forge_the_server_attachment_identity() {
         let policy = ServerPolicy::new(
             Arc::new(AllowAllRequests),
             BuildIdentity {
@@ -370,7 +412,7 @@ mod tests {
         let first = identity(&policy, metadata.clone());
         let second = identity(&policy, metadata);
 
-        assert_ne!(first.connection(), second.connection());
+        assert_ne!(first.attachment(), second.attachment());
         assert_eq!(first.client_id().hostname, second.client_id().hostname);
     }
 
@@ -434,7 +476,9 @@ mod tests {
         let controller = identity(&policy, ClientId::new());
         let observer = identity(&policy, ClientId::new());
         assert!(matches!(
-            policy.apply_control(&controller, 9, ControlLeaseAction::Acquire),
+            policy
+                .apply_control(&controller, 9, ControlLeaseAction::Acquire)
+                .unwrap(),
             ControlLeaseResult::Acquired(_)
         ));
 
@@ -464,7 +508,9 @@ mod tests {
             .is_err());
 
         assert!(matches!(
-            policy.apply_control(&observer, 9, ControlLeaseAction::Take),
+            policy
+                .apply_control(&observer, 9, ControlLeaseAction::Take)
+                .unwrap(),
             ControlLeaseResult::Taken(_)
         ));
         assert!(policy
@@ -536,7 +582,9 @@ mod tests {
         policy.bind_admission(&admission).unwrap();
         let identity = identity(&policy, ClientId::new());
         assert!(matches!(
-            policy.apply_control(&identity, 1, ControlLeaseAction::Acquire),
+            policy
+                .apply_control(&identity, 1, ControlLeaseAction::Acquire)
+                .unwrap(),
             ControlLeaseResult::Acquired(_)
         ));
         let request = Pdu::SplitPane(SplitPane {
@@ -554,7 +602,9 @@ mod tests {
             .authorize(&identity, RequestOperation::SplitPane, &request)
             .is_err());
         assert!(matches!(
-            policy.apply_control(&identity, 2, ControlLeaseAction::Acquire),
+            policy
+                .apply_control(&identity, 2, ControlLeaseAction::Acquire)
+                .unwrap(),
             ControlLeaseResult::Acquired(_)
         ));
         assert!(policy

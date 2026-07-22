@@ -158,6 +158,10 @@ impl OwnedPaneTaskKind {
             Self::Client(_) | Self::Pane(_) => true,
         }
     }
+
+    fn failure_is_fatal(self) -> bool {
+        !matches!(self, Self::Client(ClientPaneTaskKind::Request))
+    }
 }
 
 struct OwnedPaneTask {
@@ -599,10 +603,19 @@ fn reap_owned_pane_tasks(tasks: &mut Vec<OwnedPaneTask>) -> anyhow::Result<()> {
     let mut index = 0;
     while index < tasks.len() {
         if tasks[index].task.is_finished() {
-            let task = tasks.swap_remove(index).task;
-            if let Err(err) = observe_owned_task(task) {
-                if first_error.is_none() {
-                    first_error = Some(err);
+            let owned = tasks.swap_remove(index);
+            if let Err(err) = observe_owned_task(owned.task) {
+                if owned.kind.failure_is_fatal() {
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
+                } else {
+                    // ClientPane mutations are asynchronous and have no result channel back to
+                    // their synchronous caller. Interactive WezTerm logs these failures and keeps
+                    // the mux alive; preserve that contract for the headless owner too. A request
+                    // can legitimately lose a control-lease race while Fetch/Poll failures still
+                    // terminate the projection and engage its reconnect owner.
+                    log::debug!("client pane request was rejected: {err:#}");
                 }
             }
         } else {
@@ -2974,6 +2987,37 @@ mod pane_removal_tests {
         mux.shutdown_runtime();
         assert!(mux.headless_runtime_tasks.lock().is_empty());
         assert_eq!(mux.admission.count_usage(CountClass::ExecutorRunnable), 0);
+    }
+
+    #[test]
+    fn headless_pane_request_rejection_is_recoverable_but_projection_failure_is_fatal() {
+        let admission = RuntimeAdmission::new(RuntimeRole::Client).unwrap();
+        let executor = promise::spawn::SimpleExecutor::new(Arc::clone(&admission));
+
+        let rejected_request = executor
+            .handle()
+            .try_spawn(async { Err(anyhow!("request authorization denied")) })
+            .unwrap();
+        executor.tick().unwrap();
+        let mut tasks = vec![OwnedPaneTask {
+            kind: OwnedPaneTaskKind::Client(ClientPaneTaskKind::Request),
+            task: rejected_request,
+        }];
+        reap_owned_pane_tasks(&mut tasks).unwrap();
+        assert!(tasks.is_empty());
+
+        let failed_fetch = executor
+            .handle()
+            .try_spawn(async { Err(anyhow!("projection transport closed")) })
+            .unwrap();
+        executor.tick().unwrap();
+        let mut tasks = vec![OwnedPaneTask {
+            kind: OwnedPaneTaskKind::Client(ClientPaneTaskKind::Fetch),
+            task: failed_fetch,
+        }];
+        let error = reap_owned_pane_tasks(&mut tasks).unwrap_err();
+        assert!(error.to_string().contains("projection transport closed"));
+        assert!(tasks.is_empty());
     }
 
     #[test]

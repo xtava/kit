@@ -20,7 +20,7 @@ async fn local_console_reconnects_to_authoritative_sessions_and_cleans_up() -> R
     wezterm_config::common_init(None, &[], true)
         .context("initialize headless WezTerm verifier config")?;
 
-    let mut harness = LocalConsoleHarness::start()?;
+    let mut harness = LocalConsoleHarness::start().await?;
     let nonce = uuid::Uuid::new_v4().simple().to_string();
     let mut expected = Vec::new();
     let mut offline_markers = Vec::new();

@@ -584,8 +584,42 @@ impl ClientDomain {
                 ));
             }
         };
-
-        if let Err(error) = Self::finish_attach(self.local_domain_id, client, panes, window_id) {
+        let executor = match mux.headless_executor() {
+            Ok(executor) => executor,
+            Err(error) => {
+                return Err(Self::headless_attach_error(
+                    lifecycle,
+                    HeadlessConnectionFailure::Runtime,
+                    error.context("headless attachment requires the mux owner executor"),
+                ));
+            }
+        };
+        let domain_id = self.local_domain_id;
+        let finish = match executor
+            .try_spawn(async move { Self::finish_attach(domain_id, client, panes, window_id) })
+        {
+            Ok(finish) => finish,
+            Err(error) => {
+                return Err(Self::headless_attach_error(
+                    lifecycle,
+                    HeadlessConnectionFailure::Runtime,
+                    anyhow::Error::new(error)
+                        .context("schedule pane projection on the mux owner executor"),
+                ));
+            }
+        };
+        let finish_result = match finish.await {
+            Ok(result) => result,
+            Err(error) => {
+                return Err(Self::headless_attach_error(
+                    lifecycle,
+                    HeadlessConnectionFailure::Runtime,
+                    anyhow::Error::new(error)
+                        .context("join pane projection on the mux owner executor"),
+                ));
+            }
+        };
+        if let Err(error) = finish_result {
             let inner = self.inner.lock().unwrap().take();
             if let Some(inner) = inner {
                 let outcome = inner.client.shutdown_and_join();
@@ -776,7 +810,6 @@ impl ClientDomain {
                     mux.add_tab_no_panes(&tab)?;
                     inner.record_remote_to_local_tab_mapping(remote_tab_id, tab.tab_id());
                 }
-
                 tab.set_title(tab_title);
 
                 log::debug!("domain: {} tree: {:#?}", inner.local_domain_id, tabroot);
@@ -938,6 +971,9 @@ impl ClientDomain {
         primary_window_id: Option<WindowId>,
     ) -> anyhow::Result<()> {
         let mux = Mux::get();
+        if mux.is_headless_runtime() && !mux.is_main_thread() {
+            bail!("headless pane projection must run on the mux owner thread");
+        }
         let domain = mux
             .get_domain(domain_id)
             .ok_or_else(|| anyhow!("invalid domain id {}", domain_id))?;

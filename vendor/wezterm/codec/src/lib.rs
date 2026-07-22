@@ -45,6 +45,7 @@ use wezterm_runtime_admission::{
 };
 use wezterm_term::color::ColorPalette;
 use wezterm_term::{Alert, ClipboardSelection, StableRowIndex, TerminalSize};
+use zeroize::Zeroize;
 
 #[derive(Error, Debug)]
 #[error("Corrupt Response: {0}")]
@@ -986,7 +987,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 49;
+pub const CODEC_VERSION: usize = 51;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -1024,7 +1025,7 @@ pdu! {
     PaneRemoved: 37 => Notification,
     SetPalette: 38 => RequestOrNotification(UnitResponse),
     NotifyAlert: 39 => Notification,
-    SetClientId: 40 => Request(UnitResponse),
+    SetClientId: 40 => Request(SetClientIdResponse),
     GetClientList: 41 => Request(GetClientListResponse),
     GetClientListResponse: 42 => Response,
     SetWindowWorkspace: 43 => Request(UnitResponse),
@@ -1056,6 +1057,7 @@ pdu! {
     AttachRejected: 69 => Notification,
     ServiceDrainRequest: 70 => Request(ServiceDrainResult),
     ServiceDrainResult: 71 => Response,
+    SetClientIdResponse: 72 => Response,
 }
 
 impl PduTag {
@@ -1072,7 +1074,8 @@ impl PduTag {
             | Self::TabAddedToWindow
             | Self::ControlLeaseResult
             | Self::ControlSnapshot
-            | Self::ControlChanged => MAX_DECODE_METADATA_HEAP_ENVELOPE_BYTES_PER_PDU,
+            | Self::ControlChanged
+            | Self::SetClientIdResponse => MAX_DECODE_METADATA_HEAP_ENVELOPE_BYTES_PER_PDU,
             Self::ServiceDrainResult => MAX_DECODE_METADATA_HEAP_ENVELOPE_BYTES_PER_PDU,
             Self::SetPalette
             | Self::NotifyAlert
@@ -1144,7 +1147,8 @@ impl PduTag {
             | Self::ControlSnapshot
             | Self::ControlChanged
             | Self::AttachRejected
-            | Self::ServiceDrainResult => false,
+            | Self::ServiceDrainResult
+            | Self::SetClientIdResponse => false,
         }
     }
 }
@@ -1282,6 +1286,7 @@ impl Pdu {
             | Self::GetPaneDirectionResponse(_)
             | Self::ControlLeaseResult(_)
             | Self::ServiceDrainResult(_)
+            | Self::SetClientIdResponse(_)
             | Self::ControlSnapshot(_)
             | Self::ControlChanged(_)
             | Self::AttachRejected(_) => {
@@ -1389,7 +1394,8 @@ impl Pdu {
             | Self::ControlSnapshot(_)
             | Self::ControlChanged(_)
             | Self::AttachRejected(_)
-            | Self::ServiceDrainResult(_) => {
+            | Self::ServiceDrainResult(_)
+            | Self::SetClientIdResponse(_) => {
                 return Err(InvalidPduDirection {
                     pdu: self.pdu_name(),
                 })
@@ -1543,20 +1549,45 @@ pub struct GetBuildIdentityResponse {
     pub identity: BuildIdentity,
 }
 
-/// Opaque identity issued by the server for one authenticated connection.
+/// Opaque identity issued by the server for one resumable attachment.
 ///
 /// No client request accepts this value as authority. Clients may only compare identities
 /// projected by control snapshots and changes.
 #[derive(Clone, Copy, Deserialize, Serialize, Eq, Hash, Ord, PartialEq, PartialOrd, Debug)]
-pub struct ConnectionIdentity(NonZeroU64);
+pub struct AttachmentIdentity(NonZeroU64);
 
-impl ConnectionIdentity {
+impl AttachmentIdentity {
     pub fn from_server_sequence(sequence: NonZeroU64) -> Self {
         Self(sequence)
     }
 
     pub fn get(self) -> u64 {
         self.0.get()
+    }
+}
+
+/// Secret capability used to resume one live attachment during its disconnect grace period.
+///
+/// It is intentionally absent from `Debug` output. The value is wire/runtime state only and must
+/// never be persisted or displayed.
+#[derive(Clone, Deserialize, Serialize, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct AttachmentResumeToken([u8; 32]);
+
+impl AttachmentResumeToken {
+    pub fn from_random_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
+impl std::fmt::Debug for AttachmentResumeToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AttachmentResumeToken([REDACTED])")
+    }
+}
+
+impl Drop for AttachmentResumeToken {
+    fn drop(&mut self) {
+        self.0.zeroize();
     }
 }
 
@@ -1576,7 +1607,7 @@ pub struct ControlLeaseRequest {
 #[derive(Clone, Deserialize, Serialize, Eq, PartialEq, Debug)]
 pub struct ActiveControlLease {
     pub pane_id: PaneId,
-    pub controller: ConnectionIdentity,
+    pub controller: AttachmentIdentity,
 }
 
 #[derive(Clone, Deserialize, Serialize, Eq, PartialEq, Debug)]
@@ -1617,8 +1648,8 @@ pub struct ControlSnapshot {
     /// Identity of the attachment receiving this snapshot.
     ///
     /// This is comparison-only client state: no client request accepts a
-    /// `ConnectionIdentity` as authority.
-    pub attachment_identity: ConnectionIdentity,
+    /// `AttachmentIdentity` as authority.
+    pub attachment_identity: AttachmentIdentity,
     pub state: ControlLeaseState,
 }
 
@@ -1943,6 +1974,13 @@ pub struct WindowWorkspaceChanged {
 pub struct SetClientId {
     pub client_id: ClientId,
     pub is_proxy: bool,
+    pub resume_token: Option<AttachmentResumeToken>,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct SetClientIdResponse {
+    pub resume_token: Option<AttachmentResumeToken>,
+    pub control_snapshot: Option<ControlSnapshot>,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
@@ -2640,13 +2678,13 @@ mod test {
     fn rpc_response_keeps_decode_admission_until_explicit_acceptance() {
         let admission = admission();
         let mut encoded = Vec::new();
-        Pdu::Pong(Pong {})
+        Pdu::ServiceDrainResult(ServiceDrainResult { draining: true })
             .encode(&mut encoded, 1, &admission)
             .unwrap();
 
         let decoded = Pdu::decode(
             encoded.as_slice(),
-            DecodeContext::server_to_client_response(Some(PduTag::Pong)),
+            DecodeContext::server_to_client_response(Some(PduTag::ServiceDrainResult)),
             &admission,
         )
         .unwrap();
@@ -2656,14 +2694,14 @@ mod test {
             .into_rpc_response()
             .unwrap()
             .try_map(|pdu| match pdu {
-                Pdu::Pong(pong) => Ok(pong),
+                Pdu::ServiceDrainResult(result) => Ok(result),
                 unexpected => bail!("unexpected response {unexpected:?}"),
             })
             .unwrap();
         assert_eq!(response.serial(), 1);
         assert!(admission.byte_usage(ByteClass::DecodeWorking) > 0);
 
-        let _pong = response.into_inner();
+        let _result = response.into_inner();
         assert_eq!(admission.byte_usage(ByteClass::DecodeWorking), 0);
     }
 
@@ -2914,7 +2952,7 @@ mod test {
 
     #[test]
     fn projected_attachment_identity_is_never_client_request_authority() {
-        let identity = ConnectionIdentity::from_server_sequence(NonZeroU64::new(7).unwrap());
+        let identity = AttachmentIdentity::from_server_sequence(NonZeroU64::new(7).unwrap());
         let snapshot = Pdu::ControlSnapshot(ControlSnapshot {
             attachment_identity: identity,
             state: ControlLeaseState {

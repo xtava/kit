@@ -34,12 +34,13 @@ impl ProxyCommand {
         let pdu = Pdu::SetClientId(SetClientId {
             client_id: ClientId::new(),
             is_proxy: true,
+            resume_token: None,
         });
         let serial = 1;
         pdu.encode(&mut stream, serial, mux.admission())?;
         Pdu::decode(
             &mut stream,
-            DecodeContext::server_to_client_response(Some(PduTag::UnitResponse)),
+            DecodeContext::server_to_client_response(Some(PduTag::SetClientIdResponse)),
             mux.admission(),
         )?;
 

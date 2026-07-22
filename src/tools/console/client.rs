@@ -4,10 +4,7 @@ use std::io::ErrorKind;
 use std::num::NonZeroU32;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -19,22 +16,16 @@ use crossterm::event::{
 };
 use termwiz::input::{KeyCode, KeyEvent, Modifiers};
 use tokio::sync::watch;
-use wezterm_client::client::{
-    Client, HeadlessConnectionLifecycle, HeadlessConnectionState, HeadlessLifecycleError,
-    PaneControlStatus,
-};
-use wezterm_client::domain::{ClientDomain, ClientDomainConfig};
+use wezterm_client::client::{Client, PaneControlStatus};
+use wezterm_client::domain::ClientDomainConfig;
 use wezterm_codec::{
     ControlLeaseAction, ControlLeaseRequest, ControlLeaseResult, EnvironmentFreeCommand,
     InputSerial, KillPane, Resize, SendKeyDown, SendMouseEvent, SendPaste, ServiceDrainAction,
     ServiceDrainRequest, SpawnV2, TabSpawnDomain, TabSpawnPlacement, TabTitleChanged,
 };
 use wezterm_config::UnixDomain;
-use wezterm_mux::client::ClientId;
-use wezterm_mux::domain::Domain;
 use wezterm_mux::tab::PaneNode;
-use wezterm_mux::{Mux, RuntimeAdmission, RuntimeRole, DEFAULT_WORKSPACE};
-use wezterm_promise::spawn::{SimpleExecutor, SimpleExecutorHandle};
+use wezterm_mux::{Mux, DEFAULT_WORKSPACE};
 use wezterm_term::{
     Line, MouseButton as WeztermMouseButton, MouseEvent as WeztermMouseEvent,
     MouseEventKind as WeztermMouseEventKind, TerminalSize,
@@ -42,7 +33,10 @@ use wezterm_term::{
 
 pub type SessionId = usize;
 
-const CONNECT_TIMEOUT: Duration = Duration::from_millis(750);
+// This bounds the complete WezTerm attach, including bootstrap, ListPanes, and construction of the
+// local render projection for every retained session. It is intentionally longer than an IPC-only
+// socket deadline; a busy machine or a large session set must not be misclassified as disconnected.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const RPC_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_PROJECTED_TERMINAL_ROWS: isize = 1_024;
@@ -56,15 +50,9 @@ pub enum SessionControl {
     Observer,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ConnectionState {
-    Attaching,
-    Reconnecting { attempt: u32 },
-    Ready,
-    Failed,
-    RetryExhausted,
-    Detached,
-}
+pub use super::connection::{ConnectionHealth, ConnectionState};
+
+use super::connection::{AttachmentPolicy, ConnectionHandle, ConnectionOwner};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TerminalContentGeometry {
@@ -124,86 +112,9 @@ pub(crate) enum ConsoleSocketProbe {
     Ready,
 }
 
-#[derive(Clone)]
 pub struct ConsoleClient {
-    client: Client,
-    projection: Arc<ClientProjection>,
-    lifecycle: Arc<HeadlessConnectionLifecycle>,
+    connection: ConnectionHandle,
     remote_status: Option<Arc<Mutex<watch::Receiver<Option<super::service::ConsoleStatus>>>>>,
-}
-
-struct ClientProjection {
-    domain: Arc<ClientDomain>,
-    mux: Arc<Mux>,
-    shutdown: Arc<AtomicBool>,
-    executor: SimpleExecutorHandle,
-    owner: Mutex<Option<JoinHandle<Result<()>>>>,
-}
-
-impl ClientProjection {
-    fn start(config: ClientDomainConfig) -> Result<Arc<Self>> {
-        let admission = RuntimeAdmission::new(RuntimeRole::Client)?;
-        let executor = Arc::new(SimpleExecutor::new(Arc::clone(&admission)));
-        let executor_handle = executor.handle();
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let owner_shutdown = Arc::clone(&shutdown);
-        let (ready_tx, ready_rx) = sync_channel(1);
-        let owner = std::thread::Builder::new()
-            .name("kit-console-client-mux".to_owned())
-            .spawn(move || {
-                let mux = Arc::new(Mux::new_headless(None, admission, executor));
-                if let Err(error) = Mux::set_mux(&mux) {
-                    let _ = ready_tx.send(Err(format!("{error:#}")));
-                    return Err(error);
-                }
-                ready_tx
-                    .send(Ok(Arc::clone(&mux)))
-                    .map_err(|_| anyhow!("Console client abandoned its mux during startup"))?;
-
-                let result = loop {
-                    if owner_shutdown.load(Ordering::Acquire) {
-                        break Ok(());
-                    }
-                    if let Err(error) = mux.tick_headless() {
-                        break Err(error.context("ticking Console client projection"));
-                    }
-                };
-                Mux::shutdown();
-                result
-            })
-            .context("starting the Console client projection")?;
-        let mux = match ready_rx.recv().context("waiting for the Console client projection")? {
-            Ok(mux) => mux,
-            Err(error) => {
-                let _ = owner.join();
-                bail!("initializing the Console client projection: {error}")
-            }
-        };
-        let domain = Arc::new(ClientDomain::new(config));
-        let mux_domain: Arc<dyn Domain> = domain.clone();
-        mux.add_domain(&mux_domain);
-        Ok(Arc::new(Self {
-            domain,
-            mux,
-            shutdown,
-            executor: executor_handle,
-            owner: Mutex::new(Some(owner)),
-        }))
-    }
-}
-
-impl Drop for ClientProjection {
-    fn drop(&mut self) {
-        if Mux::try_get().is_some() {
-            self.domain.perform_detach();
-        }
-        self.shutdown.store(true, Ordering::Release);
-        let wake = self.executor.try_spawn(async {});
-        if let Some(owner) = self.owner.lock().unwrap().take() {
-            let _ = owner.join();
-        }
-        drop(wake);
-    }
 }
 
 pub(crate) fn console_runtime_dir() -> Result<PathBuf> {
@@ -225,6 +136,19 @@ pub(crate) fn unix_domain() -> Result<UnixDomain> {
         no_serve_automatically: true,
         ..Default::default()
     })
+}
+
+pub(crate) fn local_connection_owner() -> Result<ConnectionOwner> {
+    ConnectionOwner::start(ClientDomainConfig::Unix(unix_domain()?))
+}
+
+pub(crate) fn remote_connection_owner(socket_path: PathBuf) -> Result<ConnectionOwner> {
+    ConnectionOwner::start(ClientDomainConfig::Unix(UnixDomain {
+        name: "kit-console-remote".to_owned(),
+        socket_path: Some(socket_path),
+        no_serve_automatically: true,
+        ..Default::default()
+    }))
 }
 
 fn validate_owned_private_socket(path: &Path, metadata: &Metadata) -> Result<()> {
@@ -347,21 +271,11 @@ pub(crate) fn remove_stale_console_socket() -> Result<()> {
 }
 
 impl ConsoleClient {
-    pub async fn connect() -> Result<Self> {
-        wezterm_config::designate_this_as_the_main_thread();
-        wezterm_config::common_init(None, &[], true)
-            .context("initializing headless WezTerm config")?;
-
-        let projection = ClientProjection::start(ClientDomainConfig::Unix(unix_domain()?))?;
+    pub(crate) async fn connect(owner: &ConnectionOwner) -> Result<Self> {
         match probe_console_socket()? {
             ConsoleSocketProbe::Ready => {
-                Self::connect_once(
-                    projection,
-                    Some(super::build_identity()?),
-                    CONNECT_TIMEOUT,
-                    None,
-                )
-                .await
+                Self::connect_once(owner, Some(super::build_identity()?), CONNECT_TIMEOUT, None)
+                    .await
             }
             ConsoleSocketProbe::Missing { .. } => bail!("the local Console agent is not running"),
             ConsoleSocketProbe::WrongOwner { path, expected_uid, actual_uid } => bail!(
@@ -374,14 +288,10 @@ impl ConsoleClient {
         }
     }
 
-    pub(crate) async fn connect_for_service_management() -> Result<Self> {
-        wezterm_config::designate_this_as_the_main_thread();
-        wezterm_config::common_init(None, &[], true)
-            .context("initializing headless WezTerm config")?;
-        let projection = ClientProjection::start(ClientDomainConfig::Unix(unix_domain()?))?;
+    pub(crate) async fn connect_for_service_management(owner: &ConnectionOwner) -> Result<Self> {
         match probe_console_socket()? {
             ConsoleSocketProbe::Ready => {
-                Self::connect_once(projection, None, CONNECT_TIMEOUT, None).await
+                Self::connect_once(owner, None, CONNECT_TIMEOUT, None).await
             }
             ConsoleSocketProbe::Missing { .. } => bail!("the local Console agent is not running"),
             ConsoleSocketProbe::WrongOwner { path, expected_uid, actual_uid } => bail!(
@@ -395,56 +305,31 @@ impl ConsoleClient {
     }
 
     async fn connect_once(
-        projection: Arc<ClientProjection>,
+        owner: &ConnectionOwner,
         expected_build_identity: Option<wezterm_codec::BuildIdentity>,
         timeout: Duration,
         remote_status: Option<watch::Receiver<Option<super::service::ConsoleStatus>>>,
     ) -> Result<Self> {
-        let admission = Arc::clone(projection.mux.admission());
-        let lifecycle = Arc::new(if remote_status.is_some() {
-            HeadlessConnectionLifecycle::with_reconnect_attempt_limit(
-                Arc::clone(&admission),
-                Some(REMOTE_RECONNECT_ATTEMPTS),
-            )
-        } else {
-            HeadlessConnectionLifecycle::new(Arc::clone(&admission))
-        });
-        let client_id = ClientId { ssh_auth_sock: None, ..ClientId::new() };
-        tokio::time::timeout(
-            timeout,
-            projection.domain.attach_with_lifecycle(
-                None,
-                &lifecycle,
+        let reconnect_attempt_limit = remote_status.as_ref().map(|_| REMOTE_RECONNECT_ATTEMPTS);
+        let connection = owner
+            .attach(AttachmentPolicy::new(
                 expected_build_identity,
-                client_id,
-            ),
-        )
-        .await
-        .context("timed out connecting to the Console agent")??;
-        let client = projection
-            .domain
-            .attached_client()
-            .context("Console client domain attached without a client")?;
+                timeout,
+                reconnect_attempt_limit,
+            ))
+            .await?;
         Ok(Self {
-            client,
-            projection,
-            lifecycle,
+            connection,
             remote_status: remote_status.map(|receiver| Arc::new(Mutex::new(receiver))),
         })
     }
 
-    pub fn drain_connection_state(&self) -> Result<Option<ConnectionState>> {
-        let mut latest = None;
-        loop {
-            match self.lifecycle.try_recv() {
-                Ok(state) => latest = Some(map_connection_state(state)),
-                Err(HeadlessLifecycleError::Empty) => return Ok(latest),
-                Err(HeadlessLifecycleError::Closed) => {
-                    return Ok(latest.or(Some(ConnectionState::Detached)))
-                }
-                Err(error) => return Err(error).context("reading Console connection lifecycle"),
-            }
-        }
+    pub fn drain_connection_health(&self) -> Result<Option<ConnectionHealth>> {
+        self.connection.drain_health()
+    }
+
+    pub async fn retry(&self) -> Result<()> {
+        self.connection.retry().await
     }
 
     pub fn drain_remote_status(&self) -> Option<Option<super::service::ConsoleStatus>> {
@@ -457,21 +342,11 @@ impl ConsoleClient {
     }
 
     pub(crate) async fn connect_to_relay(
-        socket_path: PathBuf,
+        owner: &ConnectionOwner,
         remote_status: watch::Receiver<Option<super::service::ConsoleStatus>>,
     ) -> Result<Self> {
-        wezterm_config::designate_this_as_the_main_thread();
-        wezterm_config::common_init(None, &[], true)
-            .context("initializing headless WezTerm config")?;
-        let domain = UnixDomain {
-            name: "kit-console-remote".to_owned(),
-            socket_path: Some(socket_path),
-            no_serve_automatically: true,
-            ..Default::default()
-        };
-        let projection = ClientProjection::start(ClientDomainConfig::Unix(domain))?;
         Self::connect_once(
-            projection,
+            owner,
             Some(super::build_identity()?),
             REMOTE_CONNECT_TIMEOUT,
             Some(remote_status),
@@ -490,9 +365,10 @@ impl ConsoleClient {
     }
 
     pub async fn create_session(&self, cols: u16, rows: u16) -> Result<SessionId> {
+        let client = self.connection.client()?;
         let response = bounded_rpc(
             "creating a session",
-            self.client.spawn_v2(SpawnV2 {
+            client.spawn_v2(SpawnV2 {
                 domain: TabSpawnDomain::DefaultDomain,
                 placement: TabSpawnPlacement::NewWindow {
                     size: terminal_size(cols, rows),
@@ -509,9 +385,10 @@ impl ConsoleClient {
     }
 
     pub async fn begin_service_drain(&self) -> Result<()> {
+        let client = self.connection.client()?;
         let result = bounded_rpc(
             "beginning Console service drain",
-            self.client.service_drain(ServiceDrainRequest { action: ServiceDrainAction::Begin }),
+            client.service_drain(ServiceDrainRequest { action: ServiceDrainAction::Begin }),
         )
         .await?
         .into_inner();
@@ -522,9 +399,10 @@ impl ConsoleClient {
     }
 
     pub async fn cancel_service_drain(&self) -> Result<()> {
+        let client = self.connection.client()?;
         let result = bounded_rpc(
             "cancelling Console service drain",
-            self.client.service_drain(ServiceDrainRequest { action: ServiceDrainAction::Cancel }),
+            client.service_drain(ServiceDrainRequest { action: ServiceDrainAction::Cancel }),
         )
         .await?
         .into_inner();
@@ -537,20 +415,19 @@ impl ConsoleClient {
     pub async fn close_session(&self, id: SessionId) -> Result<()> {
         let session = self.find_session(id).await?;
         self.require_control(session.pane_id).await?;
-        bounded_rpc(
-            "closing a session",
-            self.client.kill_pane(KillPane { pane_id: session.pane_id }),
-        )
-        .await?;
+        let client = self.connection.client()?;
+        bounded_rpc("closing a session", client.kill_pane(KillPane { pane_id: session.pane_id }))
+            .await?;
         Ok(())
     }
 
     pub async fn rename_session(&self, id: SessionId, title: String) -> Result<()> {
         let session = self.find_session(id).await?;
         self.require_control(session.pane_id).await?;
+        let client = self.connection.client()?;
         bounded_rpc(
             "renaming a session",
-            self.client.set_tab_title(TabTitleChanged { tab_id: session.tab_id, title }),
+            client.set_tab_title(TabTitleChanged { tab_id: session.tab_id, title }),
         )
         .await?;
         Ok(())
@@ -582,6 +459,19 @@ impl ConsoleClient {
         }
     }
 
+    pub async fn acquire_control(&self, id: SessionId) -> Result<()> {
+        let session = self.find_session(id).await?;
+        match self.apply_control(session.pane_id, ControlLeaseAction::Acquire).await? {
+            SessionControl::Controller => Ok(()),
+            SessionControl::Observer => {
+                bail!("this Console attachment is observing the session; take control to edit it")
+            }
+            SessionControl::Synchronizing | SessionControl::Uncontrolled => {
+                bail!("Console agent did not establish control of session {id}")
+            }
+        }
+    }
+
     pub async fn send_key(&self, id: SessionId, event: CrosstermKeyEvent) -> Result<()> {
         if event.kind == KeyEventKind::Release {
             return Ok(());
@@ -591,9 +481,10 @@ impl ConsoleClient {
         let Some((key, modifiers)) = map_key(event) else {
             return Ok(());
         };
+        let client = self.connection.client()?;
         bounded_rpc(
             "sending terminal input",
-            self.client.key_down(SendKeyDown {
+            client.key_down(SendKeyDown {
                 pane_id: session.pane_id,
                 event: KeyEvent { key, modifiers },
                 input_serial: InputSerial::now(),
@@ -606,9 +497,10 @@ impl ConsoleClient {
     pub async fn paste(&self, id: SessionId, text: String) -> Result<()> {
         let session = self.find_session(id).await?;
         self.require_control(session.pane_id).await?;
+        let client = self.connection.client()?;
         bounded_rpc(
             "pasting into a session",
-            self.client.send_paste(SendPaste { pane_id: session.pane_id, data: text }),
+            client.send_paste(SendPaste { pane_id: session.pane_id, data: text }),
         )
         .await?;
         Ok(())
@@ -629,9 +521,10 @@ impl ConsoleClient {
         };
         let session = self.find_session(id).await?;
         self.require_control(session.pane_id).await?;
+        let client = self.connection.client()?;
         bounded_rpc(
             "sending terminal mouse input",
-            self.client.mouse_event(SendMouseEvent { pane_id: session.pane_id, event }),
+            client.mouse_event(SendMouseEvent { pane_id: session.pane_id, event }),
         )
         .await?;
         Ok(true)
@@ -640,9 +533,10 @@ impl ConsoleClient {
     pub async fn resize(&self, id: SessionId, cols: u16, rows: u16) -> Result<()> {
         let session = self.find_session(id).await?;
         self.require_control(session.pane_id).await?;
+        let client = self.connection.client()?;
         bounded_rpc(
             "resizing a session",
-            self.client.resize(Resize {
+            client.resize(Resize {
                 containing_tab_id: session.tab_id,
                 pane_id: session.pane_id,
                 size: terminal_size(cols, rows),
@@ -669,9 +563,10 @@ impl ConsoleClient {
         pane_id: usize,
         action: ControlLeaseAction,
     ) -> Result<SessionControl> {
+        let client = self.connection.client()?;
         let result = bounded_rpc(
             "updating terminal control",
-            self.client.control_lease(ControlLeaseRequest { pane_id, action }),
+            client.control_lease(ControlLeaseRequest { pane_id, action }),
         )
         .await?
         .into_inner();
@@ -709,18 +604,19 @@ impl ConsoleClient {
     }
 
     async fn list_sessions(&self) -> Result<Vec<SessionView>> {
-        let panes = bounded_rpc("listing sessions", self.client.list_panes()).await?.into_inner();
+        let client = self.connection.client()?;
+        let panes = bounded_rpc("listing sessions", client.list_panes()).await?.into_inner();
         let mut sessions = Vec::new();
         for (root, tab_title) in panes.tabs.into_iter().zip(panes.tab_titles) {
-            flatten_panes(&self.client, root, &tab_title, &mut sessions);
+            flatten_panes(&client, root, &tab_title, &mut sessions);
         }
         sessions.sort_by_key(|session| session.id);
         Ok(sessions)
     }
 
     fn terminal_view(&self, session: &SessionView) -> Result<Option<TerminalView>> {
-        let Some(local_pane_id) = self.projection.domain.remote_to_local_pane_id(session.pane_id)
-        else {
+        let domain = self.connection.domain()?;
+        let Some(local_pane_id) = domain.remote_to_local_pane_id(session.pane_id) else {
             return Ok(None);
         };
         let Some(pane) = Mux::get().get_pane(local_pane_id) else {
@@ -790,21 +686,6 @@ fn session_control(status: PaneControlStatus) -> SessionControl {
         PaneControlStatus::Uncontrolled => SessionControl::Uncontrolled,
         PaneControlStatus::Controller => SessionControl::Controller,
         PaneControlStatus::Observer => SessionControl::Observer,
-    }
-}
-
-fn map_connection_state(state: HeadlessConnectionState) -> ConnectionState {
-    match state {
-        HeadlessConnectionState::Attaching => ConnectionState::Attaching,
-        HeadlessConnectionState::Reconnecting { attempt } => {
-            ConnectionState::Reconnecting { attempt }
-        }
-        HeadlessConnectionState::Ready => ConnectionState::Ready,
-        HeadlessConnectionState::Failed(
-            wezterm_client::client::HeadlessConnectionFailure::RetryExhausted,
-        ) => ConnectionState::RetryExhausted,
-        HeadlessConnectionState::Failed(_) => ConnectionState::Failed,
-        HeadlessConnectionState::Detached => ConnectionState::Detached,
     }
 }
 
@@ -963,15 +844,6 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
-
-    #[test]
-    fn connection_lifecycle_maps_without_losing_reconnect_attempts() {
-        assert_eq!(
-            map_connection_state(HeadlessConnectionState::Reconnecting { attempt: 3 }),
-            ConnectionState::Reconnecting { attempt: 3 }
-        );
-        assert_eq!(map_connection_state(HeadlessConnectionState::Ready), ConnectionState::Ready);
-    }
 
     struct SocketFixture {
         runtime_dir: PathBuf,

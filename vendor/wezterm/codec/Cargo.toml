@@ -23,6 +23,7 @@ varbincode.workspace = true
 wezterm-term = { workspace=true, features=["use_serde"] }
 wezterm-runtime-admission.workspace = true
 zstd.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 base91.workspace = true

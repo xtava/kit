@@ -276,6 +276,7 @@ xkbcommon = "0.7.0"
 xml-rs = "0.8"
 zbus = "4.2"
 zstd = "0.11"
+zeroize = "1"
 zvariant = "4.0"
 
 [patch.crates-io]
