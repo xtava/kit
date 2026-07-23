@@ -297,6 +297,9 @@ async fn close_all_sessions(
     sessions: Vec<super::client::SessionView>,
 ) -> Result<()> {
     for session in sessions {
+        client.take_control(session.id).await.with_context(|| {
+            format!("taking control of Console pane {} ({})", session.pane_id, session.title)
+        })?;
         client.close_pane(session.pane_id).await.with_context(|| {
             format!("closing Console pane {} ({})", session.pane_id, session.title)
         })?;
