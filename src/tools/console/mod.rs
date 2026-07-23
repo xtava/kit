@@ -1,5 +1,6 @@
 //! console — persistent terminal sessions backed by the embedded WezTerm mux.
 
+mod activity;
 mod agent;
 mod authorization;
 mod bridge;

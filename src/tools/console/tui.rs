@@ -24,6 +24,7 @@ use crate::tui::{
     SplitMinimums, SplitRatio,
 };
 
+use super::activity::{AgentActivity, AgentPresentation};
 use super::client::{
     ConnectionHealth, ConnectionState, ConsoleClient, ConsoleSnapshot, SessionControl, SessionId,
     SessionView, TerminalContentGeometry, TerminalView,
@@ -1839,20 +1840,19 @@ fn render_sessions(frame: &mut Frame<'_>, area: Rect, app: &App, regions: &mut U
         &mut state,
     );
     let offset = state.offset();
-    regions.session_rows = app
-        .snapshot
-        .sessions
-        .iter()
-        .skip(offset)
-        .take(usize::from(chunks[0].height))
-        .enumerate()
-        .map(|(row, session)| {
-            (
-                Rect::new(chunks[0].x, chunks[0].y.saturating_add(row as u16), chunks[0].width, 1),
-                session.id,
-            )
-        })
-        .collect();
+    regions.session_rows.clear();
+    let mut row = chunks[0].y;
+    let bottom = chunks[0].y.saturating_add(chunks[0].height);
+    for session in app.snapshot.sessions.iter().skip(offset) {
+        let height = session_item_height(session);
+        if row.saturating_add(height) > bottom {
+            break;
+        }
+        regions
+            .session_rows
+            .push((Rect::new(chunks[0].x, row, chunks[0].width, height), session.id));
+        row = row.saturating_add(height);
+    }
     for (row, id) in &regions.session_rows {
         let control_width = row.width.min(11);
         let control_area = Rect::new(
@@ -1899,13 +1899,70 @@ fn session_item(session: &SessionView, surface: &Surface, width: usize) -> ListI
     let status_width = 10.min(width);
     let title_width = width.saturating_sub(status_width.saturating_add(1));
     title.truncate(title.char_indices().nth(title_width).map_or(title.len(), |(index, _)| index));
-    ListItem::new(Line::from(vec![
-        Span::styled(format!("{title:<title_width$} "), Style::default().fg(NORD.text)),
+    let title_style = session
+        .agent
+        .filter(|agent| {
+            matches!(agent.activity, AgentActivity::NeedsAttention)
+                || matches!(agent.activity, AgentActivity::Idle) && !agent.seen
+        })
+        .map_or_else(
+            || Style::default().fg(NORD.text),
+            |agent| Style::default().fg(agent_color(agent)).add_modifier(Modifier::BOLD),
+        );
+    let primary = Line::from(vec![
+        Span::styled(format!("{title:<title_width$} "), title_style),
         Span::styled(
             format!("{status:>status_width$}"),
             Style::default().fg(control_color(session.control)),
         ),
-    ]))
+    ]);
+    match session.agent {
+        Some(agent) => {
+            let color = agent_color(agent);
+            ListItem::new(vec![
+                primary,
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(agent_icon(agent), Style::default().fg(color)),
+                    Span::raw(" "),
+                    Span::styled(agent.kind.label(), Style::default().fg(NORD.text_muted)),
+                    Span::styled(
+                        format!(" · {}", agent.status_label()),
+                        Style::default().fg(color),
+                    ),
+                ]),
+            ])
+        }
+        None => ListItem::new(primary),
+    }
+}
+
+fn session_item_height(session: &SessionView) -> u16 {
+    if session.agent.is_some() {
+        2
+    } else {
+        1
+    }
+}
+
+fn agent_icon(agent: AgentPresentation) -> &'static str {
+    match (agent.activity, agent.seen) {
+        (AgentActivity::NeedsAttention, _) => "◉",
+        (AgentActivity::Working, _) => "●",
+        (AgentActivity::Idle, false) => "●",
+        (AgentActivity::Idle, true) => "✓",
+        (AgentActivity::Unknown, _) => "○",
+    }
+}
+
+fn agent_color(agent: AgentPresentation) -> Color {
+    match (agent.activity, agent.seen) {
+        (AgentActivity::NeedsAttention, _) => NORD.danger,
+        (AgentActivity::Working, _) => NORD.warning,
+        (AgentActivity::Idle, false) => NORD.accent_alt,
+        (AgentActivity::Idle, true) => NORD.success,
+        (AgentActivity::Unknown, _) => NORD.text_muted,
+    }
 }
 
 fn control_label(control: SessionControl) -> &'static str {
@@ -2278,6 +2335,7 @@ fn cell_color(color: ColorAttribute) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::console::activity::AgentKind;
     use wezterm_term::Line as TerminalLine;
 
     fn context(control: SessionControl) -> ConsoleActionContext {
@@ -2548,6 +2606,24 @@ mod tests {
         assert_eq!(visible_line_range(20, 5, 0), 15..20);
         assert_eq!(visible_line_range(20, 5, 3), 12..17);
         assert_eq!(visible_line_range(3, 5, usize::MAX), 0..3);
+    }
+
+    #[test]
+    fn agent_attention_projection_keeps_blocked_and_unseen_done_distinct() {
+        let blocked = AgentPresentation {
+            kind: AgentKind::Claude,
+            activity: AgentActivity::NeedsAttention,
+            seen: false,
+        };
+        let done = AgentPresentation {
+            kind: AgentKind::Codex,
+            activity: AgentActivity::Idle,
+            seen: false,
+        };
+
+        assert_eq!((agent_icon(blocked), agent_color(blocked)), ("◉", NORD.danger));
+        assert_eq!((agent_icon(done), agent_color(done)), ("●", NORD.accent_alt));
+        assert_eq!((blocked.status_label(), done.status_label()), ("needs input", "done"));
     }
 
     #[test]

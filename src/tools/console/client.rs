@@ -31,6 +31,8 @@ use wezterm_term::{
     MouseEventKind as WeztermMouseEventKind, TerminalSize,
 };
 
+use super::activity::{self, ActivityTracker, AgentEvidence, AgentPresentation};
+
 pub type SessionId = usize;
 
 // This bounds the complete WezTerm attach, including bootstrap, ListPanes, and construction of the
@@ -40,6 +42,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const RPC_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_PROJECTED_TERMINAL_ROWS: isize = 1_024;
+const MAX_AGENT_DETECTION_ROWS: isize = 16;
 const REMOTE_RECONNECT_ATTEMPTS: NonZeroU32 = NonZeroU32::new(8).unwrap();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -85,6 +88,9 @@ pub struct SessionView {
     pub window_id: usize,
     pub title: String,
     pub control: SessionControl,
+    pub agent: Option<AgentPresentation>,
+    pane_title: String,
+    foreground_process_name: Option<String>,
 }
 
 pub struct TerminalView {
@@ -115,6 +121,7 @@ pub(crate) enum ConsoleSocketProbe {
 pub struct ConsoleClient {
     connection: ConnectionHandle,
     remote_status: Option<Arc<Mutex<watch::Receiver<Option<super::service::ConsoleStatus>>>>>,
+    activity: Mutex<ActivityTracker>,
 }
 
 pub(crate) fn console_runtime_dir() -> Result<PathBuf> {
@@ -321,6 +328,7 @@ impl ConsoleClient {
         Ok(Self {
             connection,
             remote_status: remote_status.map(|receiver| Arc::new(Mutex::new(receiver))),
+            activity: Mutex::new(ActivityTracker::default()),
         })
     }
 
@@ -355,7 +363,17 @@ impl ConsoleClient {
     }
 
     pub async fn snapshot(&self, selected: Option<SessionId>) -> Result<ConsoleSnapshot> {
-        let sessions = self.list_sessions().await?;
+        let mut sessions = self.list_sessions().await?;
+        let detections = sessions
+            .iter()
+            .map(|session| self.detect_agent_activity(session))
+            .collect::<Result<Vec<_>>>()?;
+        let mut tracker = self.activity.lock().unwrap();
+        for (session, detection) in sessions.iter_mut().zip(detections) {
+            session.agent = tracker.observe(session.id, detection, selected == Some(session.id));
+        }
+        tracker.retain(sessions.iter().map(|session| session.id));
+        drop(tracker);
         let selected = selected.and_then(|id| sessions.iter().find(|session| session.id == id));
         let terminal = match selected {
             Some(session) => self.terminal_view(session)?,
@@ -646,6 +664,39 @@ impl ConsoleClient {
             lines,
         }))
     }
+
+    fn detect_agent_activity(
+        &self,
+        session: &SessionView,
+    ) -> Result<Option<activity::AgentDetection>> {
+        let domain = self.connection.domain()?;
+        let Some(local_pane_id) = domain.remote_to_local_pane_id(session.pane_id) else {
+            return Ok(activity::detect(AgentEvidence {
+                foreground_process_name: session.foreground_process_name.as_deref(),
+                title: &session.pane_title,
+                screen: "",
+            }));
+        };
+        let Some(pane) = Mux::get().get_pane(local_pane_id) else {
+            return Ok(None);
+        };
+        let dimensions = pane.get_dimensions();
+        let end = dimensions
+            .physical_top
+            .checked_add(dimensions.viewport_rows as isize)
+            .context("computing Console agent-detection range")?;
+        let start =
+            dimensions.physical_top.max(end.saturating_sub(MAX_AGENT_DETECTION_ROWS)).min(end);
+        let _ = pane.get_changed_since(start..end, pane.get_current_seqno());
+        let (_, lines) = pane.get_lines(start..end);
+        let screen = lines.iter().map(Line::as_str).collect::<Vec<_>>().join("\n");
+        let title = pane.get_title();
+        Ok(activity::detect(AgentEvidence {
+            foreground_process_name: session.foreground_process_name.as_deref(),
+            title: &title,
+            screen: &screen,
+        }))
+    }
 }
 
 async fn bounded_rpc<T>(
@@ -674,8 +725,11 @@ fn flatten_panes(
             pane_id: pane.pane_id,
             tab_id: pane.tab_id,
             window_id: pane.window_id,
-            title: if tab_title.is_empty() { pane.title } else { tab_title.to_owned() },
+            title: if tab_title.is_empty() { pane.title.clone() } else { tab_title.to_owned() },
             control: session_control(client.pane_control_status(pane.pane_id)),
+            agent: None,
+            pane_title: pane.title,
+            foreground_process_name: pane.foreground_process_name,
         }),
     }
 }

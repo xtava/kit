@@ -889,16 +889,28 @@ where
         .await
         .context("encoding a bootstrap PDU")?;
     stream.flush().await.context("flushing a bootstrap PDU")?;
-    let response = read_server_pdu_async(
-        stream,
-        |response_serial| (response_serial == serial).then_some(expected_response),
-        admission,
-    )
-    .await?;
-    if matches!(response.pdu(), Pdu::AttachRejected(_)) {
-        return Err(AttachmentRejectedError.into());
+    loop {
+        let response = read_server_pdu_async(
+            stream,
+            |response_serial| (response_serial == serial).then_some(expected_response),
+            admission,
+        )
+        .await?;
+        if matches!(response.pdu(), Pdu::AttachRejected(_)) {
+            return Err(AttachmentRejectedError.into());
+        }
+        if response.serial() == 0 {
+            // Broadcasts can race with a new connection before SetClientId completes. The
+            // post-bootstrap ListPanes/control snapshots supersede those pre-registration
+            // notifications, so consume them here instead of misclassifying them as the reply.
+            log::trace!(
+                "discarding pre-registration {} notification during bootstrap",
+                response.pdu().pdu_name()
+            );
+            continue;
+        }
+        return response.into_rpc_response();
     }
-    response.into_rpc_response()
 }
 
 async fn bootstrap_client_stream_async<R>(
@@ -3462,6 +3474,39 @@ mod admission_tests {
             }
         }
         assert!(written.is_empty());
+    }
+
+    #[test]
+    fn stream_bootstrap_skips_broadcast_before_correlated_response() {
+        let admission = RuntimeAdmission::new(RuntimeRole::Client).unwrap();
+        let mut readable = Vec::new();
+        Pdu::PaneRemoved(PaneRemoved { pane_id: 91 })
+            .encode(&mut readable, 0, &admission)
+            .unwrap();
+        Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+            codec_vers: CODEC_VERSION,
+            version_string: "test-version".to_string(),
+            executable_path: PathBuf::from("/test/kit"),
+            config_file_path: None,
+        })
+        .encode(&mut readable, 1, &admission)
+        .unwrap();
+        let mut stream = ScriptedBootstrapStream {
+            readable: Cursor::new(readable),
+            written: Vec::new(),
+        };
+        let permit = reserve_client_request(&admission).unwrap();
+
+        let response = block_on(bootstrap_request(
+            &mut stream,
+            1,
+            Pdu::GetCodecVersion(GetCodecVersion {}),
+            &admission,
+            &permit,
+        ))
+        .unwrap();
+
+        assert!(matches!(response.value(), Pdu::GetCodecVersionResponse(_)));
     }
 
     #[test]
