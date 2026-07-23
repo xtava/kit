@@ -743,6 +743,16 @@ async fn process_unilateral_async(
         .pane_id()
         .ok_or_else(|| anyhow!("don't know how to handle {notification:?}"))?;
 
+    // Service-management clients inspect and close remote panes without projecting them into the
+    // local mux. A removal for such a pane is already fully reconciled from this client's point of
+    // view and must not terminate the connection while the remaining panes are being drained.
+    if matches!(notification.pdu(), Pdu::PaneRemoved(_))
+        && client_domain.remote_to_local_pane_id(pane_id).is_none()
+    {
+        log::debug!("ignoring removal for unprojected remote pane {pane_id}");
+        return Ok(());
+    }
+
     // If we get a push for a pane that we don't yet know about, another
     // client changed the topology. Resync before resolving the final owner.
     let local_pane_id = match client_domain.remote_to_local_pane_id(pane_id) {
