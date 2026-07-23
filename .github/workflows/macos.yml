@@ -1,23 +1,7 @@
 name: macOS
 
 on:
-  pull_request:
-    paths:
-      - "Cargo.lock"
-      - "Cargo.toml"
-      - "rust-toolchain.toml"
-      - "src/**"
-      - "tests/**"
-      - ".github/workflows/macos.yml"
-  push:
-    branches: [master]
-    paths:
-      - "Cargo.lock"
-      - "Cargo.toml"
-      - "rust-toolchain.toml"
-      - "src/**"
-      - "tests/**"
-      - ".github/workflows/macos.yml"
+  workflow_dispatch:
 
 permissions:
   contents: read

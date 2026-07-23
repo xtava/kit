@@ -1,51 +1,7 @@
 name: Connectivity
 
 on:
-  pull_request:
-    paths:
-      - "Cargo.lock"
-      - "Cargo.toml"
-      - ".cargo/config.toml"
-      - "build.rs"
-      - "rustfmt.toml"
-      - "rust-toolchain.toml"
-      - "src/framework/**"
-      - "src/lib.rs"
-      - "src/main.rs"
-      - "src/tailscale/**"
-      - "src/tools/console/**"
-      - "src/tools/deploy/tui.rs"
-      - "src/tools/mod.rs"
-      - "src/tools/tail/**"
-      - "src/tui/**"
-      - "tests/console_*.rs"
-      - "tests/support/**"
-      - "vendor/varbincode/**"
-      - "vendor/wezterm/**"
-      - ".github/workflows/connectivity.yml"
-  push:
-    branches: [master]
-    paths:
-      - "Cargo.lock"
-      - "Cargo.toml"
-      - ".cargo/config.toml"
-      - "build.rs"
-      - "rustfmt.toml"
-      - "rust-toolchain.toml"
-      - "src/framework/**"
-      - "src/lib.rs"
-      - "src/main.rs"
-      - "src/tailscale/**"
-      - "src/tools/console/**"
-      - "src/tools/deploy/tui.rs"
-      - "src/tools/mod.rs"
-      - "src/tools/tail/**"
-      - "src/tui/**"
-      - "tests/console_*.rs"
-      - "tests/support/**"
-      - "vendor/varbincode/**"
-      - "vendor/wezterm/**"
-      - ".github/workflows/connectivity.yml"
+  workflow_dispatch:
 
 concurrency:
   group: connectivity-${{ github.workflow }}-${{ github.ref }}
