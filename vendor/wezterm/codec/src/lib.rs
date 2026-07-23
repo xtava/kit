@@ -948,7 +948,7 @@ macro_rules! pdu {
                 admission: &RuntimeAdmission,
             ) -> Result<AdmittedDecodedPdu, Error> {
                 let heap_envelope = body.tag.decode_heap_envelope();
-                let heap = admission
+                let mut heap = admission
                     .try_bytes(ByteClass::DecodeWorking, heap_envelope)
                     .with_context(|| {
                         format!("reserving decoded heap envelope for {}", body.tag.name())
@@ -965,6 +965,11 @@ macro_rules! pdu {
                 };
                 drop(data);
                 drop(wire);
+                let retained_heap = pdu
+                    .checked_retained_decode_heap_bytes()
+                    .context("decoded PDU retained heap accounting overflow")?;
+                heap.try_shrink_to(retained_heap)
+                    .context("decoded PDU exceeds its heap envelope")?;
                 Ok(AdmittedDecodedPdu {
                     serial,
                     pdu,
@@ -2116,6 +2121,40 @@ pub struct SerializedLines {
 }
 
 impl SerializedLines {
+    fn checked_retained_heap_bytes(&self) -> Option<usize> {
+        let mut bytes = self
+            .lines
+            .capacity()
+            .checked_mul(std::mem::size_of::<(StableRowIndex, Line)>())?
+            .checked_add(
+                self.hyperlinks
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<LineHyperlink>())?,
+            )?
+            .checked_add(
+                self.images
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<SerializedImageCell>())?,
+            )?;
+
+        for (_, line) in &self.lines {
+            bytes = bytes.checked_add(line.checked_retained_heap_size_excluding_image_data()?)?;
+        }
+        for hyperlink in &self.hyperlinks {
+            let link_heap = hyperlink
+                .link
+                .retained_size()
+                .checked_sub(std::mem::size_of::<Hyperlink>())?;
+            bytes = bytes.checked_add(link_heap)?.checked_add(
+                hyperlink
+                    .coords
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<CellCoordinates>())?,
+            )?;
+        }
+        Some(bytes)
+    }
+
     /// Reconsitute hyperlinks or other attributes that were decomposed for
     /// serialization, and return the line data.
     pub fn extract_data(self) -> (Vec<(StableRowIndex, Line)>, Vec<SerializedImageCell>) {
@@ -2278,6 +2317,31 @@ pub struct GetImageCell {
 pub struct GetImageCellResponse {
     pub pane_id: PaneId,
     pub data: Option<Arc<ImageData>>,
+}
+
+impl Pdu {
+    fn checked_retained_decode_heap_bytes(&self) -> Option<usize> {
+        match self {
+            Self::GetPaneRenderChangesResponse(response) => {
+                let dirty_lines = response
+                    .dirty_lines
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<Range<StableRowIndex>>())?;
+                // `SerdeUrl` is decoded from one bounded string. Reserve the worst-case
+                // three-byte escaping expansion because `url::Url` does not expose capacity.
+                let working_dir = if response.working_dir.is_some() {
+                    MAX_WIRE_STRING_BYTES.checked_mul(3)?
+                } else {
+                    0
+                };
+                dirty_lines
+                    .checked_add(response.title.capacity())?
+                    .checked_add(working_dir)?
+                    .checked_add(response.bonus_lines.checked_retained_heap_bytes()?)
+            }
+            _ => self.tag().map(PduTag::decode_heap_envelope),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2699,6 +2763,46 @@ mod test {
         );
 
         let _result = response.into_inner();
+        assert_eq!(admission.byte_usage(ByteClass::DecodeWorking), 0);
+    }
+
+    #[test]
+    fn render_notification_retains_its_measured_heap_not_the_materialization_envelope() {
+        let admission = admission();
+        let mut encoded = Vec::new();
+        Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse {
+            pane_id: 7,
+            mouse_grabbed: false,
+            cursor_position: StableCursorPosition::default(),
+            dimensions: RenderableDimensions::default(),
+            dirty_lines: Vec::new(),
+            title: "shell".to_owned(),
+            working_dir: None,
+            bonus_lines: SerializedLines::default(),
+            input_serial: None,
+            seqno: 0,
+        })
+        .encode(&mut encoded, 0, &admission)
+        .unwrap();
+
+        let notification = Pdu::decode(
+            encoded.as_slice(),
+            DecodeContext::server_to_client_notification(),
+            &admission,
+        )
+        .unwrap()
+        .into_notification()
+        .unwrap();
+        assert!(matches!(
+            notification.pdu(),
+            Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse { pane_id: 7, .. })
+        ));
+        assert_eq!(
+            admission.byte_usage(ByteClass::DecodeWorking),
+            "shell".len()
+        );
+
+        drop(notification);
         assert_eq!(admission.byte_usage(ByteClass::DecodeWorking), 0);
     }
 

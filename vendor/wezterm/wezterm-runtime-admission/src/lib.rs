@@ -620,6 +620,20 @@ impl BytePermit {
     pub fn bytes(&self) -> usize {
         self.0.amount
     }
+
+    /// Releases materialization headroom after a bounded value has been constructed.
+    ///
+    /// This can only shrink an existing charge, including during shutdown. Callers must measure
+    /// the retained value before publishing it; growing requires a fresh admission decision.
+    pub fn try_shrink_to(&mut self, bytes: usize) -> Result<(), AdmissionError> {
+        if bytes > self.bytes() {
+            return Err(AdmissionError::InvalidFormula(
+                "byte-permit shrink exceeds the source permit",
+            ));
+        }
+        self.0.release(self.bytes() - bytes);
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -1117,6 +1131,25 @@ mod tests {
         assert!(admission.try_bytes(ByteClass::ClientRequest, 1).is_err());
         drop(permit);
         assert_eq!(admission.byte_usage(ByteClass::ClientRequest), 0);
+    }
+
+    #[test]
+    fn byte_permit_shrink_releases_only_materialization_headroom() {
+        let admission = RuntimeAdmission::new(RuntimeRole::Client).unwrap();
+        let mut permit = admission.try_bytes(ByteClass::DecodeWorking, 64).unwrap();
+
+        permit.try_shrink_to(7).unwrap();
+        assert_eq!(permit.bytes(), 7);
+        assert_eq!(admission.byte_usage(ByteClass::DecodeWorking), 7);
+        assert!(matches!(
+            permit.try_shrink_to(8),
+            Err(AdmissionError::InvalidFormula(_))
+        ));
+        assert_eq!(permit.bytes(), 7);
+        assert_eq!(admission.byte_usage(ByteClass::DecodeWorking), 7);
+
+        drop(permit);
+        assert_eq!(admission.byte_usage(ByteClass::DecodeWorking), 0);
     }
 
     #[test]
