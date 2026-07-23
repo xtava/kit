@@ -25,8 +25,8 @@ pub mod theme;
 
 pub use actions::{
     ActionId, ActionInvocation, ActionRegistry, ActionRegistryBuilder, ActionRegistryError,
-    ActionSpec, ActionState, ActionUnavailable, KeyChord, KeybindingPlacement, MenuId,
-    MenuPlacement, ResolvedAction, ResolvedMenu,
+    ActionSpec, ActionState, ActionUnavailable, KeyChord, Keybinding, KeybindingPlacement,
+    KeybindingResolution, KeybindingState, MenuId, MenuPlacement, ResolvedAction, ResolvedMenu,
 };
 pub use commandline::{CommandSet, CommandSpec, ParsedInput};
 pub use context_menu::{

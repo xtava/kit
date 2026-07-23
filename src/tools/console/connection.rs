@@ -83,6 +83,7 @@ struct LifecycleGeneration {
 struct ClientProjection {
     domain: Arc<ClientDomain>,
     mux: Arc<Mux>,
+    detaching: Arc<std::sync::atomic::AtomicBool>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
     executor: SimpleExecutorHandle,
     owner: Mutex<Option<JoinHandle<Result<()>>>>,
@@ -158,7 +159,7 @@ impl OwnerState {
 
         self.client.lock().unwrap().take();
         self.lifecycle.lock().unwrap().take();
-        self.projection.domain.perform_detach();
+        self.projection.detach();
         self.projection.quiesce().await?;
 
         generation.number = generation
@@ -206,6 +207,8 @@ impl ClientProjection {
         let admission = RuntimeAdmission::new(RuntimeRole::Client)?;
         let executor = Arc::new(SimpleExecutor::new(Arc::clone(&admission)));
         let executor_handle = executor.handle();
+        let detaching = Arc::new(AtomicBool::new(false));
+        let owner_detaching = Arc::clone(&detaching);
         let shutdown = Arc::new(AtomicBool::new(false));
         let owner_shutdown = Arc::clone(&shutdown);
         let (ready_tx, ready_rx) = sync_channel(1);
@@ -226,6 +229,11 @@ impl ClientProjection {
                         break Ok(());
                     }
                     if let Err(error) = mux.tick_headless() {
+                        if owner_detaching.load(Ordering::Acquire) {
+                            let _expected_detach_error = error;
+                            std::thread::yield_now();
+                            continue;
+                        }
                         eprintln!("Console client projection stopped: {error:#}");
                         break Err(error.context("ticking Console client projection"));
                     }
@@ -247,6 +255,7 @@ impl ClientProjection {
         Ok(Self {
             domain,
             mux,
+            detaching,
             shutdown,
             executor: executor_handle,
             owner: Mutex::new(Some(owner)),
@@ -261,6 +270,14 @@ impl ClientProjection {
             .context("joining Console connection cleanup barrier")?;
         Ok(())
     }
+
+    fn detach(&self) {
+        use std::sync::atomic::Ordering;
+
+        self.detaching.store(true, Ordering::Release);
+        self.domain.perform_detach();
+        self.detaching.store(false, Ordering::Release);
+    }
 }
 
 impl Drop for ClientProjection {
@@ -268,7 +285,7 @@ impl Drop for ClientProjection {
         use std::sync::atomic::Ordering;
 
         if Mux::try_get().is_some() {
-            self.domain.perform_detach();
+            self.detach();
         }
         self.shutdown.store(true, Ordering::Release);
         let wake = self.executor.try_spawn(async {});

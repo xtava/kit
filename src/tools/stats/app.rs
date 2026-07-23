@@ -19,8 +19,8 @@ use super::model::{
 use super::render::UiRegions;
 use super::tree::{FamilyView, ProcessForest, TreeQuery, TreeSort};
 use crate::tui::{
-    ActionInvocation, ContextMenu, ContextMenuOutcome, Direction, KeyChord, LineEditor, SplitDrag,
-    SplitRatio,
+    ActionInvocation, ContextMenu, ContextMenuOutcome, Direction, KeyChord, KeybindingResolution,
+    KeybindingState, LineEditor, SplitDrag, SplitRatio,
 };
 
 const HISTORY: usize = 120;
@@ -241,6 +241,7 @@ impl ConfirmationChoice {
 pub(super) struct StatsApp {
     pub(super) snapshot: Arc<StatsSnapshot>,
     pub(super) registry: StatsActionRegistry,
+    keybinding_state: KeybindingState,
     pub(super) pointer_enabled: bool,
     forest: ProcessForest,
     pub(super) detail: Option<Arc<DetailSnapshot>>,
@@ -302,6 +303,7 @@ impl StatsApp {
         let mut app = Self {
             snapshot,
             registry,
+            keybinding_state: KeybindingState::default(),
             pointer_enabled,
             forest,
             detail: None,
@@ -859,8 +861,11 @@ impl StatsApp {
         }
         if let (Some(chord), Some(identity)) = (KeyChord::from_event(key), self.selected) {
             let context = self.action_context(identity);
-            if let Some(invocation) = self.registry.resolve_keybinding(chord, context) {
-                return self.invoke_action(invocation);
+            match self.registry.resolve_keybinding(&mut self.keybinding_state, chord, context) {
+                KeybindingResolution::Invoke(invocation) => return self.invoke_action(invocation),
+                KeybindingResolution::Pending => return Action::None,
+                KeybindingResolution::Unmatched
+                | KeybindingResolution::UnmatchedSequence { .. } => {}
             }
         }
         match key.code {

@@ -5,7 +5,7 @@ use std::num::NonZeroU32;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use crossterm::event::{
@@ -32,6 +32,7 @@ use wezterm_term::{
 };
 
 use super::activity::{self, ActivityTracker, AgentEvidence, AgentPresentation};
+use super::perf_trace;
 
 pub type SessionId = usize;
 
@@ -80,7 +81,7 @@ impl TerminalContentGeometry {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct SessionView {
     pub id: SessionId,
     pub pane_id: usize,
@@ -93,6 +94,7 @@ pub struct SessionView {
     foreground_process_name: Option<String>,
 }
 
+#[derive(PartialEq)]
 pub struct TerminalView {
     pub pane_id: usize,
     pub title: String,
@@ -103,11 +105,18 @@ pub struct TerminalView {
     /// Whether the authoritative remote render projection reports terminal mouse capture.
     pub mouse_reporting: bool,
     pub lines: Vec<Line>,
+    pub(super) content_sequence: usize,
 }
 
+#[derive(PartialEq)]
 pub struct ConsoleSnapshot {
     pub sessions: Vec<SessionView>,
     pub terminal: Option<TerminalView>,
+}
+
+pub(super) struct ActivityRefresh {
+    pub changed: bool,
+    pub revisit: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -363,23 +372,49 @@ impl ConsoleClient {
     }
 
     pub async fn snapshot(&self, selected: Option<SessionId>) -> Result<ConsoleSnapshot> {
+        perf_trace::record_snapshot();
         let mut sessions = self.list_sessions().await?;
-        let detections = sessions
-            .iter()
-            .map(|session| self.detect_agent_activity(session))
-            .collect::<Result<Vec<_>>>()?;
-        let mut tracker = self.activity.lock().unwrap();
-        for (session, detection) in sessions.iter_mut().zip(detections) {
-            session.agent = tracker.observe(session.id, detection, selected == Some(session.id));
-        }
-        tracker.retain(sessions.iter().map(|session| session.id));
-        drop(tracker);
-        let selected = selected.and_then(|id| sessions.iter().find(|session| session.id == id));
-        let terminal = match selected {
-            Some(session) => self.terminal_view(session)?,
-            None => None,
-        };
+        let selected_pane = selected
+            .and_then(|id| sessions.iter().find(|session| session.id == id))
+            .map(|session| session.pane_id);
+        let terminal =
+            selected_pane.map(|pane_id| self.project_terminal(pane_id)).transpose()?.flatten();
+        let _ = self.refresh_activity(&mut sessions, selected, terminal.as_ref())?;
         Ok(ConsoleSnapshot { sessions, terminal })
+    }
+
+    pub fn refresh_activity(
+        &self,
+        sessions: &mut [SessionView],
+        selected: Option<SessionId>,
+        selected_terminal: Option<&TerminalView>,
+    ) -> Result<ActivityRefresh> {
+        let mut tracker = self.activity.lock().unwrap();
+        let mut changed = false;
+        let mut revisit = false;
+        let now = Instant::now();
+        for session in sessions.iter_mut() {
+            let terminal = selected_terminal.filter(|terminal| terminal.pane_id == session.pane_id);
+            let observation = self.observe_agent_activity(
+                &mut tracker,
+                session,
+                selected == Some(session.id),
+                terminal,
+                now,
+            )?;
+            let agent = observation.presentation;
+            revisit |= observation.revisit;
+            changed |= session.agent != agent;
+            session.agent = agent;
+        }
+        tracker.retain(|session_id| {
+            sessions.binary_search_by_key(&session_id, |session| session.id).is_ok()
+        });
+        Ok(ActivityRefresh { changed, revisit })
+    }
+
+    pub fn project_terminal(&self, remote_pane_id: usize) -> Result<Option<TerminalView>> {
+        self.terminal_view(remote_pane_id)
     }
 
     pub async fn create_session(&self, cols: u16, rows: u16) -> Result<SessionId> {
@@ -490,12 +525,11 @@ impl ConsoleClient {
         }
     }
 
-    pub async fn send_key(&self, id: SessionId, event: CrosstermKeyEvent) -> Result<()> {
+    pub async fn send_key(&self, pane_id: usize, event: CrosstermKeyEvent) -> Result<()> {
         if event.kind == KeyEventKind::Release {
             return Ok(());
         }
-        let session = self.find_session(id).await?;
-        self.require_control(session.pane_id).await?;
+        self.require_control(pane_id).await?;
         let Some((key, modifiers)) = map_key(event) else {
             return Ok(());
         };
@@ -503,7 +537,7 @@ impl ConsoleClient {
         bounded_rpc(
             "sending terminal input",
             client.key_down(SendKeyDown {
-                pane_id: session.pane_id,
+                pane_id,
                 event: KeyEvent { key, modifiers },
                 input_serial: InputSerial::now(),
             }),
@@ -512,15 +546,11 @@ impl ConsoleClient {
         Ok(())
     }
 
-    pub async fn paste(&self, id: SessionId, text: String) -> Result<()> {
-        let session = self.find_session(id).await?;
-        self.require_control(session.pane_id).await?;
+    pub async fn paste(&self, pane_id: usize, text: String) -> Result<()> {
+        self.require_control(pane_id).await?;
         let client = self.connection.client()?;
-        bounded_rpc(
-            "pasting into a session",
-            client.send_paste(SendPaste { pane_id: session.pane_id, data: text }),
-        )
-        .await?;
+        bounded_rpc("pasting into a session", client.send_paste(SendPaste { pane_id, data: text }))
+            .await?;
         Ok(())
     }
 
@@ -530,33 +560,31 @@ impl ConsoleClient {
     /// caller retains ownership of sidebar, borders, resize handles, and other Kit UI regions.
     pub async fn send_mouse(
         &self,
-        id: SessionId,
+        pane_id: usize,
         event: CrosstermMouseEvent,
         geometry: TerminalContentGeometry,
     ) -> Result<bool> {
         let Some(event) = map_mouse(event, geometry) else {
             return Ok(false);
         };
-        let session = self.find_session(id).await?;
-        self.require_control(session.pane_id).await?;
+        self.require_control(pane_id).await?;
         let client = self.connection.client()?;
         bounded_rpc(
             "sending terminal mouse input",
-            client.mouse_event(SendMouseEvent { pane_id: session.pane_id, event }),
+            client.mouse_event(SendMouseEvent { pane_id, event }),
         )
         .await?;
         Ok(true)
     }
 
-    pub async fn resize(&self, id: SessionId, cols: u16, rows: u16) -> Result<()> {
-        let session = self.find_session(id).await?;
-        self.require_control(session.pane_id).await?;
+    pub async fn resize(&self, tab_id: usize, pane_id: usize, cols: u16, rows: u16) -> Result<()> {
+        self.require_control(pane_id).await?;
         let client = self.connection.client()?;
         bounded_rpc(
             "resizing a session",
             client.resize(Resize {
-                containing_tab_id: session.tab_id,
-                pane_id: session.pane_id,
+                containing_tab_id: tab_id,
+                pane_id,
                 size: terminal_size(cols, rows),
             }),
         )
@@ -622,6 +650,7 @@ impl ConsoleClient {
     }
 
     async fn list_sessions(&self) -> Result<Vec<SessionView>> {
+        perf_trace::record_list_panes();
         let client = self.connection.client()?;
         let panes = bounded_rpc("listing sessions", client.list_panes()).await?.into_inner();
         let mut sessions = Vec::new();
@@ -632,9 +661,10 @@ impl ConsoleClient {
         Ok(sessions)
     }
 
-    fn terminal_view(&self, session: &SessionView) -> Result<Option<TerminalView>> {
+    fn terminal_view(&self, remote_pane_id: usize) -> Result<Option<TerminalView>> {
+        perf_trace::record_terminal_projection();
         let domain = self.connection.domain()?;
-        let Some(local_pane_id) = domain.remote_to_local_pane_id(session.pane_id) else {
+        let Some(local_pane_id) = domain.remote_to_local_pane_id(remote_pane_id) else {
             return Ok(None);
         };
         let Some(pane) = Mux::get().get_pane(local_pane_id) else {
@@ -649,12 +679,13 @@ impl ConsoleClient {
             dimensions.scrollback_top.max(end.saturating_sub(MAX_PROJECTED_TERMINAL_ROWS)).min(end);
         // Drive the projected pane's canonical render-change request before reading its state.
         // The request is owned and deduplicated by ClientPane; a later snapshot observes it.
-        let _ = pane.get_changed_since(start..end, pane.get_current_seqno());
+        let content_sequence = pane.get_current_seqno();
+        let _ = pane.get_changed_since(start..end, content_sequence);
         let (_, lines) = pane.get_lines(start..end);
         let cursor = pane.get_cursor_position();
         let cursor_y = cursor.y.saturating_sub(dimensions.physical_top).max(0) as usize;
         Ok(Some(TerminalView {
-            pane_id: session.pane_id,
+            pane_id: remote_pane_id,
             title: pane.get_title(),
             cols: dimensions.cols,
             rows: dimensions.viewport_rows,
@@ -662,24 +693,64 @@ impl ConsoleClient {
             cursor_y,
             mouse_reporting: pane.is_mouse_grabbed(),
             lines,
+            content_sequence,
         }))
     }
 
-    fn detect_agent_activity(
+    fn observe_agent_activity(
         &self,
+        tracker: &mut ActivityTracker,
         session: &SessionView,
-    ) -> Result<Option<activity::AgentDetection>> {
+        selected: bool,
+        terminal: Option<&TerminalView>,
+        now: Instant,
+    ) -> Result<activity::ActivityObservation> {
+        if let Some(terminal) = terminal {
+            return Ok(tracker.observe_with(
+                session.id,
+                activity::AgentFingerprint {
+                    content_sequence: Some(terminal.content_sequence),
+                    foreground_process_name: session.foreground_process_name.as_deref(),
+                    title: &terminal.title,
+                },
+                selected,
+                now,
+                || {
+                    let screen =
+                        terminal.lines.iter().map(Line::as_str).collect::<Vec<_>>().join("\n");
+                    activity::detect(AgentEvidence {
+                        foreground_process_name: session.foreground_process_name.as_deref(),
+                        title: &terminal.title,
+                        screen: &screen,
+                    })
+                },
+            ));
+        }
         let domain = self.connection.domain()?;
         let Some(local_pane_id) = domain.remote_to_local_pane_id(session.pane_id) else {
-            return Ok(activity::detect(AgentEvidence {
-                foreground_process_name: session.foreground_process_name.as_deref(),
-                title: &session.pane_title,
-                screen: "",
-            }));
+            return Ok(tracker.observe_with(
+                session.id,
+                activity::AgentFingerprint {
+                    content_sequence: None,
+                    foreground_process_name: session.foreground_process_name.as_deref(),
+                    title: &session.pane_title,
+                },
+                selected,
+                now,
+                || {
+                    activity::detect(AgentEvidence {
+                        foreground_process_name: session.foreground_process_name.as_deref(),
+                        title: &session.pane_title,
+                        screen: "",
+                    })
+                },
+            ));
         };
         let Some(pane) = Mux::get().get_pane(local_pane_id) else {
-            return Ok(None);
+            return Ok(activity::ActivityObservation { presentation: None, revisit: false });
         };
+        let content_sequence = pane.get_current_seqno();
+        let title = pane.get_title();
         let dimensions = pane.get_dimensions();
         let end = dimensions
             .physical_top
@@ -687,15 +758,27 @@ impl ConsoleClient {
             .context("computing Console agent-detection range")?;
         let start =
             dimensions.physical_top.max(end.saturating_sub(MAX_AGENT_DETECTION_ROWS)).min(end);
-        let _ = pane.get_changed_since(start..end, pane.get_current_seqno());
-        let (_, lines) = pane.get_lines(start..end);
-        let screen = lines.iter().map(Line::as_str).collect::<Vec<_>>().join("\n");
-        let title = pane.get_title();
-        Ok(activity::detect(AgentEvidence {
-            foreground_process_name: session.foreground_process_name.as_deref(),
-            title: &title,
-            screen: &screen,
-        }))
+        Ok(tracker.observe_with(
+            session.id,
+            activity::AgentFingerprint {
+                content_sequence: Some(content_sequence),
+                foreground_process_name: session.foreground_process_name.as_deref(),
+                title: &title,
+            },
+            selected,
+            now,
+            || {
+                let _ = pane.get_changed_since(start..end, content_sequence);
+                let (_, lines) = pane.get_lines(start..end);
+                perf_trace::record_activity_screen_read();
+                let screen = lines.iter().map(Line::as_str).collect::<Vec<_>>().join("\n");
+                activity::detect(AgentEvidence {
+                    foreground_process_name: session.foreground_process_name.as_deref(),
+                    title: &title,
+                    screen: &screen,
+                })
+            },
+        ))
     }
 }
 

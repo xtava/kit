@@ -648,13 +648,18 @@ impl ClientDomain {
 
     pub fn perform_detach(&self) {
         log::info!("detached domain {}", self.local_domain_id);
+        // Retain the projection mux across client shutdown. Headless owners keep the global slot
+        // active for this explicit detach phase, so projected tasks can finish before the domain is
+        // removed without racing a second global lookup.
+        let mux = Mux::try_get();
         let inner = self.inner.lock().unwrap().take();
         if let Some(inner) = inner {
             let outcome = inner.client.shutdown_and_join();
             log::debug!("client runtime detach outcome: {outcome:?}");
         }
-        let mux = Mux::get();
-        mux.domain_was_detached(self.local_domain_id);
+        if let Some(mux) = mux {
+            mux.domain_was_detached(self.local_domain_id);
+        }
     }
 
     pub fn attached_client(&self) -> Option<Client> {

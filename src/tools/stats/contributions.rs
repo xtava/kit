@@ -7,8 +7,10 @@ use super::host::ProcessAction;
 use super::model::{CapabilityState, HostCapabilities, ProcessIdentity};
 use crate::tui::{
     ActionId, ActionRegistry, ActionRegistryBuilder, ActionRegistryError, ActionSpec, ActionState,
-    KeyChord, KeybindingPlacement, MenuId, MenuPlacement,
+    KeyChord, Keybinding, KeybindingPlacement, MenuId, MenuPlacement,
 };
+#[cfg(test)]
+use crate::tui::{KeybindingResolution, KeybindingState};
 
 pub(super) const VIEW_COMMAND: ActionId = ActionId::new("stats.process.viewCommand");
 pub(super) const OPEN_PROFILE: ActionId = ActionId::new("stats.process.openProfile");
@@ -114,27 +116,27 @@ pub(super) fn contribute_actions(
             when: always,
         })
         .bind_key(KeybindingPlacement {
-            chord: KeyChord::new(KeyCode::Char('v'), KeyModifiers::NONE),
+            binding: Keybinding::chord(KeyChord::new(KeyCode::Char('v'), KeyModifiers::NONE)),
             action: VIEW_COMMAND,
             when: overview,
         })
         .bind_key(KeybindingPlacement {
-            chord: KeyChord::new(KeyCode::Char('p'), KeyModifiers::NONE),
+            binding: Keybinding::chord(KeyChord::new(KeyCode::Char('p'), KeyModifiers::NONE)),
             action: OPEN_PROFILE,
             when: always,
         })
         .bind_key(KeybindingPlacement {
-            chord: KeyChord::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            binding: Keybinding::chord(KeyChord::new(KeyCode::Char('x'), KeyModifiers::NONE)),
             action: TERMINATE,
             when: always,
         })
         .bind_key(KeybindingPlacement {
-            chord: KeyChord::new(KeyCode::Delete, KeyModifiers::NONE),
+            binding: Keybinding::chord(KeyChord::new(KeyCode::Delete, KeyModifiers::NONE)),
             action: TERMINATE,
             when: always,
         })
         .bind_key(KeybindingPlacement {
-            chord: KeyChord::new(KeyCode::Char('X'), KeyModifiers::NONE),
+            binding: Keybinding::chord(KeyChord::new(KeyCode::Char('X'), KeyModifiers::NONE)),
             action: FORCE_TERMINATE,
             when: always,
         });
@@ -282,9 +284,15 @@ mod tests {
                 StatsCommand::RequestTerminate(ProcessAction::ForceTerminate),
             ),
         ] {
-            let invocation = registry
-                .resolve_keybinding(KeyChord::new(code, KeyModifiers::NONE), context)
-                .expect("approved chord must resolve");
+            let mut keybinding_state = KeybindingState::default();
+            let invocation = registry.resolve_keybinding(
+                &mut keybinding_state,
+                KeyChord::new(code, KeyModifiers::NONE),
+                context,
+            );
+            let KeybindingResolution::Invoke(invocation) = invocation else {
+                panic!("approved chord must resolve");
+            };
             assert_eq!(invocation.action, action);
             assert_eq!(registry.command_for(&invocation), Ok(command));
         }
@@ -292,14 +300,15 @@ mod tests {
         let mut non_overview = context;
         non_overview.inspector_tab = InspectorTab::Threads;
         assert!(registry.resolve_menu(PROCESS_COMMAND_INLINE, &non_overview).is_empty());
-        assert!(
-            registry
-                .resolve_keybinding(
-                    KeyChord::new(KeyCode::Char('v'), KeyModifiers::NONE),
-                    non_overview,
-                )
-                .is_none()
-        );
+        let mut keybinding_state = KeybindingState::default();
+        assert!(matches!(
+            registry.resolve_keybinding(
+                &mut keybinding_state,
+                KeyChord::new(KeyCode::Char('v'), KeyModifiers::NONE),
+                non_overview,
+            ),
+            KeybindingResolution::Unmatched
+        ));
     }
 
     #[test]

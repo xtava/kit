@@ -1,6 +1,7 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use anyhow::{bail, Result};
+use crossterm::event::{KeyCode, KeyModifiers};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -8,12 +9,17 @@ use crate::{
         ConfigStore, ConfigValue, EditableSettings, SettingEdit, SettingField, SettingId,
         SettingsSection, SettingsSectionMeta,
     },
-    tui::SplitRatio,
+    tui::{KeyChord, SplitRatio},
 };
 
 const TOOL: &str = "console";
 const SIDEBAR_WIDTH: SettingId = SettingId("sidebar_width");
 const SIDEBAR_SPLIT_RATIO: &str = "sidebar_split_ratio";
+const PREFIX: SettingId = SettingId("prefix");
+const NEW_SESSION: SettingId = SettingId("new_session");
+const TOGGLE_SESSIONS: SettingId = SettingId("toggle_sessions");
+const HELP: SettingId = SettingId("help");
+const QUIT: SettingId = SettingId("quit");
 
 const COMPACT_SIDEBAR: SplitRatio = SplitRatio::new(200);
 const BALANCED_SIDEBAR: SplitRatio = SplitRatio::new(260);
@@ -23,6 +29,7 @@ const WIDE_SIDEBAR: SplitRatio = SplitRatio::new(360);
 pub(super) struct Config {
     store: ConfigStore,
     sidebar_split_ratio: SplitRatio,
+    keybindings: Keybindings,
     users: BTreeMap<String, String>,
 }
 
@@ -31,23 +38,134 @@ struct Stored {
     #[serde(default = "default_sidebar_split_ratio")]
     sidebar_split_ratio: SplitRatio,
     #[serde(default)]
+    keybindings: Keybindings,
+    #[serde(default)]
     users: BTreeMap<String, String>,
 }
 
 impl Default for Stored {
     fn default() -> Self {
-        Self { sidebar_split_ratio: default_sidebar_split_ratio(), users: BTreeMap::new() }
+        Self {
+            sidebar_split_ratio: default_sidebar_split_ratio(),
+            keybindings: Keybindings::default(),
+            users: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(super) struct Keybindings {
+    #[serde(default = "default_prefix")]
+    pub(super) prefix: KeyChord,
+    #[serde(default = "default_new_session")]
+    pub(super) new_session: KeyChord,
+    #[serde(default = "default_toggle_sessions")]
+    pub(super) toggle_sessions: KeyChord,
+    #[serde(default = "default_help")]
+    pub(super) help: KeyChord,
+    #[serde(default = "default_quit")]
+    pub(super) quit: KeyChord,
+}
+
+impl Default for Keybindings {
+    fn default() -> Self {
+        Self {
+            prefix: default_prefix(),
+            new_session: default_new_session(),
+            toggle_sessions: default_toggle_sessions(),
+            help: default_help(),
+            quit: default_quit(),
+        }
+    }
+}
+
+impl Keybindings {
+    fn validate(&self) -> Result<()> {
+        let mut configured = HashSet::new();
+        for (name, chord) in [
+            (NEW_SESSION.0, self.new_session),
+            (TOGGLE_SESSIONS.0, self.toggle_sessions),
+            (HELP.0, self.help),
+            (QUIT.0, self.quit),
+        ] {
+            if chord == self.prefix {
+                bail!("Console keybinding '{name}' conflicts with the prefix");
+            }
+            if !configured.insert(chord) {
+                bail!("Console keybinding '{name}' duplicates another prefixed command");
+            }
+        }
+        Ok(())
+    }
+
+    fn replace(&mut self, id: SettingId, chord: KeyChord) -> Result<&'static str> {
+        let key = match id {
+            PREFIX => {
+                self.prefix = chord;
+                PREFIX.0
+            }
+            NEW_SESSION => {
+                self.new_session = chord;
+                NEW_SESSION.0
+            }
+            TOGGLE_SESSIONS => {
+                self.toggle_sessions = chord;
+                TOGGLE_SESSIONS.0
+            }
+            HELP => {
+                self.help = chord;
+                HELP.0
+            }
+            QUIT => {
+                self.quit = chord;
+                QUIT.0
+            }
+            _ => bail!("unknown Console keybinding '{}'", id.0),
+        };
+        self.validate()?;
+        Ok(key)
     }
 }
 
 impl Config {
     pub(super) fn load(store: ConfigStore) -> Result<Self> {
         let stored: Stored = store.load(TOOL)?;
-        Ok(Self { store, sidebar_split_ratio: stored.sidebar_split_ratio, users: stored.users })
+        stored.keybindings.validate()?;
+        Ok(Self {
+            store,
+            sidebar_split_ratio: stored.sidebar_split_ratio,
+            keybindings: stored.keybindings,
+            users: stored.users,
+        })
     }
 
     pub(super) const fn sidebar_split_ratio(&self) -> SplitRatio {
         self.sidebar_split_ratio
+    }
+
+    pub(super) const fn keybindings(&self) -> &Keybindings {
+        &self.keybindings
+    }
+
+    fn set_keybinding(&mut self, id: SettingId, chord: KeyChord) -> Result<()> {
+        let mut keybindings = self.keybindings.clone();
+        let key = keybindings.replace(id, chord)?;
+        self.store.set_table_string(TOOL, "keybindings", key, &chord.to_string())?;
+        self.keybindings = keybindings;
+        Ok(())
+    }
+
+    fn reset_keybinding(&mut self, id: SettingId) -> Result<()> {
+        let defaults = Keybindings::default();
+        let chord = match id {
+            PREFIX => defaults.prefix,
+            NEW_SESSION => defaults.new_session,
+            TOGGLE_SESSIONS => defaults.toggle_sessions,
+            HELP => defaults.help,
+            QUIT => defaults.quit,
+            _ => bail!("unknown Console keybinding '{}'", id.0),
+        };
+        self.set_keybinding(id, chord)
     }
 
     pub(super) fn set_sidebar_split_ratio(&mut self, ratio: SplitRatio) -> Result<()> {
@@ -130,13 +248,45 @@ impl SidebarWidth {
 
 impl EditableSettings for Config {
     fn fields(&self) -> Vec<SettingField> {
-        vec![SettingField::Choice {
-            id: SIDEBAR_WIDTH,
-            label: "Sidebar width",
-            description:
-                "Choose the initial sidebar width; divider dragging saves the exact ratio.",
-            selected: self.sidebar_width().label(),
-        }]
+        vec![
+            SettingField::Choice {
+                id: SIDEBAR_WIDTH,
+                label: "Sidebar width",
+                description:
+                    "Choose the initial sidebar width; divider dragging saves the exact ratio.",
+                selected: self.sidebar_width().label(),
+            },
+            keybinding_field(
+                PREFIX,
+                "Prefix",
+                "Start a Console key sequence.",
+                self.keybindings.prefix,
+            ),
+            keybinding_field(
+                NEW_SESSION,
+                "New session",
+                "Create a persistent terminal session after the prefix.",
+                self.keybindings.new_session,
+            ),
+            keybinding_field(
+                TOGGLE_SESSIONS,
+                "Toggle sessions",
+                "Show or hide the sessions panel after the prefix.",
+                self.keybindings.toggle_sessions,
+            ),
+            keybinding_field(
+                HELP,
+                "Help",
+                "Open Console help after the prefix.",
+                self.keybindings.help,
+            ),
+            keybinding_field(
+                QUIT,
+                "Quit",
+                "Close this Console client after the prefix.",
+                self.keybindings.quit,
+            ),
+        ]
     }
 
     fn edit(&mut self, id: SettingId, edit: SettingEdit) -> Result<()> {
@@ -150,9 +300,25 @@ impl EditableSettings for Config {
             (SIDEBAR_WIDTH, SettingEdit::Reset) => {
                 self.set_sidebar_split_ratio(default_sidebar_split_ratio())
             }
+            (
+                PREFIX | NEW_SESSION | TOGGLE_SESSIONS | HELP | QUIT,
+                SettingEdit::SetKeybinding(value),
+            ) => self.set_keybinding(id, value.parse()?),
+            (PREFIX | NEW_SESSION | TOGGLE_SESSIONS | HELP | QUIT, SettingEdit::Reset) => {
+                self.reset_keybinding(id)
+            }
             _ => bail!("unknown Console Settings field '{}'", id.0),
         }
     }
+}
+
+fn keybinding_field(
+    id: SettingId,
+    label: &'static str,
+    description: &'static str,
+    value: KeyChord,
+) -> SettingField {
+    SettingField::Keybinding { id, label, description, value: value.to_string() }
 }
 
 fn open(store: ConfigStore) -> Result<Box<dyn EditableSettings>> {
@@ -172,6 +338,26 @@ pub(super) fn settings() -> SettingsSection {
 
 const fn default_sidebar_split_ratio() -> SplitRatio {
     BALANCED_SIDEBAR
+}
+
+fn default_prefix() -> KeyChord {
+    KeyChord::new(KeyCode::Char('b'), KeyModifiers::CONTROL)
+}
+
+fn default_new_session() -> KeyChord {
+    KeyChord::new(KeyCode::Char('n'), KeyModifiers::NONE)
+}
+
+fn default_toggle_sessions() -> KeyChord {
+    KeyChord::new(KeyCode::Char('s'), KeyModifiers::NONE)
+}
+
+fn default_help() -> KeyChord {
+    KeyChord::new(KeyCode::Char('?'), KeyModifiers::NONE)
+}
+
+fn default_quit() -> KeyChord {
+    KeyChord::new(KeyCode::Char('q'), KeyModifiers::NONE)
 }
 
 #[cfg(test)]
@@ -197,6 +383,67 @@ mod tests {
 
         assert_eq!(config.sidebar_split_ratio(), SplitRatio::new(260));
         assert_eq!(config.sidebar_width(), SidebarWidth::Balanced);
+        assert_eq!(config.keybindings().prefix.to_string(), "Ctrl+B");
+        assert_eq!(config.keybindings().new_session.to_string(), "n");
+
+        cleanup(&store);
+        Ok(())
+    }
+
+    #[test]
+    fn configured_keybindings_are_parsed_by_the_shared_keyboard_system() -> Result<()> {
+        let store = store();
+        std::fs::create_dir_all(store.path(TOOL).parent().expect("Console config parent"))?;
+        std::fs::write(
+            store.path(TOOL),
+            "[keybindings]\nprefix = \"Ctrl+A\"\nnew_session = \"c\"\nhelp = \"h\"\n",
+        )?;
+
+        let config = Config::load(store.clone())?;
+        assert_eq!(config.keybindings().prefix.to_string(), "Ctrl+A");
+        assert_eq!(config.keybindings().new_session.to_string(), "c");
+        assert_eq!(config.keybindings().toggle_sessions.to_string(), "s");
+        assert_eq!(config.keybindings().help.to_string(), "h");
+
+        cleanup(&store);
+        Ok(())
+    }
+
+    #[test]
+    fn settings_edits_persist_validated_keybindings() -> Result<()> {
+        let store = store();
+        let mut config = Config::load(store.clone())?;
+        config.edit(NEW_SESSION, SettingEdit::SetKeybinding("c".to_owned()))?;
+
+        let reloaded = Config::load(store.clone())?;
+        assert_eq!(reloaded.keybindings().new_session.to_string(), "c");
+        assert!(reloaded.fields().iter().any(|field| {
+            matches!(
+                field,
+                SettingField::Keybinding {
+                    id: NEW_SESSION,
+                    value,
+                    ..
+                } if value == "c"
+            )
+        }));
+
+        cleanup(&store);
+        Ok(())
+    }
+
+    #[test]
+    fn conflicting_keybinding_edit_is_rejected_without_mutating_config() -> Result<()> {
+        let store = store();
+        let mut config = Config::load(store.clone())?;
+        let original = config.keybindings().new_session;
+        let prefix = config.keybindings().prefix.to_string();
+
+        let error = config
+            .edit(NEW_SESSION, SettingEdit::SetKeybinding(prefix))
+            .expect_err("prefix conflict must fail");
+        assert!(error.to_string().contains("conflicts with the prefix"));
+        assert_eq!(config.keybindings().new_session, original);
 
         cleanup(&store);
         Ok(())
@@ -262,14 +509,14 @@ mod tests {
     }
 
     #[test]
-    fn settings_section_exposes_only_the_consumed_sidebar_preference() -> Result<()> {
+    fn settings_section_exposes_sidebar_and_consumed_keybindings() -> Result<()> {
         let store = store();
         let config = Config::load(store.clone())?;
         let section = settings();
 
         assert_eq!(section.meta.id, TOOL);
         assert_eq!(section.meta.title, "Console");
-        assert_eq!(config.fields().len(), 1);
+        assert_eq!(config.fields().len(), 6);
         assert!(matches!(
             &config.fields()[0],
             SettingField::Choice {

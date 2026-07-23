@@ -240,7 +240,7 @@ fn contribute_actions(builder: &mut ActionRegistryBuilder<TailActionContext, Tai
         (KeyCode::Char('r'), KeyModifiers::NONE, RESUME_RECEIVING, workspace_visible),
     ] {
         builder.bind_key(KeybindingPlacement {
-            chord: KeyChord::new(code, modifiers),
+            binding: KeyChord::new(code, modifiers).into(),
             action,
             when,
         });

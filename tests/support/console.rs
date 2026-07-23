@@ -3,14 +3,16 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::future::Future;
+use std::io::{Read, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, ensure, Context, Result};
+use portable_pty::{native_pty_system, Child as PtyChild, CommandBuilder, MasterPty, PtySize};
 use wezterm_codec::{
     ControlLeaseAction, ControlLeaseRequest, ControlLeaseResult, EnvironmentFreeCommand, GetLines,
     GetPaneRenderableDimensions, KillPane, NonEmptyProgram, ServiceDrainAction,
@@ -23,10 +25,267 @@ use wezterm_mux::{RuntimeAdmission, RuntimeRole, DEFAULT_WORKSPACE};
 use wezterm_term::TerminalSize;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const EXIT_TIMEOUT: Duration = Duration::from_secs(3);
+const INITIAL_COLS: u16 = 120;
+const INITIAL_ROWS: u16 = 40;
 const RPC_TIMEOUT: Duration = Duration::from_secs(3);
 const READY_TIMEOUT: Duration = Duration::from_secs(8);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const OUTPUT_LINES: isize = 128;
+
+#[derive(Clone, Debug, Default)]
+pub struct PublicConsoleOptions {
+    pub performance_trace_path: Option<PathBuf>,
+    pub config_toml: Option<String>,
+}
+
+pub struct PublicConsole {
+    master: Box<dyn MasterPty + Send>,
+    writer: Box<dyn Write + Send>,
+    child: Box<dyn PtyChild + Send + Sync>,
+    reader: Option<thread::JoinHandle<()>>,
+    output: Arc<Mutex<Vec<u8>>>,
+    config_root: PathBuf,
+}
+
+impl PublicConsole {
+    pub fn start(harness: &LocalConsoleHarness, options: PublicConsoleOptions) -> Result<Self> {
+        let config_root =
+            harness.runtime_root().join(format!("config-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir(&config_root).context("create isolated Console config root")?;
+        if let Some(config_toml) = options.config_toml.as_deref() {
+            let config_dir = config_root.join("kit");
+            fs::create_dir(&config_dir).context("create Console config directory")?;
+            fs::write(config_dir.join("console.toml"), config_toml)
+                .context("write isolated Console config")?;
+        }
+        let pty = native_pty_system();
+        let pair = pty.openpty(PtySize {
+            rows: INITIAL_ROWS,
+            cols: INITIAL_COLS,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
+        let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_kit"));
+        command.arg("console");
+        command.env("TERM", "xterm-256color");
+        command.env("RUST_BACKTRACE", "1");
+        command.env("RUST_LOG", "wezterm_client=warn");
+        command.env("KIT_CONSOLE_RUNTIME_DIR", harness.runtime_root());
+        command.env("XDG_CONFIG_HOME", &config_root);
+        command.env("XDG_STATE_HOME", &config_root);
+        if let Some(path) = options.performance_trace_path {
+            command.env("KIT_CONSOLE_PERF_TRACE", path);
+        }
+        let child = pair.slave.spawn_command(command).context("start public kit console")?;
+        drop(pair.slave);
+
+        let mut source = pair.master.try_clone_reader().context("clone Console PTY reader")?;
+        let writer = pair.master.take_writer().context("take Console PTY writer")?;
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let reader_output = Arc::clone(&output);
+        let reader = thread::Builder::new()
+            .name("kit-console-tui-verifier-reader".to_owned())
+            .spawn(move || {
+                let mut buffer = [0_u8; 4096];
+                while let Ok(count) = source.read(&mut buffer) {
+                    if count == 0 {
+                        break;
+                    }
+                    if let Ok(mut output) = reader_output.lock() {
+                        output.extend_from_slice(&buffer[..count]);
+                    }
+                }
+            })
+            .context("start Console PTY reader")?;
+        let mut console =
+            Self { master: pair.master, writer, child, reader: Some(reader), output, config_root };
+        // Ratatui asks the terminal for its cursor position while initializing. Answer only after
+        // observing the request so the response cannot race raw-mode setup or be line-echoed.
+        console.wait_for_output(b"\x1b[6n").with_context(|| {
+            format!("Console agent startup diagnostics: {:?}", harness.diagnostics())
+        })?;
+        console.send(b"\x1b[1;1R")?;
+        console.wait_for_output(b"Sessions")?;
+        console.wait_for_output(b"\x1b[?1049h")?;
+        Ok(console)
+    }
+
+    pub fn send(&mut self, bytes: &[u8]) -> Result<()> {
+        self.writer.write_all(bytes).context("write Console PTY input")?;
+        self.writer.flush().context("flush Console PTY input")
+    }
+
+    pub fn type_text(&mut self, text: &str) -> Result<()> {
+        for byte in text.bytes() {
+            self.send(&[byte])?;
+            thread::sleep(Duration::from_millis(15));
+        }
+        Ok(())
+    }
+
+    pub fn clear_output(&self) -> Result<()> {
+        self.output
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Console PTY output lock was poisoned"))?
+            .clear();
+        Ok(())
+    }
+
+    pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+        self.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+    }
+
+    pub fn wait_for_output(&mut self, needle: &[u8]) -> Result<()> {
+        let deadline = Instant::now() + READY_TIMEOUT;
+        loop {
+            let found = self
+                .output
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Console PTY output lock was poisoned"))?
+                .windows(needle.len())
+                .any(|window| window == needle);
+            if found {
+                return Ok(());
+            }
+            if let Some(status) = self.child.try_wait().context("observe public Console")? {
+                let output = self
+                    .output
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Console PTY output lock was poisoned"))?;
+                bail!(
+                    "public Console exited before producing {:?}: {status}; output={:?}",
+                    String::from_utf8_lossy(needle),
+                    String::from_utf8_lossy(&output)
+                );
+            }
+            if Instant::now() >= deadline {
+                let output = self
+                    .output
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Console PTY output lock was poisoned"))?;
+                bail!(
+                    "public Console did not produce {:?}; output={:?}",
+                    String::from_utf8_lossy(needle),
+                    String::from_utf8_lossy(&output)
+                );
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    pub fn wait_for_any_output(&mut self, needles: &[&[u8]]) -> Result<usize> {
+        let deadline = Instant::now() + READY_TIMEOUT;
+        loop {
+            let output = self
+                .output
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Console PTY output lock was poisoned"))?;
+            if let Some(index) = needles
+                .iter()
+                .position(|needle| output.windows(needle.len()).any(|window| window == *needle))
+            {
+                return Ok(index);
+            }
+            drop(output);
+            if let Some(status) = self.child.try_wait().context("observe public Console")? {
+                let output = self
+                    .output
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Console PTY output lock was poisoned"))?;
+                bail!(
+                    "public Console exited before expected control state: {status}; output={:?}",
+                    String::from_utf8_lossy(&output)
+                )
+            }
+            if Instant::now() >= deadline {
+                let output = self
+                    .output
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Console PTY output lock was poisoned"))?;
+                bail!(
+                    "public Console did not produce any expected control state; output={:?}",
+                    String::from_utf8_lossy(&output)
+                )
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    pub fn config_path(&self) -> PathBuf {
+        self.config_root.join("kit/console.toml")
+    }
+
+    pub fn output_snapshot(&self) -> Result<String> {
+        let output = self
+            .output
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Console PTY output lock was poisoned"))?;
+        Ok(String::from_utf8_lossy(&output).into_owned())
+    }
+
+    pub fn process_id(&self) -> Result<u32> {
+        self.child.process_id().context("public Console process ID is unavailable")
+    }
+
+    pub fn output_len(&self) -> Result<usize> {
+        let output = self
+            .output
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Console PTY output lock was poisoned"))?;
+        Ok(output.len())
+    }
+
+    pub fn finish(self) -> Result<Vec<u8>> {
+        self.finish_with(b"\x02q")
+    }
+
+    pub fn finish_with(mut self, quit_sequence: &[u8]) -> Result<Vec<u8>> {
+        self.send(quit_sequence)?;
+        let deadline = Instant::now() + EXIT_TIMEOUT;
+        let status = loop {
+            if let Some(status) = self.child.try_wait().context("observe Console exit")? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                self.child.kill().context("kill unresponsive public Console")?;
+                break self.child.wait().context("reap killed public Console")?;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        if !status.success() {
+            let output = self
+                .output
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Console PTY output lock was poisoned"))?;
+            bail!(
+                "public Console exited unsuccessfully: {status}; output={:?}",
+                String::from_utf8_lossy(&output)
+            );
+        }
+        let _ = self.master.cancel_reader();
+        if let Some(reader) = self.reader.take() {
+            reader.join().map_err(|_| anyhow::anyhow!("Console PTY reader panicked"))?;
+        }
+        let output = self
+            .output
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Console PTY output lock was poisoned"))?
+            .clone();
+        Ok(output)
+    }
+}
+
+impl Drop for PublicConsole {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = self.master.cancel_reader();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct SessionIdentity {

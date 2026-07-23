@@ -348,7 +348,7 @@ async fn embedded_wezterm_protocol_bootstrap() {
     let mismatch_lifecycle =
         wezterm_client::client::HeadlessConnectionLifecycle::new(Arc::clone(&mismatch_admission));
     let mut mismatch = expected.clone();
-    mismatch.source_dirty = mismatch.source_dirty.map(|dirty| !dirty);
+    mismatch.source_dirty = Some(!expected.source_dirty.unwrap_or(false));
     let mismatch_error = wezterm_client::client::Client::new_unix_domain_headless(
         mismatch_admission,
         &mismatch_lifecycle,

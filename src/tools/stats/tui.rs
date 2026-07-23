@@ -108,7 +108,7 @@ mod tests {
 
     use crate::tui::{
         ActionInvocation, ActionRegistryBuilder, ActionSpec, ActionState, ContextMenu, KeyChord,
-        KeybindingPlacement, MenuPlacement,
+        Keybinding, KeybindingPlacement, KeybindingResolution, KeybindingState, MenuPlacement,
     };
 
     fn draw_app(
@@ -1435,10 +1435,15 @@ mod tests {
                 StatsCommand::RequestTerminate(ProcessAction::ForceTerminate),
             ),
         ] {
-            let invocation = app
-                .registry
-                .resolve_keybinding(KeyChord::new(code, KeyModifiers::NONE), context)
-                .expect("registered keybinding");
+            let mut keybinding_state = KeybindingState::default();
+            let invocation = app.registry.resolve_keybinding(
+                &mut keybinding_state,
+                KeyChord::new(code, KeyModifiers::NONE),
+                context,
+            );
+            let KeybindingResolution::Invoke(invocation) = invocation else {
+                panic!("registered keybinding");
+            };
             assert_eq!(invocation.action, action);
             assert_eq!(app.registry.command_for(&invocation), Ok(command));
         }
@@ -1537,7 +1542,10 @@ mod tests {
                 });
 
             builder.bind_key(KeybindingPlacement {
-                chord: KeyChord::new(KeyCode::F(7), KeyModifiers::CONTROL | KeyModifiers::ALT),
+                binding: Keybinding::chord(KeyChord::new(
+                    KeyCode::F(7),
+                    KeyModifiers::CONTROL | KeyModifiers::ALT,
+                )),
                 action: VIEW_COMMAND,
                 when: overview,
             });
@@ -1547,7 +1555,10 @@ mod tests {
                 (FORCE_TERMINATE, KeyCode::F(10)),
             ] {
                 builder.bind_key(KeybindingPlacement {
-                    chord: KeyChord::new(key, KeyModifiers::CONTROL | KeyModifiers::ALT),
+                    binding: Keybinding::chord(KeyChord::new(
+                        key,
+                        KeyModifiers::CONTROL | KeyModifiers::ALT,
+                    )),
                     action,
                     when: always,
                 });

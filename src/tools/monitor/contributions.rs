@@ -201,7 +201,7 @@ fn contribute_actions(builder: &mut ActionRegistryBuilder<MonitorActionContext, 
         (KeyCode::Char('f'), TOGGLE_FOLLOW, logs_view),
     ] {
         builder.bind_key(KeybindingPlacement {
-            chord: KeyChord::new(code, KeyModifiers::NONE),
+            binding: KeyChord::new(code, KeyModifiers::NONE).into(),
             action,
             when: visible,
         });

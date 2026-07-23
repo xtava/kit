@@ -19,8 +19,9 @@ use tokio::sync::mpsc;
 
 use crate::tui::{
     theme::NORD, ActionId, ActionInvocation, ActionUnavailable, ContextMenu, ContextMenuLayout,
-    ContextMenuOutcome, ContextMenuStyle, EventReader, KeyChord, NavigationMap, NavigationRegion,
-    ResolvedAction, Session, SessionOptions, SplitFrame, SplitMinimums, SplitRatio,
+    ContextMenuOutcome, ContextMenuStyle, EventReader, KeyChord, KeybindingResolution,
+    KeybindingState, NavigationMap, NavigationRegion, ResolvedAction, Session, SessionOptions,
+    SplitFrame, SplitMinimums, SplitRatio,
 };
 
 use super::{
@@ -87,6 +88,7 @@ struct App {
     snapshot: MonitorSnapshot,
     snapshot_generation: u64,
     registry: MonitorActionRegistry,
+    keybinding_state: KeybindingState,
     view: MonitorView,
     active_region: ActiveRegion,
     selections: [usize; 7],
@@ -227,6 +229,7 @@ impl App {
             snapshot,
             snapshot_generation: 1,
             registry,
+            keybinding_state: KeybindingState::default(),
             view: MonitorView::Overview,
             active_region: ActiveRegion::Primary,
             selections: [0; 7],
@@ -327,8 +330,11 @@ impl App {
 
         if let Some(chord) = KeyChord::from_event(key) {
             let context = self.action_context();
-            if let Some(invocation) = self.registry.resolve_keybinding(chord, context) {
-                return self.invoke_action(invocation);
+            match self.registry.resolve_keybinding(&mut self.keybinding_state, chord, context) {
+                KeybindingResolution::Invoke(invocation) => return self.invoke_action(invocation),
+                KeybindingResolution::Pending => return Flow::Continue,
+                KeybindingResolution::Unmatched
+                | KeybindingResolution::UnmatchedSequence { .. } => {}
             }
         }
 

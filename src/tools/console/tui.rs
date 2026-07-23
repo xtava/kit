@@ -19,9 +19,9 @@ use crate::tui::{
     render_split_divider, theme::NORD, ActionId, ActionInvocation, ActionRegistry,
     ActionRegistryBuilder, ActionSpec, ActionState, ActionUnavailable, ContextMenu,
     ContextMenuLayout, ContextMenuOutcome, ContextMenuStyle, Direction, EventReader, KeyChord,
-    KeybindingPlacement, LineEditor, MenuId, MenuPlacement, NavigationHistory, NavigationMap,
-    NavigationRegion, Session, SessionOptions, SplitDividerStyle, SplitDrag, SplitFrame,
-    SplitMinimums, SplitRatio,
+    Keybinding, KeybindingPlacement, KeybindingResolution, KeybindingState, LineEditor, MenuId,
+    MenuPlacement, NavigationHistory, NavigationMap, NavigationRegion, Session, SessionOptions,
+    SplitDividerStyle, SplitDrag, SplitFrame, SplitMinimums, SplitRatio,
 };
 
 use super::activity::{AgentActivity, AgentPresentation};
@@ -29,13 +29,16 @@ use super::client::{
     ConnectionHealth, ConnectionState, ConsoleClient, ConsoleSnapshot, SessionControl, SessionId,
     SessionView, TerminalContentGeometry, TerminalView,
 };
-use super::config::Config;
+use super::config::{Config, Keybindings};
 use super::interaction::{
     resolve_control, ControlIntent, ControlOperation, EffectiveLayout, InteractionDecision,
     LayoutPreference, SessionAccess, TerminalOnlyReason,
 };
+use super::invalidation::ConsoleInvalidations;
+use super::perf_trace::{self, InputKind};
 
-const REFRESH_INTERVAL: Duration = Duration::from_millis(100);
+const ACTIVITY_INTERVAL: Duration = Duration::from_millis(300);
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(4);
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(350);
 const SIDEBAR_STEP: i16 = 40;
 const SESSION_MENU: MenuId = MenuId::new("console.session.context");
@@ -245,6 +248,7 @@ struct ConsoleActionContext {
     selected: Option<SessionId>,
     selected_index: Option<usize>,
     session_count: usize,
+    sidebar_visible: bool,
     region: ActiveRegion,
     focus_left: Option<ActiveRegion>,
     focus_right: Option<ActiveRegion>,
@@ -265,7 +269,8 @@ struct ConsoleActionContext {
 
 enum Effect {
     None,
-    RefreshSnapshot,
+    ProjectTerminal,
+    ReconcileTopology,
     RetryConnection,
     Create { cols: u16, rows: u16 },
     Rename { id: SessionId, title: String },
@@ -275,7 +280,7 @@ enum Effect {
     TakeControl(SessionId),
     Copy(String),
     SendKey(KeyEvent),
-    SendMouse { id: SessionId, event: MouseEvent, geometry: TerminalContentGeometry },
+    SendMouse { pane_id: usize, event: MouseEvent, geometry: TerminalContentGeometry },
     Paste(String),
     Quit,
 }
@@ -354,6 +359,7 @@ struct App {
     selected: Option<SessionId>,
     active_region: ActiveRegion,
     surface: Surface,
+    keybinding_state: KeybindingState,
     layout: LayoutPreference,
     split_drag: Option<SplitDrag<()>>,
     history: NavigationHistory<SessionId>,
@@ -371,7 +377,7 @@ struct App {
 
 impl App {
     async fn new(client: ConsoleClient, config: Config) -> Result<Self> {
-        let snapshot = client.snapshot(None).await?;
+        let mut snapshot = client.snapshot(None).await?;
         let health = client.drain_connection_health()?;
         let connection_generation = health.map_or(0, |health| health.generation);
         let connection = health.map_or(ConnectionState::Ready, |health| health.state);
@@ -380,8 +386,16 @@ impl App {
         let mut history = NavigationHistory::default();
         if let Some(id) = selected {
             history.visit(id);
+            let pane_id = snapshot
+                .sessions
+                .iter()
+                .find(|session| session.id == id)
+                .map(|session| session.pane_id);
+            snapshot.terminal =
+                pane_id.map(|pane_id| client.project_terminal(pane_id)).transpose()?.flatten();
         }
-        let mut app = Self {
+        let registry = console_actions(config.keybindings())?;
+        Ok(Self {
             layout: LayoutPreference::split(config.sidebar_split_ratio()),
             client,
             config,
@@ -389,10 +403,11 @@ impl App {
             selected,
             active_region: ActiveRegion::Sessions,
             surface: Surface::Normal,
+            keybinding_state: KeybindingState::default(),
             split_drag: None,
             history,
             menu: None,
-            registry: console_actions()?,
+            registry,
             last_terminal_size: None,
             last_session_click: None,
             scroll_offset: 0,
@@ -401,25 +416,26 @@ impl App {
             connection_generation,
             connection,
             connection_detail,
-        };
-        if app.selected.is_some() {
-            app.refresh().await?;
-        }
-        Ok(app)
+        })
     }
 
-    async fn refresh(&mut self) -> Result<()> {
+    async fn reconcile_topology(&mut self) -> Result<bool> {
+        let mut changed = false;
         if let Some(status) = self.client.drain_remote_status() {
-            self.connection_detail = status.map(|status| status.text());
+            let detail = status.map(|status| status.text());
+            changed |= self.connection_detail != detail;
+            self.connection_detail = detail;
         }
         if let Some(health) = self.client.drain_connection_health()? {
+            let previous = (self.connection_generation, self.connection);
             self.apply_connection_health(health);
+            changed |= previous != (self.connection_generation, self.connection);
         }
         if matches!(
             self.connection,
             ConnectionState::Attaching | ConnectionState::Reconnecting { .. }
         ) {
-            return Ok(());
+            return Ok(changed);
         }
         let snapshot = match self.client.snapshot(self.selected).await {
             Ok(snapshot) => snapshot,
@@ -431,26 +447,58 @@ impl App {
                     self.connection,
                     ConnectionState::Attaching | ConnectionState::Reconnecting { .. }
                 ) {
-                    return Ok(());
+                    return Ok(true);
                 }
                 return Err(error);
             }
         };
-        self.reconcile(snapshot);
-        Ok(())
+        let selected = self.selected;
+        changed |= self.reconcile(snapshot);
+        if self.selected != selected {
+            changed |= self.project_terminal()?;
+        }
+        Ok(changed)
     }
 
-    async fn refresh_or_notice(&mut self) {
-        if let Err(error) = self.refresh().await {
-            if let Ok(Some(health)) = self.client.drain_connection_health() {
-                self.apply_connection_health(health);
+    async fn reconcile_or_notice(&mut self) -> bool {
+        match self.reconcile_topology().await {
+            Ok(changed) => changed,
+            Err(error) => {
+                if let Ok(Some(health)) = self.client.drain_connection_health() {
+                    self.apply_connection_health(health);
+                }
+                let notice = format!("Could not refresh Console: {error:#}");
+                let changed = self.notice.as_deref() != Some(&notice);
+                self.notice = Some(notice);
+                changed
             }
-            self.notice = Some(format!("Could not refresh Console: {error:#}"));
         }
     }
 
-    fn reconcile(&mut self, snapshot: ConsoleSnapshot) {
+    fn project_terminal(&mut self) -> Result<bool> {
+        let pane_id = self.selected_session().map(|session| session.pane_id);
+        let terminal =
+            pane_id.map(|pane_id| self.client.project_terminal(pane_id)).transpose()?.flatten();
+        let changed = self.snapshot.terminal != terminal;
+        self.snapshot.terminal = terminal;
+        if changed {
+            self.normalize_terminal_state();
+        }
+        Ok(changed)
+    }
+
+    fn refresh_activity(&mut self) -> Result<super::client::ActivityRefresh> {
+        self.client.refresh_activity(
+            &mut self.snapshot.sessions,
+            self.selected,
+            self.snapshot.terminal.as_ref(),
+        )
+    }
+
+    fn reconcile(&mut self, snapshot: ConsoleSnapshot) -> bool {
+        let mut changed = self.snapshot != snapshot;
         self.snapshot = snapshot;
+        let previous_selection = self.selected;
         let selection_exists = self
             .selected
             .is_some_and(|id| self.snapshot.sessions.iter().any(|session| session.id == id));
@@ -461,6 +509,7 @@ impl App {
                 self.history.replace_current(id);
             }
         }
+        changed |= self.selected != previous_selection;
         if self.menu.as_ref().is_some_and(|menu| !self.has_session(menu.context().target)) {
             self.menu = None;
         }
@@ -469,6 +518,11 @@ impl App {
                 self.surface = Surface::Normal;
             }
         }
+        self.normalize_terminal_state();
+        changed
+    }
+
+    fn normalize_terminal_state(&mut self) {
         let line_count = self.snapshot.terminal.as_ref().map_or(0, |terminal| terminal.lines.len());
         self.scroll_offset = self.scroll_offset.min(line_count.saturating_sub(1));
         if self.selection.is_some_and(|selection| {
@@ -551,9 +605,9 @@ impl App {
         false
     }
 
-    fn resize_request(&mut self, content: Option<Rect>) -> Option<(SessionId, u16, u16)> {
-        let (Some(id), Some(session), Some(terminal), Some(content)) =
-            (self.selected, self.selected_session(), self.snapshot.terminal.as_ref(), content)
+    fn resize_request(&mut self, content: Option<Rect>) -> Option<(usize, usize, u16, u16)> {
+        let (Some(session), Some(terminal), Some(content)) =
+            (self.selected_session(), self.snapshot.terminal.as_ref(), content)
         else {
             self.last_terminal_size = None;
             return None;
@@ -565,12 +619,14 @@ impl App {
             self.last_terminal_size = None;
             return None;
         }
-        let observed = (terminal.pane_id, content.width, content.height);
+        let tab_id = session.tab_id;
+        let pane_id = terminal.pane_id;
+        let observed = (pane_id, content.width, content.height);
         if self.last_terminal_size == Some(observed) {
             return None;
         }
         self.last_terminal_size = Some(observed);
-        Some((id, content.width, content.height))
+        Some((tab_id, pane_id, content.width, content.height))
     }
 
     fn action_context(
@@ -590,6 +646,7 @@ impl App {
             selected: self.selected,
             selected_index: self.selected_index(),
             session_count: self.snapshot.sessions.len(),
+            sidebar_visible: regions.sessions.is_some(),
             region: self.active_region,
             focus_left: navigation.neighbor(self.active_region, Direction::Left),
             focus_right: navigation.neighbor(self.active_region, Direction::Right),
@@ -662,7 +719,7 @@ impl App {
         match action {
             ConsoleAction::SelectSession => {
                 let _changed = context.target.is_some_and(|id| self.select(id));
-                Effect::RefreshSnapshot
+                Effect::ProjectTerminal
             }
             ConsoleAction::CreateSession => {
                 Effect::Create { cols: context.create_cols, rows: context.create_rows }
@@ -716,19 +773,19 @@ impl App {
             }
             ConsoleAction::PreviousSession => {
                 self.move_selection(-1);
-                Effect::RefreshSnapshot
+                Effect::ProjectTerminal
             }
             ConsoleAction::NextSession => {
                 self.move_selection(1);
-                Effect::RefreshSnapshot
+                Effect::ProjectTerminal
             }
             ConsoleAction::HistoryBack => {
                 self.navigate_history(-1);
-                Effect::RefreshSnapshot
+                Effect::ProjectTerminal
             }
             ConsoleAction::HistoryForward => {
                 self.navigate_history(1);
-                Effect::RefreshSnapshot
+                Effect::ProjectTerminal
             }
             ConsoleAction::FocusSessions => {
                 self.active_region = ActiveRegion::Sessions;
@@ -817,7 +874,7 @@ impl App {
             return Effect::None;
         };
         let Some(access) = self.session(id).map(session_access) else {
-            return Effect::RefreshSnapshot;
+            return Effect::ReconcileTopology;
         };
         match resolve_control(intent, access) {
             InteractionDecision::FocusTerminal => {
@@ -997,30 +1054,86 @@ fn session_access(session: &SessionView) -> SessionAccess {
 }
 
 pub async fn run(client: ConsoleClient, config: Config) -> Result<()> {
+    perf_trace::initialize()?;
+    let outcome = run_loop(client, config).await;
+    let flush = perf_trace::flush();
+    outcome?;
+    flush
+}
+
+async fn run_loop(client: ConsoleClient, config: Config) -> Result<()> {
     let mut app = App::new(client, config).await?;
     let mut session = Session::open(SessionOptions { mouse_capture: true, bracketed_paste: true })?;
     let mut events = EventReader::start();
-    let mut refresh = tokio::time::interval(REFRESH_INTERVAL);
-    refresh.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    refresh.tick().await;
+    let mut invalidations = ConsoleInvalidations::subscribe();
+    let now = tokio::time::Instant::now();
+    let mut reconcile = tokio::time::interval_at(now + RECONCILE_INTERVAL, RECONCILE_INTERVAL);
+    reconcile.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut activity = tokio::time::interval_at(now + ACTIVITY_INTERVAL, ACTIVITY_INTERVAL);
+    activity.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut activity_dirty = false;
+    let mut needs_draw = true;
+    let mut regions = UiRegions::default();
 
     loop {
-        let mut regions = UiRegions::default();
-        session.draw(|frame| regions = render(frame, &app))?;
-        app.normalize_focus(&regions);
+        if needs_draw {
+            session.draw(|frame| regions = render(frame, &app))?;
+            perf_trace::record_redraw();
+            app.normalize_focus(&regions);
+            needs_draw = false;
 
-        if let Some((id, cols, rows)) = app.resize_request(regions.terminal_content) {
-            if let Err(error) = app.client.resize(id, cols, rows).await {
-                app.notice = Some(error.to_string());
+            if let Some((tab_id, pane_id, cols, rows)) =
+                app.resize_request(regions.terminal_content)
+            {
+                let started = perf_trace::input_timer();
+                let result = app.client.resize(tab_id, pane_id, cols, rows).await;
+                perf_trace::record_input_latency(InputKind::Resize, started);
+                if let Err(error) = result {
+                    app.notice = Some(error.to_string());
+                    needs_draw = true;
+                }
             }
-            app.refresh_or_notice().await;
-            continue;
         }
 
         let effect = tokio::select! {
-            _ = refresh.tick() => {
-                app.refresh_or_notice().await;
-                Effect::None
+            invalidation = invalidations.recv() => {
+                let Some(invalidation) = invalidation else { break };
+                if invalidation.pane_output {
+                    activity_dirty = true;
+                }
+                let changed = if invalidation.topology {
+                    app.reconcile_or_notice().await
+                } else if invalidation.pane_output {
+                    match app.project_terminal() {
+                        Ok(changed) => changed,
+                        Err(error) => {
+                            app.notice = Some(format!("Could not project Console terminal: {error:#}"));
+                            true
+                        }
+                    }
+                } else {
+                    false
+                };
+                needs_draw |= changed;
+                continue;
+            }
+            _ = reconcile.tick() => {
+                needs_draw |= app.reconcile_or_notice().await;
+                continue;
+            }
+            _ = activity.tick(), if activity_dirty => {
+                match app.refresh_activity() {
+                    Ok(refresh) => {
+                        needs_draw |= refresh.changed;
+                        activity_dirty = refresh.revisit;
+                    }
+                    Err(error) => {
+                        activity_dirty = true;
+                        app.notice = Some(format!("Could not refresh Console activity: {error:#}"));
+                        needs_draw = true;
+                    }
+                }
+                continue;
             }
             event = events.recv() => {
                 let Some(event) = event else { break };
@@ -1028,12 +1141,16 @@ pub async fn run(client: ConsoleClient, config: Config) -> Result<()> {
             }
         };
 
+        // WezTerm predicts keyboard and paste input in the local render cache, so those effects
+        // need an immediate draw. Mouse reporting has no local prediction; pane output is the
+        // authoritative redraw signal, and drawing here would render the same terminal twice.
+        let redraw_after_effect = !matches!(&effect, Effect::SendMouse { .. });
         match apply_effect(effect, &mut app, &mut session).await {
-            Ok(EffectFlow::Continue) => {}
+            Ok(EffectFlow::Continue) => needs_draw |= redraw_after_effect,
             Ok(EffectFlow::Quit) => break,
             Err(error) => {
                 app.notice = Some(error.to_string());
-                app.refresh_or_notice().await;
+                needs_draw |= app.reconcile_or_notice().await;
             }
         }
     }
@@ -1048,12 +1165,17 @@ enum EffectFlow {
 async fn apply_effect(effect: Effect, app: &mut App, session: &mut Session) -> Result<EffectFlow> {
     match effect {
         Effect::None => {}
-        Effect::RefreshSnapshot => app.refresh().await?,
+        Effect::ProjectTerminal => {
+            app.project_terminal()?;
+        }
+        Effect::ReconcileTopology => {
+            app.reconcile_topology().await?;
+        }
         Effect::RetryConnection => {
             app.client.retry().await?;
             app.connection = ConnectionState::Attaching;
             app.connection_detail = None;
-            app.refresh().await?;
+            app.reconcile_topology().await?;
         }
         Effect::Create { cols, rows } => {
             let id = app.client.create_session(cols, rows).await?;
@@ -1062,50 +1184,52 @@ async fn apply_effect(effect: Effect, app: &mut App, session: &mut Session) -> R
             app.active_region = ActiveRegion::Terminal;
             app.scroll_offset = 0;
             app.selection = None;
-            app.refresh().await?;
+            app.reconcile_topology().await?;
         }
         Effect::Rename { id, title } => {
             app.client.rename_session(id, title).await?;
-            app.refresh().await?;
+            app.reconcile_topology().await?;
         }
         Effect::Close(id) => {
             app.client.close_session(id).await?;
-            app.refresh().await?;
+            app.reconcile_topology().await?;
         }
         Effect::AcquireControl(id) => {
             app.client.acquire_control(id).await?;
             app.active_region = ActiveRegion::Terminal;
-            app.refresh().await?;
+            app.reconcile_topology().await?;
         }
         Effect::ReleaseControl(id) => {
             app.client.release_control(id).await?;
             app.active_region = ActiveRegion::Sessions;
-            app.refresh().await?;
+            app.reconcile_topology().await?;
         }
         Effect::TakeControl(id) => {
             app.client.take_control(id).await?;
             app.active_region = ActiveRegion::Terminal;
-            app.refresh().await?;
+            app.reconcile_topology().await?;
         }
         Effect::Copy(text) => {
             session.copy(&text)?;
             app.notice = Some(format!("Copied {} visible lines", text.lines().count()));
         }
         Effect::SendKey(key) => {
-            if let Some(id) = app.selected {
-                app.client.send_key(id, key).await?;
-                app.refresh().await?;
+            if let Some(pane_id) = app.selected_session().map(|session| session.pane_id) {
+                let started = perf_trace::input_timer();
+                app.client.send_key(pane_id, key).await?;
+                perf_trace::record_input_latency(InputKind::Key, started);
             }
         }
-        Effect::SendMouse { id, event, geometry } => {
-            if app.client.send_mouse(id, event, geometry).await? {
-                app.refresh().await?;
-            }
+        Effect::SendMouse { pane_id, event, geometry } => {
+            let started = perf_trace::input_timer();
+            let _dispatched = app.client.send_mouse(pane_id, event, geometry).await?;
+            perf_trace::record_input_latency(InputKind::Mouse, started);
         }
         Effect::Paste(text) => {
-            if let Some(id) = app.selected {
-                app.client.paste(id, text).await?;
-                app.refresh().await?;
+            if let Some(pane_id) = app.selected_session().map(|session| session.pane_id) {
+                let started = perf_trace::input_timer();
+                app.client.paste(pane_id, text).await?;
+                perf_trace::record_input_latency(InputKind::Paste, started);
             }
         }
         Effect::Quit => return Ok(EffectFlow::Quit),
@@ -1143,15 +1267,20 @@ fn handle_event(event: Event, app: &mut App, regions: &UiRegions) -> Result<Effe
         Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
             handle_key(key, app, regions)
         }
-        Event::Mouse(mouse) => handle_mouse(mouse, app, regions),
+        Event::Mouse(mouse) => {
+            app.keybinding_state.cancel();
+            handle_mouse(mouse, app, regions)
+        }
         Event::Paste(text)
             if app.active_region == ActiveRegion::Terminal
                 && app.surface.kind() == SurfaceKind::Normal
                 && app.terminal_input_enabled() =>
         {
+            app.keybinding_state.cancel();
             Ok(Effect::Paste(text))
         }
         Event::Resize(_, _) => {
+            app.keybinding_state.cancel();
             if let Some(drag) = app.split_drag.take() {
                 let ratio = app.layout.restore_ratio();
                 if drag.changed(ratio) {
@@ -1165,11 +1294,23 @@ fn handle_event(event: Event, app: &mut App, regions: &UiRegions) -> Result<Effe
 }
 
 fn handle_key(key: KeyEvent, app: &mut App, regions: &UiRegions) -> Result<Effect> {
+    let Some(chord) = KeyChord::from_event(key) else {
+        return Ok(Effect::None);
+    };
     let context = app.action_context(None, regions, None);
-    if let Some(chord) = KeyChord::from_event(key) {
-        if let Some(invocation) = app.registry.resolve_keybinding(chord, context) {
-            return app.invoke(invocation, regions);
+    match app.registry.resolve_keybinding(&mut app.keybinding_state, chord, context) {
+        KeybindingResolution::Invoke(invocation) => return app.invoke(invocation, regions),
+        KeybindingResolution::Pending => return Ok(Effect::None),
+        KeybindingResolution::UnmatchedSequence { prefix, chord }
+            if prefix == chord
+                && app.active_region == ActiveRegion::Terminal
+                && app.surface.kind() == SurfaceKind::Normal
+                && app.terminal_input_enabled() =>
+        {
+            return Ok(Effect::SendKey(key));
         }
+        KeybindingResolution::UnmatchedSequence { .. } => return Ok(Effect::None),
+        KeybindingResolution::Unmatched => {}
     }
 
     match &mut app.surface {
@@ -1197,8 +1338,8 @@ fn handle_key(key: KeyEvent, app: &mut App, regions: &UiRegions) -> Result<Effec
 fn handle_mouse(mouse: MouseEvent, app: &mut App, regions: &UiRegions) -> Result<Effect> {
     let position = Position { x: mouse.column, y: mouse.row };
 
-    if let (Some(content), Some(terminal), Some(id)) =
-        (regions.terminal_content, app.snapshot.terminal.as_ref(), app.selected)
+    if let (Some(content), Some(terminal), Some(session)) =
+        (regions.terminal_content, app.snapshot.terminal.as_ref(), app.selected_session())
     {
         if terminal.mouse_reporting
             && content.contains(position)
@@ -1206,7 +1347,7 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App, regions: &UiRegions) -> Result
             && !mouse.modifiers.contains(KeyModifiers::SHIFT)
         {
             return Ok(Effect::SendMouse {
-                id,
+                pane_id: session.pane_id,
                 event: mouse,
                 geometry: TerminalContentGeometry::new(
                     content.x,
@@ -1266,7 +1407,7 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App, regions: &UiRegions) -> Result
                 let context = app.action_context(Some(id), regions, None);
                 let items = app.registry.resolve_menu(SESSION_MENU, &context);
                 app.menu = ContextMenu::open(position, context, items);
-                return Ok(Effect::RefreshSnapshot);
+                return Ok(Effect::ProjectTerminal);
             }
             if regions.terminal_content.is_some_and(|area| area.contains(position)) {
                 app.active_region = ActiveRegion::Terminal;
@@ -1328,7 +1469,9 @@ fn action_at(regions: &UiRegions, position: Position) -> Option<ActionHitTarget>
     regions.action_hits.iter().find(|hit| hit.area.contains(position)).copied()
 }
 
-fn console_actions() -> Result<ActionRegistry<ConsoleActionContext, ConsoleAction>> {
+fn console_actions(
+    keybindings: &Keybindings,
+) -> Result<ActionRegistry<ConsoleActionContext, ConsoleAction>> {
     let mut builder = ActionRegistryBuilder::new();
     for action in ConsoleAction::ALL {
         let enablement = match action {
@@ -1368,6 +1511,18 @@ fn console_actions() -> Result<ActionRegistry<ConsoleActionContext, ConsoleActio
         });
     }
 
+    for (action, order) in [(ConsoleAction::CreateSession, 10), (ConsoleAction::ToggleSidebar, 20)]
+    {
+        builder.place_menu(MenuPlacement {
+            menu: SESSION_MENU,
+            action: action.id(),
+            group: "workspace",
+            group_order: 5,
+            order,
+            when: sidebar_hidden,
+        });
+    }
+
     for (action, group, group_order, order) in [
         (ConsoleAction::Activate, "navigation", 10, 10),
         (ConsoleAction::RenameSession, "session", 20, 10),
@@ -1402,12 +1557,11 @@ fn console_actions() -> Result<ActionRegistry<ConsoleActionContext, ConsoleActio
 
     for (code, modifiers, action, when) in [
         (
-            KeyCode::Char('n'),
+            KeyCode::Char('w'),
             KeyModifiers::CONTROL,
-            ConsoleAction::CreateSession,
+            ConsoleAction::CloseSession,
             sidebar_normal as fn(&ConsoleActionContext) -> bool,
         ),
-        (KeyCode::Char('w'), KeyModifiers::CONTROL, ConsoleAction::CloseSession, sidebar_normal),
         (KeyCode::F(2), KeyModifiers::NONE, ConsoleAction::RenameSession, sidebar_normal),
         (KeyCode::Char('r'), KeyModifiers::NONE, ConsoleAction::RenameSession, sidebar_normal),
         (KeyCode::Char('d'), KeyModifiers::NONE, ConsoleAction::ReleaseControl, sidebar_normal),
@@ -1436,7 +1590,6 @@ fn console_actions() -> Result<ActionRegistry<ConsoleActionContext, ConsoleActio
         (KeyCode::Down, KeyModifiers::NONE, ConsoleAction::NextSession, sidebar_normal),
         (KeyCode::Left, KeyModifiers::NONE, ConsoleAction::HistoryBack, sidebar_normal),
         (KeyCode::Right, KeyModifiers::NONE, ConsoleAction::HistoryForward, sidebar_normal),
-        (KeyCode::Char('b'), KeyModifiers::CONTROL, ConsoleAction::ToggleSidebar, normal),
         (KeyCode::Left, KeyModifiers::CONTROL, ConsoleAction::FocusLeft, sidebar_normal),
         (KeyCode::Right, KeyModifiers::CONTROL, ConsoleAction::FocusRight, sidebar_normal),
         (KeyCode::Tab, KeyModifiers::NONE, ConsoleAction::FocusNext, sidebar_normal),
@@ -1455,8 +1608,6 @@ fn console_actions() -> Result<ActionRegistry<ConsoleActionContext, ConsoleActio
         ),
         (KeyCode::Enter, KeyModifiers::NONE, ConsoleAction::Activate, activate_available),
         (KeyCode::Esc, KeyModifiers::NONE, ConsoleAction::Dismiss, not_normal),
-        (KeyCode::F(1), KeyModifiers::NONE, ConsoleAction::ToggleHelp, not_terminal_normal),
-        (KeyCode::Char('?'), KeyModifiers::NONE, ConsoleAction::ToggleHelp, help_key_available),
         (KeyCode::F(5), KeyModifiers::NONE, ConsoleAction::RetryConnection, not_terminal_normal),
         (
             KeyCode::Char('R'),
@@ -1464,13 +1615,24 @@ fn console_actions() -> Result<ActionRegistry<ConsoleActionContext, ConsoleActio
             ConsoleAction::RetryConnection,
             connection_retryable,
         ),
-        (KeyCode::Char('q'), KeyModifiers::NONE, ConsoleAction::Quit, connection_retryable),
-        (KeyCode::Char('q'), KeyModifiers::CONTROL, ConsoleAction::Quit, not_terminal_normal),
     ] {
         builder.bind_key(KeybindingPlacement {
-            chord: KeyChord::new(code, modifiers),
+            binding: KeyChord::new(code, modifiers).into(),
             action: action.id(),
             when,
+        });
+    }
+
+    for (suffix, action) in [
+        (keybindings.new_session, ConsoleAction::CreateSession),
+        (keybindings.toggle_sessions, ConsoleAction::ToggleSidebar),
+        (keybindings.help, ConsoleAction::ToggleHelp),
+        (keybindings.quit, ConsoleAction::Quit),
+    ] {
+        builder.bind_key(KeybindingPlacement {
+            binding: Keybinding::sequence(keybindings.prefix, suffix),
+            action: action.id(),
+            when: prefix_available,
         });
     }
 
@@ -1485,6 +1647,10 @@ fn normal(context: &ConsoleActionContext) -> bool {
     context.surface == SurfaceKind::Normal
 }
 
+fn prefix_available(context: &ConsoleActionContext) -> bool {
+    matches!(context.surface, SurfaceKind::Normal | SurfaceKind::Help)
+}
+
 fn not_normal(context: &ConsoleActionContext) -> bool {
     context.surface != SurfaceKind::Normal
 }
@@ -1495,6 +1661,10 @@ fn not_terminal_normal(context: &ConsoleActionContext) -> bool {
 
 fn sidebar_normal(context: &ConsoleActionContext) -> bool {
     normal(context) && context.region == ActiveRegion::Sessions
+}
+
+fn sidebar_hidden(context: &ConsoleActionContext) -> bool {
+    normal(context) && !context.sidebar_visible
 }
 
 fn terminal_normal(context: &ConsoleActionContext) -> bool {
@@ -1515,10 +1685,6 @@ fn local_tools_available(context: &ConsoleActionContext) -> bool {
 
 fn connection_retryable(context: &ConsoleActionContext) -> bool {
     normal(context) && context.connection_retryable
-}
-
-fn help_key_available(context: &ConsoleActionContext) -> bool {
-    sidebar_normal(context) || terminal_local_tools(context) || connection_retryable(context)
 }
 
 fn activate_available(context: &ConsoleActionContext) -> bool {
@@ -1603,9 +1769,7 @@ fn can_release(context: &ConsoleActionContext) -> ActionState {
 fn can_take(context: &ConsoleActionContext) -> ActionState {
     match context.target_access {
         Some(SessionAccess::ControlledByOther | SessionAccess::Available) => ActionState::Enabled,
-        Some(SessionAccess::ControlledBySelf) => {
-            ActionState::disabled("this client already has control")
-        }
+        Some(SessionAccess::ControlledBySelf) => ActionState::disabled("Already controlling"),
         Some(SessionAccess::Synchronizing) => {
             ActionState::disabled("control state is synchronizing")
         }
@@ -1710,15 +1874,12 @@ fn focus_available(target: Option<ActiveRegion>) -> ActionState {
 fn render(frame: &mut Frame<'_>, app: &App) -> UiRegions {
     let area = frame.area();
     frame.render_widget(Block::new().style(Style::default().bg(NORD.background)), area);
-    let rows = Layout::vertical([Constraint::Length(2), Constraint::Min(1), Constraint::Length(2)])
-        .split(area);
     let mut regions = UiRegions::default();
-    render_header(frame, rows[0], app, &mut regions);
 
-    match app.layout.effective(rows[1].width) {
+    match app.layout.effective(area.width) {
         EffectiveLayout::Split => {
             let split = SplitFrame::horizontal(
-                rows[1],
+                area,
                 app.layout.restore_ratio(),
                 SplitMinimums::new(18, 20),
             );
@@ -1743,16 +1904,14 @@ fn render(frame: &mut Frame<'_>, app: &App) -> UiRegions {
         EffectiveLayout::TerminalOnly { reason: TerminalOnlyReason::Compact }
             if app.active_region == ActiveRegion::Sessions =>
         {
-            regions.sessions = Some(rows[1]);
-            render_sessions(frame, rows[1], app, &mut regions);
+            regions.sessions = Some(area);
+            render_sessions(frame, area, app, &mut regions);
         }
         EffectiveLayout::TerminalOnly { .. } => {
-            regions.terminal = Some(rows[1]);
-            render_terminal(frame, rows[1], app, &mut regions);
+            regions.terminal = Some(area);
+            render_terminal(frame, area, app, &mut regions);
         }
     }
-    render_footer(frame, rows[2], app, &mut regions);
-
     if let Some(menu) = app.menu.as_ref() {
         let layout = menu.layout(area);
         menu.render(frame, &layout, ContextMenuStyle::from_theme(NORD));
@@ -1764,57 +1923,9 @@ fn render(frame: &mut Frame<'_>, app: &App) -> UiRegions {
     regions
 }
 
-fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App, regions: &mut UiRegions) {
-    let selected = app.selected_session().map_or_else(String::new, |session| {
-        format!(
-            "  {}  ·  {}  ·  window {} / tab {} / pane {}",
-            session.title,
-            control_label(session.control),
-            session.window_id,
-            session.tab_id,
-            session.pane_id
-        )
-    });
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                " kit console ",
-                Style::default().fg(NORD.text_strong).bg(NORD.focus).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(selected, Style::default().fg(NORD.text_muted)),
-        ]))
-        .block(
-            Block::new()
-                .borders(ratatui::widgets::Borders::BOTTOM)
-                .border_style(Style::default().fg(NORD.border)),
-        ),
-        area,
-    );
-    if !app.layout.effective(area.width).is_split() {
-        let width = area.width.min(20);
-        let restore = Rect::new(area.right().saturating_sub(width), area.y, width, 1);
-        let label = if app.active_region == ActiveRegion::Sessions {
-            "[Ctrl+B] Terminal"
-        } else {
-            "[Ctrl+B] Sessions"
-        };
-        frame.render_widget(
-            Paragraph::new(label)
-                .alignment(Alignment::Right)
-                .style(Style::default().fg(NORD.accent)),
-            restore,
-        );
-        regions.action_hits.push(ActionHitTarget {
-            area: restore,
-            action: ConsoleAction::ToggleSidebar,
-            target: None,
-        });
-    }
-}
-
 fn render_sessions(frame: &mut Frame<'_>, area: Rect, app: &App, regions: &mut UiRegions) {
     let focused = app.active_region == ActiveRegion::Sessions;
-    let block = Block::bordered()
+    let mut block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(if focused { NORD.focus } else { NORD.border }))
         .title(Span::styled(
@@ -1823,6 +1934,14 @@ fn render_sessions(frame: &mut Frame<'_>, area: Rect, app: &App, regions: &mut U
                 .fg(if focused { NORD.text_strong } else { NORD.text_muted })
                 .add_modifier(if focused { Modifier::BOLD } else { Modifier::empty() }),
         ));
+    if focused {
+        if let Some(notice) = panel_notice(app) {
+            block = block.title_bottom(Span::styled(
+                format!(" {notice} "),
+                Style::default().fg(NORD.warning),
+            ));
+        }
+    }
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(inner);
@@ -1854,21 +1973,25 @@ fn render_sessions(frame: &mut Frame<'_>, area: Rect, app: &App, regions: &mut U
         row = row.saturating_add(height);
     }
     for (row, id) in &regions.session_rows {
-        let control_width = row.width.min(11);
+        let Some(session) = app.session(*id) else {
+            continue;
+        };
+        let Some(badge) = control_badge(session.control) else {
+            continue;
+        };
+        let control_width = row.width.min(badge.len() as u16);
         let control_area = Rect::new(
             row.x.saturating_add(row.width.saturating_sub(control_width)),
             row.y,
             control_width,
             1,
         );
-        if let Some(session) = app.session(*id) {
-            if session_access(session).primary_control().is_some() {
-                regions.action_hits.push(ActionHitTarget {
-                    area: control_area,
-                    action: ConsoleAction::PrimaryControl,
-                    target: Some(*id),
-                });
-            }
+        if session_access(session).primary_control().is_some() {
+            regions.action_hits.push(ActionHitTarget {
+                area: control_area,
+                action: ConsoleAction::PrimaryControl,
+                target: Some(*id),
+            });
         }
     }
 
@@ -1895,9 +2018,10 @@ fn session_item(session: &SessionView, surface: &Surface, width: usize) -> ListI
         Surface::Rename { id, input } if *id == session.id => format!("✎ {}▏", input.value()),
         _ => session.title.clone(),
     };
-    let status = control_label(session.control);
-    let status_width = 10.min(width);
-    let title_width = width.saturating_sub(status_width.saturating_add(1));
+    let badge = control_badge(session.control);
+    let status_width = badge.map_or(0, |badge| badge.len().min(width));
+    let gap_width = usize::from(status_width > 0);
+    let title_width = width.saturating_sub(status_width.saturating_add(gap_width));
     title.truncate(title.char_indices().nth(title_width).map_or(title.len(), |(index, _)| index));
     let title_style = session
         .agent
@@ -1909,13 +2033,15 @@ fn session_item(session: &SessionView, surface: &Surface, width: usize) -> ListI
             || Style::default().fg(NORD.text),
             |agent| Style::default().fg(agent_color(agent)).add_modifier(Modifier::BOLD),
         );
-    let primary = Line::from(vec![
-        Span::styled(format!("{title:<title_width$} "), title_style),
-        Span::styled(
-            format!("{status:>status_width$}"),
+    let mut primary = vec![Span::styled(format!("{title:<title_width$}"), title_style)];
+    if let Some(badge) = badge {
+        primary.push(Span::raw(" "));
+        primary.push(Span::styled(
+            format!("{badge:>status_width$}"),
             Style::default().fg(control_color(session.control)),
-        ),
-    ]);
+        ));
+    }
+    let primary = Line::from(primary);
     match session.agent {
         Some(agent) => {
             let color = agent_color(agent);
@@ -1926,10 +2052,6 @@ fn session_item(session: &SessionView, surface: &Surface, width: usize) -> ListI
                     Span::styled(agent_icon(agent), Style::default().fg(color)),
                     Span::raw(" "),
                     Span::styled(agent.kind.label(), Style::default().fg(NORD.text_muted)),
-                    Span::styled(
-                        format!(" · {}", agent.status_label()),
-                        Style::default().fg(color),
-                    ),
                 ]),
             ])
         }
@@ -1965,8 +2087,13 @@ fn agent_color(agent: AgentPresentation) -> Color {
     }
 }
 
-fn control_label(control: SessionControl) -> &'static str {
-    SessionAccess::from(control).label()
+fn control_badge(control: SessionControl) -> Option<&'static str> {
+    match SessionAccess::from(control) {
+        SessionAccess::Synchronizing => Some("syncing"),
+        SessionAccess::Available => None,
+        SessionAccess::ControlledBySelf => Some("you"),
+        SessionAccess::ControlledByOther => Some("read-only"),
+    }
 }
 
 fn control_color(control: SessionControl) -> Color {
@@ -1980,29 +2107,17 @@ fn control_color(control: SessionControl) -> Color {
 
 fn render_terminal(frame: &mut Frame<'_>, area: Rect, app: &App, regions: &mut UiRegions) {
     let focused = app.active_region == ActiveRegion::Terminal;
-    let title = app.snapshot.terminal.as_ref().map_or_else(
-        || " Terminal ".to_owned(),
-        |terminal| {
-            let scroll = if app.scroll_offset > 0 {
-                format!("  ·  -{} lines", app.scroll_offset)
-            } else {
-                String::new()
-            };
-            format!(
-                " {}  ·  pane {}  ·  {}×{}{} ",
-                terminal.title, terminal.pane_id, terminal.cols, terminal.rows, scroll
-            )
-        },
-    );
-    let block = Block::bordered()
+    let mut block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(if focused { NORD.focus } else { NORD.border }))
-        .title(Span::styled(
-            title,
-            Style::default()
-                .fg(if focused { NORD.text_strong } else { NORD.text_muted })
-                .add_modifier(if focused { Modifier::BOLD } else { Modifier::empty() }),
-        ));
+        .border_style(Style::default().fg(if focused { NORD.focus } else { NORD.border }));
+    if focused {
+        if let Some(notice) = panel_notice(app) {
+            block = block.title_bottom(Span::styled(
+                format!(" {notice} "),
+                Style::default().fg(NORD.warning),
+            ));
+        }
+    }
     let content = block.inner(area);
     frame.render_widget(block, area);
     regions.terminal_content = Some(content);
@@ -2035,9 +2150,13 @@ fn render_terminal(frame: &mut Frame<'_>, area: Rect, app: &App, regions: &mut U
     } else {
         frame.render_widget(
             Paragraph::new(if app.snapshot.sessions.is_empty() {
-                "No sessions yet\n\nPress Ctrl+N or click New session"
+                format!(
+                    "No sessions yet\n\nPress {} {} or click New session",
+                    app.config.keybindings().prefix,
+                    app.config.keybindings().new_session
+                )
             } else {
-                "Waiting for authoritative terminal projection…"
+                "Waiting for authoritative terminal projection…".to_owned()
             })
             .alignment(Alignment::Center)
             .style(Style::default().fg(NORD.text_muted)),
@@ -2046,134 +2165,30 @@ fn render_terminal(frame: &mut Frame<'_>, area: Rect, app: &App, regions: &mut U
     }
 }
 
-fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, regions: &mut UiRegions) {
-    let inner = Block::new()
-        .borders(ratatui::widgets::Borders::TOP)
-        .border_style(Style::default().fg(NORD.border))
-        .inner(area);
-    frame.render_widget(
-        Block::new()
-            .borders(ratatui::widgets::Borders::TOP)
-            .border_style(Style::default().fg(NORD.border)),
-        area,
-    );
+fn panel_notice(app: &App) -> Option<String> {
     let connection_notice = match app.connection {
         ConnectionState::Attaching => Some("Connecting to Console…".to_owned()),
         ConnectionState::Reconnecting { attempt } => {
             Some(format!("Reconnecting to Console… attempt {attempt}"))
         }
-        ConnectionState::Failed => Some("Console connection failed — press R to retry".to_owned()),
+        ConnectionState::Failed => Some("Console connection failed — press F5 to retry".to_owned()),
         ConnectionState::RetryExhausted => {
-            Some("Console reconnect limit reached — press R to retry".to_owned())
+            Some("Console reconnect limit reached — press F5 to retry".to_owned())
         }
-        ConnectionState::Detached => Some("Console is detached — press R to retry".to_owned()),
+        ConnectionState::Detached => Some("Console is detached — press F5 to retry".to_owned()),
         ConnectionState::Ready => None,
     };
-    let selected = app.selected_session();
-    let access = selected.map(session_access);
-    let base_left = match &app.surface {
+    match &app.surface {
         Surface::Rename { input, .. } => {
-            format!(" Rename: {}▏   Enter save   Esc cancel", input.value())
+            Some(format!("Rename: {}▏   Enter save   Esc cancel", input.value()))
         }
-        Surface::Search { input, .. } => {
-            format!(" Search: {}▏   Enter next   Esc close   PageUp/PageDown scroll", input.value())
+        Surface::Search { input, .. } => Some(format!(
+            "Search: {}▏   Enter next   Esc close   PageUp/PageDown scroll",
+            input.value()
+        )),
+        Surface::Normal | Surface::Help => {
+            app.notice.clone().or_else(|| app.connection_detail.clone()).or(connection_notice)
         }
-        Surface::Normal | Surface::Help => app
-            .connection_detail
-            .clone()
-            .or_else(|| connection_notice.clone())
-            .or_else(|| app.notice.clone())
-            .unwrap_or_else(|| {
-                if matches!(access, Some(SessionAccess::ControlledBySelf))
-                    && app.active_region == ActiveRegion::Terminal
-                {
-                    " Ctrl+B Sessions   ·   keyboard → terminal   ·   Shift+mouse selects"
-                        .to_owned()
-                } else {
-                    " ↑↓ sessions   ←→ history   Enter open   Ctrl+B collapse".to_owned()
-                }
-            }),
-    };
-
-    // Connection recovery, navigation, and session-control state are independent facts. Keep
-    // them visible together: a failed transport must not erase a read-only warning, and a
-    // read-only lease must not erase the path back to the sidebar.
-    let left = if matches!(app.surface, Surface::Normal | Surface::Help) {
-        access
-            .and_then(SessionAccess::banner)
-            .map(|banner| format!("{base_left}  ·  {banner}"))
-            .unwrap_or(base_left)
-    } else {
-        base_left
-    };
-
-    let mut actions = if matches!(app.surface, Surface::Normal | Surface::Help) {
-        if matches!(
-            app.connection,
-            ConnectionState::Failed | ConnectionState::RetryExhausted | ConnectionState::Detached
-        ) {
-            vec![
-                ("[R] Retry", ConsoleAction::RetryConnection, None),
-                ("[q] Quit", ConsoleAction::Quit, None),
-                ("[?] Help", ConsoleAction::ToggleHelp, None),
-            ]
-        } else {
-            match (app.selected, access) {
-                (Some(id), Some(SessionAccess::Available)) => {
-                    vec![("[Enter] Acquire", ConsoleAction::PrimaryControl, Some(id))]
-                }
-                (Some(id), Some(SessionAccess::ControlledByOther)) => {
-                    vec![("[T] Take control", ConsoleAction::PrimaryControl, Some(id))]
-                }
-                (Some(id), Some(SessionAccess::ControlledBySelf))
-                    if app.active_region == ActiveRegion::Sessions =>
-                {
-                    vec![("[D] Release", ConsoleAction::PrimaryControl, Some(id))]
-                }
-                _ => vec![("[?] Help", ConsoleAction::ToggleHelp, None)],
-            }
-        }
-    } else {
-        Vec::new()
-    };
-
-    let action_width = |label: &str| u16::try_from(label.chars().count()).unwrap_or(u16::MAX);
-    while actions.len() > 1
-        && actions.iter().map(|(label, _, _)| action_width(label).saturating_add(1)).sum::<u16>()
-            > inner.width
-    {
-        let _ = actions.pop();
-    }
-    let actions_width = actions
-        .iter()
-        .map(|(label, _, _)| action_width(label).saturating_add(1))
-        .sum::<u16>()
-        .min(inner.width);
-    let left_width = inner.width.saturating_sub(actions_width);
-    let left_area = Rect::new(inner.x, inner.y, left_width, inner.height);
-    let left_color = if app.connection_detail.is_some()
-        || connection_notice.is_some()
-        || app.notice.is_some()
-        || matches!(access, Some(SessionAccess::Synchronizing | SessionAccess::ControlledByOther))
-    {
-        NORD.warning
-    } else {
-        NORD.text_muted
-    };
-    frame.render_widget(Paragraph::new(left).style(Style::default().fg(left_color)), left_area);
-
-    let mut action_x = inner.right().saturating_sub(actions_width);
-    for (label, action, target) in actions {
-        let width = action_width(label).min(inner.right().saturating_sub(action_x));
-        let action_area = Rect::new(action_x, inner.y, width, inner.height);
-        frame.render_widget(
-            Paragraph::new(label)
-                .alignment(Alignment::Right)
-                .style(Style::default().fg(NORD.accent).add_modifier(Modifier::BOLD)),
-            action_area,
-        );
-        regions.action_hits.push(ActionHitTarget { area: action_area, action, target });
-        action_x = action_x.saturating_add(width.saturating_add(1));
     }
 }
 
@@ -2192,15 +2207,14 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, app: &App, regions: &UiRegions
         .resolve_menu(HELP_MENU, &context)
         .items()
         .iter()
-        .filter(|action| action.primary_keybinding().is_some())
-        .map(|action| {
-            let key = action.primary_keybinding().expect("filtered keybinding");
+        .filter_map(|action| {
+            let key = action.primary_keybinding()?;
             let state = if action.state.is_enabled() { "" } else { "  unavailable" };
-            Line::from(vec![
+            Some(Line::from(vec![
                 Span::styled(format!("{key:<18}"), Style::default().fg(NORD.accent)),
                 Span::styled(action.title, Style::default().fg(NORD.text)),
                 Span::styled(state, Style::default().fg(NORD.text_muted)),
-            ])
+            ]))
         })
         .collect::<Vec<_>>();
     frame.render_widget(Clear, popup);
@@ -2209,7 +2223,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, app: &App, regions: &UiRegions
             Block::bordered()
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(NORD.focus))
-                .title(" Console help · F1/Esc close ")
+                .title(" Console help · Esc close ")
                 .style(Style::default().bg(NORD.background)),
         ),
         popup,
@@ -2345,6 +2359,7 @@ mod tests {
             selected: Some(7),
             selected_index: Some(1),
             session_count: 3,
+            sidebar_visible: true,
             region: ActiveRegion::Sessions,
             focus_left: None,
             focus_right: Some(ActiveRegion::Terminal),
@@ -2364,9 +2379,32 @@ mod tests {
         }
     }
 
+    fn registry() -> ActionRegistry<ConsoleActionContext, ConsoleAction> {
+        console_actions(&Keybindings::default()).unwrap()
+    }
+
+    fn resolve(
+        registry: &ActionRegistry<ConsoleActionContext, ConsoleAction>,
+        chord: KeyChord,
+        context: ConsoleActionContext,
+    ) -> KeybindingResolution<ConsoleActionContext> {
+        registry.resolve_keybinding(&mut KeybindingState::default(), chord, context)
+    }
+
+    fn invocation(
+        registry: &ActionRegistry<ConsoleActionContext, ConsoleAction>,
+        chord: KeyChord,
+        context: ConsoleActionContext,
+    ) -> ActionInvocation<ConsoleActionContext> {
+        let KeybindingResolution::Invoke(invocation) = resolve(registry, chord, context) else {
+            panic!("{chord} did not invoke a Console action");
+        };
+        invocation
+    }
+
     #[test]
     fn catalog_projects_every_phase_two_action_and_shared_enablement() {
-        let registry = console_actions().unwrap();
+        let registry = registry();
         let controller = context(SessionControl::Controller);
         let observer = context(SessionControl::Observer);
         let help = registry.resolve_menu(HELP_MENU, &controller);
@@ -2395,11 +2433,10 @@ mod tests {
 
     #[test]
     fn keyboard_and_menu_resolve_through_the_same_catalog() {
-        let registry = console_actions().unwrap();
+        let registry = registry();
         let context = context(SessionControl::Controller);
-        let rename_key = registry
-            .resolve_keybinding(KeyChord::new(KeyCode::F(2), KeyModifiers::NONE), context)
-            .unwrap();
+        let rename_key =
+            invocation(&registry, KeyChord::new(KeyCode::F(2), KeyModifiers::NONE), context);
         let rename_menu = registry
             .resolve_menu(SESSION_MENU, &context)
             .items()
@@ -2413,18 +2450,48 @@ mod tests {
     }
 
     #[test]
+    fn configured_prefix_sequence_resolves_through_the_shared_catalog() {
+        let keybindings = Keybindings {
+            prefix: KeyChord::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            new_session: KeyChord::new(KeyCode::Char('c'), KeyModifiers::NONE),
+            ..Keybindings::default()
+        };
+        let registry = console_actions(&keybindings).unwrap();
+        let context = context(SessionControl::Controller);
+        let mut state = KeybindingState::default();
+
+        assert!(matches!(
+            registry.resolve_keybinding(&mut state, keybindings.prefix, context),
+            KeybindingResolution::Pending
+        ));
+        let KeybindingResolution::Invoke(invocation) =
+            registry.resolve_keybinding(&mut state, keybindings.new_session, context)
+        else {
+            panic!("configured Console sequence did not resolve");
+        };
+        assert_eq!(registry.command_for(&invocation), Ok(ConsoleAction::CreateSession));
+    }
+
+    #[test]
     fn session_menu_uses_one_rehydrated_control_intent() {
-        let registry = console_actions().unwrap();
+        let registry = registry();
         let menu = registry.resolve_menu(SESSION_MENU, &context(SessionControl::Controller));
 
         assert!(menu.items().iter().any(|item| item.id == PRIMARY_CONTROL));
         assert!(!menu.items().iter().any(|item| item.id == RELEASE_CONTROL));
         assert!(!menu.items().iter().any(|item| item.id == TAKE_CONTROL));
+
+        let mut hidden = context(SessionControl::Controller);
+        hidden.region = ActiveRegion::Terminal;
+        hidden.sidebar_visible = false;
+        let hidden_menu = registry.resolve_menu(SESSION_MENU, &hidden);
+        assert!(hidden_menu.items().iter().any(|item| item.id == CREATE_SESSION));
+        assert!(hidden_menu.items().iter().any(|item| item.id == TOGGLE_SIDEBAR));
     }
 
     #[test]
-    fn terminal_focus_reserves_only_the_sidebar_escape_key() {
-        let registry = console_actions().unwrap();
+    fn terminal_focus_leaves_the_configured_prefix_to_the_console_shell() {
+        let registry = registry();
         let mut terminal = context(SessionControl::Controller);
         terminal.region = ActiveRegion::Terminal;
 
@@ -2440,74 +2507,72 @@ mod tests {
             KeyChord::new(KeyCode::F(1), KeyModifiers::NONE),
         ] {
             assert!(
-                registry.resolve_keybinding(chord, terminal).is_none(),
+                matches!(resolve(&registry, chord, terminal), KeybindingResolution::Unmatched),
                 "terminal key {chord} was captured by the Console shell"
             );
         }
 
-        let escape = registry
-            .resolve_keybinding(KeyChord::new(KeyCode::Char('b'), KeyModifiers::CONTROL), terminal)
-            .unwrap();
-        assert_eq!(registry.command_for(&escape), Ok(ConsoleAction::ToggleSidebar));
+        assert!(matches!(
+            resolve(&registry, KeyChord::new(KeyCode::Char('b'), KeyModifiers::CONTROL), terminal,),
+            KeybindingResolution::Pending
+        ));
     }
 
     #[test]
     fn read_only_terminal_keeps_local_copy_without_capturing_healthy_terminal_keys() {
-        let registry = console_actions().unwrap();
+        let registry = registry();
         let mut observer = context(SessionControl::Observer);
         observer.region = ActiveRegion::Terminal;
 
-        let copy = registry
-            .resolve_keybinding(
-                KeyChord::new(KeyCode::Char('C'), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
-                observer,
-            )
-            .expect("read-only terminal keeps local copy");
+        let copy = invocation(
+            &registry,
+            KeyChord::new(KeyCode::Char('C'), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+            observer,
+        );
         assert_eq!(registry.command_for(&copy), Ok(ConsoleAction::CopyVisibleTerminal));
-        let scroll = registry
-            .resolve_keybinding(KeyChord::new(KeyCode::PageUp, KeyModifiers::NONE), observer)
-            .expect("read-only terminal keeps local scrolling");
+        let scroll =
+            invocation(&registry, KeyChord::new(KeyCode::PageUp, KeyModifiers::NONE), observer);
         assert_eq!(registry.command_for(&scroll), Ok(ConsoleAction::ScrollUp));
-        let take = registry
-            .resolve_keybinding(KeyChord::new(KeyCode::Char('t'), KeyModifiers::NONE), observer)
-            .expect("read-only terminal exposes its advertised takeover key");
+        let take =
+            invocation(&registry, KeyChord::new(KeyCode::Char('t'), KeyModifiers::NONE), observer);
         assert_eq!(registry.command_for(&take), Ok(ConsoleAction::TakeControl));
-        let help = registry
-            .resolve_keybinding(KeyChord::new(KeyCode::Char('?'), KeyModifiers::NONE), observer)
-            .expect("read-only terminal keeps local help");
-        assert_eq!(registry.command_for(&help), Ok(ConsoleAction::ToggleHelp));
+        assert!(matches!(
+            resolve(&registry, KeyChord::new(KeyCode::Char('?'), KeyModifiers::NONE), observer),
+            KeybindingResolution::Unmatched
+        ));
 
         let mut available = context(SessionControl::Uncontrolled);
         available.region = ActiveRegion::Terminal;
-        let activate = registry
-            .resolve_keybinding(KeyChord::new(KeyCode::Enter, KeyModifiers::NONE), available)
-            .expect("available terminal exposes its advertised acquire key");
+        let activate =
+            invocation(&registry, KeyChord::new(KeyCode::Enter, KeyModifiers::NONE), available);
         assert_eq!(registry.command_for(&activate), Ok(ConsoleAction::Activate));
 
         let mut controller = context(SessionControl::Controller);
         controller.region = ActiveRegion::Terminal;
-        assert!(registry
-            .resolve_keybinding(
+        assert!(matches!(
+            resolve(
+                &registry,
                 KeyChord::new(KeyCode::Char('C'), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
                 controller,
-            )
-            .is_none());
-        assert!(registry
-            .resolve_keybinding(KeyChord::new(KeyCode::PageUp, KeyModifiers::NONE), controller)
-            .is_none());
+            ),
+            KeybindingResolution::Unmatched
+        ));
+        assert!(matches!(
+            resolve(&registry, KeyChord::new(KeyCode::PageUp, KeyModifiers::NONE), controller,),
+            KeybindingResolution::Unmatched
+        ));
     }
 
     #[test]
     fn sidebar_keeps_panel_navigation_keys() {
-        let registry = console_actions().unwrap();
+        let registry = registry();
         let sidebar = context(SessionControl::Controller);
 
         for (chord, expected) in [
             (KeyChord::new(KeyCode::Enter, KeyModifiers::NONE), ConsoleAction::Activate),
             (KeyChord::new(KeyCode::Tab, KeyModifiers::NONE), ConsoleAction::FocusNext),
-            (KeyChord::new(KeyCode::Char('q'), KeyModifiers::CONTROL), ConsoleAction::Quit),
         ] {
-            let invocation = registry.resolve_keybinding(chord, sidebar).unwrap();
+            let invocation = invocation(&registry, chord, sidebar);
             assert_eq!(registry.command_for(&invocation), Ok(expected));
         }
     }
@@ -2588,6 +2653,7 @@ mod tests {
                 TerminalLine::from_text("second", &attrs, 0, None),
             ],
             mouse_reporting: false,
+            content_sequence: 0,
         };
         let mut wide = Buffer::empty(Rect::new(0, 0, 12, 2));
         TerminalCells { terminal: &terminal, start: 0, query: Some("hello"), selection: None }
@@ -2623,7 +2689,6 @@ mod tests {
 
         assert_eq!((agent_icon(blocked), agent_color(blocked)), ("◉", NORD.danger));
         assert_eq!((agent_icon(done), agent_color(done)), ("●", NORD.accent_alt));
-        assert_eq!((blocked.status_label(), done.status_label()), ("needs input", "done"));
     }
 
     #[test]
@@ -2637,6 +2702,7 @@ mod tests {
             cursor_x: 0,
             cursor_y: 0,
             mouse_reporting: false,
+            content_sequence: 0,
             lines: (0..6)
                 .map(|index| TerminalLine::from_text(&format!("line-{index}"), &attrs, 0, None))
                 .collect(),

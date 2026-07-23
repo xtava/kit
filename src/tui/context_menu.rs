@@ -302,9 +302,9 @@ impl<C: Clone> ContextMenu<C> {
     }
 
     fn activate_keybinding(&mut self, chord: KeyChord) -> ContextMenuOutcome<C> {
-        let Some(index) =
-            self.items.items().iter().position(|item| item.keybindings.contains(&chord))
-        else {
+        let Some(index) = self.items.items().iter().position(|item| {
+            item.keybindings.iter().any(|binding| binding.direct_chord() == Some(chord))
+        }) else {
             return ContextMenuOutcome::Captured;
         };
         self.selected = index;
@@ -356,7 +356,10 @@ fn menu_control(chord: KeyChord) -> Option<MenuControl> {
 }
 
 fn menu_keybinding(item: &ResolvedAction) -> Option<KeyChord> {
-    item.keybindings.iter().copied().find(|chord| menu_control(*chord).is_none())
+    item.keybindings
+        .iter()
+        .filter_map(|binding| binding.direct_chord())
+        .find(|chord| menu_control(*chord).is_none())
 }
 
 fn clamp_axis(anchor: u16, start: u16, end: u16, length: u16) -> u16 {
@@ -515,32 +518,32 @@ mod tests {
                 when: visible,
             })
             .bind_key(KeybindingPlacement {
-                chord: KeyChord::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+                binding: KeyChord::new(KeyCode::Char('o'), KeyModifiers::CONTROL).into(),
                 action: OPEN,
                 when: visible,
             })
             .bind_key(KeybindingPlacement {
-                chord: KeyChord::new(KeyCode::Delete, KeyModifiers::NONE),
+                binding: KeyChord::new(KeyCode::Delete, KeyModifiers::NONE).into(),
                 action: DELETE,
                 when: visible,
             })
             .bind_key(KeybindingPlacement {
-                chord: KeyChord::new(KeyCode::Char('j'), KeyModifiers::NONE),
+                binding: KeyChord::new(KeyCode::Char('j'), KeyModifiers::NONE).into(),
                 action: OPEN,
                 when: visible,
             })
             .bind_key(KeybindingPlacement {
-                chord: KeyChord::new(KeyCode::Enter, KeyModifiers::CONTROL),
+                binding: KeyChord::new(KeyCode::Enter, KeyModifiers::CONTROL).into(),
                 action: OPEN,
                 when: visible,
             })
             .bind_key(KeybindingPlacement {
-                chord: KeyChord::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+                binding: KeyChord::new(KeyCode::Char('j'), KeyModifiers::CONTROL).into(),
                 action: DELETE,
                 when: visible,
             })
             .bind_key(KeybindingPlacement {
-                chord: KeyChord::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+                binding: KeyChord::new(KeyCode::Char('q'), KeyModifiers::CONTROL).into(),
                 action: OPEN,
                 when: visible,
             });
@@ -641,9 +644,8 @@ mod tests {
         let context = Context { target: 44, visible: true, writable: true };
         let mut menu = menu(context, Position { x: 2, y: 2 });
         let layout = menu.layout(Rect::new(0, 0, 50, 12));
-        assert!(menu.items()[0]
-            .keybindings
-            .contains(&KeyChord::new(KeyCode::Char('j'), KeyModifiers::NONE)));
+        assert!(menu.items()[0].keybindings.iter().any(|binding| binding.direct_chord()
+            == Some(KeyChord::new(KeyCode::Char('j'), KeyModifiers::NONE))));
 
         assert_eq!(menu.on_event(key(KeyCode::Char('j')), &layout), ContextMenuOutcome::Captured);
         assert_eq!(menu.selected(), 1);
@@ -693,7 +695,7 @@ mod tests {
                 title: "Open item",
                 group: "fixture",
                 state: ActionState::Enabled,
-                keybindings: vec![chord],
+                keybindings: vec![chord.into()],
             };
             assert_eq!(menu_keybinding(&item), None, "reserved control {chord} was advertised");
         }
@@ -704,7 +706,10 @@ mod tests {
             title: "Open item",
             group: "fixture",
             state: ActionState::Enabled,
-            keybindings: vec![KeyChord::new(KeyCode::Char('q'), KeyModifiers::NONE), modified],
+            keybindings: vec![
+                KeyChord::new(KeyCode::Char('q'), KeyModifiers::NONE).into(),
+                modified.into(),
+            ],
         };
         assert_eq!(menu_keybinding(&item), Some(modified));
         let rendered = item_line(&item, 30, false, ContextMenuStyle::default())
@@ -712,7 +717,7 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<String>();
-        assert!(rendered.contains("Ctrl+q"));
+        assert!(rendered.contains("Ctrl+Q"));
     }
 
     #[test]
@@ -845,7 +850,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
 
-        for expected in ["Open item", "Ctrl+o", "Delete item", "read only", "─"] {
+        for expected in ["Open item", "Ctrl+O", "Delete item", "read only", "─"] {
             assert!(screen.contains(expected), "missing rendered metadata {expected:?}");
         }
         assert_eq!(layout.separators().len(), 1);
@@ -859,7 +864,7 @@ mod tests {
             title: "界面",
             group: "fixture",
             state: ActionState::disabled("危険"),
-            keybindings: vec![KeyChord::new(KeyCode::Char('界'), KeyModifiers::CONTROL)],
+            keybindings: vec![KeyChord::new(KeyCode::Char('界'), KeyModifiers::CONTROL).into()],
         };
 
         assert_eq!(item_width(&item), 22);

@@ -24,26 +24,6 @@ impl SessionAccess {
         matches!(self, Self::ControlledBySelf)
     }
 
-    pub(super) const fn label(self) -> &'static str {
-        match self {
-            Self::Synchronizing => "syncing",
-            Self::Available => "available",
-            Self::ControlledBySelf => "you",
-            Self::ControlledByOther => "read-only",
-        }
-    }
-
-    /// A stable local affordance. This is deliberately independent of connection recovery so a
-    /// reconnecting client never hides the fact that the selected session can still be inspected.
-    pub(super) const fn banner(self) -> Option<&'static str> {
-        match self {
-            Self::Synchronizing => Some("Control is synchronizing"),
-            Self::Available => Some("Available — Enter or click Acquire to control"),
-            Self::ControlledBySelf => None,
-            Self::ControlledByOther => Some("Read-only — T or click Take control"),
-        }
-    }
-
     pub(super) const fn supports_local_terminal_tools(self) -> bool {
         !matches!(self, Self::Synchronizing)
     }
@@ -186,12 +166,6 @@ pub(super) enum EffectiveLayout {
     TerminalOnly { reason: TerminalOnlyReason },
 }
 
-impl EffectiveLayout {
-    pub(super) const fn is_split(self) -> bool {
-        matches!(self, Self::Split)
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum TerminalOnlyReason {
     User,
@@ -242,10 +216,6 @@ mod tests {
         );
         assert!(!SessionAccess::ControlledByOther.permits_terminal_input());
         assert!(SessionAccess::ControlledByOther.supports_local_terminal_tools());
-        assert_eq!(
-            SessionAccess::ControlledByOther.banner(),
-            Some("Read-only — T or click Take control")
-        );
     }
 
     #[test]

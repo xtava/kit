@@ -2,237 +2,19 @@
 
 mod support;
 
-use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, ensure, Context, Result};
-use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
-use support::console::{HeadlessConsoleClient, LocalConsoleHarness};
+use support::console::{
+    HeadlessConsoleClient, LocalConsoleHarness, PublicConsole, PublicConsoleOptions,
+};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(8);
-const EXIT_TIMEOUT: Duration = Duration::from_secs(3);
-const INITIAL_COLS: u16 = 120;
-const INITIAL_ROWS: u16 = 40;
 const RESIZED_COLS: u16 = 150;
 const RESIZED_ROWS: u16 = 48;
-
-struct PublicConsole {
-    master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
-    child: Box<dyn Child + Send + Sync>,
-    reader: Option<thread::JoinHandle<()>>,
-    output: Arc<Mutex<Vec<u8>>>,
-    config_root: PathBuf,
-}
-
-impl PublicConsole {
-    fn start(harness: &LocalConsoleHarness) -> Result<Self> {
-        let config_root =
-            harness.runtime_root().join(format!("config-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir(&config_root).context("create isolated Console config root")?;
-        let pty = native_pty_system();
-        let pair = pty.openpty(PtySize {
-            rows: INITIAL_ROWS,
-            cols: INITIAL_COLS,
-            pixel_width: 0,
-            pixel_height: 0,
-        })?;
-        let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_kit"));
-        command.arg("console");
-        command.env("TERM", "xterm-256color");
-        command.env("RUST_BACKTRACE", "1");
-        command.env("RUST_LOG", "wezterm_client=warn");
-        command.env("KIT_CONSOLE_RUNTIME_DIR", harness.runtime_root());
-        command.env("XDG_CONFIG_HOME", &config_root);
-        command.env("XDG_STATE_HOME", &config_root);
-        let child = pair.slave.spawn_command(command).context("start public kit console")?;
-        drop(pair.slave);
-
-        let mut source = pair.master.try_clone_reader().context("clone Console PTY reader")?;
-        let writer = pair.master.take_writer().context("take Console PTY writer")?;
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let reader_output = Arc::clone(&output);
-        let reader = thread::Builder::new()
-            .name("kit-console-tui-verifier-reader".to_owned())
-            .spawn(move || {
-                let mut buffer = [0_u8; 4096];
-                while let Ok(count) = source.read(&mut buffer) {
-                    if count == 0 {
-                        break;
-                    }
-                    if let Ok(mut output) = reader_output.lock() {
-                        output.extend_from_slice(&buffer[..count]);
-                    }
-                }
-            })
-            .context("start Console PTY reader")?;
-        let mut console =
-            Self { master: pair.master, writer, child, reader: Some(reader), output, config_root };
-        // Ratatui asks the terminal for its cursor position while initializing. Answer only after
-        // observing the request so the response cannot race raw-mode setup or be line-echoed.
-        console.wait_for_output(b"\x1b[6n").with_context(|| {
-            format!("Console agent startup diagnostics: {:?}", harness.diagnostics())
-        })?;
-        console.send(b"\x1b[1;1R")?;
-        console.wait_for_output(b"kit console")?;
-        console.wait_for_output(b"\x1b[?1049h")?;
-        Ok(console)
-    }
-
-    fn send(&mut self, bytes: &[u8]) -> Result<()> {
-        self.writer.write_all(bytes).context("write Console PTY input")?;
-        self.writer.flush().context("flush Console PTY input")
-    }
-
-    fn type_text(&mut self, text: &str) -> Result<()> {
-        for byte in text.bytes() {
-            self.send(&[byte])?;
-            thread::sleep(Duration::from_millis(15));
-        }
-        Ok(())
-    }
-
-    fn clear_output(&self) -> Result<()> {
-        self.output
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Console PTY output lock was poisoned"))?
-            .clear();
-        Ok(())
-    }
-
-    fn resize(&self, cols: u16, rows: u16) -> Result<()> {
-        self.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
-    }
-
-    fn wait_for_output(&mut self, needle: &[u8]) -> Result<()> {
-        let deadline = Instant::now() + READY_TIMEOUT;
-        loop {
-            let found = self
-                .output
-                .lock()
-                .map_err(|_| anyhow::anyhow!("Console PTY output lock was poisoned"))?
-                .windows(needle.len())
-                .any(|window| window == needle);
-            if found {
-                return Ok(());
-            }
-            if let Some(status) = self.child.try_wait().context("observe public Console")? {
-                let output = self
-                    .output
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("Console PTY output lock was poisoned"))?;
-                bail!(
-                    "public Console exited before producing {:?}: {status}; output={:?}",
-                    String::from_utf8_lossy(needle),
-                    String::from_utf8_lossy(&output)
-                );
-            }
-            if Instant::now() >= deadline {
-                let output = self
-                    .output
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("Console PTY output lock was poisoned"))?;
-                bail!(
-                    "public Console did not produce {:?}; output={:?}",
-                    String::from_utf8_lossy(needle),
-                    String::from_utf8_lossy(&output)
-                );
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-    }
-
-    fn wait_for_any_output(&mut self, needles: &[&[u8]]) -> Result<usize> {
-        let deadline = Instant::now() + READY_TIMEOUT;
-        loop {
-            let output = self
-                .output
-                .lock()
-                .map_err(|_| anyhow::anyhow!("Console PTY output lock was poisoned"))?;
-            if let Some(index) = needles
-                .iter()
-                .position(|needle| output.windows(needle.len()).any(|window| window == *needle))
-            {
-                return Ok(index);
-            }
-            drop(output);
-            if let Some(status) = self.child.try_wait().context("observe public Console")? {
-                let output = self
-                    .output
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("Console PTY output lock was poisoned"))?;
-                bail!(
-                    "public Console exited before expected control state: {status}; output={:?}",
-                    String::from_utf8_lossy(&output)
-                )
-            }
-            if Instant::now() >= deadline {
-                let output = self
-                    .output
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("Console PTY output lock was poisoned"))?;
-                bail!(
-                    "public Console did not produce any expected control state; output={:?}",
-                    String::from_utf8_lossy(&output)
-                )
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-    }
-
-    fn config_path(&self) -> PathBuf {
-        self.config_root.join("kit/console.toml")
-    }
-
-    fn output_snapshot(&self) -> Result<String> {
-        let output = self
-            .output
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Console PTY output lock was poisoned"))?;
-        Ok(String::from_utf8_lossy(&output).into_owned())
-    }
-
-    fn finish(mut self) -> Result<Vec<u8>> {
-        self.send(b"\x02\x11")?;
-        let deadline = Instant::now() + EXIT_TIMEOUT;
-        let status = loop {
-            if let Some(status) = self.child.try_wait().context("observe Console exit")? {
-                break status;
-            }
-            if Instant::now() >= deadline {
-                self.child.kill().context("kill unresponsive public Console")?;
-                break self.child.wait().context("reap killed public Console")?;
-            }
-            thread::sleep(Duration::from_millis(10));
-        };
-        ensure!(status.success(), "public Console exited unsuccessfully: {status}");
-        let _ = self.master.cancel_reader();
-        if let Some(reader) = self.reader.take() {
-            reader.join().map_err(|_| anyhow::anyhow!("Console PTY reader panicked"))?;
-        }
-        let output = self
-            .output
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Console PTY output lock was poisoned"))?
-            .clone();
-        Ok(output)
-    }
-}
-
-impl Drop for PublicConsole {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = self.master.cancel_reader();
-        if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
-        }
-    }
-}
 
 fn wait_for_file(path: &Path) -> Result<()> {
     let deadline = Instant::now() + READY_TIMEOUT;
@@ -251,23 +33,46 @@ fn sgr_mouse(button: u8, column: u16, row: u16, release: bool) -> Vec<u8> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_console_honors_custom_prefix_sequences() -> Result<()> {
+    wezterm_config::designate_this_as_the_main_thread();
+    wezterm_config::common_init(None, &[], true)
+        .context("initialize headless WezTerm verifier config")?;
+
+    let mut harness = LocalConsoleHarness::start().await?;
+    let mut console = PublicConsole::start(
+        &harness,
+        PublicConsoleOptions {
+            config_toml: Some(
+                "[keybindings]\nprefix = \"Ctrl+A\"\nnew_session = \"c\"\nquit = \"q\"\n"
+                    .to_owned(),
+            ),
+            ..PublicConsoleOptions::default()
+        },
+    )?;
+
+    console.send(b"\x01c")?;
+    let observer = HeadlessConsoleClient::connect(&harness).await?;
+    if let Err(error) = observer.wait_for_session_count(1).await {
+        bail!("{error:#}; output={:?}", console.output_snapshot()?);
+    }
+    drop(observer);
+    console.finish_with(b"\x01q")?;
+    harness.shutdown()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn public_console_drives_keyboard_mouse_history_resize_paste_and_clipboard() -> Result<()> {
     wezterm_config::designate_this_as_the_main_thread();
     wezterm_config::common_init(None, &[], true)
         .context("initialize headless WezTerm verifier config")?;
 
     let mut harness = LocalConsoleHarness::start().await?;
-    let mut console = PublicConsole::start(&harness)?;
+    let mut console = PublicConsole::start(&harness, PublicConsoleOptions::default())?;
     let nonce_source = uuid::Uuid::new_v4().simple().to_string();
     let nonce = &nonce_source[..12];
 
     console.clear_output()?;
-    console.send(b"\x0e")?;
-    if console.wait_for_any_output(&[b"you", b"read-only"])? == 1 {
-        console.clear_output()?;
-        console.send(b"\x02t")?;
-        console.wait_for_output(b"you")?;
-    }
+    console.send(b"\x02n")?;
     let first_receipt = std::env::temp_dir().join(format!("kitc-{nonce}"));
     let first_marker = format!("KIT_TUI_FIRST_{nonce}");
     let first_command = format!("printf '{first_marker}\\n'; : > '{}'", first_receipt.display());
@@ -277,16 +82,11 @@ async fn public_console_drives_keyboard_mouse_history_resize_paste_and_clipboard
     std::fs::remove_file(&first_receipt).context("remove Console input receipt")?;
 
     console.clear_output()?;
-    console.send(b"\x02\x0e")?;
-    if console.wait_for_any_output(&[b"you", b"read-only"])? == 1 {
-        console.clear_output()?;
-        console.send(b"\x02t")?;
-        console.wait_for_output(b"you")?;
-    }
+    console.send(b"\x02n")?;
 
     console.clear_output()?;
-    console.send(b"\x02t")?;
-    console.wait_for_any_output(&[b"you", b"already has control"])?;
+    console.send(b"\x02st")?;
+    console.wait_for_any_output(&[b"you", b"Already controlling"])?;
     console.send(b"\x1bOQ")?;
     let title_suffix = format!("-{}", &nonce[..4]);
     let shell_path = std::env::var_os("SHELL").context("the Console verifier requires SHELL")?;
@@ -306,7 +106,7 @@ async fn public_console_drives_keyboard_mouse_history_resize_paste_and_clipboard
     console.wait_for_output(first_marker.as_bytes())?;
     console.clear_output()?;
     console.send(b"t")?;
-    console.wait_for_any_output(&[b"you", b"already has control"])?;
+    console.wait_for_any_output(&[b"you", b"Already controlling"])?;
     console.send(b"\x1b[1;5C")?;
     let history_back = format!("KIT_HISTORY_BACK_{nonce}");
     let history_back_receipt = std::env::temp_dir().join(format!("kitc-back-{nonce}"));
@@ -320,11 +120,11 @@ async fn public_console_drives_keyboard_mouse_history_resize_paste_and_clipboard
     std::fs::remove_file(&history_back_receipt).context("remove history-back receipt")?;
 
     console.clear_output()?;
-    console.send(b"\x02\x1b[C")?;
+    console.send(b"\x02s\x1b[C")?;
     console.wait_for_output(title_suffix.as_bytes())?;
     console.clear_output()?;
     console.send(b"t")?;
-    console.wait_for_any_output(&[b"you", b"already has control"])?;
+    console.wait_for_any_output(&[b"you", b"Already controlling"])?;
     console.send(b"\x1b[1;5C")?;
     let history_forward = format!("KIT_HISTORY_FORWARD_{nonce}");
     let history_forward_receipt = std::env::temp_dir().join(format!("kitc-forward-{nonce}"));
@@ -349,15 +149,15 @@ async fn public_console_drives_keyboard_mouse_history_resize_paste_and_clipboard
     let config = std::fs::read_to_string(&config_path).context("read persisted Console divider")?;
     ensure!(config.contains("sidebar_split_ratio"), "divider drag did not persist its ratio");
 
-    console.send(&sgr_mouse(2, 2, 3, false))?;
+    console.send(&sgr_mouse(2, 2, 1, false))?;
     thread::sleep(Duration::from_millis(100));
-    console.send(&sgr_mouse(0, 3, 10, false))?;
-    console.send(&sgr_mouse(0, 3, 10, true))?;
+    console.send(&sgr_mouse(0, 3, 8, false))?;
+    console.send(&sgr_mouse(0, 3, 8, true))?;
     console.wait_for_output(b"\x1b]52;c;")?;
 
     // A second real TUI must remain useful while observing and must transfer control through the
     // same keyboard/mouse action surface without entering the old dead-notice state.
-    let mut peer = PublicConsole::start(&harness)?;
+    let mut peer = PublicConsole::start(&harness, PublicConsoleOptions::default())?;
     peer.wait_for_output(b"read-only")?;
     peer.clear_output()?;
     peer.send(&sgr_mouse(0, 50, 8, false))?;
@@ -370,28 +170,16 @@ async fn public_console_drives_keyboard_mouse_history_resize_paste_and_clipboard
     );
 
     console.clear_output()?;
-    peer.send(b"\x02t")?;
+    peer.send(b"t")?;
     peer.wait_for_output(b"you")?;
     console.wait_for_output(b"read-only")?;
-
-    // The persistent footer takeover affordance is a real pointer target, not instructional text.
-    console.clear_output()?;
-    console.send(&sgr_mouse(0, RESIZED_COLS - 10, RESIZED_ROWS - 1, false))?;
-    console.send(&sgr_mouse(0, RESIZED_COLS - 10, RESIZED_ROWS - 1, true))?;
-    console.wait_for_output(b"you")?;
-    peer.wait_for_output(b"read-only")?;
 
     let peer_output = peer.finish()?;
     ensure!(peer_output.windows(b"\x1b[?1049l".len()).any(|w| w == b"\x1b[?1049l"));
 
     console.clear_output()?;
-    console.send(b"\x02\x02")?;
-    console.wait_for_output(b"[Ctrl+B] Sessions")?;
-    console.clear_output()?;
-    console.send(&sgr_mouse(0, RESIZED_COLS - 10, 0, false))?;
-    console.send(&sgr_mouse(0, RESIZED_COLS - 10, 0, true))?;
+    console.send(b"\x02s\x02s")?;
     console.wait_for_output(b"Hide sessions")?;
-    console.send(b"\x02")?;
 
     let output = console.finish()?;
     ensure!(output.windows(b"\x1b[?1049l".len()).any(|w| w == b"\x1b[?1049l"));

@@ -8,6 +8,8 @@ mod client;
 mod config;
 mod connection;
 mod interaction;
+mod invalidation;
+mod perf_trace;
 mod remote;
 mod runtime;
 mod service;
@@ -119,7 +121,6 @@ pub(crate) fn build_identity() -> Result<wezterm_codec::BuildIdentity> {
     {
         bail!("Kit was built without an exact embedded WezTerm revision");
     }
-
     Ok(wezterm_codec::BuildIdentity {
         product: "kit-console".to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),

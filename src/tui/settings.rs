@@ -10,7 +10,7 @@ use ratatui::{
     Frame,
 };
 
-use super::{theme::TuiTheme, Direction, NavigationMap, NavigationRegion};
+use super::{theme::TuiTheme, Direction, KeyChord, NavigationMap, NavigationRegion};
 use crate::framework::{ConfigStore, EditableSettings, SettingEdit, SettingField, SettingsSection};
 
 const MIN_WIDTH: u16 = 58;
@@ -60,6 +60,7 @@ pub struct SettingsEditor {
     section_scroll: usize,
     field_scroll: usize,
     active_region: ActiveRegion,
+    capturing: Option<crate::framework::SettingId>,
     notice: Notice,
     theme: TuiTheme,
     regions: Regions,
@@ -85,6 +86,7 @@ impl SettingsEditor {
             section_scroll: 0,
             field_scroll: 0,
             active_region: ActiveRegion::Sections,
+            capturing: None,
             notice: Notice::None,
             theme,
             regions: Regions::default(),
@@ -92,6 +94,17 @@ impl SettingsEditor {
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> SettingsFlow {
+        if let Some(id) = self.capturing {
+            if key.code == KeyCode::Esc {
+                self.capturing = None;
+                return SettingsFlow::Continue;
+            }
+            if let Some(chord) = KeyChord::from_event(key) {
+                self.capturing = None;
+                self.apply_edit(id, SettingEdit::SetKeybinding(chord.to_string()));
+            }
+            return SettingsFlow::Continue;
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('c' | 'd'))
         {
@@ -191,12 +204,23 @@ impl SettingsEditor {
             return;
         };
         let id = field.id();
-        let edit = match (field, edit) {
-            (SettingField::Toggle { .. }, SettingEdit::Previous | SettingEdit::Next) => {
-                SettingEdit::Activate
-            }
-            _ => edit,
+        if matches!(field, SettingField::Keybinding { .. }) && matches!(edit, SettingEdit::Activate)
+        {
+            self.capturing = Some(id);
+            self.notice = Notice::None;
+            return;
+        }
+        let edit = if matches!(field, SettingField::Toggle { .. })
+            && matches!(edit, SettingEdit::Previous | SettingEdit::Next)
+        {
+            SettingEdit::Activate
+        } else {
+            edit
         };
+        self.apply_edit(id, edit);
+    }
+
+    fn apply_edit(&mut self, id: crate::framework::SettingId, edit: SettingEdit) {
         let result = self
             .current_model_mut()
             .context("selected Settings section could not be loaded")
@@ -395,13 +419,17 @@ fn field_height(field: &SettingField, width: u16) -> usize {
 }
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &SettingsEditor) {
-    let (status, color) = match &app.notice {
-        Notice::None => (
-            "↑/↓ select · ←/→ region · Enter/Space change · r reset · q quit".to_owned(),
-            app.theme.text_muted,
-        ),
-        Notice::Saved => ("Saved".to_owned(), app.theme.text_muted),
-        Notice::Error(error) => (error.clone(), app.theme.danger),
+    let (status, color) = if app.capturing.is_some() {
+        ("Press the new keybinding · Esc cancel".to_owned(), app.theme.accent)
+    } else {
+        match &app.notice {
+            Notice::None => (
+                "↑/↓ select · ←/→ region · Enter/Space change · r reset · q quit".to_owned(),
+                app.theme.text_muted,
+            ),
+            Notice::Saved => ("Saved".to_owned(), app.theme.text_muted),
+            Notice::Error(error) => (error.clone(), app.theme.danger),
+        }
     };
     let path = app
         .sections
@@ -425,6 +453,7 @@ fn display_value(field: &SettingField) -> String {
         SettingField::Toggle { value: true, .. } => "[●] On".to_owned(),
         SettingField::Toggle { value: false, .. } => "[○] Off".to_owned(),
         SettingField::Choice { selected, .. } => format!("‹ {selected} ›"),
+        SettingField::Keybinding { value, .. } => format!("‹ {value} ›"),
     }
 }
 
@@ -450,6 +479,7 @@ mod tests {
     use crate::tui::theme::NORD;
 
     const ENABLED: SettingId = SettingId("enabled");
+    const SHORTCUT: SettingId = SettingId("shortcut");
 
     struct TestSettings {
         store: ConfigStore,
@@ -461,6 +491,11 @@ mod tests {
     struct Stored {
         #[serde(default)]
         enabled: bool,
+    }
+
+    #[derive(Default, Deserialize)]
+    struct ShortcutStored {
+        shortcut: String,
     }
 
     impl EditableSettings for TestSettings {
@@ -498,6 +533,37 @@ mod tests {
 
     fn open_many(store: ConfigStore) -> Result<Box<dyn EditableSettings>> {
         Ok(Box::new(TestSettings { store, enabled: false, field_count: 12 }))
+    }
+
+    struct KeybindingSettings {
+        store: ConfigStore,
+        shortcut: String,
+    }
+
+    impl EditableSettings for KeybindingSettings {
+        fn fields(&self) -> Vec<SettingField> {
+            vec![SettingField::Keybinding {
+                id: SHORTCUT,
+                label: "Shortcut",
+                description: "Exercise shared keybinding capture.",
+                value: self.shortcut.clone(),
+            }]
+        }
+
+        fn edit(&mut self, id: SettingId, edit: SettingEdit) -> Result<()> {
+            match (id, edit) {
+                (SHORTCUT, SettingEdit::SetKeybinding(value)) => {
+                    self.store.set("keys", SHORTCUT.0, ConfigValue::String(value.clone()))?;
+                    self.shortcut = value;
+                    Ok(())
+                }
+                _ => bail!("invalid keybinding edit"),
+            }
+        }
+    }
+
+    fn open_keybinding(store: ConfigStore) -> Result<Box<dyn EditableSettings>> {
+        Ok(Box::new(KeybindingSettings { store, shortcut: "Ctrl+B".to_owned() }))
     }
 
     fn open_invalid(_store: ConfigStore) -> Result<Box<dyn EditableSettings>> {
@@ -550,6 +616,27 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
         let stored: Stored = store.load("test")?;
         assert!(!stored.enabled);
+        let _ = std::fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn keybinding_fields_capture_the_next_chord() -> Result<()> {
+        let dir =
+            std::env::temp_dir().join(format!("kit-settings-keybinding-{}", std::process::id()));
+        let store = ConfigStore::rooted(dir.clone());
+        let mut app = SettingsEditor::open(store.clone(), vec![section(open_keybinding)], NORD);
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.capturing, Some(SHORTCUT));
+        app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+
+        let stored: ShortcutStored = store.load("keys")?;
+        assert_eq!(stored.shortcut, "Ctrl+A");
+        assert_eq!(app.capturing, None);
+        assert!(matches!(app.notice, Notice::Saved));
+
         let _ = std::fs::remove_dir_all(dir);
         Ok(())
     }

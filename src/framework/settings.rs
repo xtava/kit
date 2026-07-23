@@ -11,35 +11,41 @@ pub struct SettingId(pub &'static str);
 pub enum SettingField {
     Toggle { id: SettingId, label: &'static str, description: &'static str, value: bool },
     Choice { id: SettingId, label: &'static str, description: &'static str, selected: &'static str },
+    Keybinding { id: SettingId, label: &'static str, description: &'static str, value: String },
 }
 
 impl SettingField {
     pub const fn id(&self) -> SettingId {
         match self {
-            Self::Toggle { id, .. } | Self::Choice { id, .. } => *id,
+            Self::Toggle { id, .. } | Self::Choice { id, .. } | Self::Keybinding { id, .. } => *id,
         }
     }
 
     pub const fn label(&self) -> &'static str {
         match self {
-            Self::Toggle { label, .. } | Self::Choice { label, .. } => label,
+            Self::Toggle { label, .. }
+            | Self::Choice { label, .. }
+            | Self::Keybinding { label, .. } => label,
         }
     }
 
     pub const fn description(&self) -> &'static str {
         match self {
-            Self::Toggle { description, .. } | Self::Choice { description, .. } => description,
+            Self::Toggle { description, .. }
+            | Self::Choice { description, .. }
+            | Self::Keybinding { description, .. } => description,
         }
     }
 }
 
 /// A semantic edit requested by the shared Settings editor.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SettingEdit {
     Activate,
     Previous,
     Next,
     Reset,
+    SetKeybinding(String),
 }
 
 /// A tool-owned typed Settings model editable through the shared TUI.

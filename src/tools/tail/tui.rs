@@ -29,8 +29,9 @@ use crate::{
     tui::{
         render_split_divider, ActionId, ActionInvocation, ActionState, ActionUnavailable,
         ContextMenu, ContextMenuLayout, ContextMenuOutcome, ContextMenuStyle, EventReader,
-        KeyChord, NavigationHistory, NavigationMap, NavigationRegion, ResolvedAction, Session,
-        SessionOptions, SplitDividerStyle, SplitDrag, SplitFrame, SplitMinimums, SplitRatio,
+        KeyChord, KeybindingResolution, KeybindingState, NavigationHistory, NavigationMap,
+        NavigationRegion, ResolvedAction, Session, SessionOptions, SplitDividerStyle, SplitDrag,
+        SplitFrame, SplitMinimums, SplitRatio,
     },
 };
 
@@ -274,6 +275,7 @@ struct App {
     mode: Mode,
     overlay: Option<Overlay>,
     registry: TailActionRegistry,
+    keybinding_state: KeybindingState,
     composer: Composer,
     sends: SendQueue,
     search: String,
@@ -1028,6 +1030,7 @@ impl App {
             mode,
             overlay: None,
             registry: contributions::registry().expect("Tail action contributions are valid"),
+            keybinding_state: KeybindingState::default(),
             composer: Composer::default(),
             sends: SendQueue::default(),
             search: String::new(),
@@ -1880,12 +1883,26 @@ fn handle_key(key: KeyEvent, app: &mut App, regions: &UiRegions, login_idle: boo
             _ => {}
         }
     }
-    let contributed = (matches!(app.mode, Mode::Workspace)
+    let contributed = if matches!(app.mode, Mode::Workspace)
         && (app.active_region != ActiveRegion::Composer
-            || key.modifiers.contains(KeyModifiers::CONTROL)))
-    .then(|| KeyChord::from_event(key))
-    .flatten()
-    .and_then(|chord| app.registry.resolve_keybinding(chord, app.action_context()));
+            || key.modifiers.contains(KeyModifiers::CONTROL))
+    {
+        let Some(chord) = KeyChord::from_event(key) else {
+            app.keybinding_state.cancel();
+            return Flow::Continue;
+        };
+        let context = app.action_context();
+        match app.registry.resolve_keybinding(&mut app.keybinding_state, chord, context) {
+            KeybindingResolution::Invoke(invocation) => Some(invocation),
+            KeybindingResolution::Pending => return Flow::Continue,
+            KeybindingResolution::Unmatched | KeybindingResolution::UnmatchedSequence { .. } => {
+                None
+            }
+        }
+    } else {
+        app.keybinding_state.cancel();
+        None
+    };
     let action = match (&app.mode, key.code) {
         (Mode::Auth, KeyCode::Char('o')) => Some(contributions::OPEN_LOGIN),
         (Mode::Auth, KeyCode::Char('c')) => Some(contributions::COPY_LOGIN),
