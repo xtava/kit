@@ -49,7 +49,8 @@ fn invoke_command(console: &mut PublicConsole, query: &str) -> Result<()> {
     console.clear_output()?;
     console.send(b"\x10")?;
     console.wait_for_output(b"Commands")?;
-    console.type_text(query)?;
+    console.send(format!("\x1b[200~{query}\x1b[201~").as_bytes())?;
+    console.wait_for_output(query.as_bytes())?;
     console.send(b"\r")
 }
 
@@ -208,7 +209,10 @@ async fn public_console_drives_keyboard_mouse_history_resize_paste_and_clipboard
     let title = format!("{shell_name}{title_suffix}");
     console.type_text(&title_suffix)?;
     console.send(b"\r")?;
-    console.wait_for_output(title_suffix.as_bytes())?;
+    let observer = HeadlessConsoleClient::connect(&harness).await?;
+    let renamed = observer.wait_for_session_count(2).await?[1];
+    observer.wait_for_title(renamed.tab_id, &title).await?;
+    drop(observer);
 
     console.clear_output()?;
     // Rename is a sidebar-owned interaction and deliberately leaves focus in the sessions panel,

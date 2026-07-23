@@ -68,10 +68,10 @@ impl PublicConsole {
             harness.runtime_root().join(format!("config-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir(&config_root).context("create isolated Console config root")?;
         if let Some(config_toml) = options.config_toml.as_deref() {
-            let config_dir = config_root.join("kit");
-            fs::create_dir(&config_dir).context("create Console config directory")?;
-            fs::write(config_dir.join("console.toml"), config_toml)
-                .context("write isolated Console config")?;
+            let config_path = isolated_console_config_path(&config_root);
+            fs::create_dir_all(config_path.parent().expect("Console config parent"))
+                .context("create Console config directory")?;
+            fs::write(config_path, config_toml).context("write isolated Console config")?;
         }
         let pty = native_pty_system();
         let pair = pty.openpty(PtySize {
@@ -91,6 +91,8 @@ impl PublicConsole {
         command.env("KIT_CONSOLE_RUNTIME_DIR", harness.runtime_root());
         command.env("XDG_CONFIG_HOME", &config_root);
         command.env("XDG_STATE_HOME", &config_root);
+        #[cfg(target_os = "macos")]
+        command.env("HOME", &config_root);
         if let Some(prefix) = options.path_prefix.as_ref() {
             let mut paths = vec![prefix.clone()];
             paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
@@ -238,7 +240,7 @@ impl PublicConsole {
     }
 
     pub fn config_path(&self) -> PathBuf {
-        self.config_root.join("kit/console.toml")
+        isolated_console_config_path(&self.config_root)
     }
 
     pub fn output_snapshot(&self) -> Result<String> {
@@ -298,6 +300,17 @@ impl PublicConsole {
             .map_err(|_| anyhow::anyhow!("Console PTY output lock was poisoned"))?
             .clone();
         Ok(output)
+    }
+}
+
+fn isolated_console_config_path(root: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        return root.join("Library/Application Support/kit/console.toml");
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        root.join("kit/console.toml")
     }
 }
 
