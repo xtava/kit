@@ -536,11 +536,12 @@ fn read_body<R: std::io::Read>(r: &mut R, body: &AdmittedPduBody) -> anyhow::Res
     Ok(data)
 }
 
-/// A successfully decoded inbound PDU whose working-memory reservation remains live.
+/// A successfully decoded inbound PDU whose decoded-heap reservation remains live.
 ///
 /// Outbound PDUs are represented directly by `Pdu` plus their serial. Keeping this
 /// type inbound-only makes it impossible to construct decoded data without the
-/// reservation that bounded its wire and heap materialization.
+/// reservation that bounded its retained heap materialization. The decoder releases
+/// the separate wire-buffer permit as soon as the source buffer is dropped.
 #[derive(Debug)]
 pub struct AdmittedDecodedPdu {
     serial: u64,
@@ -550,7 +551,6 @@ pub struct AdmittedDecodedPdu {
 
 #[derive(Debug)]
 pub struct DecodeReservation {
-    _wire: BytePermit,
     _heap: BytePermit,
 }
 
@@ -953,32 +953,23 @@ macro_rules! pdu {
                     .with_context(|| {
                         format!("reserving decoded heap envelope for {}", body.tag.name())
                     })?;
-                let AdmittedPduBody {
-                    serial,
-                    tag,
-                    is_compressed,
-                    wire,
-                    ..
-                } = body;
-                match tag {
+                let AdmittedPduBody { serial, tag, is_compressed, wire, .. } = body;
+                let pdu = match tag {
                     $(
                         PduTag::$name => {
                             metrics::histogram!("pdu.size", "pdu" => stringify!($name)).record(data.len() as f64);
                             metrics::histogram!("pdu.size.rate", "pdu" => stringify!($name)).record(data.len() as f64);
-                            Ok(AdmittedDecodedPdu {
-                                serial,
-                                pdu: Pdu::$name(deserialize(
-                                    data.as_slice(),
-                                    is_compressed,
-                                )?),
-                                reservation: DecodeReservation {
-                                    _wire: wire,
-                                    _heap: heap,
-                                },
-                            })
+                            Pdu::$name(deserialize(data.as_slice(), is_compressed)?)
                         }
                     ,)*
-                }
+                };
+                drop(data);
+                drop(wire);
+                Ok(AdmittedDecodedPdu {
+                    serial,
+                    pdu,
+                    reservation: DecodeReservation { _heap: heap },
+                })
             }
         }
     }
@@ -2675,7 +2666,7 @@ mod test {
     }
 
     #[test]
-    fn rpc_response_keeps_decode_admission_until_explicit_acceptance() {
+    fn rpc_response_releases_wire_admission_but_keeps_heap_until_explicit_acceptance() {
         let admission = admission();
         let mut encoded = Vec::new();
         Pdu::ServiceDrainResult(ServiceDrainResult { draining: true })
@@ -2688,7 +2679,10 @@ mod test {
             &admission,
         )
         .unwrap();
-        assert!(admission.byte_usage(ByteClass::DecodeWorking) > 0);
+        assert_eq!(
+            admission.byte_usage(ByteClass::DecodeWorking),
+            MAX_DECODE_METADATA_HEAP_ENVELOPE_BYTES_PER_PDU
+        );
 
         let response = decoded
             .into_rpc_response()
@@ -2699,7 +2693,10 @@ mod test {
             })
             .unwrap();
         assert_eq!(response.serial(), 1);
-        assert!(admission.byte_usage(ByteClass::DecodeWorking) > 0);
+        assert_eq!(
+            admission.byte_usage(ByteClass::DecodeWorking),
+            MAX_DECODE_METADATA_HEAP_ENVELOPE_BYTES_PER_PDU
+        );
 
         let _result = response.into_inner();
         assert_eq!(admission.byte_usage(ByteClass::DecodeWorking), 0);

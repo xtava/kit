@@ -21,6 +21,7 @@ use support::console::{
 const DEFAULT_SETTLE_SECS: u64 = 10;
 const DEFAULT_SAMPLE_SECS: u64 = 30;
 const MAX_DURATION_SECS: u64 = 600;
+const RUN_OVERHEAD_TIMEOUT_SECS: u64 = 60;
 const MOUSE_MAX_TRANSIENT_RSS_BYTES: u64 = 8 * 1024 * 1024;
 const MOUSE_RECOVERY_TOLERANCE_BYTES: u64 = 1024 * 1024;
 const SESSION_COUNTS: &[usize] = &[1, 10, 20];
@@ -41,6 +42,15 @@ impl PerformanceConfig {
         let sample = parse_duration("KIT_CONSOLE_PERF_SAMPLE_SECS", DEFAULT_SAMPLE_SECS)?;
         let workload = Workload::from_env()?;
         Ok(Self { session_count, settle, sample, workload })
+    }
+
+    fn run_timeout(self) -> Result<Duration> {
+        self.settle
+            .checked_add(self.sample)
+            .and_then(|duration| {
+                duration.checked_add(Duration::from_secs(RUN_OVERHEAD_TIMEOUT_SECS))
+            })
+            .context("compute Console performance verifier deadline")
     }
 }
 
@@ -276,11 +286,19 @@ async fn kit_console_performance_matrix() -> Result<()> {
         .context("initialize headless WezTerm verifier config")?;
 
     let config = PerformanceConfig::from_env()?;
+    let run_timeout = config.run_timeout()?;
+    eprintln!(
+        "console-perf phase=starting sessions={} workload={} deadline={}s",
+        config.session_count,
+        config.workload.label(),
+        run_timeout.as_secs()
+    );
     let mut harness = LocalConsoleHarness::start().await?;
     let trace_path = harness.runtime_root().join("console-performance-trace.json");
     let mut public_console = None;
 
-    let outcome = async {
+    let outcome = tokio::time::timeout(run_timeout, async {
+        eprintln!("console-perf phase=creating-sessions");
         let client = HeadlessConsoleClient::connect(&harness).await?;
         let run_id = uuid::Uuid::new_v4().simple().to_string();
         let sleep_seconds = config
@@ -319,6 +337,7 @@ async fn kit_console_performance_matrix() -> Result<()> {
             console.send(b"\r")?;
             console.wait_for_output(b"you")?;
         }
+        eprintln!("console-perf phase=settling duration={}s", config.settle.as_secs());
         tokio::time::sleep(config.settle).await;
         let console = public_console.as_mut().context("public Console did not start")?;
 
@@ -330,6 +349,7 @@ async fn kit_console_performance_matrix() -> Result<()> {
         let rss_sampler = (config.workload == Workload::Mouse)
             .then(|| RssSampler::start(client_pid, agent_pid, sample_started))
             .transpose()?;
+        eprintln!("console-perf phase=sampling duration={}s", config.sample.as_secs());
         run_workload(console, config.workload, config.sample).await?;
         let elapsed = sample_started.elapsed();
         let after = capture_processes()?;
@@ -389,9 +409,17 @@ async fn kit_console_performance_matrix() -> Result<()> {
             agent,
         };
         Ok::<PerformanceResult, anyhow::Error>(result)
-    }
-    .await;
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "Console performance verifier exceeded its {}s hard deadline",
+            run_timeout.as_secs()
+        )
+    })
+    .and_then(|result| result);
 
+    eprintln!("console-perf phase=cleaning-up");
     let finish_result = match public_console.take() {
         Some(console) => console.finish().map(|_| ()),
         None => Ok(()),
