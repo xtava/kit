@@ -7,6 +7,7 @@ mod bridge;
 mod client;
 mod config;
 mod connection;
+mod control_center;
 mod interaction;
 mod invalidation;
 mod perf_trace;
@@ -39,7 +40,7 @@ enum HiddenEntry {
 #[derive(Parser)]
 #[command(name = "console", about = "Persistent terminal sessions across your tailnet")]
 struct ConsoleArgs {
-    /// Tailnet machine. Omit it to use this machine.
+    /// Tailnet machine, or `this-machine` for the direct local path.
     #[arg(value_name = "MACHINE")]
     machine: Option<String>,
     /// Create a new session immediately after connecting.
@@ -206,15 +207,57 @@ impl Tool for ConsoleTool {
             bail!("kit console is an interactive TUI and does not emit JSON");
         }
 
-        let mut config = config::Config::load(cx.config.clone())?;
         if let Some(machine) = args.machine {
-            let mut resolution = remote::resolve(&cx.processes, &mut config, &machine).await?;
+            let request = if machine == "this-machine" {
+                control_center::MachineConnectionRequest::Local { create_session: args.new }
+            } else {
+                control_center::MachineConnectionRequest::Remote {
+                    selector: machine,
+                    create_session: args.new,
+                }
+            };
+            let _ = run_connection(cx, request).await?;
+            return Ok(());
+        }
+
+        loop {
+            let config = config::Config::load(cx.config.clone())?;
+            match control_center::run(cx, config).await? {
+                control_center::ControlCenterOutcome::Connect(request) => {
+                    match run_connection(cx, request).await? {
+                        control_center::ConnectedSessionOutcome::ReturnToControlCenter => {}
+                        control_center::ConnectedSessionOutcome::Quit => return Ok(()),
+                    }
+                }
+                control_center::ControlCenterOutcome::Quit => return Ok(()),
+            }
+        }
+    }
+}
+
+async fn run_connection(
+    cx: &Context,
+    request: control_center::MachineConnectionRequest,
+) -> Result<control_center::ConnectedSessionOutcome> {
+    let config = config::Config::load(cx.config.clone())?;
+    match request {
+        control_center::MachineConnectionRequest::Local { create_session } => {
+            let connection_owner = client::local_connection_owner()?;
+            let client = client::ConsoleClient::connect(&connection_owner).await?;
+            if create_session {
+                client.create_session(120, 32).await?;
+            }
+            tui::run(client, config).await
+        }
+        control_center::MachineConnectionRequest::Remote { selector, create_session } => {
+            let mut config = config;
+            let mut resolution = remote::resolve(&cx.processes, &mut config, &selector).await?;
             if matches!(
                 &resolution,
                 remote::Resolution::Status(service::ConsoleStatus::NeedsTailscaleLogin { .. })
             ) {
                 remote::login(&cx.processes).await?;
-                resolution = remote::resolve(&cx.processes, &mut config, &machine).await?;
+                resolution = remote::resolve(&cx.processes, &mut config, &selector).await?;
             }
             let target = match resolution {
                 remote::Resolution::Ready(target) => target,
@@ -228,7 +271,7 @@ impl Tool for ConsoleTool {
                 let client =
                     client::ConsoleClient::connect_to_relay(&connection_owner, relay_status)
                         .await?;
-                if args.new {
+                if create_session {
                     client.create_session(120, 32).await?;
                 }
                 tui::run(client, config).await
@@ -236,22 +279,18 @@ impl Tool for ConsoleTool {
             .await;
             let latest_status = relay.latest_status();
             let shutdown = relay.shutdown().await;
-            if let Err(error) = result {
-                if let Some(status) = latest_status {
-                    bail!("{}", status.text());
+            let outcome = match result {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    if let Some(status) = latest_status {
+                        bail!("{}", status.text());
+                    }
+                    return Err(error);
                 }
-                return Err(error);
-            }
+            };
             shutdown?;
-            return Ok(());
+            Ok(outcome)
         }
-
-        let connection_owner = client::local_connection_owner()?;
-        let client = client::ConsoleClient::connect(&connection_owner).await?;
-        if args.new {
-            client.create_session(120, 32).await?;
-        }
-        tui::run(client, config).await
     }
 }
 
@@ -278,6 +317,9 @@ mod tests {
         let remote = ConsoleArgs::try_parse_from(["console", "tvxm", "--new"]).unwrap();
         assert_eq!(remote.machine.as_deref(), Some("tvxm"));
         assert!(remote.new);
+
+        let local = ConsoleArgs::try_parse_from(["console", "this-machine"]).unwrap();
+        assert_eq!(local.machine.as_deref(), Some("this-machine"));
 
         let setup = ConsoleArgs::try_parse_from(["console", "setup", "tvxm"]).unwrap();
         assert!(matches!(

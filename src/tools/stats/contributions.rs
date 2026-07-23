@@ -7,7 +7,7 @@ use super::host::ProcessAction;
 use super::model::{CapabilityState, HostCapabilities, ProcessIdentity};
 use crate::tui::{
     ActionId, ActionRegistry, ActionRegistryBuilder, ActionRegistryError, ActionSpec, ActionState,
-    KeyChord, Keybinding, KeybindingPlacement, MenuId, MenuPlacement,
+    CommandPalettePlacement, KeyChord, Keybinding, KeybindingPlacement, MenuId, MenuPlacement,
 };
 #[cfg(test)]
 use crate::tui::{KeybindingResolution, KeybindingState};
@@ -54,24 +54,44 @@ pub(super) fn contribute_actions(
             title: "View full command",
             command: StatsCommand::ViewCommand,
             enablement: live_process,
+            command_palette: CommandPalettePlacement::Visible {
+                group: "Process",
+                group_order: 10,
+                order: 10,
+            },
         })
         .register_action(ActionSpec {
             id: OPEN_PROFILE,
             title: "Profile",
             command: StatsCommand::OpenProfile,
             enablement: enabled,
+            command_palette: CommandPalettePlacement::Visible {
+                group: "Process",
+                group_order: 10,
+                order: 20,
+            },
         })
         .register_action(ActionSpec {
             id: TERMINATE,
             title: "End process…",
             command: StatsCommand::RequestTerminate(ProcessAction::GracefulTerminate),
             enablement: graceful_termination_available,
+            command_palette: CommandPalettePlacement::Visible {
+                group: "Process",
+                group_order: 10,
+                order: 30,
+            },
         })
         .register_action(ActionSpec {
             id: FORCE_TERMINATE,
             title: "Force end process…",
             command: StatsCommand::RequestTerminate(ProcessAction::ForceTerminate),
             enablement: force_termination_available,
+            command_palette: CommandPalettePlacement::Visible {
+                group: "Process",
+                group_order: 10,
+                order: 40,
+            },
         });
 
     for (action, group, group_order, order) in [

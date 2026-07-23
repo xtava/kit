@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 
 use anyhow::Context;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
-    layout::{Constraint, Direction as LayoutDirection, Layout, Rect},
+    layout::{Constraint, Direction as LayoutDirection, Layout, Position, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Padding, Paragraph, Wrap},
@@ -33,6 +33,8 @@ enum ActiveRegion {
 struct Regions {
     sections: Rect,
     fields: Rect,
+    section_rows: Vec<(Rect, usize)>,
+    field_rows: Vec<(Rect, usize)>,
 }
 
 enum SectionState {
@@ -127,7 +129,50 @@ impl SettingsEditor {
         SettingsFlow::Continue
     }
 
+    pub fn on_mouse(&mut self, mouse: MouseEvent) -> SettingsFlow {
+        let position = Position::new(mouse.column, mouse.row);
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some((_, index)) =
+                    self.regions.section_rows.iter().find(|(area, _)| area.contains(position))
+                {
+                    self.active_region = ActiveRegion::Sections;
+                    self.selected_section = *index;
+                    self.selected_field = 0;
+                    self.field_scroll = 0;
+                    self.notice = Notice::None;
+                } else if let Some((_, index)) =
+                    self.regions.field_rows.iter().find(|(area, _)| area.contains(position))
+                {
+                    self.active_region = ActiveRegion::Fields;
+                    self.selected_field = *index;
+                    self.apply(SettingEdit::Activate);
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                if self.regions.fields.contains(position) {
+                    self.active_region = ActiveRegion::Fields;
+                } else if self.regions.sections.contains(position) {
+                    self.active_region = ActiveRegion::Sections;
+                }
+                self.select_relative(-1);
+            }
+            MouseEventKind::ScrollDown => {
+                if self.regions.fields.contains(position) {
+                    self.active_region = ActiveRegion::Fields;
+                } else if self.regions.sections.contains(position) {
+                    self.active_region = ActiveRegion::Sections;
+                }
+                self.select_relative(1);
+            }
+            _ => {}
+        }
+        SettingsFlow::Continue
+    }
+
     pub fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        self.regions.section_rows.clear();
+        self.regions.field_rows.clear();
         let compact = area.width < MIN_WIDTH || area.height < MIN_HEIGHT;
         let header_height = u16::from(area.height >= 3);
         let footer_height = if area.height >= 5 { 2 } else { u16::from(area.height >= 2) };
@@ -333,6 +378,12 @@ fn render_sections(frame: &mut Frame<'_>, area: Rect, app: &mut SettingsEditor) 
             ])
         })
         .collect::<Vec<_>>();
+    app.regions.section_rows = (app.section_scroll..app.section_scroll + lines.len())
+        .enumerate()
+        .map(|(row, index)| {
+            (Rect::new(inner.x, inner.y + u16::try_from(row).unwrap_or(0), inner.width, 1), index)
+        })
+        .collect();
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -368,7 +419,16 @@ fn render_fields(frame: &mut Frame<'_>, area: Rect, app: &mut SettingsEditor) {
     let fields = app.fields();
     keep_field_visible(app, &fields, inner);
     let mut lines = Vec::new();
+    let mut row = 0_u16;
     for (index, field) in fields.iter().enumerate().skip(app.field_scroll) {
+        let height = u16::try_from(field_height(field, inner.width)).unwrap_or(u16::MAX);
+        if row >= inner.height {
+            break;
+        }
+        app.regions.field_rows.push((
+            Rect::new(inner.x, inner.y + row, inner.width, height.min(inner.height - row)),
+            index,
+        ));
         let selected = index == app.selected_field;
         lines.push(Line::from(vec![
             Span::styled(if selected { "▌ " } else { "  " }, Style::default().fg(app.theme.accent)),
@@ -385,6 +445,7 @@ fn render_fields(frame: &mut Frame<'_>, area: Rect, app: &mut SettingsEditor) {
             Style::default().fg(app.theme.text_muted),
         ));
         lines.push(Line::from(""));
+        row = row.saturating_add(height);
     }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
@@ -470,7 +531,9 @@ fn panel(title: &str, active: bool, theme: TuiTheme) -> Block<'_> {
 #[cfg(test)]
 mod tests {
     use anyhow::{bail, Result};
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
     use ratatui::{backend::TestBackend, Terminal};
     use serde::Deserialize;
 
@@ -616,6 +679,34 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
         let stored: Stored = store.load("test")?;
         assert!(!stored.enabled);
+        let _ = std::fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn mouse_uses_rendered_field_geometry_and_updates_the_typed_file() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "kit-settings-mouse-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let store = ConfigStore::rooted(dir.clone());
+        let mut app = SettingsEditor::open(store.clone(), vec![section(open_test)], NORD);
+        let mut terminal = Terminal::new(TestBackend::new(90, 20))?;
+        terminal.draw(|frame| app.render(frame, frame.area()))?;
+        let field = app.regions.field_rows[0].0;
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: field.x,
+            row: field.y,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        let stored: Stored = store.load("test")?;
+        assert!(stored.enabled);
+        assert_eq!(app.active_region, ActiveRegion::Fields);
+        assert!(matches!(app.notice, Notice::Saved));
         let _ = std::fs::remove_dir_all(dir);
         Ok(())
     }

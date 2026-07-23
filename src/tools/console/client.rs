@@ -417,6 +417,10 @@ impl ConsoleClient {
         self.terminal_view(remote_pane_id)
     }
 
+    pub fn local_pane_id(&self, remote_pane_id: usize) -> Result<Option<usize>> {
+        Ok(self.connection.domain()?.remote_to_local_pane_id(remote_pane_id))
+    }
+
     pub async fn create_session(&self, cols: u16, rows: u16) -> Result<SessionId> {
         let client = self.connection.client()?;
         let response = bounded_rpc(
@@ -465,12 +469,10 @@ impl ConsoleClient {
         Ok(())
     }
 
-    pub async fn close_session(&self, id: SessionId) -> Result<()> {
-        let session = self.find_session(id).await?;
-        self.require_control(session.pane_id).await?;
+    pub async fn close_pane(&self, pane_id: usize) -> Result<()> {
+        self.require_control(pane_id).await?;
         let client = self.connection.client()?;
-        bounded_rpc("closing a session", client.kill_pane(KillPane { pane_id: session.pane_id }))
-            .await?;
+        bounded_rpc("closing a session", client.kill_pane(KillPane { pane_id })).await?;
         Ok(())
     }
 
@@ -529,7 +531,6 @@ impl ConsoleClient {
         if event.kind == KeyEventKind::Release {
             return Ok(());
         }
-        self.require_control(pane_id).await?;
         let Some((key, modifiers)) = map_key(event) else {
             return Ok(());
         };
@@ -547,7 +548,6 @@ impl ConsoleClient {
     }
 
     pub async fn paste(&self, pane_id: usize, text: String) -> Result<()> {
-        self.require_control(pane_id).await?;
         let client = self.connection.client()?;
         bounded_rpc("pasting into a session", client.send_paste(SendPaste { pane_id, data: text }))
             .await?;
@@ -567,7 +567,6 @@ impl ConsoleClient {
         let Some(event) = map_mouse(event, geometry) else {
             return Ok(false);
         };
-        self.require_control(pane_id).await?;
         let client = self.connection.client()?;
         bounded_rpc(
             "sending terminal mouse input",
@@ -578,7 +577,6 @@ impl ConsoleClient {
     }
 
     pub async fn resize(&self, tab_id: usize, pane_id: usize, cols: u16, rows: u16) -> Result<()> {
-        self.require_control(pane_id).await?;
         let client = self.connection.client()?;
         bounded_rpc(
             "resizing a session",
@@ -663,8 +661,7 @@ impl ConsoleClient {
 
     fn terminal_view(&self, remote_pane_id: usize) -> Result<Option<TerminalView>> {
         perf_trace::record_terminal_projection();
-        let domain = self.connection.domain()?;
-        let Some(local_pane_id) = domain.remote_to_local_pane_id(remote_pane_id) else {
+        let Some(local_pane_id) = self.local_pane_id(remote_pane_id)? else {
             return Ok(None);
         };
         let Some(pane) = Mux::get().get_pane(local_pane_id) else {
@@ -726,8 +723,7 @@ impl ConsoleClient {
                 },
             ));
         }
-        let domain = self.connection.domain()?;
-        let Some(local_pane_id) = domain.remote_to_local_pane_id(session.pane_id) else {
+        let Some(local_pane_id) = self.local_pane_id(session.pane_id)? else {
             return Ok(tracker.observe_with(
                 session.id,
                 activity::AgentFingerprint {

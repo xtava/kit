@@ -21,12 +21,13 @@ use crate::{
         ProcessSupervisor, StreamPolicy, TerminationPolicy,
     },
     framework::{start_external, ExternalTarget},
-    tailscale::{find_login_url, LoginEvent, Readiness, Status, TailscaleClient},
+    release::UpdateOutcome,
+    tailscale::{find_login_url, LoginEvent, Node, Readiness, Status, TailscaleClient},
 };
 
 use super::{
     config::Config,
-    service::ConsoleStatus,
+    service::{ConsoleStatus, RemoteFailureKind},
     transport::{RelayEpochFailure, RelayEpochProvider, RelayTarget, SshRelay},
 };
 
@@ -87,6 +88,14 @@ pub(crate) async fn resolve(
         Err(status) => return Ok(Resolution::Status(status)),
     };
     let node = status.resolve_peer(machine)?;
+    resolve_node(config, node, explicit_user)
+}
+
+pub(crate) fn resolve_node(
+    config: &mut Config,
+    node: &Node,
+    explicit_user: Option<&str>,
+) -> Result<Resolution> {
     if !node.online {
         return Ok(Resolution::Status(ConsoleStatus::PeerOffline {
             machine: node.display_name().to_owned(),
@@ -101,7 +110,7 @@ pub(crate) async fn resolve(
         return Ok(Resolution::Status(ConsoleStatus::NeedsUnixUser {
             machine: node.display_name().to_owned(),
             stable_node_id: node.id.clone(),
-            action: format!("retry as USER@{machine}"),
+            action: format!("retry as USER@{}", node.display_name()),
         }));
     };
     let address = node.addresses.first().copied().context("Tailscale peer has no address")?;
@@ -190,12 +199,14 @@ async fn status_with_authentication(
     authenticate: bool,
 ) -> Result<ConsoleStatus> {
     let status =
-        invoke(processes, target, &["kit", "--json", "console", "status"], authenticate).await?;
+        invoke_status(processes, target, &["kit", "--json", "console", "status"], authenticate)
+            .await?;
     if let ConsoleStatus::Ready { platform, sessions, build } = status {
         let expected = super::build_identity()?;
         if build != expected {
             return Ok(ConsoleStatus::BuildIncompatible {
                 platform,
+                sessions: Some(sessions),
                 expected,
                 actual: build,
                 action: format!("update Kit on {} and run setup again", target.machine),
@@ -210,7 +221,7 @@ pub(crate) async fn setup(
     processes: &ProcessSupervisor,
     target: &RemoteTarget,
 ) -> Result<ConsoleStatus> {
-    invoke(processes, target, &["kit", "--json", "console", "setup"], false).await
+    invoke_status(processes, target, &["kit", "--json", "console", "setup"], false).await
 }
 
 pub(crate) async fn stop(
@@ -222,7 +233,19 @@ pub(crate) async fn stop(
     if force {
         arguments.push("--force");
     }
-    invoke(processes, target, &arguments, false).await
+    invoke_status(processes, target, &arguments, false).await
+}
+
+pub(crate) async fn update(
+    processes: &ProcessSupervisor,
+    target: &RemoteTarget,
+) -> Result<UpdateOutcome> {
+    match invoke_bytes(processes, target, &["kit", "--json", "update"], false).await? {
+        RemoteCommandResult::Output(bytes) => {
+            serde_json::from_slice(&bytes).context("decode typed remote Kit update outcome")
+        }
+        RemoteCommandResult::Status(status) => bail!("{}", status.text()),
+    }
 }
 
 pub(crate) async fn start_relay(
@@ -290,12 +313,51 @@ impl RemoteEpochProvider {
     }
 }
 
-async fn invoke(
+enum RemoteCommandResult {
+    Output(Vec<u8>),
+    Status(Box<ConsoleStatus>),
+}
+
+impl RemoteCommandResult {
+    fn status(status: ConsoleStatus) -> Self {
+        Self::Status(Box::new(status))
+    }
+}
+
+async fn invoke_status(
     processes: &ProcessSupervisor,
     target: &RemoteTarget,
     remote_arguments: &[&str],
     authenticate: bool,
 ) -> Result<ConsoleStatus> {
+    match invoke_bytes(processes, target, remote_arguments, authenticate).await? {
+        RemoteCommandResult::Output(bytes) => {
+            if bytes.is_empty() {
+                return Ok(remote_failure(
+                    &target.machine,
+                    RemoteFailureKind::EmptyOutput,
+                    "the remote command exited successfully without JSON output".to_owned(),
+                ));
+            }
+            match serde_json::from_slice(&bytes) {
+                Ok(status) => Ok(status),
+                Err(error) => Ok(remote_failure(
+                    &target.machine,
+                    RemoteFailureKind::Decode,
+                    format!("decode typed remote Console status: {error}"),
+                )),
+            }
+        }
+        RemoteCommandResult::Status(status) => Ok(*status),
+    }
+}
+
+async fn invoke_bytes(
+    processes: &ProcessSupervisor,
+    target: &RemoteTarget,
+    remote_arguments: &[&str],
+    authenticate: bool,
+) -> Result<RemoteCommandResult> {
     let arguments = target.relay.ssh_arguments(remote_arguments)?;
     let environment =
         ProcessEnvironment::new(EnvironmentBase::Inherit, BTreeMap::new(), BTreeSet::new())?;
@@ -319,8 +381,20 @@ async fn invoke(
         ProcessDeadline::After(COMMAND_TIMEOUT),
         TerminationPolicy::new(TERMINATION_GRACE),
     );
-    let started =
-        processes.spawn(spec).await.context("starting supervised remote Console command")?;
+    let started = match processes.spawn(spec).await {
+        Ok(started) => started,
+        Err(error) => {
+            let detail = format!("start supervised remote Console command: {error:#}");
+            let kind = if detail.to_ascii_lowercase().contains("no such file")
+                || detail.to_ascii_lowercase().contains("not found")
+            {
+                RemoteFailureKind::OpenSshUnavailable
+            } else {
+                RemoteFailureKind::Supervision
+            };
+            return Ok(RemoteCommandResult::status(remote_failure(&target.machine, kind, detail)));
+        }
+    };
     let mut stderr = match started.stderr {
         ProcessOutputHandle::Stream(stderr) => stderr,
         _ => {
@@ -348,7 +422,7 @@ async fn invoke(
                         if !authenticate {
                             let _ = control.cancel().await;
                             let _ = wait.await;
-                            return Ok(status);
+                            return Ok(RemoteCommandResult::status(status));
                         }
                         if !opened_authentication {
                             let ConsoleStatus::NeedsSshAuthentication { url, .. } = &status else {
@@ -365,7 +439,7 @@ async fn invoke(
                                 let _ = control.cancel().await;
                                 let _ = wait.await;
                                 eprintln!("Could not open the authentication link: {error:#}");
-                                return Ok(status);
+                                return Ok(RemoteCommandResult::status(status));
                             }
                             opened_authentication = true;
                         }
@@ -375,7 +449,7 @@ async fn invoke(
                 Err(_) => {
                     let _ = control.cancel().await;
                     let _ = wait.await;
-                    return Ok(transport_failed(target));
+                    return Ok(RemoteCommandResult::status(transport_failed(target)));
                 }
             },
             report = &mut wait => break report,
@@ -383,23 +457,41 @@ async fn invoke(
     };
     let report = match report {
         Ok(report) => report,
-        Err(_) => {
+        Err(failure) => {
             if let Some(status) = ssh_authentication_status(target, &stderr_bytes) {
-                return Ok(status);
+                return Ok(RemoteCommandResult::status(status));
             }
-            return Ok(transport_failed(target));
+            let detail = format!("remote command supervision failed: {:?}", failure.failure);
+            let kind = if detail.to_ascii_lowercase().contains("deadline")
+                || detail.to_ascii_lowercase().contains("timed out")
+            {
+                RemoteFailureKind::Timeout
+            } else {
+                RemoteFailureKind::Supervision
+            };
+            return Ok(RemoteCommandResult::status(remote_failure(&target.machine, kind, detail)));
         }
     };
     if report.leader_exit != LeaderExitObservation::Observed(LeaderExit::Code(0)) {
         if let Some(status) = ssh_authentication_status(target, &stderr_bytes) {
-            return Ok(status);
+            return Ok(RemoteCommandResult::status(status));
         }
-        return Ok(transport_failed(target));
+        let detail = String::from_utf8_lossy(&stderr_bytes).trim().to_owned();
+        let kind = ssh_exit_failure_kind(&detail);
+        return Ok(RemoteCommandResult::status(remote_failure(
+            &target.machine,
+            kind,
+            if detail.is_empty() {
+                format!("remote command exited with {:?}", report.leader_exit)
+            } else {
+                detail
+            },
+        )));
     }
     let crate::framework::process::OutputReport::Captured(stdout) = report.stdout else {
         bail!("remote Console status stdout was not captured")
     };
-    serde_json::from_slice(&stdout.bytes).context("decode typed remote Console status")
+    Ok(RemoteCommandResult::Output(stdout.bytes.into_vec()))
 }
 
 fn ssh_authentication_status(target: &RemoteTarget, stderr: &[u8]) -> Option<ConsoleStatus> {
@@ -412,14 +504,47 @@ fn ssh_authentication_status(target: &RemoteTarget, stderr: &[u8]) -> Option<Con
     })
 }
 
+fn ssh_exit_failure_kind(stderr: &str) -> RemoteFailureKind {
+    let stderr = stderr.to_ascii_lowercase();
+    if [
+        "connection refused",
+        "connection timed out",
+        "operation timed out",
+        "no route to host",
+        "could not resolve hostname",
+        "connection closed",
+    ]
+    .iter()
+    .any(|pattern| stderr.contains(pattern))
+    {
+        RemoteFailureKind::Transport
+    } else {
+        RemoteFailureKind::RemoteCommand
+    }
+}
+
 fn transport_failed(target: &RemoteTarget) -> ConsoleStatus {
-    transport_failed_for(&target.machine)
+    remote_failure(
+        &target.machine,
+        RemoteFailureKind::Transport,
+        "OpenSSH could not reach the machine".to_owned(),
+    )
 }
 
 fn transport_failed_for(machine: &str) -> ConsoleStatus {
-    ConsoleStatus::TransportFailed {
+    remote_failure(
+        machine,
+        RemoteFailureKind::Transport,
+        "OpenSSH could not reach the machine".to_owned(),
+    )
+}
+
+fn remote_failure(machine: &str, kind: RemoteFailureKind, detail: String) -> ConsoleStatus {
+    ConsoleStatus::RemoteFailure {
         machine: machine.to_owned(),
-        action: "verify OpenSSH access over Tailscale and retry".to_owned(),
+        kind,
+        detail,
+        action: "inspect the details, correct the failing layer, and retry".to_owned(),
     }
 }
 
@@ -444,7 +569,8 @@ mod tests {
     use std::net::IpAddr;
 
     use super::{
-        split_selector, ssh_authentication_status, ConsoleStatus, RelayTarget, RemoteTarget,
+        split_selector, ssh_authentication_status, ssh_exit_failure_kind, ConsoleStatus,
+        RelayTarget, RemoteFailureKind, RemoteTarget,
     };
 
     #[test]
@@ -478,5 +604,17 @@ mod tests {
             b"authenticate: https://login.tailscale.com.evil/a/token\n"
         )
         .is_none());
+    }
+
+    #[test]
+    fn ssh_exit_diagnostics_separate_transport_from_remote_command_failures() {
+        assert_eq!(
+            ssh_exit_failure_kind("ssh: connect to host 100.64.0.2: Connection refused"),
+            RemoteFailureKind::Transport
+        );
+        assert_eq!(
+            ssh_exit_failure_kind("Error: Decode limit exceeded for containers: 65536"),
+            RemoteFailureKind::RemoteCommand
+        );
     }
 }

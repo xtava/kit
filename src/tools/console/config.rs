@@ -15,9 +15,11 @@ use crate::{
 const TOOL: &str = "console";
 const SIDEBAR_WIDTH: SettingId = SettingId("sidebar_width");
 const SIDEBAR_SPLIT_RATIO: &str = "sidebar_split_ratio";
+const SELECTED_MACHINE: &str = "selected_machine";
 const PREFIX: SettingId = SettingId("prefix");
 const NEW_SESSION: SettingId = SettingId("new_session");
 const TOGGLE_SESSIONS: SettingId = SettingId("toggle_sessions");
+const COMMAND_PALETTE: SettingId = SettingId("command_palette");
 const HELP: SettingId = SettingId("help");
 const QUIT: SettingId = SettingId("quit");
 
@@ -31,6 +33,7 @@ pub(super) struct Config {
     sidebar_split_ratio: SplitRatio,
     keybindings: Keybindings,
     users: BTreeMap<String, String>,
+    selected_machine: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -41,6 +44,8 @@ struct Stored {
     keybindings: Keybindings,
     #[serde(default)]
     users: BTreeMap<String, String>,
+    #[serde(default)]
+    selected_machine: Option<String>,
 }
 
 impl Default for Stored {
@@ -49,6 +54,7 @@ impl Default for Stored {
             sidebar_split_ratio: default_sidebar_split_ratio(),
             keybindings: Keybindings::default(),
             users: BTreeMap::new(),
+            selected_machine: None,
         }
     }
 }
@@ -61,6 +67,8 @@ pub(super) struct Keybindings {
     pub(super) new_session: KeyChord,
     #[serde(default = "default_toggle_sessions")]
     pub(super) toggle_sessions: KeyChord,
+    #[serde(default = "default_command_palette")]
+    pub(super) command_palette: KeyChord,
     #[serde(default = "default_help")]
     pub(super) help: KeyChord,
     #[serde(default = "default_quit")]
@@ -73,6 +81,7 @@ impl Default for Keybindings {
             prefix: default_prefix(),
             new_session: default_new_session(),
             toggle_sessions: default_toggle_sessions(),
+            command_palette: default_command_palette(),
             help: default_help(),
             quit: default_quit(),
         }
@@ -95,6 +104,9 @@ impl Keybindings {
                 bail!("Console keybinding '{name}' duplicates another prefixed command");
             }
         }
+        if self.command_palette == self.prefix {
+            bail!("Console keybinding '{}' conflicts with the prefix", COMMAND_PALETTE.0);
+        }
         Ok(())
     }
 
@@ -111,6 +123,10 @@ impl Keybindings {
             TOGGLE_SESSIONS => {
                 self.toggle_sessions = chord;
                 TOGGLE_SESSIONS.0
+            }
+            COMMAND_PALETTE => {
+                self.command_palette = chord;
+                COMMAND_PALETTE.0
             }
             HELP => {
                 self.help = chord;
@@ -136,6 +152,7 @@ impl Config {
             sidebar_split_ratio: stored.sidebar_split_ratio,
             keybindings: stored.keybindings,
             users: stored.users,
+            selected_machine: stored.selected_machine,
         })
     }
 
@@ -145,6 +162,10 @@ impl Config {
 
     pub(super) const fn keybindings(&self) -> &Keybindings {
         &self.keybindings
+    }
+
+    pub(super) fn store(&self) -> ConfigStore {
+        self.store.clone()
     }
 
     fn set_keybinding(&mut self, id: SettingId, chord: KeyChord) -> Result<()> {
@@ -161,6 +182,7 @@ impl Config {
             PREFIX => defaults.prefix,
             NEW_SESSION => defaults.new_session,
             TOGGLE_SESSIONS => defaults.toggle_sessions,
+            COMMAND_PALETTE => defaults.command_palette,
             HELP => defaults.help,
             QUIT => defaults.quit,
             _ => bail!("unknown Console keybinding '{}'", id.0),
@@ -185,6 +207,16 @@ impl Config {
     pub(super) fn set_unix_user(&mut self, stable_node_id: &str, user: &str) -> Result<()> {
         self.store.set_table_string(TOOL, "users", stable_node_id, user)?;
         self.users.insert(stable_node_id.to_owned(), user.to_owned());
+        Ok(())
+    }
+
+    pub(super) fn selected_machine(&self) -> Option<&str> {
+        self.selected_machine.as_deref()
+    }
+
+    pub(super) fn set_selected_machine(&mut self, stable_node_id: &str) -> Result<()> {
+        self.store.set(TOOL, SELECTED_MACHINE, ConfigValue::String(stable_node_id.to_owned()))?;
+        self.selected_machine = Some(stable_node_id.to_owned());
         Ok(())
     }
 
@@ -275,9 +307,15 @@ impl EditableSettings for Config {
                 self.keybindings.toggle_sessions,
             ),
             keybinding_field(
+                COMMAND_PALETTE,
+                "Command palette",
+                "Open searchable Console commands directly.",
+                self.keybindings.command_palette,
+            ),
+            keybinding_field(
                 HELP,
-                "Help",
-                "Open Console help after the prefix.",
+                "Prefix help",
+                "Open the command palette after the prefix.",
                 self.keybindings.help,
             ),
             keybinding_field(
@@ -301,12 +339,13 @@ impl EditableSettings for Config {
                 self.set_sidebar_split_ratio(default_sidebar_split_ratio())
             }
             (
-                PREFIX | NEW_SESSION | TOGGLE_SESSIONS | HELP | QUIT,
+                PREFIX | NEW_SESSION | TOGGLE_SESSIONS | COMMAND_PALETTE | HELP | QUIT,
                 SettingEdit::SetKeybinding(value),
             ) => self.set_keybinding(id, value.parse()?),
-            (PREFIX | NEW_SESSION | TOGGLE_SESSIONS | HELP | QUIT, SettingEdit::Reset) => {
-                self.reset_keybinding(id)
-            }
+            (
+                PREFIX | NEW_SESSION | TOGGLE_SESSIONS | COMMAND_PALETTE | HELP | QUIT,
+                SettingEdit::Reset,
+            ) => self.reset_keybinding(id),
             _ => bail!("unknown Console Settings field '{}'", id.0),
         }
     }
@@ -352,6 +391,10 @@ fn default_toggle_sessions() -> KeyChord {
     KeyChord::new(KeyCode::Char('s'), KeyModifiers::NONE)
 }
 
+fn default_command_palette() -> KeyChord {
+    KeyChord::new(KeyCode::Char('p'), KeyModifiers::CONTROL)
+}
+
 fn default_help() -> KeyChord {
     KeyChord::new(KeyCode::Char('?'), KeyModifiers::NONE)
 }
@@ -385,6 +428,7 @@ mod tests {
         assert_eq!(config.sidebar_width(), SidebarWidth::Balanced);
         assert_eq!(config.keybindings().prefix.to_string(), "Ctrl+B");
         assert_eq!(config.keybindings().new_session.to_string(), "n");
+        assert_eq!(config.keybindings().command_palette.to_string(), "Ctrl+P");
 
         cleanup(&store);
         Ok(())
@@ -427,6 +471,21 @@ mod tests {
                 } if value == "c"
             )
         }));
+
+        cleanup(&store);
+        Ok(())
+    }
+
+    #[test]
+    fn machine_identity_preferences_persist_without_live_status() -> Result<()> {
+        let store = store();
+        let mut config = Config::load(store.clone())?;
+        config.set_unix_user("node-mac", "tvx")?;
+        config.set_selected_machine("node-mac")?;
+
+        let reloaded = Config::load(store.clone())?;
+        assert_eq!(reloaded.unix_user("node-mac"), Some("tvx"));
+        assert_eq!(reloaded.selected_machine(), Some("node-mac"));
 
         cleanup(&store);
         Ok(())

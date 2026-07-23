@@ -18,7 +18,7 @@ use super::client::{
 };
 use super::connection::ConnectionOwner;
 
-pub use model::{ConsoleServicePlatform, ConsoleStatus, NativeServiceState};
+pub use model::{ConsoleServicePlatform, ConsoleStatus, NativeServiceState, RemoteFailureKind};
 
 #[cfg(target_os = "linux")]
 use linux as native;
@@ -159,6 +159,7 @@ async fn mux_status(
                 {
                     return Ok(ConsoleStatus::BuildIncompatible {
                         platform,
+                        sessions: None,
                         expected: incompatible.expected.clone(),
                         actual: incompatible.actual.clone(),
                         action: "close active sessions, then run kit console setup".to_owned(),
@@ -296,7 +297,7 @@ async fn close_all_sessions(
     sessions: Vec<super::client::SessionView>,
 ) -> Result<()> {
     for session in sessions {
-        client.close_session(session.id).await.with_context(|| {
+        client.close_pane(session.pane_id).await.with_context(|| {
             format!("closing Console pane {} ({})", session.pane_id, session.title)
         })?;
     }

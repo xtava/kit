@@ -2,7 +2,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 
 use crate::tui::{
     ActionId, ActionRegistry, ActionRegistryBuilder, ActionRegistryError, ActionSpec, ActionState,
-    KeyChord, KeybindingPlacement, MenuId, MenuPlacement,
+    CommandPalettePlacement, KeyChord, KeybindingPlacement, MenuId, MenuPlacement,
 };
 
 pub(super) const FOCUS_COMPOSER: ActionId = ActionId::new("tail.share.focusComposer");
@@ -167,7 +167,13 @@ fn contribute_actions(builder: &mut ActionRegistryBuilder<TailActionContext, Tai
         (CONFIRM_QUIT, "Quit now", TailCommand::ConfirmQuit, always),
         (QUIT, "Quit", TailCommand::Quit, always),
     ] {
-        builder.register_action(ActionSpec { id, title, command, enablement });
+        builder.register_action(ActionSpec {
+            id,
+            title,
+            command,
+            enablement,
+            command_palette: CommandPalettePlacement::Hidden,
+        });
     }
 
     for (menu, action, group, group_order, order, when) in [

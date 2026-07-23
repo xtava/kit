@@ -7,6 +7,7 @@
 
 mod actions;
 pub mod clipboard;
+mod command_palette;
 mod commandline;
 mod context_menu;
 mod editor;
@@ -25,9 +26,11 @@ pub mod theme;
 
 pub use actions::{
     ActionId, ActionInvocation, ActionRegistry, ActionRegistryBuilder, ActionRegistryError,
-    ActionSpec, ActionState, ActionUnavailable, KeyChord, Keybinding, KeybindingPlacement,
-    KeybindingResolution, KeybindingState, MenuId, MenuPlacement, ResolvedAction, ResolvedMenu,
+    ActionSpec, ActionState, ActionUnavailable, CommandPalettePlacement, KeyChord, Keybinding,
+    KeybindingPlacement, KeybindingResolution, KeybindingState, MenuId, MenuPlacement,
+    ResolvedAction, ResolvedActions,
 };
+pub use command_palette::{CommandPalette, CommandPaletteLayout, CommandPaletteOutcome};
 pub use commandline::{CommandSet, CommandSpec, ParsedInput};
 pub use context_menu::{
     ContextMenu, ContextMenuItemLayout, ContextMenuLayout, ContextMenuOutcome, ContextMenuStyle,

@@ -1471,24 +1471,28 @@ mod tests {
                     title: "SNTL-CMD",
                     command: StatsCommand::ViewCommand,
                     enablement: enabled,
+                    command_palette: crate::tui::CommandPalettePlacement::Hidden,
                 })
                 .register_action(ActionSpec {
                     id: OPEN_PROFILE,
                     title: "SNTL-PROFILE",
                     command: StatsCommand::OpenProfile,
                     enablement: enabled,
+                    command_palette: crate::tui::CommandPalettePlacement::Hidden,
                 })
                 .register_action(ActionSpec {
                     id: TERMINATE,
                     title: "SNTL-END",
                     command: StatsCommand::RequestTerminate(ProcessAction::GracefulTerminate),
                     enablement: enabled,
+                    command_palette: crate::tui::CommandPalettePlacement::Hidden,
                 })
                 .register_action(ActionSpec {
                     id: FORCE_TERMINATE,
                     title: "SNTL-FORCE",
                     command: StatsCommand::RequestTerminate(ProcessAction::ForceTerminate),
                     enablement: enabled,
+                    command_palette: crate::tui::CommandPalettePlacement::Hidden,
                 });
 
             for (action, group, group_order, order) in [

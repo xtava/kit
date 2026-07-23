@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -9,7 +9,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Margin, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph, Widget, Wrap},
+    widgets::{Block, BorderType, List, ListItem, ListState, Paragraph, Widget},
     Frame,
 };
 use tokio::time::MissedTickBehavior;
@@ -17,11 +17,13 @@ use wezterm_term::{color::ColorAttribute, Blink, CellAttributes, Intensity, Unde
 
 use crate::tui::{
     render_split_divider, theme::NORD, ActionId, ActionInvocation, ActionRegistry,
-    ActionRegistryBuilder, ActionSpec, ActionState, ActionUnavailable, ContextMenu,
+    ActionRegistryBuilder, ActionSpec, ActionState, ActionUnavailable, CommandPalette,
+    CommandPaletteLayout, CommandPaletteOutcome, CommandPalettePlacement, ContextMenu,
     ContextMenuLayout, ContextMenuOutcome, ContextMenuStyle, Direction, EventReader, KeyChord,
     Keybinding, KeybindingPlacement, KeybindingResolution, KeybindingState, LineEditor, MenuId,
     MenuPlacement, NavigationHistory, NavigationMap, NavigationRegion, Session, SessionOptions,
-    SplitDividerStyle, SplitDrag, SplitFrame, SplitMinimums, SplitRatio,
+    SettingsEditor, SettingsFlow, SplitDividerStyle, SplitDrag, SplitFrame, SplitMinimums,
+    SplitRatio,
 };
 
 use super::activity::{AgentActivity, AgentPresentation};
@@ -30,6 +32,7 @@ use super::client::{
     SessionView, TerminalContentGeometry, TerminalView,
 };
 use super::config::{Config, Keybindings};
+use super::control_center::ConnectedSessionOutcome;
 use super::interaction::{
     resolve_control, ControlIntent, ControlOperation, EffectiveLayout, InteractionDecision,
     LayoutPreference, SessionAccess, TerminalOnlyReason,
@@ -42,7 +45,6 @@ const RECONCILE_INTERVAL: Duration = Duration::from_secs(4);
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(350);
 const SIDEBAR_STEP: i16 = 40;
 const SESSION_MENU: MenuId = MenuId::new("console.session.context");
-const HELP_MENU: MenuId = MenuId::new("console.help.actions");
 
 const SELECT_SESSION: ActionId = ActionId::new("console.session.select");
 const CREATE_SESSION: ActionId = ActionId::new("console.session.create");
@@ -70,7 +72,8 @@ const NARROW_SIDEBAR: ActionId = ActionId::new("console.sidebar.narrow");
 const WIDEN_SIDEBAR: ActionId = ActionId::new("console.sidebar.widen");
 const RESIZE_SIDEBAR: ActionId = ActionId::new("console.sidebar.resize");
 const TOGGLE_SIDEBAR: ActionId = ActionId::new("console.sidebar.toggle");
-const TOGGLE_HELP: ActionId = ActionId::new("console.help.toggle");
+const OPEN_COMMAND_PALETTE: ActionId = ActionId::new("console.commandPalette.open");
+const OPEN_SETTINGS: ActionId = ActionId::new("console.settings.open");
 const RETRY_CONNECTION: ActionId = ActionId::new("console.connection.retry");
 const QUIT: ActionId = ActionId::new("console.quit");
 
@@ -85,14 +88,16 @@ enum SurfaceKind {
     Normal,
     Rename,
     Search,
-    Help,
+    CommandPalette,
+    Settings,
 }
 
 enum Surface {
     Normal,
     Rename { id: SessionId, input: LineEditor },
     Search { input: LineEditor, current_match: Option<usize> },
-    Help,
+    CommandPalette(CommandPalette<ConsoleActionContext>),
+    Settings(SettingsEditor),
 }
 
 impl Surface {
@@ -101,7 +106,8 @@ impl Surface {
             Self::Normal => SurfaceKind::Normal,
             Self::Rename { .. } => SurfaceKind::Rename,
             Self::Search { .. } => SurfaceKind::Search,
-            Self::Help => SurfaceKind::Help,
+            Self::CommandPalette(_) => SurfaceKind::CommandPalette,
+            Self::Settings(_) => SurfaceKind::Settings,
         }
     }
 }
@@ -134,13 +140,14 @@ enum ConsoleAction {
     WidenSidebar,
     ResizeSidebar,
     ToggleSidebar,
-    ToggleHelp,
+    OpenCommandPalette,
+    OpenSettings,
     RetryConnection,
     Quit,
 }
 
 impl ConsoleAction {
-    const ALL: [Self; 29] = [
+    const ALL: [Self; 30] = [
         Self::SelectSession,
         Self::CreateSession,
         Self::Activate,
@@ -167,7 +174,8 @@ impl ConsoleAction {
         Self::WidenSidebar,
         Self::ResizeSidebar,
         Self::ToggleSidebar,
-        Self::ToggleHelp,
+        Self::OpenCommandPalette,
+        Self::OpenSettings,
         Self::RetryConnection,
         Self::Quit,
     ];
@@ -200,7 +208,8 @@ impl ConsoleAction {
             Self::WidenSidebar => WIDEN_SIDEBAR,
             Self::ResizeSidebar => RESIZE_SIDEBAR,
             Self::ToggleSidebar => TOGGLE_SIDEBAR,
-            Self::ToggleHelp => TOGGLE_HELP,
+            Self::OpenCommandPalette => OPEN_COMMAND_PALETTE,
+            Self::OpenSettings => OPEN_SETTINGS,
             Self::RetryConnection => RETRY_CONNECTION,
             Self::Quit => QUIT,
         }
@@ -234,10 +243,47 @@ impl ConsoleAction {
             Self::WidenSidebar => "Widen sidebar",
             Self::ResizeSidebar => "Resize sidebar",
             Self::ToggleSidebar => "Toggle sessions sidebar",
-            Self::ToggleHelp => "Help",
+            Self::OpenCommandPalette => "Show command palette",
+            Self::OpenSettings => "Open Console settings",
             Self::RetryConnection => "Retry connection",
             Self::Quit => "Quit Console",
         }
+    }
+
+    const fn command_palette(self) -> CommandPalettePlacement {
+        let (group, group_order, order) = match self {
+            Self::CreateSession => ("Session", 10, 10),
+            Self::RenameSession => ("Session", 10, 20),
+            Self::CloseSession => ("Session", 10, 30),
+            Self::PreviousSession => ("Session", 10, 40),
+            Self::NextSession => ("Session", 10, 50),
+            Self::HistoryBack => ("Session", 10, 60),
+            Self::HistoryForward => ("Session", 10, 70),
+            Self::ReleaseControl => ("Control", 20, 10),
+            Self::TakeControl => ("Control", 20, 20),
+            Self::CopyVisibleTerminal => ("Terminal", 30, 10),
+            Self::OpenSearch => ("Terminal", 30, 20),
+            Self::ScrollUp => ("Terminal", 30, 30),
+            Self::ScrollDown => ("Terminal", 30, 40),
+            Self::FocusSessions => ("View", 40, 10),
+            Self::FocusLeft => ("View", 40, 20),
+            Self::FocusRight => ("View", 40, 30),
+            Self::FocusNext => ("View", 40, 40),
+            Self::FocusPrevious => ("View", 40, 50),
+            Self::NarrowSidebar => ("View", 40, 60),
+            Self::WidenSidebar => ("View", 40, 70),
+            Self::ToggleSidebar => ("View", 40, 80),
+            Self::RetryConnection => ("Console", 50, 10),
+            Self::OpenSettings => ("Console", 50, 20),
+            Self::OpenCommandPalette => ("Console", 50, 30),
+            Self::Quit => ("Console", 50, 40),
+            Self::SelectSession
+            | Self::Activate
+            | Self::Dismiss
+            | Self::PrimaryControl
+            | Self::ResizeSidebar => return CommandPalettePlacement::Hidden,
+        };
+        CommandPalettePlacement::Visible { group, group_order, order }
     }
 }
 
@@ -335,6 +381,7 @@ struct UiRegions {
     session_rows: Vec<(Rect, SessionId)>,
     action_hits: Vec<ActionHitTarget>,
     context_menu: Option<ContextMenuLayout>,
+    command_palette: Option<CommandPaletteLayout>,
 }
 
 impl UiRegions {
@@ -350,6 +397,12 @@ impl UiRegions {
             .map(|area| (area.width.max(1), area.height.max(1)))
             .unwrap_or((80, 24))
     }
+}
+
+#[derive(Clone, Copy)]
+struct CloseTransition {
+    pane_id: usize,
+    local_pane_id: usize,
 }
 
 struct App {
@@ -373,6 +426,7 @@ struct App {
     connection_generation: u64,
     connection: ConnectionState,
     connection_detail: Option<String>,
+    close_transitions: Vec<CloseTransition>,
 }
 
 impl App {
@@ -416,6 +470,7 @@ impl App {
             connection_generation,
             connection,
             connection_detail,
+            close_transitions: Vec::new(),
         })
     }
 
@@ -437,7 +492,7 @@ impl App {
         ) {
             return Ok(changed);
         }
-        let snapshot = match self.client.snapshot(self.selected).await {
+        let mut snapshot = match self.client.snapshot(self.selected).await {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 if let Some(health) = self.client.drain_connection_health()? {
@@ -452,6 +507,12 @@ impl App {
                 return Err(error);
             }
         };
+        let remote_panes =
+            snapshot.sessions.iter().map(|session| session.pane_id).collect::<Vec<_>>();
+        snapshot.sessions.retain(|session| {
+            !self.close_transitions.iter().any(|transition| transition.pane_id == session.pane_id)
+        });
+        self.close_transitions.retain(|transition| remote_panes.contains(&transition.pane_id));
         let selected = self.selected;
         changed |= self.reconcile(snapshot);
         if self.selected != selected {
@@ -473,6 +534,69 @@ impl App {
                 changed
             }
         }
+    }
+
+    async fn begin_close(&mut self, id: SessionId) -> Result<()> {
+        let pane_id =
+            self.session(id).map(|session| session.pane_id).context("session no longer exists")?;
+        let local_pane_id = self
+            .client
+            .local_pane_id(pane_id)?
+            .context("session has no local terminal projection")?;
+        let restore_terminal_focus =
+            self.selected == Some(id) && self.active_region == ActiveRegion::Terminal;
+        self.client.close_pane(pane_id).await?;
+        self.close_transitions.push(CloseTransition { pane_id, local_pane_id });
+        self.snapshot.sessions.retain(|session| session.pane_id != pane_id);
+        if self.selected == Some(id) {
+            self.selected = self.snapshot.sessions.first().map(|session| session.id);
+            self.scroll_offset = 0;
+            self.selection = None;
+            if let Some(selected) = self.selected {
+                self.history.replace_current(selected);
+            }
+            self.project_terminal()?;
+        }
+        if !restore_terminal_focus {
+            return Ok(());
+        }
+        let Some((replacement_id, replacement_access)) =
+            self.selected_session().map(|session| (session.id, session_access(session)))
+        else {
+            self.active_region = ActiveRegion::Sessions;
+            return Ok(());
+        };
+        match replacement_access {
+            SessionAccess::Available | SessionAccess::Synchronizing => {
+                self.client.acquire_control(replacement_id).await?;
+                self.active_region = ActiveRegion::Terminal;
+                if let Some(session) =
+                    self.snapshot.sessions.iter_mut().find(|session| session.id == replacement_id)
+                {
+                    session.control = super::client::SessionControl::Controller;
+                }
+            }
+            SessionAccess::ControlledBySelf => {
+                self.active_region = ActiveRegion::Terminal;
+            }
+            SessionAccess::ControlledByOther => {
+                self.active_region = ActiveRegion::Sessions;
+                self.notice =
+                    Some("Focused session closed; the replacement is controlled elsewhere".into());
+            }
+        }
+        Ok(())
+    }
+
+    fn confirm_closed_panes(&mut self, local_pane_ids: &[usize]) -> bool {
+        let before = self.close_transitions.len();
+        self.close_transitions
+            .retain(|transition| !local_pane_ids.contains(&transition.local_pane_id));
+        self.close_transitions.len() != before
+    }
+
+    fn has_pending_closures(&self) -> bool {
+        !self.close_transitions.is_empty()
     }
 
     fn project_terminal(&mut self) -> Result<bool> {
@@ -833,12 +957,17 @@ impl App {
                 self.toggle_sidebar();
                 Effect::None
             }
-            ConsoleAction::ToggleHelp => {
-                self.surface = if matches!(self.surface, Surface::Help) {
-                    Surface::Normal
-                } else {
-                    Surface::Help
-                };
+            ConsoleAction::OpenCommandPalette => {
+                self.surface =
+                    Surface::CommandPalette(CommandPalette::open(context, &self.registry));
+                Effect::None
+            }
+            ConsoleAction::OpenSettings => {
+                self.surface = Surface::Settings(SettingsEditor::open(
+                    self.config.store(),
+                    vec![super::config::settings()],
+                    NORD,
+                ));
                 Effect::None
             }
             ConsoleAction::RetryConnection => Effect::RetryConnection,
@@ -862,9 +991,23 @@ impl App {
                 self.advance_search(context.visible_rows);
                 Effect::None
             }
-            Surface::Help => {
-                self.surface = Surface::Normal;
-                Effect::None
+            Surface::CommandPalette(_) | Surface::Settings(_) => Effect::None,
+        }
+    }
+
+    fn reload_config(&mut self) {
+        let store = self.config.store();
+        match Config::load(store).and_then(|config| {
+            let registry = console_actions(config.keybindings())?;
+            Ok((config, registry))
+        }) {
+            Ok((config, registry)) => {
+                self.layout = self.layout.with_ratio(config.sidebar_split_ratio());
+                self.config = config;
+                self.registry = registry;
+            }
+            Err(error) => {
+                self.notice = Some(format!("Could not reload Console settings: {error:#}"));
             }
         }
     }
@@ -1053,15 +1196,16 @@ fn session_access(session: &SessionView) -> SessionAccess {
     session.control.into()
 }
 
-pub async fn run(client: ConsoleClient, config: Config) -> Result<()> {
+pub async fn run(client: ConsoleClient, config: Config) -> Result<ConnectedSessionOutcome> {
     perf_trace::initialize()?;
     let outcome = run_loop(client, config).await;
     let flush = perf_trace::flush();
-    outcome?;
-    flush
+    let outcome = outcome?;
+    flush?;
+    Ok(outcome)
 }
 
-async fn run_loop(client: ConsoleClient, config: Config) -> Result<()> {
+async fn run_loop(client: ConsoleClient, config: Config) -> Result<ConnectedSessionOutcome> {
     let mut app = App::new(client, config).await?;
     let mut session = Session::open(SessionOptions { mouse_capture: true, bracketed_paste: true })?;
     let mut events = EventReader::start();
@@ -1077,7 +1221,7 @@ async fn run_loop(client: ConsoleClient, config: Config) -> Result<()> {
 
     loop {
         if needs_draw {
-            session.draw(|frame| regions = render(frame, &app))?;
+            session.draw(|frame| regions = render(frame, &mut app))?;
             perf_trace::record_redraw();
             app.normalize_focus(&regions);
             needs_draw = false;
@@ -1097,11 +1241,17 @@ async fn run_loop(client: ConsoleClient, config: Config) -> Result<()> {
 
         let effect = tokio::select! {
             invalidation = invalidations.recv() => {
-                let Some(invalidation) = invalidation else { break };
+                let Some(invalidation) = invalidation else {
+                    return Ok(ConnectedSessionOutcome::ReturnToControlCenter);
+                };
+                let confirmed_close = app.confirm_closed_panes(&invalidation.removed_panes);
                 if invalidation.pane_output {
                     activity_dirty = true;
                 }
-                let changed = if invalidation.topology {
+                let changed = if invalidation.topology
+                    && !confirmed_close
+                    && !app.has_pending_closures()
+                {
                     app.reconcile_or_notice().await
                 } else if invalidation.pane_output {
                     match app.project_terminal() {
@@ -1118,7 +1268,9 @@ async fn run_loop(client: ConsoleClient, config: Config) -> Result<()> {
                 continue;
             }
             _ = reconcile.tick() => {
-                needs_draw |= app.reconcile_or_notice().await;
+                if !app.has_pending_closures() {
+                    needs_draw |= app.reconcile_or_notice().await;
+                }
                 continue;
             }
             _ = activity.tick(), if activity_dirty => {
@@ -1136,7 +1288,9 @@ async fn run_loop(client: ConsoleClient, config: Config) -> Result<()> {
                 continue;
             }
             event = events.recv() => {
-                let Some(event) = event else { break };
+                let Some(event) = event else {
+                    return Ok(ConnectedSessionOutcome::Quit);
+                };
                 handle_event(event, &mut app, &regions)?
             }
         };
@@ -1147,14 +1301,15 @@ async fn run_loop(client: ConsoleClient, config: Config) -> Result<()> {
         let redraw_after_effect = !matches!(&effect, Effect::SendMouse { .. });
         match apply_effect(effect, &mut app, &mut session).await {
             Ok(EffectFlow::Continue) => needs_draw |= redraw_after_effect,
-            Ok(EffectFlow::Quit) => break,
+            Ok(EffectFlow::Quit) => {
+                return Ok(ConnectedSessionOutcome::ReturnToControlCenter);
+            }
             Err(error) => {
                 app.notice = Some(error.to_string());
                 needs_draw |= app.reconcile_or_notice().await;
             }
         }
     }
-    Ok(())
 }
 
 enum EffectFlow {
@@ -1191,8 +1346,7 @@ async fn apply_effect(effect: Effect, app: &mut App, session: &mut Session) -> R
             app.reconcile_topology().await?;
         }
         Effect::Close(id) => {
-            app.client.close_session(id).await?;
-            app.reconcile_topology().await?;
+            app.begin_close(id).await?;
         }
         Effect::AcquireControl(id) => {
             app.client.acquire_control(id).await?;
@@ -1239,6 +1393,39 @@ async fn apply_effect(effect: Effect, app: &mut App, session: &mut Session) -> R
 
 fn handle_event(event: Event, app: &mut App, regions: &UiRegions) -> Result<Effect> {
     app.notice = None;
+    if matches!(app.surface, Surface::CommandPalette(_)) {
+        let Some(layout) = regions.command_palette.as_ref() else {
+            app.surface = Surface::Normal;
+            return Ok(Effect::None);
+        };
+        let outcome = match &mut app.surface {
+            Surface::CommandPalette(command_palette) => command_palette.on_event(event, layout),
+            _ => unreachable!("palette surface checked above"),
+        };
+        return match outcome {
+            CommandPaletteOutcome::Captured => Ok(Effect::None),
+            CommandPaletteOutcome::Dismissed => {
+                app.surface = Surface::Normal;
+                Ok(Effect::None)
+            }
+            CommandPaletteOutcome::Invoke(invocation) => {
+                app.surface = Surface::Normal;
+                app.invoke(invocation, regions)
+            }
+        };
+    }
+    if matches!(app.surface, Surface::Settings(_)) {
+        let flow = match (&mut app.surface, event) {
+            (Surface::Settings(editor), Event::Key(key)) => editor.on_key(key),
+            (Surface::Settings(editor), Event::Mouse(mouse)) => editor.on_mouse(mouse),
+            _ => SettingsFlow::Continue,
+        };
+        if flow == SettingsFlow::Exit {
+            app.surface = Surface::Normal;
+            app.reload_config();
+        }
+        return Ok(Effect::None);
+    }
     if app.menu.is_some() {
         let Some(layout) = regions.context_menu.as_ref() else {
             app.menu = None;
@@ -1331,7 +1518,7 @@ fn handle_key(key: KeyEvent, app: &mut App, regions: &UiRegions) -> Result<Effec
                 Ok(Effect::None)
             }
         }
-        Surface::Normal | Surface::Help => Ok(Effect::None),
+        Surface::Normal | Surface::CommandPalette(_) | Surface::Settings(_) => Ok(Effect::None),
     }
 }
 
@@ -1482,7 +1669,8 @@ fn console_actions(
             | ConsoleAction::WidenSidebar
             | ConsoleAction::ResizeSidebar
             | ConsoleAction::ToggleSidebar
-            | ConsoleAction::ToggleHelp
+            | ConsoleAction::OpenCommandPalette
+            | ConsoleAction::OpenSettings
             | ConsoleAction::Quit => enabled,
             ConsoleAction::RetryConnection => can_retry_connection,
             ConsoleAction::Activate => can_activate,
@@ -1508,6 +1696,7 @@ fn console_actions(
             title: action.title(),
             command: action,
             enablement,
+            command_palette: action.command_palette(),
         });
     }
 
@@ -1541,17 +1730,6 @@ fn console_actions(
             group_order,
             order,
             when: always,
-        });
-    }
-
-    for (order, action) in ConsoleAction::ALL.into_iter().enumerate() {
-        builder.place_menu(MenuPlacement {
-            menu: HELP_MENU,
-            action: action.id(),
-            group: "commands",
-            group_order: 10,
-            order: order as i16,
-            when: visible_in_help,
         });
     }
 
@@ -1626,7 +1804,7 @@ fn console_actions(
     for (suffix, action) in [
         (keybindings.new_session, ConsoleAction::CreateSession),
         (keybindings.toggle_sessions, ConsoleAction::ToggleSidebar),
-        (keybindings.help, ConsoleAction::ToggleHelp),
+        (keybindings.help, ConsoleAction::OpenCommandPalette),
         (keybindings.quit, ConsoleAction::Quit),
     ] {
         builder.bind_key(KeybindingPlacement {
@@ -1635,6 +1813,12 @@ fn console_actions(
             when: prefix_available,
         });
     }
+
+    builder.bind_key(KeybindingPlacement {
+        binding: keybindings.command_palette.into(),
+        action: ConsoleAction::OpenCommandPalette.id(),
+        when: normal,
+    });
 
     Ok(builder.build()?)
 }
@@ -1648,7 +1832,7 @@ fn normal(context: &ConsoleActionContext) -> bool {
 }
 
 fn prefix_available(context: &ConsoleActionContext) -> bool {
-    matches!(context.surface, SurfaceKind::Normal | SurfaceKind::Help)
+    context.surface == SurfaceKind::Normal
 }
 
 fn not_normal(context: &ConsoleActionContext) -> bool {
@@ -1698,10 +1882,6 @@ fn take_control_available(context: &ConsoleActionContext) -> bool {
                 context.target_access,
                 Some(SessionAccess::Available | SessionAccess::ControlledByOther)
             ))
-}
-
-fn visible_in_help(_: &ConsoleActionContext) -> bool {
-    true
 }
 
 fn enabled(_: &ConsoleActionContext) -> ActionState {
@@ -1871,10 +2051,14 @@ fn focus_available(target: Option<ActiveRegion>) -> ActionState {
     }
 }
 
-fn render(frame: &mut Frame<'_>, app: &App) -> UiRegions {
+fn render(frame: &mut Frame<'_>, app: &mut App) -> UiRegions {
     let area = frame.area();
     frame.render_widget(Block::new().style(Style::default().bg(NORD.background)), area);
     let mut regions = UiRegions::default();
+    if let Surface::Settings(editor) = &mut app.surface {
+        editor.render(frame, area);
+        return regions;
+    }
 
     match app.layout.effective(area.width) {
         EffectiveLayout::Split => {
@@ -1917,8 +2101,10 @@ fn render(frame: &mut Frame<'_>, app: &App) -> UiRegions {
         menu.render(frame, &layout, ContextMenuStyle::from_theme(NORD));
         regions.context_menu = Some(layout);
     }
-    if matches!(app.surface, Surface::Help) {
-        render_help(frame, area, app, &regions);
+    if let Surface::CommandPalette(command_palette) = &app.surface {
+        let layout = command_palette.layout(area);
+        command_palette.render(frame, &layout, NORD);
+        regions.command_palette = Some(layout);
     }
     regions
 }
@@ -2186,48 +2372,10 @@ fn panel_notice(app: &App) -> Option<String> {
             "Search: {}▏   Enter next   Esc close   PageUp/PageDown scroll",
             input.value()
         )),
-        Surface::Normal | Surface::Help => {
+        Surface::Normal | Surface::CommandPalette(_) | Surface::Settings(_) => {
             app.notice.clone().or_else(|| app.connection_detail.clone()).or(connection_notice)
         }
     }
-}
-
-fn render_help(frame: &mut Frame<'_>, area: Rect, app: &App, regions: &UiRegions) {
-    let width = area.width.saturating_sub(4).min(64).max(20.min(area.width));
-    let height = area.height.saturating_sub(4).min(30).max(8.min(area.height));
-    let popup = Rect::new(
-        area.x.saturating_add(area.width.saturating_sub(width) / 2),
-        area.y.saturating_add(area.height.saturating_sub(height) / 2),
-        width,
-        height,
-    );
-    let context = app.action_context(None, regions, None);
-    let lines = app
-        .registry
-        .resolve_menu(HELP_MENU, &context)
-        .items()
-        .iter()
-        .filter_map(|action| {
-            let key = action.primary_keybinding()?;
-            let state = if action.state.is_enabled() { "" } else { "  unavailable" };
-            Some(Line::from(vec![
-                Span::styled(format!("{key:<18}"), Style::default().fg(NORD.accent)),
-                Span::styled(action.title, Style::default().fg(NORD.text)),
-                Span::styled(state, Style::default().fg(NORD.text_muted)),
-            ]))
-        })
-        .collect::<Vec<_>>();
-    frame.render_widget(Clear, popup);
-    frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-            Block::bordered()
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(NORD.focus))
-                .title(" Console help · Esc close ")
-                .style(Style::default().bg(NORD.background)),
-        ),
-        popup,
-    );
 }
 
 struct TerminalCells<'a> {
@@ -2403,16 +2551,25 @@ mod tests {
     }
 
     #[test]
-    fn catalog_projects_every_phase_two_action_and_shared_enablement() {
+    fn catalog_projects_palette_actions_and_shared_enablement() {
         let registry = registry();
         let controller = context(SessionControl::Controller);
         let observer = context(SessionControl::Observer);
-        let help = registry.resolve_menu(HELP_MENU, &controller);
+        let command_palette = registry.resolve_command_palette(&controller);
+        let visible = ConsoleAction::ALL
+            .iter()
+            .filter(|action| {
+                matches!(action.command_palette(), CommandPalettePlacement::Visible { .. })
+            })
+            .count();
 
-        assert_eq!(help.len(), ConsoleAction::ALL.len());
+        assert_eq!(command_palette.len(), visible);
         assert!(ConsoleAction::ALL
             .iter()
-            .all(|action| help.items().iter().any(|item| item.id == action.id())));
+            .filter(|action| {
+                matches!(action.command_palette(), CommandPalettePlacement::Visible { .. })
+            })
+            .all(|action| { command_palette.items().iter().any(|item| item.id == action.id()) }));
 
         for action in [
             ConsoleAction::RenameSession,
@@ -2470,6 +2627,29 @@ mod tests {
             panic!("configured Console sequence did not resolve");
         };
         assert_eq!(registry.command_for(&invocation), Ok(ConsoleAction::CreateSession));
+    }
+
+    #[test]
+    fn direct_and_prefixed_palette_bindings_share_one_action() {
+        let keybindings = Keybindings::default();
+        let registry = console_actions(&keybindings).unwrap();
+        let context = context(SessionControl::Controller);
+
+        let direct = invocation(&registry, keybindings.command_palette, context);
+        assert_eq!(direct.action, OPEN_COMMAND_PALETTE);
+
+        let mut state = KeybindingState::default();
+        assert!(matches!(
+            registry.resolve_keybinding(&mut state, keybindings.prefix, context),
+            KeybindingResolution::Pending
+        ));
+        let KeybindingResolution::Invoke(prefixed) =
+            registry.resolve_keybinding(&mut state, keybindings.help, context)
+        else {
+            panic!("configured Console palette sequence did not resolve");
+        };
+        assert_eq!(prefixed.action, direct.action);
+        assert_eq!(registry.command_for(&direct), Ok(ConsoleAction::OpenCommandPalette));
     }
 
     #[test]

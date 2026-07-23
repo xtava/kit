@@ -1194,7 +1194,9 @@ async fn client_thread_async(
                                 anyhow::bail!("{reason}");
                             };
                             if pending.promise.try_send(Ok(response)).is_err() {
-                                return Err(NotReconnectableError::ClientWasDestroyed.into());
+                                log::debug!(
+                                    "discarding response for cancelled client request serial {serial}"
+                                );
                             }
                         }
                     }

@@ -3,8 +3,10 @@
 mod support;
 
 use std::path::Path;
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
+use std::{fs, os::unix::fs::PermissionsExt};
 
 use anyhow::{bail, ensure, Context, Result};
 
@@ -15,6 +17,11 @@ use support::console::{
 const READY_TIMEOUT: Duration = Duration::from_secs(8);
 const RESIZED_COLS: u16 = 150;
 const RESIZED_ROWS: u16 = 48;
+
+async fn live_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    static GUARD: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    GUARD.get_or_init(|| tokio::sync::Mutex::new(())).lock().await
+}
 
 fn wait_for_file(path: &Path) -> Result<()> {
     let deadline = Instant::now() + READY_TIMEOUT;
@@ -27,16 +34,90 @@ fn wait_for_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn output_tail(console: &PublicConsole) -> Result<String> {
+    let output = console.output_snapshot()?;
+    let start = output.char_indices().rev().nth(2_000).map_or(0, |(index, _)| index);
+    Ok(output[start..].to_owned())
+}
+
 fn sgr_mouse(button: u8, column: u16, row: u16, release: bool) -> Vec<u8> {
     format!("\x1b[<{button};{};{}{}", column + 1, row + 1, if release { 'm' } else { 'M' })
         .into_bytes()
 }
 
+fn invoke_command(console: &mut PublicConsole, query: &str) -> Result<()> {
+    console.clear_output()?;
+    console.send(b"\x10")?;
+    console.wait_for_output(b"Commands")?;
+    console.type_text(query)?;
+    console.send(b"\r")
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn public_console_honors_custom_prefix_sequences() -> Result<()> {
+async fn public_console_discovers_this_machine_and_opens_command_palette() -> Result<()> {
+    let _live_test_guard = live_test_guard().await;
     wezterm_config::designate_this_as_the_main_thread();
     wezterm_config::common_init(None, &[], true)
-        .context("initialize headless WezTerm verifier config")?;
+        .context("initialize headless Console verifier config")?;
+
+    let fixture_root =
+        std::env::temp_dir().join(format!("kit-console-tailnet-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&fixture_root).context("create tailnet fixture directory")?;
+    let tailscale = fixture_root.join("tailscale");
+    let operating_system = if cfg!(target_os = "macos") { "macOS" } else { "linux" };
+    let tailnet_status = format!(
+        r#"{{"BackendState":"Running","TailscaleIPs":["100.64.0.1"],"Self":{{"ID":"local-verifier","DNSName":"local-verifier.test.ts.net.","HostName":"local-verifier","OS":"{operating_system}","Online":true,"TailscaleIPs":["100.64.0.1"]}},"Peer":{{"peer-verifier":{{"ID":"peer-verifier","DNSName":"slow-peer.test.ts.net.","HostName":"slow-peer","OS":"linux","Online":true,"TailscaleIPs":["100.64.0.2"]}}}}}}"#
+    );
+    fs::write(&tailscale, format!("#!/bin/sh\nprintf '%s\\n' '{tailnet_status}'\n"))
+        .context("write tailnet fixture")?;
+    fs::set_permissions(&tailscale, fs::Permissions::from_mode(0o755))
+        .context("make tailnet fixture executable")?;
+    let ssh = fixture_root.join("ssh");
+    fs::write(&ssh, "#!/bin/sh\nsleep 30\n").context("write slow OpenSSH fixture")?;
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755))
+        .context("make slow OpenSSH fixture executable")?;
+
+    let mut harness = LocalConsoleHarness::start().await?;
+    let mut console = PublicConsole::start(
+        &harness,
+        PublicConsoleOptions {
+            config_toml: Some("[users]\npeer-verifier = \"tvx\"\n".to_owned()),
+            direct_machine: None,
+            path_prefix: Some(fixture_root.clone()),
+            ..PublicConsoleOptions::default()
+        },
+    )?;
+    console.wait_for_output(b"local-verifier")?;
+    console.wait_for_output(b"slow-peer")?;
+    console.clear_output()?;
+    console.send(&sgr_mouse(2, 10, 3, false))?;
+    console.wait_for_output(b"Set Unix user")?;
+    console.clear_output()?;
+    console.send(b"\x1b")?;
+    console.wait_for_output(b"\x1b[?25l")?;
+    console.clear_output()?;
+    console.send(b"\x10")?;
+    console.wait_for_output(b"Commands")?;
+    console.clear_output()?;
+    console.type_text("open console settings")?;
+    console.send(b"\r")?;
+    console.wait_for_output(b"operator preferences")?;
+    console.clear_output()?;
+    console.send(b"q")?;
+    console.wait_for_output(b"\x1b[?25l")?;
+    let output = console.finish_with(b"q")?;
+    ensure!(output.windows(b"\x1b[?1049l".len()).any(|window| window == b"\x1b[?1049l"));
+
+    harness.shutdown()?;
+    fs::remove_dir_all(&fixture_root).context("remove tailnet fixture")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_console_honors_custom_prefix_sequences() -> Result<()> {
+    let _live_test_guard = live_test_guard().await;
+    wezterm_config::designate_this_as_the_main_thread();
+    wezterm_config::common_init(None, &[], true)
+        .context("initialize headless Console verifier config")?;
 
     let mut harness = LocalConsoleHarness::start().await?;
     let mut console = PublicConsole::start(
@@ -61,10 +142,40 @@ async fn public_console_honors_custom_prefix_sequences() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn public_console_drives_keyboard_mouse_history_resize_paste_and_clipboard() -> Result<()> {
+async fn public_console_command_palette_opens_mouse_editable_settings() -> Result<()> {
+    let _live_test_guard = live_test_guard().await;
     wezterm_config::designate_this_as_the_main_thread();
     wezterm_config::common_init(None, &[], true)
-        .context("initialize headless WezTerm verifier config")?;
+        .context("initialize headless Console verifier config")?;
+
+    let mut harness = LocalConsoleHarness::start().await?;
+    let mut console = PublicConsole::start(&harness, PublicConsoleOptions::default())?;
+    invoke_command(&mut console, "open console settings")?;
+    console.wait_for_output(b"operator preferences")?;
+
+    console.clear_output()?;
+    console.send(&sgr_mouse(0, 27, 2, false))?;
+    console.send(&sgr_mouse(0, 27, 2, true))?;
+    console.wait_for_output(b"Saved")?;
+    console.send(b"q")?;
+
+    let config = std::fs::read_to_string(console.config_path())
+        .context("read Console config after mouse Settings edit")?;
+    ensure!(
+        config.contains("sidebar_split_ratio = 360"),
+        "mouse Settings edit did not persist the wide sidebar ratio: {config:?}"
+    );
+
+    console.finish_with(b"\x02q")?;
+    harness.shutdown()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_console_drives_keyboard_mouse_history_resize_paste_and_clipboard() -> Result<()> {
+    let _live_test_guard = live_test_guard().await;
+    wezterm_config::designate_this_as_the_main_thread();
+    wezterm_config::common_init(None, &[], true)
+        .context("initialize headless Console verifier config")?;
 
     let mut harness = LocalConsoleHarness::start().await?;
     let mut console = PublicConsole::start(&harness, PublicConsoleOptions::default())?;
@@ -204,6 +315,69 @@ async fn public_console_drives_keyboard_mouse_history_resize_paste_and_clipboard
         observer.wait_for_dimensions(second.pane_id, |cols, rows| cols > 86 && rows > 34).await?;
     ensure!(after.0 > 86 && after.1 > 34, "PTY resize did not reach the mux");
 
+    drop(observer);
+    harness.shutdown()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_console_closes_the_focused_session_without_freezing() -> Result<()> {
+    let _live_test_guard = live_test_guard().await;
+    wezterm_config::designate_this_as_the_main_thread();
+    wezterm_config::common_init(None, &[], true)
+        .context("initialize headless Console verifier config")?;
+
+    let mut harness = LocalConsoleHarness::start().await?;
+    let mut console = PublicConsole::start(&harness, PublicConsoleOptions::default())?;
+    invoke_command(&mut console, "new session")?;
+    let observer = HeadlessConsoleClient::connect(&harness).await?;
+    observer.wait_for_session_count(1).await?;
+    drop(observer);
+    console.send(b"\x02n")?;
+    let observer = HeadlessConsoleClient::connect(&harness).await?;
+    observer.wait_for_session_count(2).await?;
+    drop(observer);
+
+    invoke_command(&mut console, "close session")?;
+    let observer = HeadlessConsoleClient::connect(&harness).await?;
+    observer.wait_for_session_count(1).await?;
+    drop(observer);
+    let first_receipt =
+        std::env::temp_dir().join(format!("kit-console-close-{}", uuid::Uuid::new_v4()));
+    console.send(format!("\x1b[200~: > '{}'\x1b[201~\n", first_receipt.display()).as_bytes())?;
+    if let Err(error) = wait_for_file(&first_receipt) {
+        bail!(
+            "{error:#}; agent={:?}; recent output={:?}",
+            harness.diagnostics(),
+            output_tail(&console)?
+        );
+    }
+    std::fs::remove_file(&first_receipt).context("remove post-close input receipt")?;
+
+    invoke_command(&mut console, "close session")?;
+    let observer = HeadlessConsoleClient::connect(&harness).await?;
+    if let Err(error) = observer.wait_for_session_count(0).await {
+        bail!("{error:#}; recent output={:?}", output_tail(&console)?);
+    }
+    drop(observer);
+    console.wait_for_output(b"No sessions yet")?;
+
+    invoke_command(&mut console, "new session")?;
+    let observer = HeadlessConsoleClient::connect(&harness).await?;
+    let replacement = observer.wait_for_session_count(1).await?[0];
+    drop(observer);
+    let replacement_receipt =
+        std::env::temp_dir().join(format!("kit-console-replacement-{}", uuid::Uuid::new_v4()));
+    console
+        .send(format!("\x1b[200~: > '{}'\x1b[201~\n", replacement_receipt.display()).as_bytes())?;
+    wait_for_file(&replacement_receipt)
+        .context("Console could not create and drive a replacement session")?;
+    std::fs::remove_file(&replacement_receipt).context("remove replacement input receipt")?;
+
+    let output = console.finish_with(b"\x02q")?;
+    ensure!(output.windows(b"\x1b[?1049l".len()).any(|window| window == b"\x1b[?1049l"));
+    let observer = HeadlessConsoleClient::connect(&harness).await?;
+    observer.close_pane(replacement.pane_id).await?;
+    observer.wait_for_session_count(0).await?;
     drop(observer);
     harness.shutdown()
 }

@@ -73,6 +73,13 @@ pub struct ActionSpec<C, Command> {
     pub title: &'static str,
     pub command: Command,
     pub enablement: fn(&C) -> ActionState,
+    pub command_palette: CommandPalettePlacement,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommandPalettePlacement {
+    Hidden,
+    Visible { group: &'static str, group_order: i16, order: i16 },
 }
 
 pub struct MenuPlacement<C> {
@@ -353,11 +360,11 @@ impl ResolvedAction {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct ResolvedMenu {
+pub struct ResolvedActions {
     items: Vec<ResolvedAction>,
 }
 
-impl ResolvedMenu {
+impl ResolvedActions {
     pub fn items(&self) -> &[ResolvedAction] {
         &self.items
     }
@@ -543,7 +550,7 @@ pub struct ActionRegistry<C, Command> {
 }
 
 impl<C, Command> ActionRegistry<C, Command> {
-    pub fn resolve_menu(&self, menu: MenuId, context: &C) -> ResolvedMenu {
+    pub fn resolve_menu(&self, menu: MenuId, context: &C) -> ResolvedActions {
         let items = self
             .menu_placements
             .iter()
@@ -564,7 +571,48 @@ impl<C, Command> ActionRegistry<C, Command> {
                 }
             })
             .collect::<Vec<_>>();
-        ResolvedMenu { items }
+        ResolvedActions { items }
+    }
+
+    pub fn resolve_command_palette(&self, context: &C) -> ResolvedActions {
+        let mut items = self
+            .actions
+            .iter()
+            .filter_map(|action| {
+                let CommandPalettePlacement::Visible { group, group_order, order } =
+                    action.command_palette
+                else {
+                    return None;
+                };
+                let keybindings = self
+                    .keybindings
+                    .iter()
+                    .filter(|binding| binding.action == action.id && (binding.when)(context))
+                    .map(|binding| binding.binding)
+                    .collect();
+                Some((
+                    group_order,
+                    order,
+                    ResolvedAction {
+                        id: action.id,
+                        title: action.title,
+                        group,
+                        state: (action.enablement)(context),
+                        keybindings,
+                    },
+                ))
+            })
+            .collect::<Vec<_>>();
+        items.sort_by(|left, right| {
+            (left.0, left.2.group, left.1, left.2.title, left.2.id).cmp(&(
+                right.0,
+                right.2.group,
+                right.1,
+                right.2.title,
+                right.2.id,
+            ))
+        });
+        ResolvedActions { items: items.into_iter().map(|(_, _, action)| action).collect() }
     }
 
     pub fn resolve_keybinding(
@@ -688,18 +736,21 @@ mod tests {
                 title: "Open",
                 command: FixtureCommand::Open,
                 enablement: enabled,
+                command_palette: CommandPalettePlacement::Hidden,
             })
             .register_action(ActionSpec {
                 id: DELETE,
                 title: "Delete",
                 command: FixtureCommand::Delete,
                 enablement: writable,
+                command_palette: CommandPalettePlacement::Hidden,
             })
             .register_action(ActionSpec {
                 id: DETAILS,
                 title: "Details",
                 command: FixtureCommand::Details,
                 enablement: enabled,
+                command_palette: CommandPalettePlacement::Hidden,
             });
         builder
     }
@@ -720,6 +771,7 @@ mod tests {
                 title: "Valid",
                 command: FixtureCommand::Open,
                 enablement: enabled,
+                command_palette: CommandPalettePlacement::Hidden,
             });
             assert!(builder.build().is_ok(), "expected valid ID {valid:?}");
         }
@@ -732,6 +784,7 @@ mod tests {
                 title: "Invalid",
                 command: FixtureCommand::Open,
                 enablement: enabled,
+                command_palette: CommandPalettePlacement::Hidden,
             });
             assert_eq!(
                 build_error(builder),
@@ -775,6 +828,7 @@ mod tests {
             title: "Other",
             command: FixtureCommand::Open,
             enablement: enabled,
+            command_palette: CommandPalettePlacement::Hidden,
         });
         assert_eq!(build_error(duplicate), ActionRegistryError::DuplicateAction { id: OPEN });
 
@@ -1043,6 +1097,7 @@ mod tests {
                 title: "Tie",
                 command: FixtureCommand::Open,
                 enablement: enabled,
+                command_palette: CommandPalettePlacement::Hidden,
             });
         }
         for (target_menu, action, group, group_order, order) in [
@@ -1170,6 +1225,7 @@ mod tests {
                 title: "Format document",
                 command: DocumentCommand::Format,
                 enablement: available,
+                command_palette: CommandPalettePlacement::Hidden,
             })
             .place_menu(MenuPlacement {
                 menu,

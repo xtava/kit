@@ -2,7 +2,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 
 use crate::tui::{
     ActionId, ActionRegistry, ActionRegistryBuilder, ActionRegistryError, ActionSpec, ActionState,
-    KeyChord, KeybindingPlacement, MenuId, MenuPlacement,
+    CommandPalettePlacement, KeyChord, KeybindingPlacement, MenuId, MenuPlacement,
 };
 
 use super::model::MonitorView;
@@ -89,48 +89,88 @@ fn contribute_actions(builder: &mut ActionRegistryBuilder<MonitorActionContext, 
             title: "Inspect",
             command: MonitorCommand::Inspect,
             enablement: inspectable,
+            command_palette: CommandPalettePlacement::Visible {
+                group: "Monitor",
+                group_order: 10,
+                order: 10,
+            },
         })
         .register_action(ActionSpec {
             id: REFRESH,
             title: "Refresh",
             command: MonitorCommand::Refresh,
             enablement: refreshable,
+            command_palette: CommandPalettePlacement::Visible {
+                group: "Monitor",
+                group_order: 10,
+                order: 20,
+            },
         })
         .register_action(ActionSpec {
             id: OPEN_EXTERNAL,
             title: "Open provider",
             command: MonitorCommand::OpenExternal,
             enablement: external_open,
+            command_palette: CommandPalettePlacement::Visible {
+                group: "Monitor",
+                group_order: 10,
+                order: 30,
+            },
         })
         .register_action(ActionSpec {
             id: OPEN_IN_DEPLOY,
             title: "Open in kit deploy",
             command: MonitorCommand::OpenInDeploy,
             enablement: deploy_handoff,
+            command_palette: CommandPalettePlacement::Visible {
+                group: "Monitor",
+                group_order: 10,
+                order: 40,
+            },
         })
         .register_action(ActionSpec {
             id: TOGGLE_FOLLOW,
             title: "Toggle log follow",
             command: MonitorCommand::ToggleLogFollow,
             enablement: follow,
+            command_palette: CommandPalettePlacement::Visible {
+                group: "Monitor",
+                group_order: 10,
+                order: 50,
+            },
         })
         .register_action(ActionSpec {
             id: OPEN_TRACE,
             title: "Same trace",
             command: MonitorCommand::OpenTraceCorrelation,
             enablement: trace_correlation,
+            command_palette: CommandPalettePlacement::Visible {
+                group: "Correlation",
+                group_order: 20,
+                order: 10,
+            },
         })
         .register_action(ActionSpec {
             id: OPEN_METRICS,
             title: "Nearby metrics",
             command: MonitorCommand::OpenMetricsCorrelation,
             enablement: metrics_correlation,
+            command_palette: CommandPalettePlacement::Visible {
+                group: "Correlation",
+                group_order: 20,
+                order: 20,
+            },
         })
         .register_action(ActionSpec {
             id: OPEN_DEPLOYMENT,
             title: "Nearest deployment",
             command: MonitorCommand::OpenDeploymentCorrelation,
             enablement: deployment_correlation,
+            command_palette: CommandPalettePlacement::Visible {
+                group: "Correlation",
+                group_order: 20,
+                order: 30,
+            },
         });
 
     for (action, group, group_order, order, visible) in [

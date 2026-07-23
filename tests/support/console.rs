@@ -33,10 +33,23 @@ const READY_TIMEOUT: Duration = Duration::from_secs(8);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const OUTPUT_LINES: isize = 128;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct PublicConsoleOptions {
     pub performance_trace_path: Option<PathBuf>,
     pub config_toml: Option<String>,
+    pub direct_machine: Option<String>,
+    pub path_prefix: Option<PathBuf>,
+}
+
+impl Default for PublicConsoleOptions {
+    fn default() -> Self {
+        Self {
+            performance_trace_path: None,
+            config_toml: None,
+            direct_machine: Some("this-machine".to_owned()),
+            path_prefix: None,
+        }
+    }
 }
 
 pub struct PublicConsole {
@@ -50,6 +63,7 @@ pub struct PublicConsole {
 
 impl PublicConsole {
     pub fn start(harness: &LocalConsoleHarness, options: PublicConsoleOptions) -> Result<Self> {
+        let control_center = options.direct_machine.is_none();
         let config_root =
             harness.runtime_root().join(format!("config-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir(&config_root).context("create isolated Console config root")?;
@@ -68,12 +82,23 @@ impl PublicConsole {
         })?;
         let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_kit"));
         command.arg("console");
+        if let Some(machine) = options.direct_machine.as_deref() {
+            command.arg(machine);
+        }
         command.env("TERM", "xterm-256color");
         command.env("RUST_BACKTRACE", "1");
         command.env("RUST_LOG", "wezterm_client=warn");
         command.env("KIT_CONSOLE_RUNTIME_DIR", harness.runtime_root());
         command.env("XDG_CONFIG_HOME", &config_root);
         command.env("XDG_STATE_HOME", &config_root);
+        if let Some(prefix) = options.path_prefix.as_ref() {
+            let mut paths = vec![prefix.clone()];
+            paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
+            command.env(
+                "PATH",
+                std::env::join_paths(paths).context("construct Console verifier PATH")?,
+            );
+        }
         if let Some(path) = options.performance_trace_path {
             command.env("KIT_CONSOLE_PERF_TRACE", path);
         }
@@ -106,7 +131,7 @@ impl PublicConsole {
             format!("Console agent startup diagnostics: {:?}", harness.diagnostics())
         })?;
         console.send(b"\x1b[1;1R")?;
-        console.wait_for_output(b"Sessions")?;
+        console.wait_for_output(if control_center { b"Machines" } else { b"Sessions" })?;
         console.wait_for_output(b"\x1b[?1049h")?;
         Ok(console)
     }

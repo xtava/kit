@@ -1,18 +1,13 @@
 //! `update` — discover and install signed-for-transport Kit release binaries.
 
-use std::{
-    env, fs,
-    path::{Path, PathBuf},
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::env;
 
-use anyhow::{bail, Context as AnyhowContext, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use clap::{ArgMatches, Command, CommandFactory, FromArgMatches, Parser};
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
-use directories::ProjectDirs;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Position, Rect},
     style::{Modifier, Style},
@@ -20,17 +15,13 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
     Frame,
 };
-use serde::{Deserialize, Serialize};
 
 use crate::{
-    framework::{AtomicFileWriter, Context, Terminal, Tool, ToolMeta},
+    framework::{Context, Terminal, Tool, ToolMeta},
+    release::{ReleaseUpdater, UpdateAvailability, UpdateOutcome},
     tui::{theme::NORD, EventReader, Session, SessionOptions},
 };
 
-const REPO_OWNER: &str = "xtava";
-const REPO_NAME: &str = "kit";
-const CHECK_INTERVAL: Duration = Duration::from_secs(20 * 60 * 60);
-const CACHE_FILE: &str = "version.json";
 const RELEASES_URL: &str = "https://github.com/xtava/kit/releases";
 
 pub fn tool() -> UpdateTool {
@@ -63,11 +54,13 @@ impl Tool for UpdateTool {
 
     async fn run(&self, cx: &Context, matches: &ArgMatches) -> Result<()> {
         UpdateArgs::from_arg_matches(matches)?;
+        let outcome = perform_update(cx.term.stdout_tty && !cx.out.is_json()).await?;
         if cx.out.is_json() {
-            bail!("kit update does not support --json because it reports download progress");
+            cx.out.json(&outcome)
+        } else {
+            print_outcome(&outcome);
+            Ok(())
         }
-
-        perform_update(cx.term.stdout_tty).await
     }
 }
 
@@ -83,60 +76,48 @@ pub async fn startup() -> Result<bool> {
         return Ok(false);
     }
 
-    let Some(path) = cache_path() else {
-        return Ok(false);
-    };
-    let cached = read_cache(&path);
-    if cached.as_ref().is_none_or(VersionCache::is_stale) {
-        let refresh_path = path.clone();
+    let updater = ReleaseUpdater::new();
+    let cached = updater.cached();
+    if cached.as_ref().is_none_or(|cached| cached.stale) {
         tokio::spawn(async move {
-            if let Err(error) = refresh_cache(&refresh_path).await {
+            if let Err(error) = updater.check().await {
                 let _ = error;
             }
         });
     }
 
-    let Some(cached) = cached.filter(VersionCache::has_visible_update) else {
+    let Some(cached) = cached.filter(|cached| !cached.dismissed) else {
+        return Ok(false);
+    };
+    let UpdateAvailability::Available { latest, .. } = cached.availability else {
         return Ok(false);
     };
 
-    match prompt(&cached.latest_version).await? {
+    match prompt(&latest).await? {
         UpdateChoice::UpdateNow => {
-            perform_update(true).await?;
+            let outcome = perform_update(true).await?;
+            print_outcome(&outcome);
             Ok(true)
         }
         UpdateChoice::Later => Ok(false),
         UpdateChoice::SkipVersion => {
-            dismiss_version(&path, &cached.latest_version)?;
+            updater.dismiss(&latest)?;
             Ok(false)
         }
     }
 }
 
-async fn perform_update(show_progress: bool) -> Result<()> {
-    let updater = updater(show_progress)?;
-    let status = updater.update_async().await.context("update Kit from GitHub Releases")?;
-
-    if status.is_updated() {
-        println!("Kit updated to {}", status.version());
-    } else {
-        println!("Kit is already up to date ({})", status.version());
-    }
-    Ok(())
+async fn perform_update(show_progress: bool) -> Result<UpdateOutcome> {
+    ReleaseUpdater::new().install(show_progress).await
 }
 
-fn updater(show_progress: bool) -> Result<self_update::backends::github::AsyncUpdate> {
-    self_update::backends::github::Update::configure()
-        .repo_owner(REPO_OWNER)
-        .repo_name(REPO_NAME)
-        .bin_name("kit")
-        .current_version(env!("CARGO_PKG_VERSION"))
-        .show_download_progress(show_progress)
-        .show_output(false)
-        .no_confirm(true)
-        .verify_release_digest(true)
-        .build_async()
-        .context("configure the Kit release updater")
+fn print_outcome(outcome: &UpdateOutcome) {
+    match outcome {
+        UpdateOutcome::Updated { to, .. } => println!("Kit updated to {to}"),
+        UpdateOutcome::AlreadyCurrent { version } => {
+            println!("Kit is already up to date ({version})")
+        }
+    }
 }
 
 fn should_notify(args: &[std::ffi::OsString], terminal: &Terminal) -> bool {
@@ -150,78 +131,6 @@ fn should_notify(args: &[std::ffi::OsString], terminal: &Terminal) -> bool {
     }
 
     args.iter().find(|arg| !arg.starts_with('-')).is_some_and(|command| *command != "update")
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct VersionCache {
-    latest_version: String,
-    checked_at: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    dismissed_version: Option<String>,
-}
-
-impl VersionCache {
-    fn is_stale(&self) -> bool {
-        now().saturating_sub(self.checked_at) >= CHECK_INTERVAL.as_secs()
-    }
-
-    fn has_visible_update(&self) -> bool {
-        self.dismissed_version.as_deref() != Some(&self.latest_version)
-            && self_update::version::bump_is_greater(
-                env!("CARGO_PKG_VERSION"),
-                &self.latest_version,
-            )
-            .unwrap_or(false)
-    }
-}
-
-fn cache_path() -> Option<PathBuf> {
-    let project = ProjectDirs::from("", "", "kit")?;
-    let base = project.state_dir().unwrap_or_else(|| project.data_local_dir());
-    Some(base.join("updates").join(CACHE_FILE))
-}
-
-fn read_cache(path: &Path) -> Option<VersionCache> {
-    let bytes = fs::read(path).ok()?;
-    serde_json::from_slice(&bytes).ok()
-}
-
-async fn refresh_cache(path: &Path) -> Result<()> {
-    let latest = updater(false)?
-        .is_update_available_async()
-        .await
-        .context("check the latest Kit release")?
-        .map(|release| release.version().to_owned())
-        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned());
-    write_cache(path, |current| VersionCache {
-        latest_version: latest,
-        checked_at: now(),
-        dismissed_version: current.and_then(|cache| cache.dismissed_version),
-    })
-}
-
-fn dismiss_version(path: &Path, version: &str) -> Result<()> {
-    write_cache(path, |current| VersionCache {
-        latest_version: version.to_owned(),
-        checked_at: current.as_ref().map_or_else(now, |cache| cache.checked_at),
-        dismissed_version: Some(version.to_owned()),
-    })
-}
-
-fn write_cache(
-    path: &Path,
-    update: impl FnOnce(Option<VersionCache>) -> VersionCache,
-) -> Result<()> {
-    let dir = path.parent().context("resolve the Kit update cache directory")?;
-    let writer = AtomicFileWriter::new(dir, ".version.lock", ".version");
-    let _lock = writer.lock().context("lock the Kit update cache")?;
-    let cache = update(read_cache(path));
-    let bytes = serde_json::to_vec_pretty(&cache).context("serialize the Kit update cache")?;
-    writer.replace(path, &bytes).context("write the Kit update cache")
-}
-
-fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -423,21 +332,6 @@ mod tests {
             &args(&["kit", "tail"]),
             &Terminal { stdin_tty: true, stdout_tty: false }
         ));
-    }
-
-    #[test]
-    fn cache_only_surfaces_newer_undismissed_versions() {
-        let mut cache = VersionCache {
-            latest_version: "99.0.0".into(),
-            checked_at: now(),
-            dismissed_version: None,
-        };
-        assert!(cache.has_visible_update());
-        cache.dismissed_version = Some("99.0.0".into());
-        assert!(!cache.has_visible_update());
-        cache.latest_version = env!("CARGO_PKG_VERSION").into();
-        cache.dismissed_version = None;
-        assert!(!cache.has_visible_update());
     }
 
     #[test]

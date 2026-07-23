@@ -1,13 +1,14 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 use wezterm_mux::{Mux, MuxNotification};
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(super) struct ConsoleInvalidation {
     pub pane_output: bool,
     pub topology: bool,
+    pub removed_panes: Vec<usize>,
 }
 
 pub(super) struct ConsoleInvalidations {
@@ -53,6 +54,7 @@ struct InvalidationState {
     closed: AtomicBool,
     pane_output: AtomicBool,
     topology: AtomicBool,
+    removed_panes: Mutex<Vec<usize>>,
 }
 
 impl InvalidationState {
@@ -65,8 +67,11 @@ impl InvalidationState {
     fn record(&self, notification: &MuxNotification) -> bool {
         let target = match notification {
             MuxNotification::PaneOutput(_) | MuxNotification::TabResized(_) => &self.pane_output,
+            MuxNotification::PaneRemoved(pane_id) => {
+                self.removed_panes.lock().unwrap().push(*pane_id);
+                &self.topology
+            }
             MuxNotification::PaneAdded(_)
-            | MuxNotification::PaneRemoved(_)
             | MuxNotification::WindowCreated(_)
             | MuxNotification::WindowRemoved(_)
             | MuxNotification::WindowInvalidated(_)
@@ -89,6 +94,7 @@ impl InvalidationState {
         ConsoleInvalidation {
             pane_output: self.pane_output.swap(false, Ordering::AcqRel),
             topology: self.topology.swap(false, Ordering::AcqRel),
+            removed_panes: std::mem::take(&mut *self.removed_panes.lock().unwrap()),
         }
     }
 }
@@ -108,7 +114,10 @@ mod tests {
         assert!(state.record(&MuxNotification::PaneOutput(7)));
         assert!(!state.record(&MuxNotification::PaneOutput(8)));
         assert!(state.record(&MuxNotification::PaneRemoved(7)));
-        assert_eq!(state.take(), ConsoleInvalidation { pane_output: true, topology: true });
+        assert_eq!(
+            state.take(),
+            ConsoleInvalidation { pane_output: true, topology: true, removed_panes: vec![7] }
+        );
         assert_eq!(state.take(), ConsoleInvalidation::default());
     }
 
@@ -127,7 +136,10 @@ mod tests {
     fn terminal_resize_projects_content_without_reconciling_topology() {
         let state = InvalidationState::default();
         assert!(state.record(&MuxNotification::TabResized(7)));
-        assert_eq!(state.take(), ConsoleInvalidation { pane_output: true, topology: false });
+        assert_eq!(
+            state.take(),
+            ConsoleInvalidation { pane_output: true, topology: false, removed_panes: Vec::new() }
+        );
     }
 
     #[tokio::test]
@@ -143,7 +155,7 @@ mod tests {
 
         assert_eq!(
             invalidations.recv().await,
-            Some(ConsoleInvalidation { pane_output: true, topology: true })
+            Some(ConsoleInvalidation { pane_output: true, topology: true, removed_panes: vec![7] })
         );
         assert!(invalidations.receiver.try_recv().is_err());
         assert_eq!(state.take(), ConsoleInvalidation::default());

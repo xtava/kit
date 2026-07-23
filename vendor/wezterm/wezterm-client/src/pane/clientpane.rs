@@ -227,7 +227,7 @@ impl ClientPane {
                 log::trace!("remote pane {} has been removed", pane_id);
                 self.renderable.lock().inner.borrow_mut().dead = true;
                 let mux = Mux::get();
-                mux.prune_dead_windows();
+                mux.unregister_pane(self.local_pane_id);
 
                 self.client.expire_stale_mappings();
             }

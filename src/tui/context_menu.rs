@@ -15,7 +15,7 @@ use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::actions::{
-    ActionId, ActionInvocation, ActionState, KeyChord, ResolvedAction, ResolvedMenu,
+    ActionId, ActionInvocation, ActionState, KeyChord, ResolvedAction, ResolvedActions,
 };
 use super::theme::{TuiTheme, NORD};
 
@@ -107,12 +107,12 @@ pub enum ContextMenuOutcome<C> {
 pub struct ContextMenu<C> {
     anchor: Position,
     context: C,
-    items: ResolvedMenu,
+    items: ResolvedActions,
     selected: usize,
 }
 
 impl<C> ContextMenu<C> {
-    pub fn open(anchor: Position, context: C, items: ResolvedMenu) -> Option<Self> {
+    pub fn open(anchor: Position, context: C, items: ResolvedActions) -> Option<Self> {
         if items.is_empty() {
             return None;
         }
@@ -430,8 +430,8 @@ fn fit(value: &str, width: usize) -> String {
 mod tests {
     use super::*;
     use crate::tui::actions::{
-        ActionRegistry, ActionRegistryBuilder, ActionSpec, KeybindingPlacement, MenuId,
-        MenuPlacement,
+        ActionRegistry, ActionRegistryBuilder, ActionSpec, CommandPalettePlacement,
+        KeybindingPlacement, MenuId, MenuPlacement,
     };
     use crossterm::event::{KeyEvent, KeyModifiers, MouseEvent};
     use ratatui::backend::TestBackend;
@@ -480,18 +480,21 @@ mod tests {
                 title: "Open item",
                 command: Command::Open,
                 enablement: enabled,
+                command_palette: CommandPalettePlacement::Hidden,
             })
             .register_action(ActionSpec {
                 id: DELETE,
                 title: "Delete item",
                 command: Command::Delete,
                 enablement: writable,
+                command_palette: CommandPalettePlacement::Hidden,
             })
             .register_action(ActionSpec {
                 id: INSPECT,
                 title: "Inspect other item",
                 command: Command::Inspect,
                 enablement: enabled,
+                command_palette: CommandPalettePlacement::Hidden,
             })
             .place_menu(MenuPlacement {
                 menu: MENU,

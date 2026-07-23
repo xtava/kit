@@ -29,6 +29,18 @@ pub enum NativeServiceState {
     WrongOwner { path: PathBuf, expected_uid: u32, actual_uid: u32 },
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RemoteFailureKind {
+    OpenSshUnavailable,
+    Transport,
+    RemoteCommand,
+    EmptyOutput,
+    Decode,
+    Timeout,
+    Supervision,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "state", rename_all = "kebab-case")]
 pub enum ConsoleStatus {
@@ -65,8 +77,10 @@ pub enum ConsoleStatus {
         url: String,
         action: String,
     },
-    TransportFailed {
+    RemoteFailure {
         machine: String,
+        kind: RemoteFailureKind,
+        detail: String,
         action: String,
     },
     NotInstalled {
@@ -119,6 +133,7 @@ pub enum ConsoleStatus {
     },
     BuildIncompatible {
         platform: ConsoleServicePlatform,
+        sessions: Option<usize>,
         expected: BuildIdentity,
         actual: BuildIdentity,
         action: String,
@@ -166,8 +181,11 @@ impl ConsoleStatus {
             Self::NeedsSshAuthentication { machine, url, action } => {
                 format!("SSH authentication required — {machine}\n{url}\nnext: {action}")
             }
-            Self::TransportFailed { machine, action } => {
-                format!("transport failed — {machine}\nnext: {action}")
+            Self::RemoteFailure { machine, kind, detail, action } => {
+                format!(
+                    "{} — {machine}\n{detail}\nnext: {action}",
+                    kind.label()
+                )
             }
             Self::NotInstalled { platform, action } => {
                 format!("not installed — {}\nnext: {action}", platform.label())
@@ -210,10 +228,21 @@ impl ConsoleStatus {
                 "incompatible — {}\nserver {server_version} uses codec {server_codec}\nnext: {action}",
                 platform.label()
             ),
-            Self::BuildIncompatible { platform, expected, actual, action } => format!(
-                "update required — {}\nexpected {expected:?}\nactual   {actual:?}\nnext: {action}",
-                platform.label()
-            ),
+            Self::BuildIncompatible {
+                platform,
+                sessions,
+                expected,
+                actual,
+                action,
+            } => {
+                let sessions = sessions
+                    .map(|sessions| format!("\nactive sessions: {sessions}"))
+                    .unwrap_or_default();
+                format!(
+                    "update required — {}{sessions}\nexpected {expected:?}\nactual   {actual:?}\nnext: {action}",
+                    platform.label()
+                )
+            }
             Self::MuxUnavailable { platform, detail, action } => {
                 format!("unavailable — {} mux\n{detail}\nnext: {action}", platform.label())
             }
@@ -225,9 +254,23 @@ impl ConsoleStatus {
     }
 }
 
+impl RemoteFailureKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::OpenSshUnavailable => "OpenSSH unavailable",
+            Self::Transport => "connection failed",
+            Self::RemoteCommand => "remote command failed",
+            Self::EmptyOutput => "remote command returned no status",
+            Self::Decode => "remote status could not be decoded",
+            Self::Timeout => "remote command timed out",
+            Self::Supervision => "remote command supervision failed",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::ConsoleServicePlatform;
+    use super::{ConsoleServicePlatform, ConsoleStatus, RemoteFailureKind};
 
     #[test]
     fn service_platform_wire_values_decode_on_every_supported_client() {
@@ -239,5 +282,21 @@ mod tests {
             serde_json::from_str::<ConsoleServicePlatform>("\"macos-launch-agent\"").unwrap(),
             ConsoleServicePlatform::MacosLaunchAgent
         );
+    }
+
+    #[test]
+    fn remote_failure_wire_state_preserves_the_failing_layer_and_evidence() {
+        let status = ConsoleStatus::RemoteFailure {
+            machine: "tvxm".to_owned(),
+            kind: RemoteFailureKind::RemoteCommand,
+            detail: "Decode limit exceeded".to_owned(),
+            action: "repair Console".to_owned(),
+        };
+        let encoded = serde_json::to_string(&status).unwrap();
+        let decoded = serde_json::from_str::<ConsoleStatus>(&encoded).unwrap();
+
+        assert_eq!(decoded, status);
+        assert!(status.text().contains("remote command failed"));
+        assert!(status.text().contains("Decode limit exceeded"));
     }
 }
