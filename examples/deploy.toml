@@ -6,6 +6,8 @@ id = "staging"
 name = "Staging"
 description = "Build and publish the staging artifact"
 working_dir = "<path-to-your-project>"
+# Additional Git worktrees whose exact source state participates in this Target's fingerprint.
+# source_roots = ["<path-to-an-additional-source-repository>"]
 
 [[targets.steps]]
 name = "Build release"

@@ -1,7 +1,7 @@
 use std::{collections::HashSet, ffi::OsString, path::Path, time::SystemTime};
 
 use ::time::{format_description::well_known::Rfc3339, OffsetDateTime};
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Result};
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -28,12 +28,15 @@ use super::{
     config::{DeployAction, DeployTarget, LoadedPlan},
     journal::{DeployJournal, JournalEntry, JournalStatus, JournalStore, VersionId},
     layout::{DeployLayout, LayoutFrame, LayoutStore, SplitSurface},
-    runner::{self, OutputStream, RunOperation, RunOutcome, RunSpec, RunTargetSpec},
+    orchestration::{prepare_run, target_environment, target_working_dir},
+    runner::{self, OutputStream, RunOperation, RunOutcome, RunSpec},
     state::{
         ActiveRegion, App, Modal, ModalResult, Phase, ProgressStatus, RunIntent, VersionsSource,
         VersionsState,
     },
 };
+#[cfg(test)]
+use super::{orchestration::ensure_preview_branch, runner::RunTargetSpec};
 use crate::framework::{
     process::ProcessSupervisor, start_external, ExternalCommand, ExternalTarget,
 };
@@ -495,7 +498,7 @@ fn handle_key(key: KeyEvent, app: &mut App) -> UiAction {
                 UiAction::None
             }
             KeyCode::Enter => {
-                app.review_deploy();
+                app.review_production_deploy();
                 UiAction::None
             }
             KeyCode::Char('r') if app.versions_source() == VersionsSource::CloudflarePages => {
@@ -792,99 +795,11 @@ fn spawn_tailscale_auth_open(
     })
 }
 
-async fn prepare_run(
-    loaded: &LoadedPlan,
-    intent: RunIntent,
-    review_targets: Vec<DeployTarget>,
-    journal_store: &JournalStore,
-) -> Result<RunSpec> {
-    let op = OpClient::new();
-    match intent {
-        RunIntent::Deploy => {
-            let mut targets = Vec::new();
-            for target in review_targets {
-                let working_dir = target_working_dir(&loaded.base_dir, &target);
-                let version = journal_store.current_version(&target.id, &working_dir).await?;
-                let environment = target_environment(loaded, &target.id)?;
-                let branch = cloudflare_production_branch(&target, &environment, &op).await?;
-                targets.push(RunTargetSpec { target, version, branch, environment });
-            }
-            Ok(RunSpec {
-                base_dir: loaded.base_dir.clone(),
-                operation: RunOperation::Deploy,
-                targets,
-            })
-        }
-        RunIntent::DeployPreview { branch, .. } => {
-            let target = review_targets
-                .into_iter()
-                .next()
-                .ok_or_else(|| anyhow!("selected preview Target no longer exists"))?;
-            let working_dir = target_working_dir(&loaded.base_dir, &target);
-            let version = journal_store.current_version(&target.id, &working_dir).await?;
-            let environment = target_environment(loaded, &target.id)?;
-            let production = cloudflare_production_branch(&target, &environment, &op)
-                .await?
-                .ok_or_else(|| anyhow!("selected Target has no Cloudflare Pages backend"))?;
-            ensure_preview_branch(&branch, &production)?;
-            Ok(RunSpec {
-                base_dir: loaded.base_dir.clone(),
-                operation: RunOperation::Deploy,
-                targets: vec![RunTargetSpec { target, version, branch: Some(branch), environment }],
-            })
-        }
-        RunIntent::Rollback { version, .. } => {
-            let target = review_targets
-                .into_iter()
-                .next()
-                .ok_or_else(|| anyhow!("selected Target has no rollback Steps"))?;
-            let environment = target_environment(loaded, &target.id)?;
-            Ok(RunSpec {
-                base_dir: loaded.base_dir.clone(),
-                operation: RunOperation::Rollback { selected_version: version.clone() },
-                targets: vec![RunTargetSpec { target, version, branch: None, environment }],
-            })
-        }
-        RunIntent::CloudflarePagesRollback { .. } => {
-            Err(anyhow!("Cloudflare Pages rollback must use the platform API"))
-        }
-    }
-}
-
-async fn cloudflare_production_branch(
-    target: &DeployTarget,
-    environment: &super::environment::TargetEnvironment,
-    op: &OpClient,
-) -> Result<Option<String>> {
-    let Some(client) = CloudflarePagesClient::for_target(target, environment, op).await? else {
-        return Ok(None);
-    };
-    Ok(Some(client.get_project().await?.production_branch))
-}
-
-fn ensure_preview_branch(branch: &str, production: &str) -> Result<()> {
-    if branch == production {
-        bail!("'{branch}' is Cloudflare's production branch; use a normal deploy instead")
-    }
-    Ok(())
-}
-
 enum BackendEvent {
     VersionsLoaded { target_id: String, result: Result<CloudflareVersions, String> },
     Deleted { short_id: String, result: Result<(), String> },
     RunPrepared { preparation_id: u64, result: Result<RunSpec, String> },
     ExternalOpenFinished { url: String, result: Result<(), String> },
-}
-
-fn target_environment(
-    loaded: &LoadedPlan,
-    target_id: &str,
-) -> Result<super::environment::TargetEnvironment> {
-    loaded
-        .environments
-        .get(target_id)
-        .cloned()
-        .ok_or_else(|| anyhow!("Target '{target_id}' has no loaded environment"))
 }
 
 fn spawn_versions_load(app: &App, sender: mpsc::Sender<BackendEvent>) -> Result<JoinHandle<()>> {
@@ -927,7 +842,7 @@ fn spawn_delete(
 
 fn spawn_cloudflare_rollback(
     target: DeployTarget,
-    environment: super::environment::TargetEnvironment,
+    environment: crate::onepassword::OpEnvironment,
     deployment_id: String,
 ) -> (mpsc::Receiver<runner::RunEvent>, watch::Sender<bool>, JoinHandle<()>) {
     let (event_tx, event_rx) = mpsc::channel(16);
@@ -1002,7 +917,12 @@ fn spawn_cloudflare_rollback(
             return;
         }
         if event_tx
-            .send(runner::RunEvent::TargetFinished { target: 0, outcome: target_outcome, elapsed })
+            .send(runner::RunEvent::TargetFinished {
+                target: 0,
+                artifact: None,
+                outcome: target_outcome,
+                elapsed,
+            })
             .await
             .is_err()
         {
@@ -1064,14 +984,6 @@ fn extract_deploy_url(line: &str) -> Option<String> {
     let start = line.find("https://")?;
     let url: String = line[start..].chars().take_while(|ch| !ch.is_whitespace()).collect();
     url.contains(".pages.dev").then_some(url)
-}
-
-fn target_working_dir(base_dir: &Path, target: &DeployTarget) -> std::path::PathBuf {
-    match target.working_dir.as_deref() {
-        Some(path) if path.is_absolute() => path.to_path_buf(),
-        Some(path) => base_dir.join(path),
-        None => base_dir.to_path_buf(),
-    }
 }
 
 fn persist_run(app: &mut App, store: &JournalStore) -> Result<()> {
@@ -1342,7 +1254,7 @@ fn render_target_detail(
         Span::styled("Space", Style::default().fg(CYAN)),
         Span::styled(" select   ", Style::default().fg(MUTED)),
         Span::styled("Enter", Style::default().fg(CYAN)),
-        Span::styled(" deploy   ", Style::default().fg(MUTED)),
+        Span::styled(" production deploy   ", Style::default().fg(MUTED)),
         Span::styled("v", Style::default().fg(CYAN)),
         Span::styled(" versions", Style::default().fg(MUTED)),
     ];
@@ -1692,8 +1604,19 @@ fn render_review(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Some(RunIntent::Rollback { .. } | RunIntent::CloudflarePagesRollback { .. })
     );
     let platform_rollback = matches!(app.intent, Some(RunIntent::CloudflarePagesRollback { .. }));
+    let production = matches!(app.intent, Some(RunIntent::DeployProduction));
+    let preview_branch = match &app.intent {
+        Some(RunIntent::DeployPreview { branch, .. }) => Some(branch.as_str()),
+        _ => None,
+    };
     let accent = if rollback { MAGENTA } else { CYAN };
-    let heading = if rollback { "Rollback plan" } else { "Deployment plan" };
+    let heading = if rollback {
+        "Rollback plan"
+    } else if production {
+        "Production deployment plan"
+    } else {
+        "Preview deployment plan"
+    };
     let mut lines = vec![
         Line::styled(heading, Style::default().fg(accent).add_modifier(Modifier::BOLD)),
         Line::styled(
@@ -1703,13 +1626,24 @@ fn render_review(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 } else {
                     "The selected recorded Version will be passed to every rollback Step."
                 }
+            } else if production {
+                "Selected Targets will publish to their production destinations."
             } else {
-                "Targets and Steps will run sequentially in configuration order."
+                "The selected Cloudflare Pages Target will publish to a preview branch alias."
             },
             Style::default().fg(MUTED),
         ),
         Line::raw(""),
     ];
+    if production {
+        lines.push(detail_line("Environment", "production"));
+        lines.push(Line::raw(""));
+    }
+    if let Some(branch) = preview_branch {
+        lines.push(detail_line("Environment", "preview"));
+        lines.push(detail_line("Branch", branch));
+        lines.push(Line::raw(""));
+    }
     if let Some(RunIntent::Rollback { version, .. }) = &app.intent {
         lines.push(Line::from(vec![
             Span::styled("Version  ", Style::default().fg(MUTED)),
@@ -1758,13 +1692,26 @@ fn render_review(frame: &mut Frame<'_>, area: Rect, app: &App) {
 fn render_running(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let layout_frame = install_split_frame(app, SplitSurface::Running, area);
     let spinner = SPINNER[app.spinner % SPINNER.len()];
+    let run_title = match &app.active_operation {
+        Some(RunOperation::DeployProduction) => "Production deploy in progress".to_owned(),
+        Some(RunOperation::DeployPreview) => {
+            app.progress.first().and_then(|target| target.branch.as_deref()).map_or_else(
+                || "Preview deploy in progress".to_owned(),
+                |branch| format!("Preview deploy in progress · {branch}"),
+            )
+        }
+        Some(RunOperation::Rollback { .. } | RunOperation::CloudflarePagesRollback { .. }) => {
+            "Rollback in progress".to_owned()
+        }
+        None => "Run in progress".to_owned(),
+    };
     let mut progress = vec![
         Line::from(vec![
             Span::styled(
                 format!("{spinner} "),
                 Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
             ),
-            Span::styled("Run in progress", Style::default().fg(TEXT).add_modifier(Modifier::BOLD)),
+            Span::styled(run_title, Style::default().fg(TEXT).add_modifier(Modifier::BOLD)),
         ]),
         Line::raw(""),
     ];
@@ -1846,15 +1793,21 @@ fn render_summary(frame: &mut Frame<'_>, area: Rect, app: &App, journal_path: &P
         app.active_operation,
         Some(RunOperation::Rollback { .. } | RunOperation::CloudflarePagesRollback { .. })
     );
-    let (title, color) = match app.outcome {
-        Some(RunOutcome::Succeeded) if rollback => ("Rollback complete", MAGENTA),
-        Some(RunOutcome::Succeeded) => ("Deploy complete", GREEN),
-        Some(RunOutcome::Failed) if rollback => ("Rollback failed", RED),
-        Some(RunOutcome::Failed) => ("Deploy failed", RED),
-        Some(RunOutcome::Cancelled) if rollback => ("Rollback cancelled", YELLOW),
-        Some(RunOutcome::Cancelled) => ("Deploy cancelled", YELLOW),
-        None => ("Run ended", MUTED),
+    let operation = match &app.active_operation {
+        Some(RunOperation::DeployProduction) => "Production deploy",
+        Some(RunOperation::DeployPreview) => "Preview deploy",
+        Some(RunOperation::Rollback { .. } | RunOperation::CloudflarePagesRollback { .. }) => {
+            "Rollback"
+        }
+        None => "Run",
     };
+    let (status, color) = match app.outcome {
+        Some(RunOutcome::Succeeded) => ("complete", if rollback { MAGENTA } else { GREEN }),
+        Some(RunOutcome::Failed) => ("failed", RED),
+        Some(RunOutcome::Cancelled) => ("cancelled", YELLOW),
+        None => ("ended", MUTED),
+    };
+    let title = format!("{operation} {status}");
     let mut lines = vec![
         Line::styled(title, Style::default().fg(color).add_modifier(Modifier::BOLD)),
         Line::styled(
@@ -1863,6 +1816,21 @@ fn render_summary(frame: &mut Frame<'_>, area: Rect, app: &App, journal_path: &P
         ),
         Line::raw(""),
     ];
+    match &app.active_operation {
+        Some(RunOperation::DeployProduction) => {
+            lines.push(detail_line("Environment", "production"));
+            lines.push(Line::raw(""));
+        }
+        Some(RunOperation::DeployPreview) => {
+            lines.push(detail_line("Environment", "preview"));
+            if let Some(branch) = app.progress.first().and_then(|target| target.branch.as_deref()) {
+                lines.push(detail_line("Branch", branch));
+            }
+            lines.push(Line::raw(""));
+        }
+        Some(RunOperation::Rollback { .. } | RunOperation::CloudflarePagesRollback { .. })
+        | None => {}
+    }
     if let Some(url) = summary_url(app) {
         lines.push(Line::from(vec![
             Span::styled("Deployed  ", Style::default().fg(MUTED)),
@@ -1984,10 +1952,10 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
 fn modal_free_controls(app: &App) -> &'static str {
     match app.phase {
         Phase::Browse if app.active_region == ActiveRegion::Secondary => {
-            "↑↓ scroll plan   ←→/Tab region   Space select   v versions   p preview   Enter review   q quit"
+            "↑↓ scroll plan   ←→/Tab region   Space select   v versions   p preview   Enter production   q quit"
         }
         Phase::Browse => {
-            "↑↓ targets   Space select   a all   v versions   p preview   Enter review   q quit"
+            "↑↓ targets   Space select   a all   v versions   p preview   Enter production   q quit"
         }
         Phase::Versions => {
             if app.layout_frame.surface.is_none() {
@@ -2003,6 +1971,12 @@ fn modal_free_controls(app: &App) -> &'static str {
             } else {
                 "↑↓ versions   ←→/Tab region   Enter rollback   drag resize   = reset   Esc targets   q quit"
             }
+        }
+        Phase::Review if matches!(app.intent, Some(RunIntent::DeployProduction)) => {
+            "Enter deploy production   Esc back   q quit"
+        }
+        Phase::Review if matches!(app.intent, Some(RunIntent::DeployPreview { .. })) => {
+            "Enter deploy preview   Esc back   q quit"
         }
         Phase::Review => "Enter run   Esc back   q quit",
         Phase::Preparing => "Esc cancel preparation   q quit",
@@ -2148,14 +2122,14 @@ fn truncate(text: &str, width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{path::PathBuf, time::Duration};
 
     use ratatui::{backend::TestBackend, Terminal};
 
     use super::*;
-    use crate::tools::deploy::{
-        config::{DeployStep, DeploymentPlan, RollbackStrategy},
-        environment::TargetEnvironment,
+    use crate::{
+        onepassword::OpEnvironment,
+        tools::deploy::config::{DeployStep, DeploymentPlan, RollbackStrategy},
     };
 
     #[test]
@@ -2177,6 +2151,7 @@ mod tests {
                         name: "Preview".to_owned(),
                         description: Some("Publish preview artifacts".to_owned()),
                         working_dir: None,
+                        source_roots: Vec::new(),
                         env_file: None,
                         steps: vec![DeployStep {
                             name: "Build".to_owned(),
@@ -2213,6 +2188,58 @@ mod tests {
         assert!(screen.contains("Build"));
         assert!(screen.contains("rollback ready"));
         assert!(screen.contains("Space select"));
+        assert!(screen.contains("production deploy"));
+        Ok(())
+    }
+
+    #[test]
+    fn production_and_preview_destinations_remain_explicit_through_summary() -> Result<()> {
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend)?;
+        let mut app = test_app();
+        app.toggle_focused();
+        app.review_production_deploy();
+
+        terminal.draw(|frame| render(frame, &mut app, Path::new("journal.json")))?;
+        let review = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(review.contains("Production deployment plan"));
+        assert!(review.contains("Environment production"));
+
+        let target = app.loaded.plan.targets[0].clone();
+        app.begin_run(&RunSpec {
+            base_dir: PathBuf::from("."),
+            operation: RunOperation::DeployPreview,
+            targets: vec![RunTargetSpec {
+                target,
+                version: VersionId("version-placeholder".to_owned()),
+                branch: Some("feature-x".to_owned()),
+                environment: OpEnvironment::default(),
+            }],
+        });
+        app.ingest(runner::RunEvent::Finished {
+            outcome: RunOutcome::Succeeded,
+            elapsed: Duration::from_millis(25),
+        });
+
+        terminal.draw(|frame| render(frame, &mut app, Path::new("journal.json")))?;
+        let summary = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(summary.contains("Preview deploy complete"));
+        assert!(summary.contains("Environment preview"));
+        assert!(summary.contains("Branch      feature-x"));
         Ok(())
     }
 
@@ -2280,12 +2307,12 @@ mod tests {
         let target = app.loaded.plan.targets[0].clone();
         app.begin_run(&RunSpec {
             base_dir: PathBuf::from("."),
-            operation: RunOperation::Deploy,
+            operation: RunOperation::DeployProduction,
             targets: vec![RunTargetSpec {
                 target,
                 version: VersionId("version-placeholder".to_owned()),
                 branch: None,
-                environment: TargetEnvironment::default(),
+                environment: OpEnvironment::default(),
             }],
         });
         for index in 0..30 {
@@ -2379,12 +2406,12 @@ mod tests {
         let target = app.loaded.plan.targets[0].clone();
         app.begin_run(&RunSpec {
             base_dir: PathBuf::from("."),
-            operation: RunOperation::Deploy,
+            operation: RunOperation::DeployProduction,
             targets: vec![RunTargetSpec {
                 target,
                 version: VersionId("version-placeholder".to_owned()),
                 branch: None,
-                environment: TargetEnvironment::default(),
+                environment: OpEnvironment::default(),
             }],
         });
         app.ingest(runner::RunEvent::Output {

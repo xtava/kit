@@ -40,7 +40,7 @@ impl<'de> Deserialize<'de> for VersionId {
     }
 }
 
-/// Whether a Journal entry was a normal deploy or a rollback.
+/// Whether a Journal entry was a production deploy or a rollback.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum JournalOperation {

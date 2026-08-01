@@ -1,9 +1,12 @@
-use std::{collections::HashSet, path::PathBuf};
+use std::{
+    collections::{BTreeMap, HashSet},
+    path::PathBuf,
+};
 
 use serde::Deserialize;
 use thiserror::Error;
 
-use super::environment::{EnvironmentError, TargetEnvironment, TargetEnvironments};
+use crate::onepassword::{EnvironmentFileError, OpEnvironment};
 
 pub const PROJECT_CONFIG: &str = ".kit/deploy.toml";
 pub const SCHEMA_VERSION: u32 = 1;
@@ -14,7 +17,7 @@ pub struct LoadedPlan {
     pub path: PathBuf,
     pub base_dir: PathBuf,
     pub plan: DeploymentPlan,
-    pub environments: TargetEnvironments,
+    pub environments: BTreeMap<String, OpEnvironment>,
 }
 
 /// The complete, versioned deploy configuration.
@@ -33,10 +36,20 @@ pub struct DeployTarget {
     pub name: String,
     pub description: Option<String>,
     pub working_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub source_roots: Vec<PathBuf>,
     pub env_file: Option<PathBuf>,
+    pub artifact: Option<ArtifactSpec>,
     pub steps: Vec<DeployStep>,
     pub backend: Option<TargetBackend>,
     pub rollback: Option<RollbackStrategy>,
+}
+
+/// A typed, non-secret artifact identity emitted by a successful deployment.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum ArtifactSpec {
+    ContainerImage,
 }
 
 /// The external platform that owns a Target's Versions and rollback operation.
@@ -109,7 +122,7 @@ pub enum ConfigError {
     Environment {
         target: String,
         #[source]
-        source: EnvironmentError,
+        source: EnvironmentFileError,
     },
 }
 
@@ -147,7 +160,7 @@ impl LoadedPlan {
             .map(PathBuf::from)
             .unwrap_or_else(|| project_dir.clone());
 
-        let mut environments = TargetEnvironments::default();
+        let mut environments = BTreeMap::new();
         for target in &plan.targets {
             let environment = match target.env_file.as_deref() {
                 Some(env_file) => {
@@ -156,11 +169,11 @@ impl LoadedPlan {
                     } else {
                         base_dir.join(env_file)
                     };
-                    TargetEnvironment::load(&resolved).map_err(|source| {
+                    OpEnvironment::load(&resolved).map_err(|source| {
                         ConfigError::Environment { target: target.id.clone(), source }
                     })?
                 }
-                None => TargetEnvironment::default(),
+                None => OpEnvironment::default(),
             };
             environments.insert(target.id.clone(), environment);
         }
@@ -212,6 +225,19 @@ fn validate(plan: &DeploymentPlan) -> Vec<String> {
             .is_some_and(|path| path.as_os_str().to_string_lossy().trim().is_empty())
         {
             issues.push(format!("- {target_label}.env_file must not be empty"));
+        }
+        for (source_index, source_root) in target.source_roots.iter().enumerate() {
+            if source_root.as_os_str().to_string_lossy().trim().is_empty() {
+                issues.push(format!(
+                    "- {target_label}.source_roots[{source_index}] must not be empty"
+                ));
+            }
+        }
+        if target.artifact.is_some() && target.backend.is_some() {
+            issues.push(format!(
+                "- Target '{}' cannot declare both artifact capture and a platform Backend",
+                target.id
+            ));
         }
 
         if let Some(TargetBackend::CloudflarePages { account_id, project, token_env }) =
@@ -320,6 +346,7 @@ id = "preview"
 name = "Preview"
 description = "Publish a preview"
 working_dir = "../app"
+source_roots = ["../shared"]
 
 [[targets.steps]]
 name = "Build"
@@ -341,6 +368,7 @@ steps = [{ name = "Restore", action = { type = "command", program = "restore", a
 
         assert_eq!(plan.version, SCHEMA_VERSION);
         assert_eq!(plan.targets.len(), 1);
+        assert_eq!(plan.targets[0].source_roots, [PathBuf::from("../shared")]);
         assert!(matches!(
             &plan.targets[0].steps[0].action,
             DeployAction::Command { program, args }

@@ -6,28 +6,22 @@ use std::{
 
 use thiserror::Error;
 
-use crate::onepassword::SecretReference;
+use super::SecretReference;
 
-/// Validated environment values for one Target, with values redacted from Debug output.
+/// Validated masking-on `op run` values with contents redacted from Debug output.
 #[derive(Clone, Default, Eq, PartialEq)]
-pub struct TargetEnvironment {
-    values: BTreeMap<String, TargetEnvironmentValue>,
+pub struct OpEnvironment {
+    values: BTreeMap<String, OpEnvironmentValue>,
 }
 
 #[derive(Clone, Eq, PartialEq)]
-enum TargetEnvironmentValue {
+enum OpEnvironmentValue {
     Literal(String),
     Reference(SecretReference),
 }
 
-/// Loaded Target environments keyed by stable Target ID.
-#[derive(Clone, Default)]
-pub struct TargetEnvironments {
-    targets: BTreeMap<String, TargetEnvironment>,
-}
-
 #[derive(Debug, Error)]
-pub enum EnvironmentError {
+pub enum EnvironmentFileError {
     #[error("read dotenv file {}: {source}", path.display())]
     Read {
         path: PathBuf,
@@ -45,11 +39,11 @@ pub struct DotenvParseError {
     pub message: String,
 }
 
-impl TargetEnvironment {
-    pub fn load(path: &Path) -> Result<Self, EnvironmentError> {
+impl OpEnvironment {
+    pub fn load(path: &Path) -> Result<Self, EnvironmentFileError> {
         let raw = std::fs::read_to_string(path)
-            .map_err(|source| EnvironmentError::Read { path: path.to_path_buf(), source })?;
-        parse_dotenv(&raw).map_err(|error| EnvironmentError::Parse {
+            .map_err(|source| EnvironmentFileError::Read { path: path.to_path_buf(), source })?;
+        parse_dotenv(&raw).map_err(|error| EnvironmentFileError::Parse {
             path: path.to_path_buf(),
             line: error.line,
             message: error.message,
@@ -60,10 +54,10 @@ impl TargetEnvironment {
     /// kept out of the process environment and written only to its scoped refs file.
     pub fn child_values(&self) -> impl Iterator<Item = (&str, &str)> {
         self.values.iter().filter_map(|(name, value)| match value {
-            TargetEnvironmentValue::Literal(value) if std::env::var_os(name).is_none() => {
+            OpEnvironmentValue::Literal(value) if std::env::var_os(name).is_none() => {
                 Some((name.as_str(), value.as_str()))
             }
-            TargetEnvironmentValue::Literal(_) | TargetEnvironmentValue::Reference(_) => None,
+            OpEnvironmentValue::Literal(_) | OpEnvironmentValue::Reference(_) => None,
         })
     }
 
@@ -71,60 +65,49 @@ impl TargetEnvironment {
         self.values
             .iter()
             .filter_map(|(name, value)| match value {
-                TargetEnvironmentValue::Reference(reference) => {
+                OpEnvironmentValue::Reference(reference) => {
                     Some((name.clone(), reference.clone()))
                 }
-                TargetEnvironmentValue::Literal(_) => None,
+                OpEnvironmentValue::Literal(_) => None,
             })
             .collect()
+    }
+
+    pub fn is_references_only(&self) -> bool {
+        !self.values.is_empty()
+            && self
+                .values
+                .values()
+                .all(|value| matches!(value, OpEnvironmentValue::Reference(_)))
     }
 
     /// Return exactly one configured reference for an in-process API consumer.
     pub fn reference(&self, name: &str) -> Option<&SecretReference> {
         match self.values.get(name) {
-            Some(TargetEnvironmentValue::Reference(reference)) => Some(reference),
-            Some(TargetEnvironmentValue::Literal(_)) | None => None,
+            Some(OpEnvironmentValue::Reference(reference)) => Some(reference),
+            Some(OpEnvironmentValue::Literal(_)) | None => None,
         }
     }
 }
 
-impl fmt::Debug for TargetEnvironment {
+impl fmt::Debug for OpEnvironment {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("TargetEnvironment")
+            .debug_struct("OpEnvironment")
             .field("value_count", &self.values.len())
             .field(
                 "reference_count",
                 &self
                     .values
                     .values()
-                    .filter(|value| matches!(value, TargetEnvironmentValue::Reference(_)))
+                    .filter(|value| matches!(value, OpEnvironmentValue::Reference(_)))
                     .count(),
             )
             .finish()
     }
 }
 
-impl TargetEnvironments {
-    pub fn insert(&mut self, target_id: String, environment: TargetEnvironment) {
-        self.targets.insert(target_id, environment);
-    }
-
-    pub fn get(&self, target_id: &str) -> Option<&TargetEnvironment> {
-        self.targets.get(target_id)
-    }
-}
-
-impl fmt::Debug for TargetEnvironments {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("TargetEnvironments")
-            .field("target_count", &self.targets.len())
-            .finish()
-    }
-}
-
-pub fn parse_dotenv(raw: &str) -> Result<TargetEnvironment, DotenvParseError> {
+pub fn parse_dotenv(raw: &str) -> Result<OpEnvironment, DotenvParseError> {
     let mut values = BTreeMap::new();
     for (index, raw_line) in raw.lines().enumerate() {
         let line_number = index + 1;
@@ -144,15 +127,15 @@ pub fn parse_dotenv(raw: &str) -> Result<TargetEnvironment, DotenvParseError> {
         }
         let value = parse_value(raw_value.trim(), line_number)?;
         let value = if value.starts_with("op://") {
-            TargetEnvironmentValue::Reference(SecretReference::new(value).map_err(|error| {
+            OpEnvironmentValue::Reference(SecretReference::new(value).map_err(|error| {
                 parse_error(line_number, &format!("invalid 1Password reference: {error}"))
             })?)
         } else {
-            TargetEnvironmentValue::Literal(value)
+            OpEnvironmentValue::Literal(value)
         };
         values.insert(name.to_owned(), value);
     }
-    Ok(TargetEnvironment { values })
+    Ok(OpEnvironment { values })
 }
 
 fn parse_value(value: &str, line: usize) -> Result<String, DotenvParseError> {
@@ -193,8 +176,8 @@ mod tests {
         )?;
 
         let literal = |name| match environment.values.get(name) {
-            Some(TargetEnvironmentValue::Literal(value)) => Some(value.as_str()),
-            Some(TargetEnvironmentValue::Reference(_)) | None => None,
+            Some(OpEnvironmentValue::Literal(value)) => Some(value.as_str()),
+            Some(OpEnvironmentValue::Reference(_)) | None => None,
         };
         assert_eq!(literal("PLAIN"), Some("value"));
         assert_eq!(literal("DOUBLE"), Some("two words"));
@@ -249,7 +232,7 @@ mod tests {
     fn missing_file_error_names_the_path() {
         let path = std::env::temp_dir()
             .join(format!("kit-deploy-env-missing-{}-placeholder.env", std::process::id()));
-        let error = TargetEnvironment::load(&path);
+        let error = OpEnvironment::load(&path);
 
         assert!(error.is_err_and(|error| error.to_string().contains(&path.display().to_string())));
     }

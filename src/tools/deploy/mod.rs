@@ -1,12 +1,15 @@
 //! deploy — interactive, config-driven deployment launcher with version history and rollback.
 
 mod annotations;
+mod artifact;
 mod cloudflare;
 mod config;
-mod environment;
+mod headless;
 mod journal;
 mod layout;
+mod orchestration;
 mod runner;
+mod source;
 mod state;
 mod tui;
 
@@ -14,7 +17,7 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Context as _, Result};
 use async_trait::async_trait;
-use clap::{ArgMatches, Command, CommandFactory, FromArgMatches, Parser};
+use clap::{ArgMatches, Args, Command, CommandFactory, FromArgMatches, Parser, Subcommand};
 
 use crate::framework::{Context, Tool, ToolMeta};
 use annotations::AnnotationStore;
@@ -32,13 +35,33 @@ pub struct DeployTool;
 #[derive(Parser)]
 #[command(
     name = "deploy",
-    about = "Interactive deployment launcher with history and rollback",
-    long_about = "Browse config-defined deployment Targets, run their ordered Steps with streamed output, inspect version history, and roll back to a recorded Version."
+    about = "Deployment launcher with history and rollback",
+    long_about = "Browse deployment Targets interactively, or run one exact production Target headlessly with the same configuration, secret injection, process supervision, and Journal."
 )]
 struct DeployArgs {
     /// Load this deployment plan instead of project-local or XDG configuration.
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: Option<DeployCommand>,
+}
+
+#[derive(Subcommand)]
+enum DeployCommand {
+    /// Run one exact production Target without opening the TUI.
+    Run(DeployRunArgs),
+}
+
+#[derive(Args)]
+struct DeployRunArgs {
+    /// Exact Target id from the loaded deployment plan.
+    #[arg(long, value_name = "ID")]
+    target: String,
+
+    /// Confirm that this command may mutate the Target's production destination.
+    #[arg(long)]
+    confirm_production: bool,
 }
 
 #[async_trait]
@@ -46,7 +69,7 @@ impl Tool for DeployTool {
     fn meta(&self) -> ToolMeta {
         ToolMeta {
             name: "deploy",
-            about: "Interactive deployment launcher with history and rollback",
+            about: "Deployment launcher with history and rollback",
             version: env!("CARGO_PKG_VERSION"),
         }
     }
@@ -56,16 +79,29 @@ impl Tool for DeployTool {
     }
 
     async fn run(&self, cx: &Context, matches: &ArgMatches) -> Result<()> {
-        let args = DeployArgs::from_arg_matches(matches)?;
+        let DeployArgs { config, command } = DeployArgs::from_arg_matches(matches)?;
+        let project_dir = std::env::current_dir().context("resolve current directory")?;
+        let loaded = LoadedPlan::load(config, project_dir, cx.config.path("deploy"))?;
+        if let Some(DeployCommand::Run(args)) = command {
+            if !args.confirm_production {
+                bail!(
+                    "headless production deploy requires --confirm-production for Target '{}'",
+                    args.target
+                );
+            }
+            return match headless::run(cx, loaded, &args.target).await? {
+                RunOutcome::Succeeded => Ok(()),
+                RunOutcome::Failed => bail!("deploy failed"),
+                RunOutcome::Cancelled => bail!("deploy cancelled"),
+            };
+        }
         if cx.out.is_json() {
-            bail!("kit deploy is interactive and does not support --json");
+            bail!("kit deploy --json requires a headless subcommand such as 'run'");
         }
         if !cx.term.interactive() {
             bail!("kit deploy requires an interactive terminal (stdin and stdout must be TTYs)");
         }
 
-        let project_dir = std::env::current_dir().context("resolve current directory")?;
-        let loaded = LoadedPlan::load(args.config, project_dir, cx.config.path("deploy"))?;
         let journal_store = JournalStore::bootstrap()?;
         let journal = journal_store.load()?;
         let annotation_store = AnnotationStore::bootstrap()?;

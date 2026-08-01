@@ -2,6 +2,7 @@ use std::{collections::VecDeque, time::Duration};
 
 use super::{
     annotations::{Annotation, DeployAnnotations},
+    artifact::ArtifactIdentity,
     cloudflare::{CloudflareDeployment, CloudflareVersions},
     config::{DeployTarget, LoadedPlan},
     journal::{
@@ -12,6 +13,7 @@ use super::{
     runner::{
         OutputStream, RunEvent, RunOperation, RunOutcome, RunSpec, StepOutcome, TargetOutcome,
     },
+    source::SourceIdentity,
 };
 use crate::tui::SplitDrag;
 
@@ -45,7 +47,7 @@ pub enum ProgressStatus {
 
 #[derive(Clone, Debug)]
 pub enum RunIntent {
-    Deploy,
+    DeployProduction,
     DeployPreview { target_index: usize, branch: String },
     Rollback { target_index: usize, version: VersionId },
     CloudflarePagesRollback { target_index: usize, deployment: CloudflareDeployment },
@@ -101,6 +103,9 @@ pub struct TargetProgress {
     pub id: String,
     pub name: String,
     pub version: VersionId,
+    pub source: Option<SourceIdentity>,
+    pub artifact: Option<ArtifactIdentity>,
+    pub branch: Option<String>,
     pub status: ProgressStatus,
     pub elapsed: Option<Duration>,
     pub steps: Vec<StepProgress>,
@@ -304,11 +309,11 @@ impl App {
             .collect()
     }
 
-    pub fn review_deploy(&mut self) {
+    pub fn review_production_deploy(&mut self) {
         if self.selected_count() == 0 {
             self.notice = Some("Select at least one Target before continuing.".to_owned());
         } else {
-            self.intent = Some(RunIntent::Deploy);
+            self.intent = Some(RunIntent::DeployProduction);
             self.change_phase(Phase::Review);
             self.notice = None;
         }
@@ -574,7 +579,7 @@ impl App {
 
     pub fn review_targets(&self) -> Vec<DeployTarget> {
         match &self.intent {
-            Some(RunIntent::Deploy) => self.selected_targets(),
+            Some(RunIntent::DeployProduction) => self.selected_targets(),
             Some(RunIntent::DeployPreview { target_index, .. }) => {
                 self.loaded.plan.targets.get(*target_index).cloned().into_iter().collect()
             }
@@ -604,7 +609,9 @@ impl App {
             Some(RunIntent::Rollback { .. } | RunIntent::CloudflarePagesRollback { .. }) => {
                 Phase::Versions
             }
-            Some(RunIntent::Deploy | RunIntent::DeployPreview { .. }) | None => Phase::Browse,
+            Some(RunIntent::DeployProduction | RunIntent::DeployPreview { .. }) | None => {
+                Phase::Browse
+            }
         };
         self.change_phase(phase);
         self.notice = None;
@@ -644,6 +651,9 @@ impl App {
                 id: run_target.target.id.clone(),
                 name: run_target.target.name.clone(),
                 version: run_target.version.clone(),
+                source: run_target.source.clone(),
+                artifact: None,
+                branch: run_target.branch.clone(),
                 status: ProgressStatus::Pending,
                 elapsed: None,
                 steps: run_target
@@ -676,6 +686,9 @@ impl App {
             id: target.id.clone(),
             name: target.name.clone(),
             version: VersionId(deployment.short_id.clone()),
+            source: None,
+            artifact: None,
+            branch: None,
             status: ProgressStatus::Pending,
             elapsed: None,
             steps: vec![StepProgress {
@@ -727,8 +740,9 @@ impl App {
                     }
                 }
             }
-            RunEvent::TargetFinished { target, outcome, elapsed } => {
+            RunEvent::TargetFinished { target, artifact, outcome, elapsed } => {
                 if let Some(target) = self.progress.get_mut(target) {
+                    target.artifact = artifact;
                     target.elapsed = Some(elapsed);
                     target.status = match outcome {
                         TargetOutcome::Succeeded => ProgressStatus::Succeeded,
@@ -754,7 +768,9 @@ impl App {
             return Vec::new();
         }
         let journal_operation = match operation {
-            RunOperation::Deploy => JournalOperation::Deploy,
+            RunOperation::DeployProduction | RunOperation::DeployPreview => {
+                JournalOperation::Deploy
+            }
             RunOperation::Rollback { selected_version } => {
                 JournalOperation::Rollback { selected_version: selected_version.clone() }
             }
@@ -900,6 +916,7 @@ mod tests {
             name: id.to_uppercase(),
             description: None,
             working_dir: None,
+            source_roots: Vec::new(),
             env_file: None,
             steps: (0..steps)
                 .map(|index| DeployStep {
@@ -1086,22 +1103,23 @@ mod tests {
     }
 
     #[test]
-    fn review_requires_a_selection() {
+    fn production_review_requires_a_selection_and_preserves_its_intent() {
         let mut app = app();
-        app.review_deploy();
+        app.review_production_deploy();
         assert_eq!(app.phase, Phase::Browse);
         assert!(app.notice.as_deref().is_some_and(|notice| notice.contains("at least one")));
 
         app.toggle_focused();
-        app.review_deploy();
+        app.review_production_deploy();
         assert_eq!(app.phase, Phase::Review);
+        assert!(matches!(app.intent, Some(RunIntent::DeployProduction)));
     }
 
     #[test]
     fn run_preparation_is_an_explicit_phase_and_failure_returns_to_review() {
         let mut app = app();
         app.toggle_focused();
-        app.review_deploy();
+        app.review_production_deploy();
 
         app.begin_run_preparation();
         assert_eq!(app.phase, Phase::Preparing);
@@ -1117,7 +1135,7 @@ mod tests {
         let mut app = app();
         let spec = RunSpec {
             base_dir: PathBuf::from("."),
-            operation: RunOperation::Deploy,
+            operation: RunOperation::DeployProduction,
             targets: vec![RunTargetSpec {
                 target: target("one", 2),
                 version: VersionId("v2".to_owned()),

@@ -145,22 +145,6 @@ impl OpClient {
         )
     }
 
-    pub async fn preflight_reference(&self, reference: &SecretReference) -> Result<(), OpError> {
-        let status = self
-            .operation_command(["read", reference.as_str(), "--no-newline"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await
-            .map_err(|source| map_spawn_error("preflight secret reference", source))?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(OpError::ReferenceFailed { reference: reference.clone(), status: status.code() })
-        }
-    }
-
     pub async fn read_reference(
         &self,
         reference: &SecretReference,
@@ -192,6 +176,8 @@ impl OpClient {
     pub async fn run_operation(
         &self,
         references: &BTreeMap<String, SecretReference>,
+        public_environment: &BTreeMap<String, String>,
+        working_directory: &Path,
         program: &str,
         arguments: &[String],
     ) -> Result<ExitStatus, OpError> {
@@ -200,8 +186,12 @@ impl OpClient {
             OsString::from(program),
             arguments.iter().map(OsString::from).collect(),
         )?;
-        let mut child = prepared
-            .command()
+        let mut command = prepared.command();
+        command
+            .current_dir(working_directory)
+            .env("PWD", working_directory)
+            .envs(public_environment);
+        let mut child = command
             .stdin(Stdio::inherit())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -499,8 +489,6 @@ impl Drop for ScopedEnvFile {
 pub enum OpError {
     #[error("the official 1Password CLI (`op`) is not installed or not in PATH")]
     NotInstalled,
-    #[error("1Password could not resolve reference {reference} (status {status:?})")]
-    ReferenceFailed { reference: SecretReference, status: Option<i32> },
     #[error("1Password CLI failed while attempting to {operation} (status {status:?}){detail}")]
     Failed { operation: &'static str, status: Option<i32>, detail: ErrorDetail },
     #[error("1Password CLI returned invalid JSON while attempting to {operation}: {source}")]

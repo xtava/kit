@@ -11,11 +11,12 @@ use crate::framework::process::{
     OutputPolicy, ProcessByteEvent, ProcessControl, ProcessLabel, ProcessOutputHandle,
     ProcessReport, ProcessSpec, ProcessSupervisor, StartedProcess, StreamPolicy, TerminationPolicy,
 };
-use crate::onepassword::OpClient;
+use crate::onepassword::{OpClient, OpEnvironment};
 
-use super::config::{DeployAction, DeployTarget};
-use super::environment::TargetEnvironment;
+use super::artifact::{ArtifactCapture, ArtifactIdentity};
+use super::config::{ArtifactSpec, DeployAction, DeployTarget};
 use super::journal::VersionId;
+use super::source::SourceIdentity;
 
 const CANCEL_GRACE: Duration = Duration::from_secs(2);
 const OUTPUT_IN_FLIGHT_BYTES: NonZeroUsize = NonZeroUsize::new(256 * 1024).unwrap();
@@ -33,7 +34,12 @@ pub enum RunEvent {
     StepStarted { target: usize, step: usize },
     Output { stream: OutputStream, line: String },
     StepFinished { target: usize, step: usize, outcome: StepOutcome, elapsed: Duration },
-    TargetFinished { target: usize, outcome: TargetOutcome, elapsed: Duration },
+    TargetFinished {
+        target: usize,
+        artifact: Option<ArtifactIdentity>,
+        outcome: TargetOutcome,
+        elapsed: Duration,
+    },
     Finished { outcome: RunOutcome, elapsed: Duration },
 }
 
@@ -69,13 +75,15 @@ pub struct RunSpec {
 pub struct RunTargetSpec {
     pub target: DeployTarget,
     pub version: VersionId,
+    pub source: Option<SourceIdentity>,
     pub branch: Option<String>,
-    pub environment: TargetEnvironment,
+    pub environment: OpEnvironment,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RunOperation {
-    Deploy,
+    DeployProduction,
+    DeployPreview,
     Rollback { selected_version: VersionId },
     CloudflarePagesRollback { deployment_id: String },
 }
@@ -86,8 +94,10 @@ struct StepExecution<'a> {
     action: &'a DeployAction,
     working_dir: &'a std::path::Path,
     version: &'a VersionId,
+    source: Option<&'a SourceIdentity>,
     branch: Option<&'a str>,
-    environment: &'a TargetEnvironment,
+    artifact_path: Option<&'a std::path::Path>,
+    environment: &'a OpEnvironment,
     event_tx: &'a mpsc::Sender<RunEvent>,
     cancel_rx: &'a mut watch::Receiver<bool>,
 }
@@ -141,6 +151,7 @@ async fn run(
                 &event_tx,
                 RunEvent::TargetFinished {
                     target: target_index,
+                    artifact: None,
                     outcome: TargetOutcome::Cancelled,
                     elapsed: target_start.elapsed(),
                 },
@@ -149,6 +160,38 @@ async fn run(
             break;
         }
 
+        let artifact_capture = match (&spec.operation, &target.artifact) {
+            (
+                RunOperation::DeployProduction | RunOperation::DeployPreview,
+                Some(ArtifactSpec::ContainerImage),
+            ) => match ArtifactCapture::create() {
+                Ok(capture) => Some(capture),
+                Err(error) => {
+                    final_outcome = RunOutcome::Failed;
+                    let _ = send(
+                        &event_tx,
+                        RunEvent::Output {
+                            stream: OutputStream::Stderr,
+                            line: format!("kit: prepare artifact capture: {error}"),
+                        },
+                    )
+                    .await;
+                    let _ = send(
+                        &event_tx,
+                        RunEvent::TargetFinished {
+                            target: target_index,
+                            artifact: None,
+                            outcome: TargetOutcome::Failed,
+                            elapsed: target_start.elapsed(),
+                        },
+                    )
+                    .await;
+                    break;
+                }
+            },
+            _ => None,
+        };
+
         for (step_index, step) in target.steps.iter().enumerate() {
             if *cancel_rx.borrow() {
                 final_outcome = RunOutcome::Cancelled;
@@ -156,6 +199,7 @@ async fn run(
                     &event_tx,
                     RunEvent::TargetFinished {
                         target: target_index,
+                        artifact: None,
                         outcome: TargetOutcome::Cancelled,
                         elapsed: target_start.elapsed(),
                     },
@@ -179,7 +223,9 @@ async fn run(
                 action: &step.action,
                 working_dir: &working_dir,
                 version: &run_target.version,
+                source: run_target.source.as_ref(),
                 branch: run_target.branch.as_deref(),
+                artifact_path: artifact_capture.as_ref().map(ArtifactCapture::path),
                 environment: &run_target.environment,
                 event_tx: &event_tx,
                 cancel_rx: &mut cancel_rx,
@@ -205,6 +251,7 @@ async fn run(
                         &event_tx,
                         RunEvent::TargetFinished {
                             target: target_index,
+                            artifact: None,
                             outcome: TargetOutcome::Failed,
                             elapsed: target_start.elapsed(),
                         },
@@ -218,6 +265,7 @@ async fn run(
                         &event_tx,
                         RunEvent::TargetFinished {
                             target: target_index,
+                            artifact: None,
                             outcome: TargetOutcome::Cancelled,
                             elapsed: target_start.elapsed(),
                         },
@@ -228,10 +276,41 @@ async fn run(
             }
         }
 
+        let artifact = match (&target.artifact, artifact_capture.as_ref()) {
+            (Some(ArtifactSpec::ContainerImage), Some(capture)) => {
+                match capture.read_container_image() {
+                    Ok(artifact) => Some(artifact),
+                    Err(error) => {
+                        final_outcome = RunOutcome::Failed;
+                        let _ = send(
+                            &event_tx,
+                            RunEvent::Output {
+                                stream: OutputStream::Stderr,
+                                line: format!("kit: read declared artifact: {error}"),
+                            },
+                        )
+                        .await;
+                        let _ = send(
+                            &event_tx,
+                            RunEvent::TargetFinished {
+                                target: target_index,
+                                artifact: None,
+                                outcome: TargetOutcome::Failed,
+                                elapsed: target_start.elapsed(),
+                            },
+                        )
+                        .await;
+                        break;
+                    }
+                }
+            }
+            _ => None,
+        };
         if send(
             &event_tx,
             RunEvent::TargetFinished {
                 target: target_index,
+                artifact,
                 outcome: TargetOutcome::Succeeded,
                 elapsed: target_start.elapsed(),
             },
@@ -281,7 +360,9 @@ async fn execute(execution: StepExecution<'_>) -> StepOutcome {
         action,
         working_dir,
         version,
+        source,
         branch,
+        artifact_path,
         environment,
         event_tx,
         cancel_rx,
@@ -309,8 +390,28 @@ async fn execute(execution: StepExecution<'_>) -> StepOutcome {
         .collect::<BTreeMap<_, _>>();
     values.insert(OsString::from("KIT_DEPLOY_VERSION"), OsString::from(&version.0));
     values.insert(OsString::from("KIT_DEPLOY_REF"), OsString::from(&version.0));
+    if let Some(source) = source {
+        values.insert(
+            OsString::from("KIT_DEPLOY_SOURCE_COMMIT"),
+            OsString::from(&source.commit),
+        );
+        values.insert(
+            OsString::from("KIT_DEPLOY_SOURCE_DIRTY"),
+            OsString::from(if source.dirty { "true" } else { "false" }),
+        );
+        values.insert(
+            OsString::from("KIT_DEPLOY_SOURCE_SHA256"),
+            OsString::from(&source.content_sha256),
+        );
+    }
     if let Some(branch) = branch {
         values.insert(OsString::from("KIT_DEPLOY_BRANCH"), OsString::from(branch));
+    }
+    if let Some(artifact_path) = artifact_path {
+        values.insert(
+            OsString::from("KIT_DEPLOY_ARTIFACT_PATH"),
+            artifact_path.as_os_str().to_owned(),
+        );
     }
     let label = ProcessLabel::new("deploy step".to_owned()).expect("static process label is valid");
     let references = environment.references();
@@ -525,9 +626,9 @@ fn outcome_from_report(report: ProcessReport) -> StepOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::deploy::{
-        config::DeployStep,
-        environment::{parse_dotenv, TargetEnvironment},
+    use crate::{
+        onepassword::{parse_dotenv, OpEnvironment},
+        tools::deploy::config::DeployStep,
     };
 
     fn target(action: DeployAction) -> DeployTarget {
@@ -536,6 +637,7 @@ mod tests {
             name: "Test".to_owned(),
             description: None,
             working_dir: None,
+            source_roots: Vec::new(),
             env_file: None,
             steps: vec![DeployStep { name: "Run".to_owned(), working_dir: None, action }],
             backend: None,
@@ -561,10 +663,10 @@ mod tests {
         outcome
     }
 
-    async fn output_for(environment: TargetEnvironment, variable: &str) -> (RunOutcome, String) {
+    async fn output_for(environment: OpEnvironment, variable: &str) -> (RunOutcome, String) {
         let spec = RunSpec {
             base_dir: std::env::temp_dir(),
-            operation: RunOperation::Deploy,
+            operation: RunOperation::DeployProduction,
             targets: vec![RunTargetSpec {
                 target: target(DeployAction::Shell {
                     script: format!("printf '%s' \"${variable}\""),
@@ -592,7 +694,7 @@ mod tests {
     async fn runs_successful_command() {
         let spec = RunSpec {
             base_dir: std::env::temp_dir(),
-            operation: RunOperation::Deploy,
+            operation: RunOperation::DeployProduction,
             targets: vec![RunTargetSpec {
                 target: target(DeployAction::Command {
                     program: "sh".to_owned(),
@@ -600,7 +702,7 @@ mod tests {
                 }),
                 version: VersionId("abc123".to_owned()),
                 branch: None,
-                environment: TargetEnvironment::default(),
+                environment: OpEnvironment::default(),
             }],
         };
 
@@ -611,12 +713,12 @@ mod tests {
     async fn stops_after_failed_command() {
         let spec = RunSpec {
             base_dir: std::env::temp_dir(),
-            operation: RunOperation::Deploy,
+            operation: RunOperation::DeployProduction,
             targets: vec![RunTargetSpec {
                 target: target(DeployAction::Shell { script: "exit 7".to_owned() }),
                 version: VersionId("abc123".to_owned()),
                 branch: None,
-                environment: TargetEnvironment::default(),
+                environment: OpEnvironment::default(),
             }],
         };
 
@@ -627,12 +729,12 @@ mod tests {
     async fn cancellation_terminates_the_active_process_group() {
         let spec = RunSpec {
             base_dir: std::env::temp_dir(),
-            operation: RunOperation::Deploy,
+            operation: RunOperation::DeployProduction,
             targets: vec![RunTargetSpec {
                 target: target(DeployAction::Shell { script: "sleep 30".to_owned() }),
                 version: VersionId("abc123".to_owned()),
                 branch: None,
-                environment: TargetEnvironment::default(),
+                environment: OpEnvironment::default(),
             }],
         };
         let (mut events, cancel, handle) = spawn(spec);
@@ -713,7 +815,7 @@ mod tests {
         let environment = parse_dotenv("FORBIDDEN_SECRET=op://Tests/runner/secret")?;
         let spec = RunSpec {
             base_dir: std::env::temp_dir(),
-            operation: RunOperation::Deploy,
+            operation: RunOperation::DeployProduction,
             targets: vec![RunTargetSpec {
                 target: target(DeployAction::Shell {
                     script: concat!(

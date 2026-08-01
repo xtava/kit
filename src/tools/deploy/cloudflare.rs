@@ -2,10 +2,9 @@ use reqwest::{Client, StatusCode, Url};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::onepassword::{OpClient, OpError, SecretBytes};
+use crate::onepassword::{OpClient, OpEnvironment, OpError, SecretBytes};
 
 use super::config::{DeployTarget, TargetBackend};
-use super::environment::TargetEnvironment;
 
 const API_ROOT: &str = "https://api.cloudflare.com/client/v4";
 
@@ -137,7 +136,7 @@ struct RollbackRequest {}
 impl CloudflarePagesClient {
     pub async fn for_target(
         target: &DeployTarget,
-        environment: &TargetEnvironment,
+        environment: &OpEnvironment,
         op: &OpClient,
     ) -> Result<Option<Self>, CloudflareError> {
         let Some(TargetBackend::CloudflarePages { account_id, project, token_env, .. }) =
@@ -346,9 +345,9 @@ fn api_error_message(errors: &[ApiError]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::deploy::{
-        config::{DeployAction, DeployStep},
-        environment::parse_dotenv,
+    use crate::{
+        onepassword::parse_dotenv,
+        tools::deploy::config::{DeployAction, DeployStep},
     };
 
     fn pages_target() -> DeployTarget {
@@ -357,6 +356,7 @@ mod tests {
             name: "Pages".to_owned(),
             description: None,
             working_dir: None,
+            source_roots: Vec::new(),
             env_file: None,
             steps: vec![DeployStep {
                 name: "Publish".to_owned(),

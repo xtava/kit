@@ -5,9 +5,11 @@
 //! fixed masking-on `op run` execution.
 
 mod client;
+mod environment;
 mod sensitive;
 
 pub use client::{OpClient, OpError, PreparedOpRun, SecretReference, SecretReferenceError};
+pub use environment::{parse_dotenv, DotenvParseError, EnvironmentFileError, OpEnvironment};
 pub use sensitive::{SecretBytes, SecretBytesError, MAX_SECRET_BYTES};
 
 pub(crate) use client::StderrPolicy;
