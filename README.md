@@ -28,6 +28,7 @@ Contributors can still build and install the current checkout with `./install.sh
 | `kit diff` | Review staged, unstaged, and untracked Git changes inline or side by side; stage or unstage the selected file. |
 | `kit domain` | Check domain registration through DNS, RDAP, and WHOIS, including aftermarket listings. |
 | `kit deploy` | Run typed deployment plans, inspect version history, and execute configured rollbacks. |
+| `kit ops` | Run named refs-only operations with validated public JSON input and 1Password-masked secrets. |
 | `kit record` | Start, stop, inspect, save, and replay Modular Playwright recorder runs. |
 | `kit render` | Read Markdown in the terminal and fuzzy-search Markdown files in the current workspace. |
 | `kit secrets` | Browse, search, and manage 1Password through a local TUI backed by the official `op` CLI. |

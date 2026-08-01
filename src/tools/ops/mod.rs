@@ -4,7 +4,11 @@ mod config;
 mod journal;
 mod runner;
 
-use std::{path::PathBuf, time::SystemTime};
+use std::{
+    io::Read as _,
+    path::{Path, PathBuf},
+    time::SystemTime,
+};
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use async_trait::async_trait;
@@ -39,6 +43,10 @@ struct OpsArgs {
     /// Load this operation catalog instead of project-local or XDG configuration.
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
+
+    /// Read declared public parameters from one JSON object; use '-' for stdin.
+    #[arg(long, value_name = "PATH")]
+    input_json: Option<PathBuf>,
 }
 
 #[async_trait]
@@ -66,6 +74,26 @@ impl Tool for OpsTool {
         let operation = loaded.config.operation(&args.operation).ok_or_else(|| {
             anyhow!("operation '{}' was not found in {}", args.operation, loaded.path.display())
         })?;
+        let working_directory = loaded.working_directory(operation);
+        if !working_directory.is_dir() {
+            bail!(
+                "operation '{}' working directory does not exist: {}",
+                operation.id,
+                working_directory.display()
+            );
+        }
+        let environment = loaded.environment(operation)?;
+        let input = read_parameter_input(args.input_json.as_deref())?;
+        let public_environment = operation.resolve_parameters(input.as_deref())?;
+        for name in public_environment.keys() {
+            if environment.reference(name).is_some() {
+                bail!(
+                    "operation '{}' public parameter environment collides with a secret reference",
+                    operation.id
+                );
+            }
+        }
+        let references = environment.references();
         let journal_store = JournalStore::bootstrap()?;
         journal_store.load()?;
         let machine = machine_name()?;
@@ -74,7 +102,9 @@ impl Tool for OpsTool {
             .context("system clock is before the Unix epoch")?
             .as_secs();
         let started = std::time::Instant::now();
-        let execution = OpsRunner::new(OpClient::new()).run(operation).await;
+        let execution = OpsRunner::new(OpClient::new())
+            .run(operation, &working_directory, &environment, &public_environment)
+            .await;
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let outcome = match &execution {
             Ok(status) if status.success() => JournalOutcome::Success,
@@ -82,7 +112,7 @@ impl Tool for OpsTool {
         };
         let journal_result = journal_store.record(JournalEntry {
             operation_id: operation.id.clone(),
-            references: operation.refs.clone(),
+            references,
             machine,
             timestamp_secs,
             outcome,
@@ -105,4 +135,29 @@ impl Tool for OpsTool {
             )),
         }
     }
+}
+
+const MAX_PARAMETER_INPUT_BYTES: u64 = 64 * 1024;
+
+fn read_parameter_input(path: Option<&Path>) -> Result<Option<Vec<u8>>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let mut input = Vec::new();
+    if path == Path::new("-") {
+        std::io::stdin()
+            .take(MAX_PARAMETER_INPUT_BYTES + 1)
+            .read_to_end(&mut input)
+            .context("read public operation input from stdin")?;
+    } else {
+        std::fs::File::open(path)
+            .with_context(|| format!("open public operation input {}", path.display()))?
+            .take(MAX_PARAMETER_INPUT_BYTES + 1)
+            .read_to_end(&mut input)
+            .with_context(|| format!("read public operation input {}", path.display()))?;
+    }
+    if input.len() as u64 > MAX_PARAMETER_INPUT_BYTES {
+        bail!("public operation input exceeds 64 KiB");
+    }
+    Ok(Some(input))
 }

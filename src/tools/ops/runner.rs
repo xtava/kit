@@ -1,6 +1,6 @@
-use std::process::ExitStatus;
+use std::{collections::BTreeMap, path::Path, process::ExitStatus};
 
-use crate::onepassword::{OpClient, OpError};
+use crate::onepassword::{OpClient, OpEnvironment, OpError};
 
 use super::config::Operation;
 
@@ -13,13 +13,21 @@ impl OpsRunner {
         Self { client }
     }
 
-    pub async fn run(&self, operation: &Operation) -> Result<ExitStatus, OpError> {
-        for reference in operation.refs.values() {
-            self.client.preflight_reference(reference).await?;
-        }
-
+    pub async fn run(
+        &self,
+        operation: &Operation,
+        working_directory: &Path,
+        environment: &OpEnvironment,
+        public_environment: &BTreeMap<String, String>,
+    ) -> Result<ExitStatus, OpError> {
         self.client
-            .run_operation(&operation.refs, &operation.command.program, &operation.command.args)
+            .run_operation(
+                &environment.references(),
+                public_environment,
+                working_directory,
+                &operation.command.program,
+                &operation.command.args,
+            )
             .await
     }
 }
@@ -27,7 +35,6 @@ impl OpsRunner {
 #[cfg(all(test, unix))]
 mod tests {
     use std::{
-        collections::BTreeMap,
         io::Write as _,
         os::unix::fs::PermissionsExt,
         path::PathBuf,
@@ -35,7 +42,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::onepassword::SecretReference;
+    use crate::onepassword::parse_dotenv;
     use crate::tools::ops::config::{CommandSpec, OpsConfig, SCHEMA_VERSION};
 
     struct FakeOp {
@@ -47,7 +54,7 @@ mod tests {
     }
 
     impl FakeOp {
-        fn new(read_status: i32) -> Self {
+        fn new(run_status: i32) -> Self {
             static NEXT_ID: AtomicU64 = AtomicU64::new(0);
             let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
             let root =
@@ -69,9 +76,6 @@ for argument in "$@"; do
   printf '\t%s' "$argument" >> "$trace"
 done
 printf '\n' >> "$trace"
-if [ "$command" = read ]; then
-  exit {read_status}
-fi
 [ "$command" = run ] || exit 90
 case "$1" in
   --env-file=*) refs_file=${{1#--env-file=}} ;;
@@ -82,6 +86,7 @@ esac
 [ "$4" = scoped ] || exit 94
 cp "$refs_file" "$snapshot" || exit 95
 printf '%s' "$refs_file" > "$env_path_record"
+exit {run_status}
 "#,
                 trace = trace.display(),
                 snapshot = snapshot.display(),
@@ -111,22 +116,16 @@ printf '%s' "$refs_file" > "$env_path_record"
     fn operation() -> Operation {
         Operation {
             id: "marketing".to_owned(),
+            env_file: PathBuf::from("production.env"),
             command: CommandSpec { program: "printf".to_owned(), args: vec!["scoped".to_owned()] },
-            refs: BTreeMap::from([(
-                "MARKETING_TOKEN".to_owned(),
-                SecretReference::new("op://Deploy/marketing/token".to_owned()).unwrap(),
-            )]),
         }
     }
 
     fn unselected_operation() -> Operation {
         Operation {
             id: "server".to_owned(),
+            env_file: PathBuf::from("production.env"),
             command: CommandSpec { program: "server".to_owned(), args: Vec::new() },
-            refs: BTreeMap::from([(
-                "SERVER_TOKEN".to_owned(),
-                SecretReference::new("op://Deploy/server/token".to_owned()).unwrap(),
-            )]),
         }
     }
 
@@ -137,18 +136,16 @@ printf '%s' "$refs_file" > "$env_path_record"
         let catalog =
             OpsConfig { version: SCHEMA_VERSION, ops: vec![operation(), unselected_operation()] };
         let selected = catalog.operation("marketing").unwrap();
+        let environment = parse_dotenv("MARKETING_TOKEN=op://Deploy/marketing/token").unwrap();
 
-        let status = runner.run(selected).await.unwrap();
+        let status = runner.run(selected, &environment).await.unwrap();
 
         assert!(status.success());
         let env_path = PathBuf::from(std::fs::read_to_string(&fake.env_path).unwrap());
         let trace = std::fs::read_to_string(&fake.trace).unwrap();
         let snapshot = std::fs::read_to_string(&fake.snapshot).unwrap();
         let expected_run = format!("run\t--env-file={}\t--\tprintf\tscoped", env_path.display());
-        assert_eq!(
-            trace.lines().collect::<Vec<_>>(),
-            ["read\top://Deploy/marketing/token\t--no-newline\t--no-color", expected_run.as_str(),]
-        );
+        assert_eq!(trace.lines().collect::<Vec<_>>(), [expected_run.as_str()]);
         assert!(!trace.contains("--no-masking"));
         assert_eq!(snapshot, "MARKETING_TOKEN=op://Deploy/marketing/token\n");
         assert!(!snapshot.contains("SERVER_TOKEN"));
@@ -157,17 +154,17 @@ printf '%s' "$refs_file" > "$env_path_record"
     }
 
     #[tokio::test]
-    async fn failed_preflight_names_the_ref_and_never_runs_the_command() {
+    async fn nonzero_child_status_is_returned_without_extra_op_calls() {
         let fake = FakeOp::new(72);
         let runner = OpsRunner::new(fake.client());
+        let environment = parse_dotenv("MARKETING_TOKEN=op://Deploy/marketing/token").unwrap();
 
-        let error = runner.run(&operation()).await.expect_err("preflight must fail");
+        let status = runner.run(&operation(), &environment).await.unwrap();
         let trace = std::fs::read_to_string(&fake.trace).unwrap();
+        let env_path = PathBuf::from(std::fs::read_to_string(&fake.env_path).unwrap());
+        let expected_run = format!("run\t--env-file={}\t--\tprintf\tscoped", env_path.display());
 
-        assert!(error.to_string().contains("op://Deploy/marketing/token"));
-        assert_eq!(
-            trace.lines().collect::<Vec<_>>(),
-            ["read\top://Deploy/marketing/token\t--no-newline\t--no-color"]
-        );
+        assert_eq!(status.code(), Some(72));
+        assert_eq!(trace.lines().collect::<Vec<_>>(), [expected_run.as_str()]);
     }
 }
