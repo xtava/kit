@@ -20,6 +20,7 @@ pub mod secrets;
 pub mod settings;
 pub mod stats;
 pub mod swarm;
+pub mod sync;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod tail;
 pub mod update;

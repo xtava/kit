@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use kit::framework::Registry;
 use kit::tools::{
     build, deploy, diff, domain, monitor, ops, process, record, render, secrets, settings, stats,
-    swarm, update,
+    swarm, sync, update,
 };
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -53,6 +53,7 @@ async fn run() -> Result<()> {
         .register(secrets::tool())
         .register(stats::tool())
         .register(swarm::tool())
+        .register(sync::tool())
         .register(update::tool());
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let registry = registry.register(tail::tool()).register(console::tool());
