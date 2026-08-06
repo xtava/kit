@@ -33,8 +33,8 @@ pub struct UpdateTool;
 #[derive(Parser)]
 #[command(
     name = "update",
-    about = "Update Kit to the newest GitHub release",
-    long_about = "Downloads the newest compatible Kit release, verifies GitHub's published SHA-256 asset digest, and replaces the running executable. No source checkout, Git, Cargo, or Rust toolchain is required."
+    about = "Update Kit and reconcile Console",
+    long_about = "Downloads a digest-verified GitHub release into Kit's managed executable path, then reconciles the native Console service."
 )]
 struct UpdateArgs;
 
@@ -43,7 +43,7 @@ impl Tool for UpdateTool {
     fn meta(&self) -> ToolMeta {
         ToolMeta {
             name: "update",
-            about: "Update Kit to the newest GitHub release",
+            about: "Update Kit and reconcile Console",
             version: env!("CARGO_PKG_VERSION"),
         }
     }
@@ -54,7 +54,8 @@ impl Tool for UpdateTool {
 
     async fn run(&self, cx: &Context, matches: &ArgMatches) -> Result<()> {
         UpdateArgs::from_arg_matches(matches)?;
-        let outcome = perform_update(cx.term.stdout_tty && !cx.out.is_json()).await?;
+        let outcome =
+            perform_update(&cx.processes, cx.term.stdout_tty && !cx.out.is_json()).await?;
         if cx.out.is_json() {
             cx.out.json(&outcome)
         } else {
@@ -95,7 +96,8 @@ pub async fn startup() -> Result<bool> {
 
     match prompt(&latest).await? {
         UpdateChoice::UpdateNow => {
-            let outcome = perform_update(true).await?;
+            let processes = crate::framework::process::ProcessSupervisor::bootstrap()?;
+            let outcome = perform_update(&processes, true).await?;
             print_outcome(&outcome);
             Ok(true)
         }
@@ -107,8 +109,11 @@ pub async fn startup() -> Result<bool> {
     }
 }
 
-async fn perform_update(show_progress: bool) -> Result<UpdateOutcome> {
-    ReleaseUpdater::new().install(show_progress).await
+async fn perform_update(
+    processes: &crate::framework::process::ProcessSupervisor,
+    show_progress: bool,
+) -> Result<UpdateOutcome> {
+    Ok(ReleaseUpdater::new().install_managed(processes, show_progress).await?.outcome)
 }
 
 fn print_outcome(outcome: &UpdateOutcome) {
