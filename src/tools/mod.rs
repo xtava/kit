@@ -19,6 +19,8 @@ pub mod scout;
 pub mod secrets;
 pub mod settings;
 pub mod stats;
+#[cfg(target_os = "linux")]
+pub mod stream;
 pub mod swarm;
 pub mod sync;
 #[cfg(any(target_os = "linux", target_os = "macos"))]

@@ -5,6 +5,9 @@ use kit::tools::{
     swarm, sync, update,
 };
 
+#[cfg(target_os = "linux")]
+use kit::tools::stream;
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use kit::tools::{console, tail};
 
@@ -57,6 +60,8 @@ async fn run() -> Result<()> {
         .register(update::tool());
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let registry = registry.register(tail::tool()).register(console::tool());
+    #[cfg(target_os = "linux")]
+    let registry = registry.register(stream::tool());
     #[cfg(unix)]
     let registry = registry.register(scout::tool()).register(cdp::tool());
     registry.register_settings(settings::tool).dispatch().await
