@@ -1708,6 +1708,31 @@ impl Mux {
             .insert(domain.domain_name().to_string(), Arc::clone(domain));
     }
 
+    pub fn remove_domain(&self, domain_id: DomainId) {
+        let removed = self.domains.write().remove(&domain_id);
+        let Some(domain) = removed else {
+            return;
+        };
+
+        let name = domain.domain_name().to_string();
+        let mut domains_by_name = self.domains_by_name.write();
+        if domains_by_name
+            .get(&name)
+            .is_some_and(|candidate| candidate.domain_id() == domain_id)
+        {
+            domains_by_name.remove(&name);
+        }
+        drop(domains_by_name);
+
+        let mut default_domain = self.default_domain.write();
+        if default_domain
+            .as_ref()
+            .is_some_and(|candidate| candidate.domain_id() == domain_id)
+        {
+            *default_domain = None;
+        }
+    }
+
     pub fn set_mux(mux: &Arc<Mux>) -> anyhow::Result<()> {
         let mut process_mux = MUX.lock();
         match &*process_mux {
@@ -1915,6 +1940,7 @@ impl Mux {
             .ok_or_else(|| anyhow!("pane lifecycle coordinator is not running"))
     }
 
+    #[track_caller]
     pub fn get() -> Arc<Mux> {
         Self::try_get().unwrap()
     }
