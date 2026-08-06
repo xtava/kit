@@ -27,6 +27,37 @@ use wezterm_term::{KeyCode, KeyModifiers, Line, StableRowIndex};
 
 const MAX_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const BASE_POLL_INTERVAL: Duration = Duration::from_millis(20);
+/// Bound each render-history response independently of terminal width. At the maximum admitted
+/// width this keeps the nested line/cell representation below the wire sequence and container
+/// budgets while allowing a caller to hydrate a larger history window through multiple requests.
+const MAX_FETCH_LINES_PER_REQUEST: usize = 16;
+
+fn fetch_chunks(to_fetch: RangeSet<StableRowIndex>) -> Vec<RangeSet<StableRowIndex>> {
+    let mut chunks = Vec::new();
+    let mut chunk = RangeSet::new();
+    let mut chunk_len = 0usize;
+
+    for range in to_fetch.iter() {
+        let mut start = range.start;
+        while start < range.end {
+            let available = MAX_FETCH_LINES_PER_REQUEST - chunk_len;
+            let end = start.saturating_add(available as isize).min(range.end);
+            chunk.add_range(start..end);
+            chunk_len += (end - start) as usize;
+            start = end;
+
+            if chunk_len == MAX_FETCH_LINES_PER_REQUEST {
+                chunks.push(std::mem::take(&mut chunk));
+                chunk_len = 0;
+            }
+        }
+    }
+
+    if !chunk.is_empty() {
+        chunks.push(chunk);
+    }
+    chunks
+}
 
 #[derive(Clone, Debug)]
 enum LineEntry {
@@ -653,37 +684,40 @@ impl RenderableInner {
         let client = Arc::clone(&self.client);
         let remote_pane_id = self.remote_pane_id;
 
-        let scheduled_fetch = to_fetch.clone();
+        let fetch_for_revert = to_fetch.clone();
+        let chunks = fetch_chunks(to_fetch);
         let future = async move {
-            let result = client
-                .client
-                .get_lines(GetLines {
-                    pane_id: remote_pane_id,
-                    lines: scheduled_fetch.clone().into(),
-                })
-                .await;
+            for scheduled_fetch in chunks {
+                let result = client
+                    .client
+                    .get_lines(GetLines {
+                        pane_id: remote_pane_id,
+                        lines: scheduled_fetch.clone().into(),
+                    })
+                    .await;
 
-            let mut decode_reservation = None;
-            let result = match result {
-                Ok(result) => {
-                    let (_serial, result, reservation) = result.into_parts();
-                    decode_reservation = Some(reservation);
-                    let lines =
-                        hydrate_lines(Arc::clone(&client), remote_pane_id, result.lines).await;
-                    Ok(lines)
-                }
-                Err(err) => Err(err),
-            };
-            let result = Self::apply_lines(local_pane_id, result, scheduled_fetch, now);
-            drop(decode_reservation);
-            result
+                let mut decode_reservation = None;
+                let result = match result {
+                    Ok(result) => {
+                        let (_serial, result, reservation) = result.into_parts();
+                        decode_reservation = Some(reservation);
+                        let lines =
+                            hydrate_lines(Arc::clone(&client), remote_pane_id, result.lines).await;
+                        Ok(lines)
+                    }
+                    Err(err) => Err(err),
+                };
+                Self::apply_lines(local_pane_id, result, scheduled_fetch, now)?;
+                drop(decode_reservation);
+            }
+            Ok(())
         };
 
         if let Err(err) =
             Mux::get().try_spawn_client_pane_task(local_pane_id, ClientPaneTaskKind::Fetch, future)
         {
             log::error!("unable to schedule client line fetch: {err:#}");
-            if let Err(revert_err) = self.revert_fetch(&to_fetch, now) {
+            if let Err(revert_err) = self.revert_fetch(&fetch_for_revert, now) {
                 log::error!("unable to revert unscheduled line fetch: {revert_err:#}");
             }
         }
