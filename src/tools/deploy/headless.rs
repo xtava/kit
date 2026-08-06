@@ -47,11 +47,7 @@ struct DeployStepReport {
     duration_ms: u64,
 }
 
-pub async fn run(
-    cx: &Context,
-    loaded: LoadedPlan,
-    target_id: &str,
-) -> Result<RunOutcome> {
+pub async fn run(cx: &Context, loaded: LoadedPlan, target_id: &str) -> Result<RunOutcome> {
     let target = loaded
         .plan
         .targets
@@ -61,14 +57,12 @@ pub async fn run(
         .ok_or_else(|| anyhow!("deploy Target '{target_id}' does not exist"))?;
     let journal_store = JournalStore::bootstrap()?;
     let journal = journal_store.load()?;
-    let spec =
-        orchestration::prepare_production(&loaded, vec![target], &journal_store).await?;
+    let spec = orchestration::prepare_production(&loaded, vec![target], &journal_store).await?;
     let mut state =
         App::new(loaded, journal, DeployAnnotations::default(), DeployLayout::default());
     state.begin_run(&spec);
 
-    let (mut events, cancel, handle) =
-        runner::spawn_with_supervisor(cx.processes.clone(), spec);
+    let (mut events, cancel, handle) = runner::spawn_with_supervisor(cx.processes.clone(), spec);
     let mut interrupt_armed = true;
     let outcome = loop {
         tokio::select! {
@@ -139,10 +133,7 @@ pub async fn run(
     if cx.out.is_json() {
         cx.out.json(&report)?;
     } else {
-        println!(
-            "Production deploy {}: {} ({})",
-            report.status, report.target_id, report.version
-        );
+        println!("Production deploy {}: {} ({})", report.status, report.target_id, report.version);
         if let Some(path) = &report.journal_path {
             println!("Journal: {path}");
         }

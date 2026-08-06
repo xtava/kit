@@ -116,16 +116,20 @@ exit {run_status}
     fn operation() -> Operation {
         Operation {
             id: "marketing".to_owned(),
+            working_dir: None,
             env_file: PathBuf::from("production.env"),
             command: CommandSpec { program: "printf".to_owned(), args: vec!["scoped".to_owned()] },
+            parameters: Vec::new(),
         }
     }
 
     fn unselected_operation() -> Operation {
         Operation {
             id: "server".to_owned(),
+            working_dir: None,
             env_file: PathBuf::from("production.env"),
             command: CommandSpec { program: "server".to_owned(), args: Vec::new() },
+            parameters: Vec::new(),
         }
     }
 
@@ -138,7 +142,8 @@ exit {run_status}
         let selected = catalog.operation("marketing").unwrap();
         let environment = parse_dotenv("MARKETING_TOKEN=op://Deploy/marketing/token").unwrap();
 
-        let status = runner.run(selected, &environment).await.unwrap();
+        let status =
+            runner.run(selected, Path::new("."), &environment, &BTreeMap::new()).await.unwrap();
 
         assert!(status.success());
         let env_path = PathBuf::from(std::fs::read_to_string(&fake.env_path).unwrap());
@@ -159,7 +164,8 @@ exit {run_status}
         let runner = OpsRunner::new(fake.client());
         let environment = parse_dotenv("MARKETING_TOKEN=op://Deploy/marketing/token").unwrap();
 
-        let status = runner.run(&operation(), &environment).await.unwrap();
+        let status =
+            runner.run(&operation(), Path::new("."), &environment, &BTreeMap::new()).await.unwrap();
         let trace = std::fs::read_to_string(&fake.trace).unwrap();
         let env_path = PathBuf::from(std::fs::read_to_string(&fake.env_path).unwrap());
         let expected_run = format!("run\t--env-file={}\t--\tprintf\tscoped", env_path.display());

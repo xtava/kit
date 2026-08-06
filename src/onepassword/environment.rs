@@ -65,9 +65,7 @@ impl OpEnvironment {
         self.values
             .iter()
             .filter_map(|(name, value)| match value {
-                OpEnvironmentValue::Reference(reference) => {
-                    Some((name.clone(), reference.clone()))
-                }
+                OpEnvironmentValue::Reference(reference) => Some((name.clone(), reference.clone())),
                 OpEnvironmentValue::Literal(_) => None,
             })
             .collect()
@@ -75,10 +73,7 @@ impl OpEnvironment {
 
     pub fn is_references_only(&self) -> bool {
         !self.values.is_empty()
-            && self
-                .values
-                .values()
-                .all(|value| matches!(value, OpEnvironmentValue::Reference(_)))
+            && self.values.values().all(|value| matches!(value, OpEnvironmentValue::Reference(_)))
     }
 
     /// Return exactly one configured reference for an in-process API consumer.

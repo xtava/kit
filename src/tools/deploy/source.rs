@@ -8,12 +8,7 @@ use std::{
 use anyhow::{bail, Context as _, Result};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
-use tokio::{
-    fs::File,
-    io::AsyncReadExt as _,
-    process::Command,
-    time,
-};
+use tokio::{fs::File, io::AsyncReadExt as _, process::Command, time};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -33,10 +28,7 @@ pub async fn inspect(
         if additional_roots.is_empty() {
             return Ok(None);
         }
-        bail!(
-            "additional source roots require a Git working directory: {}",
-            working_dir.display()
-        );
+        bail!("additional source roots require a Git working directory: {}", working_dir.display());
     };
     if additional_roots.is_empty() {
         return Ok(Some(source));
@@ -62,11 +54,9 @@ async fn inspect_root(working_dir: &Path) -> Result<Option<SourceIdentity>> {
     let Some(commit) = git_commit(working_dir).await? else {
         return Ok(None);
     };
-    let status = git_output(
-        working_dir,
-        ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
-    )
-    .await?;
+    let status =
+        git_output(working_dir, ["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+            .await?;
     let tracked_diff =
         git_output(working_dir, ["diff", "--binary", "--no-ext-diff", "HEAD", "--"]).await?;
     let untracked =
@@ -103,10 +93,8 @@ async fn git_commit(working_dir: &Path) -> Result<Option<String>> {
     if !output.status.success() {
         return Ok(None);
     }
-    let commit = String::from_utf8(output.stdout)
-        .context("git commit was not UTF-8")?
-        .trim()
-        .to_owned();
+    let commit =
+        String::from_utf8(output.stdout).context("git commit was not UTF-8")?.trim().to_owned();
     if !(7..=64).contains(&commit.len()) || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         bail!("git returned an invalid commit identity");
     }
@@ -132,11 +120,7 @@ async fn git_output<const N: usize>(working_dir: &Path, arguments: [&str; N]) ->
     Ok(output.stdout)
 }
 
-async fn hash_untracked(
-    digest: &mut Sha256,
-    working_dir: &Path,
-    raw_path: &[u8],
-) -> Result<()> {
+async fn hash_untracked(digest: &mut Sha256, working_dir: &Path, raw_path: &[u8]) -> Result<()> {
     hash_field(digest, b"untracked-path", raw_path);
     let path = working_dir.join(path_from_git(raw_path)?);
     let metadata = tokio::fs::symlink_metadata(&path)
@@ -155,8 +139,9 @@ async fn hash_untracked(
 
     digest.update(b"file\0");
     digest.update(metadata.len().to_le_bytes());
-    let mut file =
-        File::open(&path).await.with_context(|| format!("read untracked source {}", path.display()))?;
+    let mut file = File::open(&path)
+        .await
+        .with_context(|| format!("read untracked source {}", path.display()))?;
     let mut buffer = [0_u8; 64 * 1024];
     loop {
         let read = file

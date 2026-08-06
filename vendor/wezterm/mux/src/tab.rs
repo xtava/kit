@@ -278,8 +278,7 @@ fn pane_tree(
                 left_col,
                 top_row,
                 tty_name: pane.tty_name(),
-                foreground_process_name: pane
-                    .get_foreground_process_name(CachePolicy::AllowStale),
+                foreground_process_name: pane.get_foreground_process_name(CachePolicy::AllowStale),
             })
         }
     }

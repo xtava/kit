@@ -36,10 +36,8 @@ impl ArtifactCapture {
     pub fn create() -> Result<Self> {
         for _ in 0..ARTIFACT_FILE_ATTEMPTS {
             let nonce = NEXT_ARTIFACT_FILE.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "kit-deploy-artifact-{}-{nonce}.json",
-                std::process::id()
-            ));
+            let path = std::env::temp_dir()
+                .join(format!("kit-deploy-artifact-{}-{nonce}.json", std::process::id()));
             let mut options = OpenOptions::new();
             options.create_new(true).write(true);
             #[cfg(unix)]

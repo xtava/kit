@@ -221,15 +221,11 @@ impl LoadedConfig {
         } else {
             self.base_dir.join(&operation.env_file)
         };
-        let environment =
-            OpEnvironment::load(&path).map_err(|source| ConfigError::Environment {
-                operation: operation.id.clone(),
-                source,
-            })?;
+        let environment = OpEnvironment::load(&path).map_err(|source| {
+            ConfigError::Environment { operation: operation.id.clone(), source }
+        })?;
         if !environment.is_references_only() {
-            return Err(ConfigError::LiteralEnvironment {
-                operation: operation.id.clone(),
-            });
+            return Err(ConfigError::LiteralEnvironment { operation: operation.id.clone() });
         }
         Ok(environment)
     }
@@ -256,9 +252,7 @@ impl Operation {
     ) -> Result<BTreeMap<String, String>, ParameterError> {
         if self.parameters.is_empty() {
             return match input {
-                Some(_) => {
-                    Err(ParameterError::UnexpectedInput { operation: self.id.clone() })
-                }
+                Some(_) => Err(ParameterError::UnexpectedInput { operation: self.id.clone() }),
                 None => Ok(BTreeMap::new()),
             };
         }
@@ -299,10 +293,7 @@ impl ParameterKind {
                 let value = required_string(parameter, value)?;
                 let normalized = value.trim().to_lowercase();
                 if !valid_email(&normalized) {
-                    return Err(invalid_parameter(
-                        parameter,
-                        "must be a valid email address",
-                    ));
+                    return Err(invalid_parameter(parameter, "must be a valid email address"));
                 }
                 Ok(normalized)
             }
@@ -313,10 +304,7 @@ impl ParameterKind {
                 if minimum.is_some_and(|minimum| value < minimum)
                     || maximum.is_some_and(|maximum| value > maximum)
                 {
-                    return Err(invalid_parameter(
-                        parameter,
-                        "is outside its configured range",
-                    ));
+                    return Err(invalid_parameter(parameter, "is outside its configured range"));
                 }
                 Ok(value.to_string())
             }
@@ -409,9 +397,8 @@ fn validate(config: &OpsConfig) -> Vec<String> {
                     "- {parameter_label}.environment must be a valid environment name"
                 ));
             } else if parameter.environment.eq_ignore_ascii_case(NO_MASKING_ENV) {
-                issues.push(format!(
-                    "- {parameter_label}.environment must not set {NO_MASKING_ENV}"
-                ));
+                issues
+                    .push(format!("- {parameter_label}.environment must not set {NO_MASKING_ENV}"));
             } else if !parameter_environments.insert(parameter.environment.as_str()) {
                 issues.push(format!(
                     "- {label}.parameters contains duplicate environment '{}'",
@@ -422,9 +409,7 @@ fn validate(config: &OpsConfig) -> Vec<String> {
                 ParameterKind::Integer { minimum: Some(minimum), maximum: Some(maximum) }
                     if minimum > maximum =>
                 {
-                    issues.push(format!(
-                        "- {parameter_label} minimum must not exceed maximum"
-                    ));
+                    issues.push(format!("- {parameter_label} minimum must not exceed maximum"));
                 }
                 ParameterKind::String { minimum_length, maximum_length }
                     if minimum_length > maximum_length || *maximum_length > 65_536 =>
@@ -467,9 +452,7 @@ fn valid_email(value: &str) -> bool {
 }
 
 fn required_string<'a>(parameter: &str, value: &'a Value) -> Result<&'a str, ParameterError> {
-    value
-        .as_str()
-        .ok_or_else(|| invalid_parameter(parameter, "must be a JSON string"))
+    value.as_str().ok_or_else(|| invalid_parameter(parameter, "must be a JSON string"))
 }
 
 fn invalid_parameter(parameter: &str, message: &str) -> ParameterError {
@@ -507,7 +490,7 @@ mod tests {
     use super::*;
 
     const VALID: &str = r#"
-version = 2
+version = 3
 
 [[ops]]
 id = "deploy-marketing"

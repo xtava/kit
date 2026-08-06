@@ -30,17 +30,33 @@ pub enum OutputStream {
 
 #[derive(Clone, Debug)]
 pub enum RunEvent {
-    TargetStarted { target: usize },
-    StepStarted { target: usize, step: usize },
-    Output { stream: OutputStream, line: String },
-    StepFinished { target: usize, step: usize, outcome: StepOutcome, elapsed: Duration },
+    TargetStarted {
+        target: usize,
+    },
+    StepStarted {
+        target: usize,
+        step: usize,
+    },
+    Output {
+        stream: OutputStream,
+        line: String,
+    },
+    StepFinished {
+        target: usize,
+        step: usize,
+        outcome: StepOutcome,
+        elapsed: Duration,
+    },
     TargetFinished {
         target: usize,
         artifact: Option<ArtifactIdentity>,
         outcome: TargetOutcome,
         elapsed: Duration,
     },
-    Finished { outcome: RunOutcome, elapsed: Duration },
+    Finished {
+        outcome: RunOutcome,
+        elapsed: Duration,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -391,10 +407,7 @@ async fn execute(execution: StepExecution<'_>) -> StepOutcome {
     values.insert(OsString::from("KIT_DEPLOY_VERSION"), OsString::from(&version.0));
     values.insert(OsString::from("KIT_DEPLOY_REF"), OsString::from(&version.0));
     if let Some(source) = source {
-        values.insert(
-            OsString::from("KIT_DEPLOY_SOURCE_COMMIT"),
-            OsString::from(&source.commit),
-        );
+        values.insert(OsString::from("KIT_DEPLOY_SOURCE_COMMIT"), OsString::from(&source.commit));
         values.insert(
             OsString::from("KIT_DEPLOY_SOURCE_DIRTY"),
             OsString::from(if source.dirty { "true" } else { "false" }),
@@ -639,6 +652,7 @@ mod tests {
             working_dir: None,
             source_roots: Vec::new(),
             env_file: None,
+            artifact: None,
             steps: vec![DeployStep { name: "Run".to_owned(), working_dir: None, action }],
             backend: None,
             rollback: None,
@@ -672,6 +686,7 @@ mod tests {
                     script: format!("printf '%s' \"${variable}\""),
                 }),
                 version: VersionId("abc123".to_owned()),
+                source: None,
                 branch: None,
                 environment,
             }],
@@ -701,6 +716,7 @@ mod tests {
                     args: vec!["-c".to_owned(), "printf ok".to_owned()],
                 }),
                 version: VersionId("abc123".to_owned()),
+                source: None,
                 branch: None,
                 environment: OpEnvironment::default(),
             }],
@@ -717,6 +733,7 @@ mod tests {
             targets: vec![RunTargetSpec {
                 target: target(DeployAction::Shell { script: "exit 7".to_owned() }),
                 version: VersionId("abc123".to_owned()),
+                source: None,
                 branch: None,
                 environment: OpEnvironment::default(),
             }],
@@ -733,6 +750,7 @@ mod tests {
             targets: vec![RunTargetSpec {
                 target: target(DeployAction::Shell { script: "sleep 30".to_owned() }),
                 version: VersionId("abc123".to_owned()),
+                source: None,
                 branch: None,
                 environment: OpEnvironment::default(),
             }],
@@ -826,6 +844,7 @@ mod tests {
                     .to_owned(),
                 }),
                 version: VersionId("abc123".to_owned()),
+                source: None,
                 branch: None,
                 environment,
             }],

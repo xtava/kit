@@ -137,11 +137,7 @@ pub fn target_working_dir(base_dir: &Path, target: &DeployTarget) -> PathBuf {
 }
 
 fn target_source_roots(base_dir: &Path, target: &DeployTarget) -> Vec<PathBuf> {
-    target
-        .source_roots
-        .iter()
-        .map(|path| resolve_target_path(base_dir, Some(path)))
-        .collect()
+    target.source_roots.iter().map(|path| resolve_target_path(base_dir, Some(path))).collect()
 }
 
 fn resolve_target_path(base_dir: &Path, path: Option<&Path>) -> PathBuf {

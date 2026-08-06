@@ -918,6 +918,7 @@ mod tests {
             working_dir: None,
             source_roots: Vec::new(),
             env_file: None,
+            artifact: None,
             steps: (0..steps)
                 .map(|index| DeployStep {
                     name: format!("Step {index}"),
@@ -1139,6 +1140,7 @@ mod tests {
             targets: vec![RunTargetSpec {
                 target: target("one", 2),
                 version: VersionId("v2".to_owned()),
+                source: None,
                 branch: None,
                 environment: Default::default(),
             }],
@@ -1154,6 +1156,7 @@ mod tests {
         });
         app.ingest(RunEvent::TargetFinished {
             target: 0,
+            artifact: None,
             outcome: TargetOutcome::Failed,
             elapsed: Duration::from_millis(25),
         });

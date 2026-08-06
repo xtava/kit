@@ -2153,6 +2153,7 @@ mod tests {
                         working_dir: None,
                         source_roots: Vec::new(),
                         env_file: None,
+                        artifact: None,
                         steps: vec![DeployStep {
                             name: "Build".to_owned(),
                             working_dir: None,
@@ -2219,6 +2220,7 @@ mod tests {
             targets: vec![RunTargetSpec {
                 target,
                 version: VersionId("version-placeholder".to_owned()),
+                source: None,
                 branch: Some("feature-x".to_owned()),
                 environment: OpEnvironment::default(),
             }],
@@ -2311,6 +2313,7 @@ mod tests {
             targets: vec![RunTargetSpec {
                 target,
                 version: VersionId("version-placeholder".to_owned()),
+                source: None,
                 branch: None,
                 environment: OpEnvironment::default(),
             }],
@@ -2410,6 +2413,7 @@ mod tests {
             targets: vec![RunTargetSpec {
                 target,
                 version: VersionId("version-placeholder".to_owned()),
+                source: None,
                 branch: None,
                 environment: OpEnvironment::default(),
             }],

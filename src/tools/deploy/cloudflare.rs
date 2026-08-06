@@ -358,6 +358,7 @@ mod tests {
             working_dir: None,
             source_roots: Vec::new(),
             env_file: None,
+            artifact: None,
             steps: vec![DeployStep {
                 name: "Publish".to_owned(),
                 working_dir: None,

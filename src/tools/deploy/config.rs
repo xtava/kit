@@ -169,8 +169,9 @@ impl LoadedPlan {
                     } else {
                         base_dir.join(env_file)
                     };
-                    OpEnvironment::load(&resolved).map_err(|source| {
-                        ConfigError::Environment { target: target.id.clone(), source }
+                    OpEnvironment::load(&resolved).map_err(|source| ConfigError::Environment {
+                        target: target.id.clone(),
+                        source,
                     })?
                 }
                 None => OpEnvironment::default(),
