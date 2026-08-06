@@ -2,14 +2,17 @@ use crate::error::{Error, Result};
 use byteorder::{LittleEndian, ReadBytesExt};
 use serde::de::IntoDeserializer;
 
+/// The bounds a decode is held to.
+///
+/// The byte limits cap what a single value, and the payload as a whole, may own.
+/// `max_shape_nodes` caps the structure — every container, declared sequence item and declared
+/// map entry — that the payload may claim, and `max_nesting_depth` caps recursion.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DecodeLimits {
     pub max_owned_payload_bytes: usize,
     pub max_string_bytes: usize,
     pub max_byte_buffer_bytes: usize,
-    pub max_sequence_items: usize,
-    pub max_map_entries: usize,
-    pub max_containers: usize,
+    pub max_shape_nodes: usize,
     pub max_nesting_depth: usize,
 }
 
@@ -17,22 +20,13 @@ pub struct DecodeLimits {
 struct DecodeBudget {
     limits: DecodeLimits,
     owned_payload_bytes: usize,
-    sequence_items: usize,
-    map_entries: usize,
-    containers: usize,
+    shape_nodes: usize,
     nesting_depth: usize,
 }
 
 impl DecodeBudget {
     fn new(limits: DecodeLimits) -> Self {
-        Self {
-            limits,
-            owned_payload_bytes: 0,
-            sequence_items: 0,
-            map_entries: 0,
-            containers: 0,
-            nesting_depth: 0,
-        }
+        Self { limits, owned_payload_bytes: 0, shape_nodes: 0, nesting_depth: 0 }
     }
 
     fn debit(used: &mut usize, amount: usize, limit: usize, kind: &'static str) -> Result<()> {
@@ -56,21 +50,14 @@ impl DecodeBudget {
         )
     }
 
-    fn debit_sequence(&mut self, items: usize) -> Result<()> {
-        Self::debit(
-            &mut self.sequence_items,
-            items,
-            self.limits.max_sequence_items,
-            "sequence items",
-        )
-    }
-
-    fn debit_map(&mut self, entries: usize) -> Result<()> {
-        Self::debit(&mut self.map_entries, entries, self.limits.max_map_entries, "map entries")
+    /// Charges declared structure — a container, or the length a sequence or map claims — before
+    /// the decode descends into it.
+    fn debit_shape(&mut self, nodes: usize) -> Result<()> {
+        Self::debit(&mut self.shape_nodes, nodes, self.limits.max_shape_nodes, "shape nodes")
     }
 
     fn enter_container(&mut self) -> Result<()> {
-        Self::debit(&mut self.containers, 1, self.limits.max_containers, "containers")?;
+        self.debit_shape(1)?;
         let depth = self.nesting_depth.checked_add(1).ok_or(Error::LimitExceeded {
             kind: "nesting depth",
             limit: self.limits.max_nesting_depth,
@@ -289,7 +276,7 @@ impl<'de, 'a, 'b> serde::Deserializer<'de> for &'a mut Deserializer<'b> {
     where
         V: serde::de::Visitor<'de>,
     {
-        self.budget.debit_sequence(len)?;
+        self.budget.debit_shape(len)?;
         self.visit_container(|deserializer| visitor.visit_seq(Access { deserializer, len }))
     }
 
@@ -321,7 +308,7 @@ impl<'de, 'a, 'b> serde::Deserializer<'de> for &'a mut Deserializer<'b> {
     {
         let len = serde::Deserialize::deserialize(&mut *self)?;
 
-        self.budget.debit_map(len)?;
+        self.budget.debit_shape(len)?;
         self.visit_container(|deserializer| visitor.visit_map(Access { deserializer, len }))
     }
 

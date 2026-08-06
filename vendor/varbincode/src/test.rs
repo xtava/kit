@@ -16,9 +16,7 @@ fn generous_limits() -> DecodeLimits {
         max_owned_payload_bytes: 1 << 20,
         max_string_bytes: 1 << 20,
         max_byte_buffer_bytes: 1 << 20,
-        max_sequence_items: 1 << 20,
-        max_map_entries: 1 << 20,
-        max_containers: 1 << 20,
+        max_shape_nodes: 1 << 20,
         max_nesting_depth: 128,
     }
 }
@@ -151,32 +149,44 @@ fn rejects_payload_before_allocation() {
 }
 
 #[test]
-fn rejects_sequence_and_map_capacity_hints() {
+fn rejects_declared_sequence_and_map_lengths() {
     let encoded = serialize(&vec![1u64, 2, 3]).unwrap();
     let mut limits = generous_limits();
-    limits.max_sequence_items = 2;
+    limits.max_shape_nodes = 3;
     let error = deserialize::<Vec<u64>, _>(encoded.as_slice(), limits).unwrap_err();
-    assert_eq!(error, super::error::Error::LimitExceeded { kind: "sequence items", limit: 2 });
+    assert_eq!(error, super::error::Error::LimitExceeded { kind: "shape nodes", limit: 3 });
 
     let mut map = HashMap::new();
     map.insert(1u64, 1u64);
     map.insert(2u64, 2u64);
     let encoded = serialize(&map).unwrap();
     let mut limits = generous_limits();
-    limits.max_map_entries = 1;
+    limits.max_shape_nodes = 1;
     let error = deserialize::<HashMap<u64, u64>, _>(encoded.as_slice(), limits).unwrap_err();
-    assert_eq!(error, super::error::Error::LimitExceeded { kind: "map entries", limit: 1 });
+    assert_eq!(error, super::error::Error::LimitExceeded { kind: "shape nodes", limit: 1 });
 }
 
 #[test]
-fn rejects_cumulative_containers_and_nesting() {
+fn shape_nodes_accumulate_across_sibling_containers() {
     let encoded = serialize(&vec![vec![1u64], vec![2u64]]).unwrap();
 
+    // outer seq: 2 declared items + 1 container; each inner seq: 1 declared item + 1 container.
     let mut limits = generous_limits();
-    limits.max_containers = 2;
-    let error = deserialize::<Vec<Vec<u64>>, _>(encoded.as_slice(), limits).unwrap_err();
-    assert_eq!(error, super::error::Error::LimitExceeded { kind: "containers", limit: 2 });
+    limits.max_shape_nodes = 7;
+    assert_eq!(
+        deserialize::<Vec<Vec<u64>>, _>(encoded.as_slice(), limits).unwrap(),
+        vec![vec![1u64], vec![2u64]]
+    );
 
+    let mut limits = generous_limits();
+    limits.max_shape_nodes = 6;
+    let error = deserialize::<Vec<Vec<u64>>, _>(encoded.as_slice(), limits).unwrap_err();
+    assert_eq!(error, super::error::Error::LimitExceeded { kind: "shape nodes", limit: 6 });
+}
+
+#[test]
+fn rejects_nesting_beyond_the_permitted_depth() {
+    let encoded = serialize(&vec![vec![1u64], vec![2u64]]).unwrap();
     let mut limits = generous_limits();
     limits.max_nesting_depth = 1;
     let error = deserialize::<Vec<Vec<u64>>, _>(encoded.as_slice(), limits).unwrap_err();

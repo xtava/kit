@@ -35,12 +35,11 @@ use termwiz::image::{ImageData, TextureCoordinate};
 use termwiz::surface::{Line, SequenceNo};
 use thiserror::Error;
 use wezterm_runtime_admission::{
-    ByteClass, BytePermit, RuntimeAdmission, MAX_DECODE_HEAP_ENVELOPE_BYTES_PER_PDU,
-    MAX_DECODE_METADATA_HEAP_ENVELOPE_BYTES_PER_PDU,
+    wire_shape_node_budget, ByteClass, BytePermit, RuntimeAdmission,
+    MAX_DECODE_HEAP_ENVELOPE_BYTES_PER_PDU, MAX_DECODE_METADATA_HEAP_ENVELOPE_BYTES_PER_PDU,
     MAX_DECODE_NOTIFICATION_HEAP_ENVELOPE_BYTES_PER_PDU, MAX_DECOMPRESSED_PDU_BYTES,
     MAX_SINGLE_PDU_COMPRESSED_BYTES, MAX_SINGLE_PDU_SERIALIZED_BYTES, MAX_WIRE_BYTE_BUFFER_BYTES,
-    MAX_WIRE_CONTAINERS_PER_PDU, MAX_WIRE_FRAME_BYTES, MAX_WIRE_MAP_ENTRIES_PER_PDU,
-    MAX_WIRE_NESTING_DEPTH, MAX_WIRE_OWNED_PAYLOAD_BYTES_PER_PDU, MAX_WIRE_SEQUENCE_ITEMS_PER_PDU,
+    MAX_WIRE_FRAME_BYTES, MAX_WIRE_NESTING_DEPTH, MAX_WIRE_OWNED_PAYLOAD_BYTES_PER_PDU,
     MAX_WIRE_STRING_BYTES,
 };
 use wezterm_term::color::ColorPalette;
@@ -710,43 +709,45 @@ fn serialize<T: serde::Serialize>(
     }
 }
 
-fn deserialize<T: serde::de::DeserializeOwned, R: std::io::Read>(
-    mut r: R,
-    is_compressed: bool,
-) -> Result<T, Error> {
-    let limits = varbincode::DecodeLimits {
+fn decode_limits(decoded_body_bytes: usize) -> varbincode::DecodeLimits {
+    varbincode::DecodeLimits {
         max_owned_payload_bytes: MAX_WIRE_OWNED_PAYLOAD_BYTES_PER_PDU,
         max_string_bytes: MAX_WIRE_STRING_BYTES,
         max_byte_buffer_bytes: MAX_WIRE_BYTE_BUFFER_BYTES,
-        max_sequence_items: MAX_WIRE_SEQUENCE_ITEMS_PER_PDU,
-        max_map_entries: MAX_WIRE_MAP_ENTRIES_PER_PDU,
-        max_containers: MAX_WIRE_CONTAINERS_PER_PDU,
+        max_shape_nodes: wire_shape_node_budget(decoded_body_bytes),
         max_nesting_depth: MAX_WIRE_NESTING_DEPTH,
-    };
+    }
+}
+
+fn deserialize<T: serde::de::DeserializeOwned>(
+    wire: &[u8],
+    is_compressed: bool,
+) -> Result<T, Error> {
     if is_compressed {
-        let mut decompress = zstd::Decoder::new(r)?;
-        let mut data = Vec::new();
+        let mut decompress = zstd::Decoder::new(wire)?;
+        let mut decoded = Vec::new();
         std::io::Read::take(&mut decompress, (MAX_DECOMPRESSED_PDU_BYTES + 1) as u64)
-            .read_to_end(&mut data)?;
-        if data.len() > MAX_DECOMPRESSED_PDU_BYTES {
+            .read_to_end(&mut decoded)?;
+        if decoded.len() > MAX_DECOMPRESSED_PDU_BYTES {
             bail!("decompressed PDU exceeds the finite envelope");
         }
-        let mut data = data.as_slice();
+        let limits = decode_limits(decoded.len());
+        let mut body = decoded.as_slice();
         let value = {
-            let mut decode = varbincode::Deserializer::new(&mut data, limits);
+            let mut decode = varbincode::Deserializer::new(&mut body, limits);
             serde::Deserialize::deserialize(&mut decode)?
         };
-        if !data.is_empty() {
+        if !body.is_empty() {
             bail!("trailing bytes after compressed PDU body");
         }
         Ok(value)
     } else {
+        let mut body = wire;
         let value = {
-            let mut decode = varbincode::Deserializer::new(&mut r, limits);
+            let mut decode = varbincode::Deserializer::new(&mut body, decode_limits(wire.len()));
             serde::Deserialize::deserialize(&mut decode)?
         };
-        let mut trailing = [0u8; 1];
-        if r.read(&mut trailing)? != 0 {
+        if !body.is_empty() {
             bail!("trailing bytes after PDU body");
         }
         Ok(value)
@@ -959,7 +960,10 @@ macro_rules! pdu {
                         PduTag::$name => {
                             metrics::histogram!("pdu.size", "pdu" => stringify!($name)).record(data.len() as f64);
                             metrics::histogram!("pdu.size.rate", "pdu" => stringify!($name)).record(data.len() as f64);
-                            Pdu::$name(deserialize(data.as_slice(), is_compressed)?)
+                            Pdu::$name(
+                                deserialize(data.as_slice(), is_compressed)
+                                    .with_context(|| format!("decoding a {} body", stringify!($name)))?
+                            )
                         }
                     ,)*
                 };
@@ -2347,6 +2351,9 @@ impl Pdu {
 #[cfg(test)]
 mod test {
     use super::*;
+    use wezterm_runtime_admission::{
+        MAX_SERVER_TERMINAL_ROWS, MAX_WIRE_SHAPE_NODES_PER_DECODED_BYTE,
+    };
 
     struct HeaderThenPoison {
         header: Cursor<Vec<u8>>,
@@ -2412,7 +2419,7 @@ mod test {
     fn hostile_empty_program_fails_during_deserialization() {
         let admission = admission();
         let (encoded, compressed, _permit) = serialize(&String::new(), &admission).unwrap();
-        let error = deserialize::<NonEmptyProgram, _>(encoded.as_slice(), compressed).unwrap_err();
+        let error = deserialize::<NonEmptyProgram>(encoded.as_slice(), compressed).unwrap_err();
         assert!(error.to_string().contains("program must not be empty"));
     }
 
@@ -3100,6 +3107,154 @@ mod test {
             &admission,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("trailing bytes"));
+        let reason = format!("{error:#}");
+        assert!(reason.contains("trailing bytes"), "{reason}");
+        assert!(reason.contains("Ping"), "{reason}");
+    }
+
+    fn distinctly_attributed_cell(column: usize, truecolor: bool) -> termwiz::cell::Cell {
+        use termwiz::cell::{Cell, CellAttributes};
+        use termwiz::color::{ColorAttribute, SrgbaTuple};
+
+        let mut attrs = CellAttributes::default();
+        if truecolor {
+            let shade = (column % 251) as f32 / 251.0;
+            let foreground = SrgbaTuple(shade, 0.5, 1.0 - shade, 1.0);
+            let background = SrgbaTuple(0.1, shade, 0.2, 1.0);
+            attrs.set_foreground(ColorAttribute::TrueColorWithDefaultFallback(foreground));
+            attrs.set_background(ColorAttribute::TrueColorWithDefaultFallback(background));
+        } else {
+            attrs.set_foreground(ColorAttribute::PaletteIndex((column % 255) as u8));
+        }
+        Cell::new('x', attrs)
+    }
+
+    /// One attribute run per cell, which is the densest structure a line can carry.
+    fn per_cell_attributed_line(cols: usize, truecolor: bool) -> Line {
+        let cells = (0..cols)
+            .map(|x| distinctly_attributed_cell(x, truecolor))
+            .collect();
+        let mut line = Line::from_cells(cells, 1);
+        line.compress_for_scrollback();
+        line
+    }
+
+    fn render_changes_for_viewport(
+        rows: usize,
+        cols: usize,
+        truecolor: bool,
+    ) -> GetPaneRenderChangesResponse {
+        let line = per_cell_attributed_line(cols, truecolor);
+        let rows = 0..rows as StableRowIndex;
+        GetPaneRenderChangesResponse {
+            pane_id: 1,
+            mouse_grabbed: false,
+            cursor_position: StableCursorPosition::default(),
+            dimensions: RenderableDimensions::default(),
+            dirty_lines: Vec::new(),
+            title: "shell".to_owned(),
+            working_dir: None,
+            bonus_lines: rows
+                .map(|row| (row, line.clone()))
+                .collect::<Vec<_>>()
+                .into(),
+            input_serial: None,
+            seqno: 1,
+        }
+    }
+
+    /// Every cell of a viewport repaint is dirty on the first poll after an attach, so a render
+    /// notification routinely carries one attribute cluster per cell. A fixed shape ceiling made
+    /// that legal traffic undecodable past a few thousand attributed cells.
+    #[test]
+    fn a_fully_attributed_viewport_repaint_decodes() {
+        let admission = admission();
+        for (rows, cols, truecolor) in [
+            (50usize, 200usize, true),
+            (MAX_SERVER_TERMINAL_ROWS, 1_024, false),
+        ] {
+            let mut encoded = Vec::new();
+            Pdu::GetPaneRenderChangesResponse(render_changes_for_viewport(rows, cols, truecolor))
+                .encode(&mut encoded, 0, &admission)
+                .unwrap();
+
+            let notification = Pdu::decode(
+                encoded.as_slice(),
+                DecodeContext::server_to_client_notification(),
+                &admission,
+            )
+            .unwrap()
+            .into_notification()
+            .unwrap();
+
+            match notification.pdu() {
+                Pdu::GetPaneRenderChangesResponse(response) => {
+                    assert_eq!(response.bonus_lines.lines.len(), rows)
+                }
+                other => panic!(
+                    "decoded {} instead of a render notification",
+                    other.pdu_name()
+                ),
+            }
+        }
+    }
+
+    /// The shape budget is only sound if legal traffic stays well inside it. Measure the nodes the
+    /// densest line shape actually declares per wire byte, so the multiplier keeps its headroom.
+    #[test]
+    fn the_densest_line_shape_leaves_the_shape_budget_room_to_spare() {
+        let response = render_changes_for_viewport(50, 200, false);
+        let mut wire = Vec::new();
+        let mut encode = varbincode::Serializer::new(&mut wire);
+        serde::Serialize::serialize(&response, &mut encode).unwrap();
+
+        let mut lowest_admitting = 1usize;
+        let mut highest_rejecting = wire.len() * MAX_WIRE_SHAPE_NODES_PER_DECODED_BYTE;
+        while lowest_admitting < highest_rejecting {
+            let candidate = lowest_admitting + (highest_rejecting - lowest_admitting) / 2;
+            let limits = varbincode::DecodeLimits {
+                max_shape_nodes: candidate,
+                ..decode_limits(wire.len())
+            };
+            match varbincode::deserialize::<GetPaneRenderChangesResponse, _>(
+                wire.as_slice(),
+                limits,
+            ) {
+                Ok(_) => highest_rejecting = candidate,
+                Err(_) => lowest_admitting = candidate + 1,
+            }
+        }
+
+        let declared_per_byte = lowest_admitting as f64 / wire.len() as f64;
+        assert!(
+            declared_per_byte * 4.0 <= MAX_WIRE_SHAPE_NODES_PER_DECODED_BYTE as f64,
+            "densest line shape declares {declared_per_byte:.3} nodes per byte, leaving less than \
+             a factor of four under the permitted {MAX_WIRE_SHAPE_NODES_PER_DECODED_BYTE}"
+        );
+    }
+
+    #[test]
+    fn a_body_claiming_a_shape_it_does_not_carry_is_rejected() {
+        let mut claimed_length = Vec::new();
+        leb128::write::unsigned(&mut claimed_length, 10_000_000).unwrap();
+        let mut encoded = Vec::new();
+        encode_raw(
+            PduTag::SearchScrollbackResponse.ident(),
+            1,
+            &claimed_length,
+            false,
+            &mut encoded,
+        )
+        .unwrap();
+
+        let error = Pdu::decode(
+            encoded.as_slice(),
+            DecodeContext::server_to_client_response(Some(PduTag::SearchScrollbackResponse)),
+            &admission(),
+        )
+        .unwrap_err();
+        let reason = format!("{error:#}");
+        assert!(reason.contains("shape nodes"), "{reason}");
+        assert!(reason.contains("SearchScrollbackResponse"), "{reason}");
     }
 }

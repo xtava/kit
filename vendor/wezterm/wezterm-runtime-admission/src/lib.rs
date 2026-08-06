@@ -43,9 +43,15 @@ pub const MAX_DECOMPRESSED_PDU_BYTES: usize = 16_777_216;
 pub const MAX_WIRE_OWNED_PAYLOAD_BYTES_PER_PDU: usize = 16_777_216;
 pub const MAX_WIRE_STRING_BYTES: usize = 1_048_576;
 pub const MAX_WIRE_BYTE_BUFFER_BYTES: usize = 16_777_216;
-pub const MAX_WIRE_SEQUENCE_ITEMS_PER_PDU: usize = 262_144;
-pub const MAX_WIRE_MAP_ENTRIES_PER_PDU: usize = 65_536;
-pub const MAX_WIRE_CONTAINERS_PER_PDU: usize = 65_536;
+/// Fixed allowance for a PDU's own shape, before any of its content is charged. No protocol PDU
+/// declares this much structure from its metadata alone, so the allowance only ever spares a
+/// small body from being charged for the frame it must carry.
+pub const WIRE_SHAPE_NODES_PER_PDU_ALLOWANCE: usize = 4_096;
+/// Shape nodes a PDU may declare per byte of decoded body. Structure is only real if the bytes
+/// that describe it are present: the densest run the protocol can carry — singly attributed cell
+/// clusters — declares 1.72 nodes per byte, so this leaves an order of magnitude of headroom for
+/// legal traffic while still rejecting a body that claims a shape it never carries.
+pub const MAX_WIRE_SHAPE_NODES_PER_DECODED_BYTE: usize = 16;
 pub const MAX_WIRE_NESTING_DEPTH: usize = 64;
 pub const MAX_SCALAR_DERIVED_ALLOCATION_BYTES: usize = 16_777_216;
 pub const MAX_DECODE_HEAP_ENVELOPE_BYTES_PER_PDU: usize = 67_108_864;
@@ -91,6 +97,13 @@ pub const MAX_CLIENT_IMAGE_CACHE_BYTES_TOTAL: usize = 134_217_728;
 pub const MAX_RETAINED_STATE_BYTES_TOTAL: usize = 536_870_912;
 pub const MAX_BLOB_STORE_ENTRIES: usize = 256;
 pub const MAX_BLOB_STORE_BYTES_TOTAL: usize = 134_217_728;
+
+/// The structure a decoded PDU body of `decoded_bytes` is permitted to declare.
+pub fn wire_shape_node_budget(decoded_bytes: usize) -> usize {
+    decoded_bytes
+        .saturating_mul(MAX_WIRE_SHAPE_NODES_PER_DECODED_BYTE)
+        .saturating_add(WIRE_SHAPE_NODES_PER_PDU_ALLOWANCE)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeRole {
