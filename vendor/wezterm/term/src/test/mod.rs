@@ -1241,7 +1241,9 @@ fn test_alt_screen_region_scroll() {
     term.print("M\no\nn\nk\ne\ny");
 
     // Enter alternate-screen mode, saving current state
+    let seqno = term.current_seqno();
     term.set_mode("?1049", true);
+    term.assert_dirty_lines(seqno, &[0, 1, 2, 3, 4], None);
     term.print("1\n2\n3\n4\n5");
 
     // Test scroll region that doesn't start on first row

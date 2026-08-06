@@ -306,11 +306,9 @@ impl ScreenOrAlt {
     // use case needs to know to invalidate its cache, so we mark those rows
     // as dirty.
     fn dirty_top_phys_rows(&mut self, seqno: SequenceNo) {
-        let num_rows = self.screen.physical_rows;
+        let num_rows = self.physical_rows;
         for line_idx in 0..num_rows {
-            self.screen
-                .line_mut(line_idx)
-                .update_last_change_seqno(seqno);
+            self.line_mut(line_idx).update_last_change_seqno(seqno);
         }
     }
 

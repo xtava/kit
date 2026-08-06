@@ -83,6 +83,7 @@ pub(crate) struct PerPane {
     working_dir: Option<Url>,
     dimensions: RenderableDimensions,
     mouse_grabbed: bool,
+    is_alt_screen_active: bool,
     sent_initial_palette: bool,
     seqno: SequenceNo,
     config_generation: usize,
@@ -117,7 +118,15 @@ impl PerPane {
         }
 
         let dims = pane.get_dimensions();
+        let viewport_range =
+            dims.physical_top..dims.physical_top + dims.viewport_rows as StableRowIndex;
         if dims != self.dimensions {
+            changed = true;
+        }
+
+        let is_alt_screen_active = pane.is_alt_screen_active();
+        let screen_changed = is_alt_screen_active != self.is_alt_screen_active;
+        if screen_changed {
             changed = true;
         }
 
@@ -142,6 +151,9 @@ impl PerPane {
             0..dims.physical_top + dims.viewport_rows as StableRowIndex,
             old_seqno,
         );
+        if screen_changed {
+            all_dirty_lines.add_range(viewport_range.clone());
+        }
         if !all_dirty_lines.is_empty() {
             changed = true;
         }
@@ -151,9 +163,6 @@ impl PerPane {
         }
 
         // Figure out what we're going to send as dirty lines vs bonus lines
-        let viewport_range =
-            dims.physical_top..dims.physical_top + dims.viewport_rows as StableRowIndex;
-
         let (first_line, lines) = pane.get_lines(viewport_range);
         let mut bonus_lines = lines
             .into_iter()
@@ -182,6 +191,7 @@ impl PerPane {
         self.working_dir = working_dir.clone();
         self.dimensions = dims;
         self.mouse_grabbed = mouse_grabbed;
+        self.is_alt_screen_active = is_alt_screen_active;
 
         let bonus_lines = bonus_lines.into();
         Some(GetPaneRenderChangesResponse {
