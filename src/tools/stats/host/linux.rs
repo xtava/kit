@@ -10,7 +10,8 @@ use thiserror::Error;
 
 use super::{ActionError, ProcessAction, ProcessObservation, TaskBatch, TaskReadFailure, TaskStat};
 use crate::tools::stats::model::{
-    DetailUnavailable, Observed, ProcessKey, ProcessState, ResourceSample,
+    DetailUnavailable, FileWatcherLimits, FileWatcherUsage, Observed, ProcessKey, ProcessState,
+    ResourceSample,
 };
 
 #[derive(Debug, Error)]
@@ -85,6 +86,78 @@ pub fn read_process_resources(pid: u32) -> Result<ResourceSample, DetailUnavaila
         write_bytes_per_second: Observed::Warming,
         io_label: "storage I/O",
     })
+}
+
+pub fn read_file_watcher_limits() -> Result<FileWatcherLimits, DetailUnavailable> {
+    Ok(FileWatcherLimits {
+        max_user_instances: read_u64("/proc/sys/fs/inotify/max_user_instances")?,
+        max_user_watches: read_u64("/proc/sys/fs/inotify/max_user_watches")?,
+        max_queued_events: read_u64("/proc/sys/fs/inotify/max_queued_events")?,
+    })
+}
+
+pub fn read_process_file_watchers(
+    process: ProcessKey,
+) -> Result<FileWatcherUsage, DetailUnavailable> {
+    verify_process_generation(process)?;
+    let root = format!("/proc/{}/fd", process.pid);
+    let entries = std::fs::read_dir(root).map_err(|error| detail_unavailable(&error))?;
+    let mut usage = FileWatcherUsage::default();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(detail_unavailable(&error)),
+        };
+        let target = match std::fs::read_link(entry.path()) {
+            Ok(target) => target,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(detail_unavailable(&error)),
+        };
+        if target.as_os_str() != "anon_inode:inotify" {
+            continue;
+        }
+        let fdinfo =
+            format!("/proc/{}/fdinfo/{}", process.pid, entry.file_name().to_string_lossy());
+        let text = match std::fs::read_to_string(fdinfo) {
+            Ok(text) => text,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(detail_unavailable(&error)),
+        };
+        usage.descriptors = usage.descriptors.saturating_add(1);
+        usage.watches = usage.watches.saturating_add(count_file_watcher_records(&text) as u64);
+    }
+    verify_process_generation(process)?;
+    Ok(usage)
+}
+
+fn verify_process_generation(process: ProcessKey) -> Result<(), DetailUnavailable> {
+    match read_process_observation(process.pid) {
+        Ok(observation) if observation.start_token == process.start_token => Ok(()),
+        Ok(_) => Err(DetailUnavailable::TargetReplaced),
+        Err(error) => Err(detail_unavailable(&error)),
+    }
+}
+
+fn read_u64(path: &str) -> Result<u64, DetailUnavailable> {
+    std::fs::read_to_string(path)
+        .map_err(|error| detail_unavailable(&error))?
+        .trim()
+        .parse()
+        .map_err(|_| DetailUnavailable::Failed)
+}
+
+fn count_file_watcher_records(fdinfo: &str) -> usize {
+    fdinfo.lines().filter(|line| line.starts_with("inotify ")).count()
+}
+
+fn detail_unavailable(error: &io::Error) -> DetailUnavailable {
+    match error.kind() {
+        io::ErrorKind::PermissionDenied => DetailUnavailable::PermissionDenied,
+        io::ErrorKind::NotFound => DetailUnavailable::TargetGone,
+        io::ErrorKind::Unsupported => DetailUnavailable::Unsupported,
+        _ => DetailUnavailable::Failed,
+    }
 }
 
 fn observed<T>(result: io::Result<T>) -> Observed<T> {
@@ -241,6 +314,9 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::CString;
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
     use std::process::{Command, Stdio};
     use std::thread;
     use std::time::Duration;
@@ -280,6 +356,41 @@ mod tests {
     #[test]
     fn rejects_truncated_stat() {
         assert!(matches!(parse_stat("1 (x) S 0"), Err(StatParseError::MissingField(14))));
+    }
+
+    #[test]
+    fn counts_only_inotify_watch_records_from_fdinfo() {
+        let fdinfo = "\
+pos:\t0
+flags:\t02000000
+mnt_id:\t18
+ino:\t1066
+inotify wd:2 ino:6e5 sdev:0 mask:fc6 ignored_mask:0
+inotify wd:1 ino:6e4 sdev:0 mask:fc6 ignored_mask:0
+";
+        assert_eq!(count_file_watcher_records(fdinfo), 2);
+        assert_eq!(count_file_watcher_records("pos:\t0\nflags:\t02\n"), 0);
+    }
+
+    #[test]
+    fn attributes_a_live_inotify_watch_to_its_stable_process() {
+        // SAFETY: `inotify_init1` has no pointer arguments. A non-negative result is an owned fd.
+        let raw_fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
+        assert!(raw_fd >= 0, "inotify_init1 failed: {}", io::Error::last_os_error());
+        // SAFETY: the successful `inotify_init1` call returned a fresh descriptor owned by the test.
+        let _inotify = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        let watched = CString::new(std::env::temp_dir().as_os_str().as_bytes()).unwrap();
+        // SAFETY: `watched` is a live NUL-terminated path and `raw_fd` remains open for this scope.
+        let watch = unsafe { libc::inotify_add_watch(raw_fd, watched.as_ptr(), libc::IN_ATTRIB) };
+        assert!(watch >= 0, "inotify_add_watch failed: {}", io::Error::last_os_error());
+
+        let pid = std::process::id();
+        let observation = read_process_observation(pid).expect("test process observation");
+        let usage =
+            read_process_file_watchers(ProcessKey { pid, start_token: observation.start_token })
+                .expect("test process watcher attribution");
+        assert!(usage.descriptors >= 1);
+        assert!(usage.watches >= 1);
     }
 
     #[test]

@@ -7,7 +7,9 @@ use ratatui::widgets::{Block, BorderType, Cell, Clear, Paragraph, Row, Table, Wr
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
-use super::app::{ActiveRegion, ConfirmationChoice, InspectorTab, SortBy, StatsApp, StatsOverlay};
+use super::app::{
+    ActiveRegion, ConfirmationChoice, InspectorTab, SortBy, StatsApp, StatsOverlay, StatsView,
+};
 use super::contributions::{PROCESS_COMMAND_INLINE, PROCESS_INSPECTOR_INLINE};
 use super::host::ProcessAction;
 use super::model::{
@@ -52,6 +54,7 @@ pub(super) struct InlineActionRegion {
 
 #[derive(Default)]
 pub(super) struct UiRegions {
+    pub(super) views: Vec<(Rect, StatsView)>,
     pub(super) processes: Option<Rect>,
     pub(super) inspector: Option<Rect>,
     pub(super) split: Option<SplitFrame>,
@@ -94,30 +97,36 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &StatsApp) -> UiRegions {
         Constraint::Length(1),
     ])
     .split(area);
-    render_header(frame, app, chunks[0]);
+    render_header(frame, app, chunks[0], &mut regions);
     render_system_band(frame, app, chunks[1], &mut regions);
-    let wide = area.width >= 120;
-    if wide {
-        let split = SplitFrame::horizontal(chunks[2], app.split_ratio, SplitMinimums::new(54, 42));
-        regions.split = Some(split);
-        render_processes(frame, app, split.first, true, &mut regions);
-        render_inspector(frame, app, split.second, false, &mut regions);
-        render_split_divider(
-            frame,
-            split,
-            app.split_drag.is_some(),
-            SplitDividerStyle {
-                idle_color: BORDER,
-                active_color: HIGHLIGHT,
-                idle_line: "│",
-                idle_grip: "┋",
-                active_line: "┃",
-            },
-        );
-    } else if app.active_region == ActiveRegion::Inspector {
-        render_inspector(frame, app, chunks[2], true, &mut regions);
-    } else {
-        render_processes(frame, app, chunks[2], false, &mut regions);
+    match app.view {
+        StatsView::Processes => {
+            let wide = area.width >= 120;
+            if wide {
+                let split =
+                    SplitFrame::horizontal(chunks[2], app.split_ratio, SplitMinimums::new(54, 42));
+                regions.split = Some(split);
+                render_processes(frame, app, split.first, true, &mut regions);
+                render_inspector(frame, app, split.second, false, &mut regions);
+                render_split_divider(
+                    frame,
+                    split,
+                    app.split_drag.is_some(),
+                    SplitDividerStyle {
+                        idle_color: BORDER,
+                        active_color: HIGHLIGHT,
+                        idle_line: "│",
+                        idle_grip: "┋",
+                        active_line: "┃",
+                    },
+                );
+            } else if app.active_region == ActiveRegion::Inspector {
+                render_inspector(frame, app, chunks[2], true, &mut regions);
+            } else {
+                render_processes(frame, app, chunks[2], false, &mut regions);
+            }
+        }
+        StatsView::FileWatchers => render_file_watchers(frame, app, chunks[2], &mut regions),
     }
     render_footer(frame, app, chunks[3]);
     match app.overlay.as_ref() {
@@ -137,10 +146,33 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &StatsApp) -> UiRegions {
     regions
 }
 
-fn render_header(frame: &mut Frame<'_>, app: &StatsApp, area: Rect) {
+fn render_header(frame: &mut Frame<'_>, app: &StatsApp, area: Rect, regions: &mut UiRegions) {
     let system = &app.snapshot.system;
+    let chunks = Layout::horizontal([
+        Constraint::Length(13),
+        Constraint::Length(11),
+        Constraint::Length(10),
+        Constraint::Min(0),
+    ])
+    .split(area);
+    frame.render_widget(
+        Paragraph::new(" KIT / STATS ")
+            .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        chunks[0],
+    );
+    for (index, view) in StatsView::ALL.iter().copied().enumerate() {
+        let area = chunks[index + 1];
+        regions.views.push((area, view));
+        frame.render_widget(
+            Paragraph::new(format!(" {} ", view.label())).style(if view == app.view {
+                Style::default().fg(PAPER).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            } else {
+                Style::default().fg(MUTED)
+            }),
+            area,
+        );
+    }
     let line = Line::from(vec![
-        Span::styled(" KIT / STATS ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
         Span::styled(" LIVE ", Style::default().fg(MUTED)),
         Span::styled(
             format!("{:.1}s", app.snapshot.interval_ms as f64 / 1_000.0),
@@ -169,7 +201,7 @@ fn render_header(frame: &mut Frame<'_>, app: &StatsApp, area: Rect) {
             Style::default().fg(TEXT),
         ),
     ]);
-    frame.render_widget(Paragraph::new(line).style(Style::default().bg(BACKGROUND)), area);
+    frame.render_widget(Paragraph::new(line).style(Style::default().bg(BACKGROUND)), chunks[3]);
 }
 
 fn render_system_band(frame: &mut Frame<'_>, app: &StatsApp, area: Rect, regions: &mut UiRegions) {
@@ -310,6 +342,177 @@ fn render_system_band(frame: &mut Frame<'_>, app: &StatsApp, area: Rect, regions
         Paragraph::new(Line::from(source_spans)),
         Rect::new(inner.x, inner.y + 2, inner.width, 1),
     );
+}
+
+fn render_file_watchers(
+    frame: &mut Frame<'_>,
+    app: &StatsApp,
+    area: Rect,
+    regions: &mut UiRegions,
+) {
+    regions.processes = Some(area);
+    let base_block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .style(Style::default().bg(PANEL))
+        .border_style(Style::default().fg(ACCENT));
+    let Some(outcome) = app.detail.as_deref().and_then(|detail| detail.file_watchers()) else {
+        frame.render_widget(
+            Paragraph::new("Scanning process file-watch resources…")
+                .style(Style::default().fg(MUTED).bg(PANEL))
+                .block(base_block.title(" FILE WATCHERS ")),
+            area,
+        );
+        return;
+    };
+    let DetailOutcome::Available { completeness, value: sample, .. } = outcome else {
+        let DetailOutcome::Unavailable(reason) = outcome else { unreachable!() };
+        frame.render_widget(
+            Paragraph::new(format!("File-watch attribution is {}.", detail_unavailable(reason)))
+                .style(Style::default().fg(MUTED).bg(PANEL))
+                .block(base_block.title(" FILE WATCHERS ")),
+            area,
+        );
+        return;
+    };
+
+    let title = Line::from(vec![
+        Span::styled(
+            format!(
+                " FILE WATCHERS  {} watches · {} fds · {} owners ",
+                sample.usage.watches,
+                sample.usage.descriptors,
+                sample.owners.len()
+            ),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            if *completeness == DetailCompleteness::Partial {
+                format!(" PARTIAL · {} unobserved ", sample.unobserved_processes)
+            } else {
+                String::new()
+            },
+            Style::default().fg(WARN),
+        ),
+        Span::styled(
+            format!(
+                " limits/user W/I/Q {}/{}/{} ",
+                sample.limits.max_user_watches,
+                sample.limits.max_user_instances,
+                sample.limits.max_queued_events
+            ),
+            Style::default().fg(MUTED),
+        ),
+        Span::styled(
+            if app.filter.value().is_empty() {
+                " / filter ".into()
+            } else {
+                format!(" / {} ", app.filter.value())
+            },
+            Style::default().fg(if app.filtering { TEXT } else { MUTED }),
+        ),
+    ]);
+    let block = base_block.title(title);
+    let inner = block.inner(area);
+    let visible = app.visible_file_watchers();
+    if visible.is_empty() {
+        let message = if app.filter.value().is_empty() {
+            "No inotify-backed file watchers are currently visible."
+        } else {
+            "No file-watch owners match the current filter."
+        };
+        frame.render_widget(
+            Paragraph::new(message).style(Style::default().fg(MUTED).bg(PANEL)).block(block),
+            area,
+        );
+        return;
+    }
+
+    let wide = area.width >= 120;
+    let visible_height = inner.height.saturating_sub(1) as usize;
+    let rows = visible.iter().skip(app.watcher_offset).take(visible_height).map(|owner| {
+        let identity = ProcessIdentity::stable(owner.process);
+        let process = app.file_watcher_process(owner);
+        let style = if app.selected == Some(identity) {
+            Style::default().fg(PAPER).bg(SELECTED).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(TEXT).bg(PANEL)
+        };
+        let mut cells = vec![
+            Cell::from(process.map_or("<exited>", |process| process.name.as_str()).to_owned()),
+            Cell::from(owner.process.pid.to_string()).style(Style::default().fg(MUTED)),
+        ];
+        if wide {
+            cells.extend([
+                Cell::from(
+                    process.and_then(|process| process.user.as_deref()).unwrap_or("—").to_owned(),
+                )
+                .style(Style::default().fg(MUTED)),
+                Cell::from(process.map_or_else(
+                    || "—".to_owned(),
+                    |process| format!("{:.1}%", process.cpu_percent),
+                )),
+                Cell::from(
+                    process
+                        .map_or_else(|| "—".to_owned(), |process| report::bytes(process.rss_bytes)),
+                ),
+            ]);
+        }
+        cells.extend([
+            Cell::from(owner.usage.descriptors.to_string()),
+            Cell::from(owner.usage.watches.to_string()),
+        ]);
+        Row::new(cells).style(style)
+    });
+    let mut headers = vec![
+        Cell::from("PROCESS").style(Style::default().fg(MUTED)),
+        Cell::from("PID").style(Style::default().fg(MUTED)),
+    ];
+    let constraints = if wide {
+        headers.extend([
+            Cell::from("USER").style(Style::default().fg(MUTED)),
+            Cell::from("CPU").style(Style::default().fg(MUTED)),
+            Cell::from("MEM").style(Style::default().fg(MUTED)),
+        ]);
+        vec![
+            Constraint::Min(24),
+            Constraint::Length(8),
+            Constraint::Length(14),
+            Constraint::Length(9),
+            Constraint::Length(10),
+            Constraint::Length(12),
+            Constraint::Length(12),
+        ]
+    } else {
+        vec![
+            Constraint::Min(18),
+            Constraint::Length(8),
+            Constraint::Length(10),
+            Constraint::Length(10),
+        ]
+    };
+    headers.extend([
+        Cell::from("DESCRIPTORS").style(Style::default().fg(MUTED)),
+        Cell::from("WATCHES").style(Style::default().fg(MUTED)),
+    ]);
+    frame.render_widget(
+        Table::new(rows, constraints)
+            .header(
+                Row::new(headers).style(Style::default().bg(PANEL).add_modifier(Modifier::BOLD)),
+            )
+            .style(Style::default().fg(TEXT).bg(PANEL))
+            .block(block),
+        area,
+    );
+
+    let row_top = inner.y + 1;
+    for (screen_index, owner) in
+        visible.iter().skip(app.watcher_offset).take(visible_height).enumerate()
+    {
+        regions.rows.push(ProcessRowRegion {
+            area: Rect::new(inner.x, row_top + screen_index as u16, inner.width, 1),
+            identity: ProcessIdentity::stable(owner.process),
+        });
+    }
 }
 
 fn render_processes(
@@ -693,7 +896,7 @@ fn thread_lines(app: &StatsApp, area: Rect, regions: &mut UiRegions) -> Vec<Line
     let detail = app.detail.as_deref();
     let outcome = detail.and_then(|detail| match &detail.detail {
         DetailData::Threads { outcome, .. } | DetailData::Core { outcome, .. } => Some(outcome),
-        DetailData::Resources { .. } => None,
+        DetailData::Resources { .. } | DetailData::FileWatchers { .. } => None,
     });
     let state = match outcome {
         Some(DetailOutcome::Available { readiness, completeness, .. }) => format!(
@@ -762,7 +965,9 @@ fn resources_lines(app: &StatsApp) -> Vec<Line<'static>> {
                         Style::default().fg(MUTED),
                     )],
                 },
-                DetailData::Threads { .. } | DetailData::Core { .. } => {
+                DetailData::Threads { .. }
+                | DetailData::Core { .. }
+                | DetailData::FileWatchers { .. } => {
                     vec![Line::styled("RESOURCES · LOADING…", Style::default().fg(MUTED))]
                 }
             },
@@ -1069,37 +1274,52 @@ fn render_footer(frame: &mut Frame<'_>, app: &StatsApp, area: Rect) {
         );
     } else {
         let key = Style::default().fg(HIGHLIGHT).add_modifier(Modifier::BOLD);
-        let help = match app.active_region {
-            ActiveRegion::Processes => Line::from(vec![
+        let help = if app.view == StatsView::FileWatchers {
+            Line::from(vec![
                 Span::styled(" ↑↓ ", key),
                 Span::styled("select   ", Style::default().fg(MUTED)),
-                Span::styled("home ", key),
-                Span::styled("top   ", Style::default().fg(MUTED)),
-                Span::styled("←→ ", key),
-                Span::styled("tree / inspect   ", Style::default().fg(MUTED)),
-                Span::styled("tab ", key),
-                Span::styled("region   ", Style::default().fg(MUTED)),
+                Span::styled("enter ", key),
+                Span::styled("inspect process   ", Style::default().fg(MUTED)),
                 Span::styled("/ ", key),
-                Span::styled("search   ", Style::default().fg(MUTED)),
-                Span::styled("f ", key),
-                Span::styled("focus root   ", Style::default().fg(MUTED)),
-                Span::styled("drag/<> ", key),
-                Span::styled("resize   ", Style::default().fg(MUTED)),
-                Span::styled("= ", key),
-                Span::styled("reset   ", Style::default().fg(MUTED)),
+                Span::styled("filter   ", Style::default().fg(MUTED)),
+                Span::styled("w/esc ", key),
+                Span::styled("processes   ", Style::default().fg(MUTED)),
                 Span::styled("q ", key),
                 Span::styled("quit", Style::default().fg(MUTED)),
-            ]),
-            ActiveRegion::Inspector => Line::from(vec![
-                Span::styled(" ←→ ", key),
-                Span::styled("tabs / processes   ", Style::default().fg(MUTED)),
-                Span::styled("tab ", key),
-                Span::styled("region   ", Style::default().fg(MUTED)),
-                Span::styled("esc ", key),
-                Span::styled("back   ", Style::default().fg(MUTED)),
-                Span::styled("q ", key),
-                Span::styled("quit", Style::default().fg(MUTED)),
-            ]),
+            ])
+        } else {
+            match app.active_region {
+                ActiveRegion::Processes => Line::from(vec![
+                    Span::styled(" ↑↓ ", key),
+                    Span::styled("select   ", Style::default().fg(MUTED)),
+                    Span::styled("home ", key),
+                    Span::styled("top   ", Style::default().fg(MUTED)),
+                    Span::styled("←→ ", key),
+                    Span::styled("tree / inspect   ", Style::default().fg(MUTED)),
+                    Span::styled("tab ", key),
+                    Span::styled("region   ", Style::default().fg(MUTED)),
+                    Span::styled("/ ", key),
+                    Span::styled("search   ", Style::default().fg(MUTED)),
+                    Span::styled("f ", key),
+                    Span::styled("focus root   ", Style::default().fg(MUTED)),
+                    Span::styled("drag/<> ", key),
+                    Span::styled("resize   ", Style::default().fg(MUTED)),
+                    Span::styled("= ", key),
+                    Span::styled("reset   ", Style::default().fg(MUTED)),
+                    Span::styled("q ", key),
+                    Span::styled("quit", Style::default().fg(MUTED)),
+                ]),
+                ActiveRegion::Inspector => Line::from(vec![
+                    Span::styled(" ←→ ", key),
+                    Span::styled("tabs / processes   ", Style::default().fg(MUTED)),
+                    Span::styled("tab ", key),
+                    Span::styled("region   ", Style::default().fg(MUTED)),
+                    Span::styled("esc ", key),
+                    Span::styled("back   ", Style::default().fg(MUTED)),
+                    Span::styled("q ", key),
+                    Span::styled("quit", Style::default().fg(MUTED)),
+                ]),
+            }
         };
         frame.render_widget(Paragraph::new(help).style(Style::default().bg(BACKGROUND)), area);
     }

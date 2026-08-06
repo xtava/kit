@@ -5,6 +5,8 @@ use std::io;
 use thiserror::Error;
 
 use super::model::{CapabilityState, HostCapabilities, Observed, ProcessState};
+#[cfg(not(target_os = "linux"))]
+use super::model::{DetailUnavailable, FileWatcherLimits, FileWatcherUsage, ProcessKey};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProcessObservation {
@@ -159,7 +161,8 @@ pub fn capabilities() -> HostCapabilities {
 mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::{
-    read_process_observation, read_process_resources, read_process_tasks, send_action,
+    read_file_watcher_limits, read_process_file_watchers, read_process_observation,
+    read_process_resources, read_process_tasks, send_action,
 };
 
 #[cfg(target_os = "macos")]
@@ -175,6 +178,18 @@ mod windows;
 pub use windows::{
     read_process_observation, read_process_resources, read_process_tasks, send_action,
 };
+
+#[cfg(not(target_os = "linux"))]
+pub fn read_file_watcher_limits() -> Result<FileWatcherLimits, DetailUnavailable> {
+    Err(DetailUnavailable::Unsupported)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn read_process_file_watchers(
+    _process: ProcessKey,
+) -> Result<FileWatcherUsage, DetailUnavailable> {
+    Err(DetailUnavailable::Unsupported)
+}
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 mod fallback {

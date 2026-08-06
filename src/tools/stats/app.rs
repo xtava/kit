@@ -13,8 +13,8 @@ use super::contributions::{
 use super::history::{HistorySeries, HistoryStore};
 use super::host::ProcessAction;
 use super::model::{
-    DetailData, DetailRequest, DetailRequestKind, DetailSnapshot, ProcessIdentity, ProcessKey,
-    ProcessSample, StatsSnapshot, ThreadSample,
+    DetailData, DetailRequest, DetailRequestKind, DetailSnapshot, FileWatcherOwner,
+    ProcessIdentity, ProcessKey, ProcessSample, StatsSnapshot, ThreadSample,
 };
 use super::render::UiRegions;
 use super::tree::{FamilyView, ProcessForest, TreeQuery, TreeSort};
@@ -26,6 +26,23 @@ use crate::tui::{
 const HISTORY: usize = 120;
 const RECENT_CPU_SAMPLES: usize = 3;
 const DEFAULT_SPLIT_RATIO: SplitRatio = SplitRatio::new(640);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum StatsView {
+    Processes,
+    FileWatchers,
+}
+
+impl StatsView {
+    pub(super) const ALL: [Self; 2] = [Self::Processes, Self::FileWatchers];
+
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Processes => "PROCESSES",
+            Self::FileWatchers => "WATCHERS",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SortBy {
@@ -254,6 +271,7 @@ pub(super) struct StatsApp {
     pub(super) focused_core: Option<u16>,
     pub(super) sort: SortBy,
     pub(super) descending: bool,
+    pub(super) view: StatsView,
     pub(super) inspector_tab: InspectorTab,
     pub(super) family_cursor: usize,
     pub(super) thread_cursor: usize,
@@ -268,6 +286,7 @@ pub(super) struct StatsApp {
     pub(super) visible: Vec<VisibleRow>,
     family_view: Option<FamilyView>,
     pub(super) row_offset: usize,
+    pub(super) watcher_offset: usize,
     pub(super) viewport_rows: usize,
     pub(super) histories: Vec<VecDeque<u64>>,
     process_history: HistoryStore,
@@ -316,6 +335,7 @@ impl StatsApp {
             focused_core: None,
             sort: SortBy::Cpu,
             descending: true,
+            view: StatsView::Processes,
             inspector_tab: InspectorTab::Overview,
             family_cursor: 0,
             thread_cursor: 0,
@@ -330,6 +350,7 @@ impl StatsApp {
             visible: Vec::new(),
             family_view: None,
             row_offset: 0,
+            watcher_offset: 0,
             viewport_rows: 0,
             histories: Vec::new(),
             process_history: HistoryStore::default(),
@@ -389,6 +410,19 @@ impl StatsApp {
         if affects_projection {
             self.reproject();
         }
+        if self.view == StatsView::FileWatchers {
+            let owners = self.visible_file_watchers();
+            let selected_is_visible = self.selected.is_some_and(|selected| {
+                owners.iter().any(|owner| Some(owner.process) == selected.stable_key())
+            });
+            if !selected_is_visible {
+                if let Some(process) =
+                    owners.first().map(|owner| ProcessIdentity::stable(owner.process))
+                {
+                    self.select_identity(process);
+                }
+            }
+        }
     }
 
     pub(super) fn record_history(&mut self) {
@@ -410,7 +444,9 @@ impl StatsApp {
     }
 
     pub(super) fn detail_kind(&self) -> Option<DetailRequestKind> {
-        if let Some(core) = self.focused_core {
+        if self.view == StatsView::FileWatchers {
+            Some(DetailRequestKind::FileWatchers)
+        } else if let Some(core) = self.focused_core {
             Some(DetailRequestKind::Core { logical_index: core })
         } else {
             let process = self.selected_process()?.identity.stable_key()?;
@@ -516,6 +552,10 @@ impl StatsApp {
             }
         }
         self.row_offset = self.row_offset.min(self.visible.len().saturating_sub(1));
+        if self.view == StatsView::FileWatchers {
+            self.watcher_offset =
+                self.watcher_offset.min(self.visible_file_watchers().len().saturating_sub(1));
+        }
         self.refresh_family_view();
     }
 
@@ -568,6 +608,48 @@ impl StatsApp {
         self.selected
             .and_then(ProcessIdentity::stable_key)
             .and_then(|key| self.process_history.get(key))
+    }
+
+    pub(super) fn visible_file_watchers(&self) -> Vec<&FileWatcherOwner> {
+        let Some(sample) = self
+            .detail
+            .as_deref()
+            .and_then(DetailSnapshot::file_watchers)
+            .and_then(|value| value.value())
+        else {
+            return Vec::new();
+        };
+        let needle = self.filter.value().to_lowercase();
+        sample
+            .owners
+            .iter()
+            .filter(|owner| {
+                if needle.is_empty() {
+                    return true;
+                }
+                let pid = owner.process.pid.to_string();
+                self.snapshot
+                    .processes
+                    .iter()
+                    .find(|process| process.identity.stable_key() == Some(owner.process))
+                    .is_some_and(|process| {
+                        process.name.to_lowercase().contains(&needle)
+                            || process.command.to_lowercase().contains(&needle)
+                            || process
+                                .user
+                                .as_deref()
+                                .is_some_and(|user| user.to_lowercase().contains(&needle))
+                    })
+                    || pid.contains(&needle)
+            })
+            .collect()
+    }
+
+    pub(super) fn file_watcher_process(&self, owner: &FileWatcherOwner) -> Option<&ProcessSample> {
+        self.snapshot
+            .processes
+            .iter()
+            .find(|process| process.identity.stable_key() == Some(owner.process))
     }
 
     pub(super) fn pressure_sources(&self, limit: usize) -> Vec<ProcessPressure> {
@@ -689,6 +771,10 @@ impl StatsApp {
     }
 
     pub(super) fn move_selection(&mut self, delta: isize) {
+        if self.view == StatsView::FileWatchers {
+            self.move_file_watcher_selection(delta);
+            return;
+        }
         if self.visible.is_empty() {
             return;
         }
@@ -702,6 +788,28 @@ impl StatsApp {
             self.row_offset = next;
         } else if self.viewport_rows > 0 && next >= self.row_offset + self.viewport_rows {
             self.row_offset = next + 1 - self.viewport_rows;
+        }
+    }
+
+    fn move_file_watcher_selection(&mut self, delta: isize) {
+        let keys = self
+            .visible_file_watchers()
+            .into_iter()
+            .map(|owner| ProcessIdentity::stable(owner.process))
+            .collect::<Vec<_>>();
+        if keys.is_empty() {
+            return;
+        }
+        let current = self
+            .selected
+            .and_then(|selected| keys.iter().position(|key| *key == selected))
+            .unwrap_or(0) as isize;
+        let next = (current + delta).clamp(0, keys.len() as isize - 1) as usize;
+        self.select_identity(keys[next]);
+        if next < self.watcher_offset {
+            self.watcher_offset = next;
+        } else if self.viewport_rows > 0 && next >= self.watcher_offset + self.viewport_rows {
+            self.watcher_offset = next + 1 - self.viewport_rows;
         }
     }
 
@@ -736,8 +844,19 @@ impl StatsApp {
     }
 
     fn jump_to_top(&mut self) {
-        self.row_offset = 0;
-        self.select_index(0);
+        if self.view == StatsView::FileWatchers {
+            self.watcher_offset = 0;
+            if let Some(process) = self
+                .visible_file_watchers()
+                .first()
+                .map(|owner| ProcessIdentity::stable(owner.process))
+            {
+                self.select_identity(process);
+            }
+        } else {
+            self.row_offset = 0;
+            self.select_index(0);
+        }
     }
 
     pub(super) fn on_event(&mut self, event: Event, regions: &UiRegions) -> Action {
@@ -856,6 +975,9 @@ impl StatsApp {
             }
             return Action::None;
         }
+        if self.view == StatsView::FileWatchers {
+            return self.on_file_watcher_key(key);
+        }
         if let Some(action) = self.on_inspector_table_key(key, regions) {
             return action;
         }
@@ -870,6 +992,10 @@ impl StatsApp {
         }
         match key.code {
             KeyCode::Char('q') => Action::Quit,
+            KeyCode::Char('w') => {
+                self.set_view(StatsView::FileWatchers);
+                Action::None
+            }
             KeyCode::Esc => {
                 if self.active_region == ActiveRegion::Inspector {
                     self.active_region = ActiveRegion::Processes;
@@ -1001,6 +1127,53 @@ impl StatsApp {
             }
             KeyCode::Char('=') if regions.split.is_some() => {
                 self.split_ratio = DEFAULT_SPLIT_RATIO;
+                Action::None
+            }
+            _ => Action::None,
+        }
+    }
+
+    fn on_file_watcher_key(&mut self, key: KeyEvent) -> Action {
+        match key.code {
+            KeyCode::Char('q') => Action::Quit,
+            KeyCode::Esc | KeyCode::Char('w') => {
+                self.set_view(StatsView::Processes);
+                Action::None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.move_selection(-1);
+                Action::None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.move_selection(1);
+                Action::None
+            }
+            KeyCode::PageUp => {
+                self.move_selection(-(self.viewport_rows.max(1) as isize));
+                Action::None
+            }
+            KeyCode::PageDown => {
+                self.move_selection(self.viewport_rows.max(1) as isize);
+                Action::None
+            }
+            KeyCode::Home => {
+                self.jump_to_top();
+                Action::None
+            }
+            KeyCode::Enter => {
+                let selected_is_watcher = self.selected.is_some_and(|selected| {
+                    self.visible_file_watchers()
+                        .iter()
+                        .any(|owner| selected.stable_key() == Some(owner.process))
+                });
+                if selected_is_watcher {
+                    self.set_view(StatsView::Processes);
+                    self.active_region = ActiveRegion::Inspector;
+                }
+                Action::None
+            }
+            KeyCode::Char('/') => {
+                self.filtering = true;
                 Action::None
             }
             _ => Action::None,
@@ -1166,6 +1339,21 @@ impl StatsApp {
 
     pub(super) fn move_inspector_tab(&mut self, delta: isize) {
         self.set_inspector_tab(self.inspector_tab.next(delta));
+    }
+
+    pub(super) fn set_view(&mut self, view: StatsView) {
+        if self.view == view {
+            return;
+        }
+        self.view = view;
+        self.active_region = ActiveRegion::Processes;
+        self.focused_core = None;
+        self.split_drag = None;
+        self.overlay = None;
+        if view == StatsView::FileWatchers {
+            self.watcher_offset = 0;
+        }
+        self.reproject();
     }
 
     pub(super) fn set_inspector_tab(&mut self, tab: InspectorTab) {
@@ -1421,6 +1609,10 @@ impl StatsApp {
         if let Some(region) = regions.navigation().hit_test(mouse.column, mouse.row) {
             self.active_region = region;
         }
+        if let Some((_, view)) = regions.views.iter().find(|(area, _)| contains(*area, point)) {
+            self.set_view(*view);
+            return Action::None;
+        }
         if regions.back.is_some_and(|area| contains(area, point)) {
             self.active_region = ActiveRegion::Processes;
             return Action::None;
@@ -1458,6 +1650,7 @@ impl StatsApp {
             return Action::None;
         }
         if let Some((_, core)) = regions.cores.iter().find(|(area, _)| contains(*area, point)) {
+            self.set_view(StatsView::Processes);
             self.focused_core = if self.focused_core == Some(*core) { None } else { Some(*core) };
             self.reproject();
             return Action::None;

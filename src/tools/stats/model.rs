@@ -113,12 +113,15 @@ pub enum DetailRequestKind {
     Threads { process: ProcessKey },
     Resources { process: ProcessKey },
     Core { logical_index: u16 },
+    FileWatchers,
 }
 
 impl DetailRequestKind {
     pub fn minimum_interval(self) -> Duration {
         match self {
-            Self::Core { .. } | Self::Resources { .. } => Duration::from_secs(4),
+            Self::Core { .. } | Self::Resources { .. } | Self::FileWatchers => {
+                Duration::from_secs(4)
+            }
             Self::Threads { .. } if cfg!(target_os = "windows") => Duration::from_secs(4),
             Self::Threads { .. } => Duration::from_secs(2),
         }
@@ -150,7 +153,16 @@ impl DetailSnapshot {
             DetailData::Threads { outcome, .. } | DetailData::Core { outcome, .. } => {
                 outcome.value().map(Vec::as_slice)
             }
-            DetailData::Resources { .. } => None,
+            DetailData::Resources { .. } | DetailData::FileWatchers { .. } => None,
+        }
+    }
+
+    pub fn file_watchers(&self) -> Option<&DetailOutcome<FileWatcherSample>> {
+        match &self.detail {
+            DetailData::FileWatchers { outcome } => Some(outcome),
+            DetailData::Threads { .. } | DetailData::Resources { .. } | DetailData::Core { .. } => {
+                None
+            }
         }
     }
 }
@@ -161,6 +173,7 @@ pub enum DetailData {
     Threads { process: ProcessKey, outcome: DetailOutcome<Vec<ThreadSample>> },
     Resources { process: ProcessKey, outcome: DetailOutcome<ResourceSample> },
     Core { logical_index: u16, outcome: DetailOutcome<Vec<ThreadSample>> },
+    FileWatchers { outcome: DetailOutcome<FileWatcherSample> },
 }
 
 impl DetailData {
@@ -171,6 +184,7 @@ impl DetailData {
             Self::Core { logical_index, .. } => {
                 DetailRequestKind::Core { logical_index: *logical_index }
             }
+            Self::FileWatchers { .. } => DetailRequestKind::FileWatchers,
         }
     }
 }
@@ -240,6 +254,33 @@ pub struct ResourceSample {
     pub read_bytes_per_second: Observed<f64>,
     pub write_bytes_per_second: Observed<f64>,
     pub io_label: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct FileWatcherLimits {
+    pub max_user_instances: u64,
+    pub max_user_watches: u64,
+    pub max_queued_events: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct FileWatcherUsage {
+    pub descriptors: u64,
+    pub watches: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct FileWatcherOwner {
+    pub process: ProcessKey,
+    pub usage: FileWatcherUsage,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct FileWatcherSample {
+    pub limits: FileWatcherLimits,
+    pub usage: FileWatcherUsage,
+    pub owners: Vec<FileWatcherOwner>,
+    pub unobserved_processes: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]

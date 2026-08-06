@@ -17,9 +17,9 @@ use tokio::sync::watch;
 use super::host;
 use super::model::{
     CpuSample, DetailCompleteness, DetailData, DetailOutcome, DetailRequest, DetailRequestKind,
-    DetailSnapshot, DetailUnavailable, IdentityUnavailable, Observed, ProcessIdentity, ProcessKey,
-    ProcessSample, ProcessState, SampleReadiness, SampleWarning, StatsSnapshot, SystemSample,
-    ThreadSample,
+    DetailSnapshot, DetailUnavailable, FileWatcherLimits, FileWatcherOwner, FileWatcherSample,
+    FileWatcherUsage, IdentityUnavailable, Observed, ProcessIdentity, ProcessKey, ProcessSample,
+    ProcessState, SampleReadiness, SampleWarning, StatsSnapshot, SystemSample, ThreadSample,
 };
 
 const MAX_WARNINGS: usize = 32;
@@ -82,6 +82,7 @@ enum DetailCollectorState {
     Threads { request_id: u64, process: ProcessKey, delta: ThreadDelta, scan: Option<ThreadScan> },
     Resources { request_id: u64, process: ProcessKey, delta: ResourceDelta },
     Core { request_id: u64, logical_index: u16, delta: ThreadDelta, scan: Option<ThreadScan> },
+    FileWatchers { request_id: u64, scan: Option<FileWatcherScan> },
 }
 
 impl DetailCollectorState {
@@ -104,6 +105,9 @@ impl DetailCollectorState {
                 delta: ThreadDelta::default(),
                 scan: None,
             },
+            DetailRequestKind::FileWatchers => {
+                Self::FileWatchers { request_id: request.request_id, scan: None }
+            }
         }
     }
 
@@ -121,6 +125,9 @@ impl DetailCollectorState {
                 request_id: *request_id,
                 kind: DetailRequestKind::Core { logical_index: *logical_index },
             },
+            Self::FileWatchers { request_id, .. } => {
+                DetailRequest { request_id: *request_id, kind: DetailRequestKind::FileWatchers }
+            }
         }
     }
 }
@@ -144,6 +151,34 @@ struct ThreadScan {
     threads: Vec<ThreadSample>,
     warnings: Vec<SampleWarning>,
     partial: bool,
+}
+
+struct FileWatcherScan {
+    process_keys: Vec<ProcessKey>,
+    next_process: usize,
+    started: Instant,
+    limits: FileWatcherLimits,
+    usage: FileWatcherUsage,
+    owners: Vec<FileWatcherOwner>,
+    unobserved_processes: usize,
+}
+
+impl FileWatcherScan {
+    fn new(processes: &[ProcessSample]) -> Result<Self, DetailUnavailable> {
+        let process_keys = processes
+            .iter()
+            .filter_map(|process| process.identity.stable_key())
+            .collect::<Vec<_>>();
+        Ok(Self {
+            unobserved_processes: processes.len().saturating_sub(process_keys.len()),
+            process_keys,
+            next_process: 0,
+            started: Instant::now(),
+            limits: host::read_file_watcher_limits()?,
+            usage: FileWatcherUsage::default(),
+            owners: Vec::new(),
+        })
+    }
 }
 
 impl ThreadScan {
@@ -440,8 +475,80 @@ impl Sampler {
                     deadline,
                 )
             }
+            DetailCollectorState::FileWatchers { request_id, scan } => {
+                poll_file_watcher_scan(*request_id, scan, processes, deadline)
+            }
         }
     }
+}
+
+fn poll_file_watcher_scan(
+    request_id: u64,
+    scan: &mut Option<FileWatcherScan>,
+    processes: &[ProcessSample],
+    deadline: Option<Instant>,
+) -> Option<DetailSnapshot> {
+    if scan.is_none() {
+        match FileWatcherScan::new(processes) {
+            Ok(next) => *scan = Some(next),
+            Err(reason) => {
+                return Some(unavailable_file_watcher_detail(request_id, Instant::now(), reason));
+            }
+        }
+    }
+    let current = scan.as_mut().expect("file watcher scan was just initialized");
+    while current.next_process < current.process_keys.len() {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return None;
+        }
+        let process = current.process_keys[current.next_process];
+        current.next_process += 1;
+        match host::read_process_file_watchers(process) {
+            Ok(usage) => {
+                current.usage.descriptors =
+                    current.usage.descriptors.saturating_add(usage.descriptors);
+                current.usage.watches = current.usage.watches.saturating_add(usage.watches);
+                if usage.descriptors > 0 {
+                    current.owners.push(FileWatcherOwner { process, usage });
+                }
+            }
+            Err(_) => {
+                current.unobserved_processes = current.unobserved_processes.saturating_add(1);
+            }
+        }
+    }
+
+    let mut completed = scan.take().expect("completed file watcher scan exists");
+    completed.owners.sort_by(|left, right| {
+        right
+            .usage
+            .watches
+            .cmp(&left.usage.watches)
+            .then_with(|| right.usage.descriptors.cmp(&left.usage.descriptors))
+            .then_with(|| left.process.pid.cmp(&right.process.pid))
+    });
+    Some(DetailSnapshot {
+        request_id,
+        sampled_at_ms: now_ms(),
+        collection_duration_ms: duration_ms(completed.started.elapsed()),
+        detail: DetailData::FileWatchers {
+            outcome: DetailOutcome::Available {
+                readiness: SampleReadiness::Ready,
+                completeness: if completed.unobserved_processes == 0 {
+                    DetailCompleteness::Complete
+                } else {
+                    DetailCompleteness::Partial
+                },
+                value: FileWatcherSample {
+                    limits: completed.limits,
+                    usage: completed.usage,
+                    owners: completed.owners,
+                    unobserved_processes: completed.unobserved_processes,
+                },
+            },
+        },
+        warnings: Vec::new(),
+    })
 }
 
 fn poll_thread_scan(
@@ -855,6 +962,20 @@ fn unavailable_resource_detail(
     }
 }
 
+fn unavailable_file_watcher_detail(
+    request_id: u64,
+    started: Instant,
+    reason: DetailUnavailable,
+) -> DetailSnapshot {
+    DetailSnapshot {
+        request_id,
+        sampled_at_ms: now_ms(),
+        collection_duration_ms: duration_ms(started.elapsed()),
+        detail: DetailData::FileWatchers { outcome: DetailOutcome::Unavailable(reason) },
+        warnings: Vec::new(),
+    }
+}
+
 impl Drop for SamplerWorker {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Release);
@@ -1239,6 +1360,7 @@ mod tests {
             Some(DetailRequestKind::Threads { .. }) => "selected_process",
             Some(DetailRequestKind::Resources { .. }) => "selected_resources",
             Some(DetailRequestKind::Core { .. }) => "focused_core",
+            Some(DetailRequestKind::FileWatchers) => "file_watchers",
         }
     }
 }

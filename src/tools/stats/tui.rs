@@ -87,7 +87,7 @@ mod tests {
 
     use super::super::app::{
         ActiveRegion, CommandViewer, Confirmation, ConfirmationChoice, DetailIntent, InspectorTab,
-        SortBy, StatsOverlay,
+        SortBy, StatsOverlay, StatsView,
     };
     use super::super::contributions::{
         self, StatsActionContext, StatsActionRegistry, StatsCommand, FORCE_TERMINATE, OPEN_PROFILE,
@@ -97,8 +97,9 @@ mod tests {
     use super::super::host::ProcessAction;
     use super::super::model::{
         CapabilityState, CpuSample, DetailCompleteness, DetailData, DetailOutcome, DetailRequest,
-        DetailRequestKind, DetailSnapshot, HostCapabilities, Observed, ProcessIdentity, ProcessKey,
-        ProcessSample, ProcessState, SampleReadiness, StatsSnapshot, SystemSample, ThreadSample,
+        DetailRequestKind, DetailSnapshot, FileWatcherLimits, FileWatcherOwner, FileWatcherSample,
+        FileWatcherUsage, HostCapabilities, Observed, ProcessIdentity, ProcessKey, ProcessSample,
+        ProcessState, SampleReadiness, StatsSnapshot, SystemSample, ThreadSample,
     };
     use super::*;
     use crossterm::event::{
@@ -201,6 +202,40 @@ mod tests {
             })
             .collect();
         Arc::new(snapshot)
+    }
+
+    fn file_watcher_detail(request_id: u64) -> Arc<DetailSnapshot> {
+        Arc::new(DetailSnapshot {
+            request_id,
+            sampled_at_ms: 10,
+            collection_duration_ms: 2,
+            detail: DetailData::FileWatchers {
+                outcome: DetailOutcome::Available {
+                    readiness: SampleReadiness::Ready,
+                    completeness: DetailCompleteness::Partial,
+                    value: FileWatcherSample {
+                        limits: FileWatcherLimits {
+                            max_user_instances: 1_024,
+                            max_user_watches: 524_288,
+                            max_queued_events: 16_384,
+                        },
+                        usage: FileWatcherUsage { descriptors: 3, watches: 2_755 },
+                        owners: vec![
+                            FileWatcherOwner {
+                                process: ProcessKey { pid: 3, start_token: 3 },
+                                usage: FileWatcherUsage { descriptors: 1, watches: 2_735 },
+                            },
+                            FileWatcherOwner {
+                                process: ProcessKey { pid: 2, start_token: 2 },
+                                usage: FileWatcherUsage { descriptors: 2, watches: 20 },
+                            },
+                        ],
+                        unobserved_processes: 1,
+                    },
+                },
+            },
+            warnings: Vec::new(),
+        })
     }
 
     fn snapshot_with_processes(count: usize) -> Arc<StatsSnapshot> {
@@ -770,6 +805,71 @@ mod tests {
         let compact = draw_app(&mut terminal, &app);
         assert!(compact.processes.is_none());
         assert!(compact.inspector.is_some());
+    }
+
+    #[test]
+    fn file_watchers_are_a_lazy_top_level_view_with_process_inspection() {
+        let mut app = StatsApp::new(snapshot());
+        app.set_view(StatsView::FileWatchers);
+        let request = app
+            .reconcile_detail_intent()
+            .and_then(DetailIntent::request)
+            .expect("watchers view requests global watcher detail");
+        assert_eq!(request.kind, DetailRequestKind::FileWatchers);
+        app.on_event(event_key(KeyCode::Enter), &UiRegions::default());
+        assert_eq!(app.view, StatsView::FileWatchers, "loading cannot inspect the prior selection");
+        app.ingest_detail(Some(file_watcher_detail(request.request_id)));
+        app.watcher_offset = 1;
+        app.filter.set("quiet".to_owned());
+        app.reproject();
+        assert_eq!(app.watcher_offset, 0);
+        app.filter.clear();
+        app.reproject();
+
+        let backend = ratatui::backend::TestBackend::new(140, 35);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let regions = draw_app(&mut terminal, &app);
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("2755 watches"));
+        assert!(screen.contains("2735"));
+        assert!(screen.contains("PARTIAL · 1 unobserved"));
+        assert_eq!(regions.views.len(), StatsView::ALL.len());
+        assert_eq!(regions.rows.len(), 2);
+
+        app.on_event(event_key(KeyCode::Up), &regions);
+        assert_eq!(app.selected.unwrap().stable_key().unwrap().pid, 3);
+        app.on_event(event_key(KeyCode::Enter), &regions);
+        assert_eq!(app.view, StatsView::Processes);
+        assert_eq!(app.active_region, ActiveRegion::Inspector);
+        assert_eq!(app.selected.unwrap().stable_key().unwrap().pid, 3);
+    }
+
+    #[test]
+    fn top_level_view_tabs_support_mouse_and_compact_rendering() {
+        let mut app = StatsApp::new(snapshot());
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let regions = draw_app(&mut terminal, &app);
+        let watchers = regions
+            .views
+            .iter()
+            .find(|(_, view)| *view == StatsView::FileWatchers)
+            .map(|(area, _)| Position { x: area.x, y: area.y })
+            .expect("watchers top-level tab");
+        app.on_event(event_mouse(MouseEventKind::Down(MouseButton::Left), watchers), &regions);
+        assert_eq!(app.view, StatsView::FileWatchers);
+        assert_eq!(app.detail_kind(), Some(DetailRequestKind::FileWatchers));
+
+        let compact = draw_app(&mut terminal, &app);
+        assert!(compact.processes.is_some());
+        assert!(compact.inspector.is_none());
+        assert!(compact.split.is_none());
     }
 
     #[test]
