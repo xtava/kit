@@ -2656,7 +2656,8 @@ fn render_browser(frame: &mut Frame<'_>, area: Rect, app: &App, regions: &mut Ui
                     MUTED
                 })
             };
-            ListItem::new(format!(" {status} {:<24} {}", peer.name, peer.os)).style(style)
+            ListItem::new(format!(" {status} {:<24} {}", peer.name, peer.operating_system.label()))
+                .style(style)
         })
         .collect::<Vec<_>>();
     let mut peer_state =
@@ -3713,7 +3714,7 @@ mod tests {
             id: name.into(),
             name: name.into(),
             dns_name: format!("{name}.example.ts.net"),
-            os: "linux".into(),
+            operating_system: crate::tailscale::OperatingSystem::Linux,
             online: true,
             addresses: vec![address.into()],
             taildrop_target: Some(address.into()),

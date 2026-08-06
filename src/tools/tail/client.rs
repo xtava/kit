@@ -303,7 +303,7 @@ mod tests {
             id: "peer".into(),
             name: "Laptop".into(),
             dns_name: "laptop.example.ts.net".into(),
-            os: "macOS".into(),
+            operating_system: crate::tailscale::OperatingSystem::Macos,
             online: true,
             addresses: vec!["100.64.0.2".into()],
             taildrop_target: None,

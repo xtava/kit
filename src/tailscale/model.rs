@@ -9,9 +9,37 @@ pub struct Node {
     pub id: String,
     pub dns_name: String,
     pub host_name: String,
-    pub os: String,
+    pub operating_system: OperatingSystem,
     pub online: bool,
     pub addresses: Vec<IpAddr>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OperatingSystem {
+    Linux,
+    Macos,
+    Unsupported(String),
+    Unknown,
+}
+
+impl OperatingSystem {
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Linux => "Linux",
+            Self::Macos => "macOS",
+            Self::Unsupported(label) => label,
+            Self::Unknown => "unknown OS",
+        }
+    }
+
+    fn from_tailnet_label(label: String) -> Self {
+        match label.to_ascii_lowercase().as_str() {
+            "linux" => Self::Linux,
+            "macos" | "darwin" => Self::Macos,
+            "" => Self::Unknown,
+            _ => Self::Unsupported(label),
+        }
+    }
 }
 
 impl Node {
@@ -25,11 +53,18 @@ impl Node {
         }
     }
 
-    fn matches_exact_selector(&self, selector: &str, address: Option<IpAddr>) -> bool {
+    fn matches_stable_selector(&self, selector: &str, address: Option<IpAddr>) -> bool {
         self.id == selector
-            || self.host_name.eq_ignore_ascii_case(selector)
             || self.dns_name.eq_ignore_ascii_case(selector.trim_end_matches('.'))
             || address.is_some_and(|address| self.addresses.contains(&address))
+    }
+
+    fn matches_dns_label(&self, selector: &str) -> bool {
+        self.dns_name.split('.').next().is_some_and(|label| label.eq_ignore_ascii_case(selector))
+    }
+
+    fn matches_host_name(&self, selector: &str) -> bool {
+        self.host_name.eq_ignore_ascii_case(selector)
     }
 }
 
@@ -47,11 +82,17 @@ impl Status {
             return Err(PeerSelectorError::Empty);
         }
         let address = selector.parse::<IpAddr>().ok();
-        let matches = self
-            .peers
-            .iter()
-            .filter(|peer| peer.matches_exact_selector(selector, address))
-            .collect::<Vec<_>>();
+        let matches = [
+            Node::matches_stable_selector as fn(&Node, &str, Option<IpAddr>) -> bool,
+            |peer: &Node, selector: &str, _| peer.matches_dns_label(selector),
+            |peer: &Node, selector: &str, _| peer.matches_host_name(selector),
+        ]
+        .into_iter()
+        .map(|matches| {
+            self.peers.iter().filter(|peer| matches(peer, selector, address)).collect::<Vec<_>>()
+        })
+        .find(|matches| !matches.is_empty())
+        .unwrap_or_default();
         match matches.as_slice() {
             [] => Err(PeerSelectorError::NotFound { selector: selector.to_owned() }),
             [peer] => Ok(peer),
@@ -136,7 +177,7 @@ impl RawNode {
             id: self.id,
             dns_name: self.dns_name.trim_end_matches('.').to_owned(),
             host_name: self.host_name,
-            os: self.os,
+            operating_system: OperatingSystem::from_tailnet_label(self.os),
             online: self.online,
             addresses: self.tailscale_ips,
         }
@@ -181,7 +222,7 @@ fn classify(raw: RawStatus) -> Readiness {
 mod tests {
     use super::*;
 
-    const READY_STATUS: &[u8] = br#"{"BackendState":"Running","TailscaleIPs":["100.64.0.1"],"Self":{"ID":"me","DNSName":"desktop.test.ts.net.","HostName":"desktop","OS":"linux","Online":true},"Peer":{"one":{"ID":"peer-one","DNSName":"shared.one.ts.net.","HostName":"shared","OS":"linux","Online":true,"TailscaleIPs":["100.64.0.2"]},"two":{"ID":"peer-two","DNSName":"shared.two.ts.net.","HostName":"shared","OS":"macOS","Online":false,"TailscaleIPs":["fd7a:115c:a1e0::2"]}}}"#;
+    const READY_STATUS: &[u8] = br#"{"BackendState":"Running","TailscaleIPs":["100.64.0.1"],"Self":{"ID":"me","DNSName":"desktop.test.ts.net.","HostName":"desktop","OS":"linux","Online":true},"Peer":{"one":{"ID":"peer-one","DNSName":"shared.one.ts.net.","HostName":"shared","OS":"linux","Online":true,"TailscaleIPs":["100.64.0.2"],"sshHostKeys":["ssh-ed25519 AAAA"]},"two":{"ID":"peer-two","DNSName":"shared.two.ts.net.","HostName":"shared","OS":"macOS","Online":false,"TailscaleIPs":["fd7a:115c:a1e0::2"]}}}"#;
 
     #[test]
     fn running_status_projects_stable_nodes_and_root_local_address() {
@@ -191,7 +232,7 @@ mod tests {
         assert_eq!(status.local.dns_name, "desktop.test.ts.net");
         assert_eq!(status.local.addresses[0].to_string(), "100.64.0.1");
         assert_eq!(status.peers[0].id, "peer-one");
-        assert_eq!(status.peers[1].os, "macOS");
+        assert_eq!(status.peers[1].operating_system, OperatingSystem::Macos);
     }
 
     #[test]
