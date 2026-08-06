@@ -4,8 +4,6 @@
 //! authentication preflight, remote service state, mux reconnect, and presentation remain with the
 //! Console orchestrator.
 
-mod model;
 mod relay;
 
-pub(crate) use model::{RelayEpochFailure, RelayTarget};
-pub(crate) use relay::{RelayEpochProvider, SshRelay};
+pub(crate) use relay::{PreparedRelayEpoch, RelayEpochFailure, RelayEpochProvider, SshRelay};

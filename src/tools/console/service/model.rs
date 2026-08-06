@@ -3,6 +3,70 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use wezterm_codec::BuildIdentity;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ConsoleRecovery {
+    AuthenticateTailscale,
+    InstallTailscale,
+    StartTailscale,
+    RestoreTailscaleAccess,
+    UpdateTailscale,
+    BringPeerOnline,
+    RetryWithUnixUser { machine: String },
+    AuthenticateSsh,
+    InspectAndRetry,
+    UpdateRemoteKit,
+    InstallKit,
+    RunSetup,
+    RestoreServiceManager,
+    RemoveForeignServiceDefinition,
+    InspectServiceLog,
+    RemoveRejectedSocket,
+    CloseSessions,
+    Retry,
+}
+
+impl std::fmt::Display for ConsoleRecovery {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let text = match self {
+            Self::AuthenticateTailscale => "tailscale login".to_owned(),
+            Self::InstallTailscale => "install the Tailscale CLI and retry".to_owned(),
+            Self::StartTailscale => "start Tailscale and retry".to_owned(),
+            Self::RestoreTailscaleAccess => {
+                "restore access to the local Tailscale daemon and retry".to_owned()
+            }
+            Self::UpdateTailscale => "update Tailscale and retry".to_owned(),
+            Self::BringPeerOnline => "bring the machine online and retry".to_owned(),
+            Self::RetryWithUnixUser { machine } => format!("retry as USER@{machine}"),
+            Self::AuthenticateSsh => "open the link, authenticate, then retry".to_owned(),
+            Self::InspectAndRetry => {
+                "inspect the details, correct the failing layer, and retry".to_owned()
+            }
+            Self::UpdateRemoteKit => "update Kit on the machine and run setup again".to_owned(),
+            Self::InstallKit => "install Kit and configure Console".to_owned(),
+            Self::RunSetup => "kit console setup".to_owned(),
+            Self::RestoreServiceManager => {
+                "restore the logged-in user service manager, then run kit console status".to_owned()
+            }
+            Self::RemoveForeignServiceDefinition => {
+                "remove the foreign service definition, then run kit console setup".to_owned()
+            }
+            Self::InspectServiceLog => {
+                "inspect the Console service log, then run kit console setup".to_owned()
+            }
+            Self::RemoveRejectedSocket => {
+                "stop Console, remove only the rejected owned socket, and run setup".to_owned()
+            }
+            Self::CloseSessions => {
+                "close the active sessions, then run kit console setup again".to_owned()
+            }
+            Self::Retry => {
+                "wait for the current Console operation to finish, then retry".to_owned()
+            }
+        };
+        formatter.write_str(&text)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ConsoleServicePlatform {
@@ -33,6 +97,7 @@ pub enum NativeServiceState {
 #[serde(rename_all = "kebab-case")]
 pub enum RemoteFailureKind {
     OpenSshUnavailable,
+    HostKeyMismatch,
     Transport,
     RemoteCommand,
     EmptyOutput,
@@ -41,107 +106,106 @@ pub enum RemoteFailureKind {
     Supervision,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConsoleStage {
+    Transport,
+    RemoteCommand,
+    Decode,
+    Supervision,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "state", rename_all = "kebab-case")]
 pub enum ConsoleStatus {
-    NeedsTailscaleLogin {
-        action: String,
-    },
+    NeedsTailscaleLogin,
     TailscaleCliUnavailable {
         detail: String,
-        action: String,
     },
     TailscaleDaemonUnavailable {
         detail: String,
-        action: String,
     },
     TailscalePermissionDenied {
         detail: String,
-        action: String,
     },
     TailscaleUnsupported {
         detail: String,
-        action: String,
     },
     PeerOffline {
         machine: String,
-        action: String,
     },
     NeedsUnixUser {
         machine: String,
         stable_node_id: String,
-        action: String,
     },
     NeedsSshAuthentication {
         machine: String,
         url: String,
-        action: String,
     },
     RemoteFailure {
         machine: String,
+        stage: ConsoleStage,
         kind: RemoteFailureKind,
         detail: String,
-        action: String,
+    },
+    KitUnavailable {
+        machine: String,
     },
     NotInstalled {
         platform: ConsoleServicePlatform,
-        action: String,
     },
     Stopped {
         platform: ConsoleServicePlatform,
-        action: String,
     },
     ServiceFailed {
         platform: ConsoleServicePlatform,
         detail: String,
-        action: String,
     },
     ServiceUnavailable {
         platform: ConsoleServicePlatform,
         detail: String,
-        action: String,
     },
     WrongOwner {
         platform: ConsoleServicePlatform,
         path: PathBuf,
         expected_uid: u32,
         actual_uid: u32,
-        action: String,
     },
     SocketMissing {
         platform: ConsoleServicePlatform,
         path: PathBuf,
-        action: String,
     },
     SocketStale {
         platform: ConsoleServicePlatform,
         path: PathBuf,
         detail: String,
-        action: String,
     },
     SocketRejected {
         platform: ConsoleServicePlatform,
         path: PathBuf,
         detail: String,
-        action: String,
     },
     CodecIncompatible {
         platform: ConsoleServicePlatform,
         server_version: String,
         server_codec: usize,
-        action: String,
     },
     BuildIncompatible {
         platform: ConsoleServicePlatform,
         sessions: Option<usize>,
         expected: BuildIdentity,
         actual: BuildIdentity,
-        action: String,
+    },
+    ActivationDeferred {
+        platform: ConsoleServicePlatform,
+        sessions: usize,
+    },
+    RepairBusy {
+        platform: ConsoleServicePlatform,
     },
     MuxUnavailable {
         platform: ConsoleServicePlatform,
         detail: String,
-        action: String,
     },
     Ready {
         platform: ConsoleServicePlatform,
@@ -156,100 +220,136 @@ impl ConsoleStatus {
     }
 
     pub fn text(&self) -> String {
-        match self {
-            Self::NeedsTailscaleLogin { action } => {
-                format!("Tailscale authentication required\nnext: {action}")
+        let fact = match self {
+            Self::NeedsTailscaleLogin => "Tailscale authentication required".to_owned(),
+            Self::TailscaleCliUnavailable { detail } => {
+                format!("Tailscale CLI unavailable\n{detail}")
             }
-            Self::TailscaleCliUnavailable { detail, action } => {
-                format!("Tailscale CLI unavailable\n{detail}\nnext: {action}")
+            Self::TailscaleDaemonUnavailable { detail } => {
+                format!("Tailscale daemon unavailable\n{detail}")
             }
-            Self::TailscaleDaemonUnavailable { detail, action } => {
-                format!("Tailscale daemon unavailable\n{detail}\nnext: {action}")
+            Self::TailscalePermissionDenied { detail } => {
+                format!("Tailscale permission denied\n{detail}")
             }
-            Self::TailscalePermissionDenied { detail, action } => {
-                format!("Tailscale permission denied\n{detail}\nnext: {action}")
+            Self::TailscaleUnsupported { detail } => {
+                format!("unsupported Tailscale state\n{detail}")
             }
-            Self::TailscaleUnsupported { detail, action } => {
-                format!("unsupported Tailscale state\n{detail}\nnext: {action}")
+            Self::PeerOffline { machine } => format!("offline — {machine}"),
+            Self::NeedsUnixUser { machine, stable_node_id } => {
+                format!("Unix user required — {machine} ({stable_node_id})")
             }
-            Self::PeerOffline { machine, action } => {
-                format!("offline — {machine}\nnext: {action}")
+            Self::NeedsSshAuthentication { machine, url } => {
+                format!("SSH authentication required — {machine}\n{url}")
             }
-            Self::NeedsUnixUser { machine, stable_node_id, action } => format!(
-                "Unix user required — {machine} ({stable_node_id})\nnext: {action}"
-            ),
-            Self::NeedsSshAuthentication { machine, url, action } => {
-                format!("SSH authentication required — {machine}\n{url}\nnext: {action}")
+            Self::RemoteFailure { machine, kind, detail, .. } => {
+                format!("{} — {machine}\n{detail}", kind.label())
             }
-            Self::RemoteFailure { machine, kind, detail, action } => {
-                format!(
-                    "{} — {machine}\n{detail}\nnext: {action}",
-                    kind.label()
-                )
+            Self::KitUnavailable { machine } => format!("Kit is not installed — {machine}"),
+            Self::NotInstalled { platform } => format!("not installed — {}", platform.label()),
+            Self::Stopped { platform } => format!("stopped — {}", platform.label()),
+            Self::ServiceFailed { platform, detail } => {
+                format!("failed — {}\n{detail}", platform.label())
             }
-            Self::NotInstalled { platform, action } => {
-                format!("not installed — {}\nnext: {action}", platform.label())
+            Self::ServiceUnavailable { platform, detail } => {
+                format!("unavailable — {}\n{detail}", platform.label())
             }
-            Self::Stopped { platform, action } => {
-                format!("stopped — {}\nnext: {action}", platform.label())
-            }
-            Self::ServiceFailed { platform, detail, action } => {
-                format!("failed — {}\n{detail}\nnext: {action}", platform.label())
-            }
-            Self::ServiceUnavailable { platform, detail, action } => {
-                format!("unavailable — {}\n{detail}\nnext: {action}", platform.label())
-            }
-            Self::WrongOwner { platform, path, expected_uid, actual_uid, action } => format!(
-                "rejected — {}\n{} is owned by uid {actual_uid}; expected uid {expected_uid}\nnext: {action}",
+            Self::WrongOwner { platform, path, expected_uid, actual_uid } => format!(
+                "rejected — {}\n{} is owned by uid {actual_uid}; expected uid {expected_uid}",
                 platform.label(),
                 path.display()
             ),
-            Self::SocketMissing { platform, path, action } => format!(
-                "starting — {}\nagent socket {} is missing\nnext: {action}",
+            Self::SocketMissing { platform, path } => format!(
+                "starting — {}\nagent socket {} is missing",
                 platform.label(),
                 path.display()
             ),
-            Self::SocketStale { platform, path, detail, action } => format!(
-                "stale — {} is stopped\nowned socket {} remains\n{detail}\nnext: {action}",
+            Self::SocketStale { platform, path, detail } => format!(
+                "stale — {} is stopped\nowned socket {} remains\n{detail}",
                 platform.label(),
                 path.display()
             ),
-            Self::SocketRejected { platform, path, detail, action } => format!(
-                "rejected — {}\nagent socket {}: {detail}\nnext: {action}",
+            Self::SocketRejected { platform, path, detail } => format!(
+                "rejected — {}\nagent socket {}: {detail}",
                 platform.label(),
                 path.display()
             ),
-            Self::CodecIncompatible {
-                platform,
-                server_version,
-                server_codec,
-                action,
-            } => format!(
-                "incompatible — {}\nserver {server_version} uses codec {server_codec}\nnext: {action}",
+            Self::CodecIncompatible { platform, server_version, server_codec } => format!(
+                "incompatible — {}\nserver {server_version} uses codec {server_codec}",
                 platform.label()
             ),
-            Self::BuildIncompatible {
-                platform,
-                sessions,
-                expected,
-                actual,
-                action,
-            } => {
+            Self::BuildIncompatible { platform, sessions, expected, actual } => {
                 let sessions = sessions
                     .map(|sessions| format!("\nactive sessions: {sessions}"))
                     .unwrap_or_default();
                 format!(
-                    "update required — {}{sessions}\nexpected {expected:?}\nactual   {actual:?}\nnext: {action}",
+                    "update required — {}{sessions}\nexpected {expected:?}\nactual   {actual:?}",
                     platform.label()
                 )
             }
-            Self::MuxUnavailable { platform, detail, action } => {
-                format!("unavailable — {} mux\n{detail}\nnext: {action}", platform.label())
+            Self::ActivationDeferred { platform, sessions } => {
+                format!("activation deferred — {}\nactive sessions: {sessions}", platform.label())
+            }
+            Self::RepairBusy { platform } => format!("repair busy — {}", platform.label()),
+            Self::MuxUnavailable { platform, detail } => {
+                format!("unavailable — {} mux\n{detail}", platform.label())
             }
             Self::Ready { platform, sessions, .. } => {
                 let suffix = if *sessions == 1 { "session" } else { "sessions" };
                 format!("ready — {} — {sessions} {suffix}", platform.label())
             }
+        };
+        match self.recovery() {
+            Some(recovery) => format!("{fact}\nnext: {recovery}"),
+            None => fact,
+        }
+    }
+
+    pub(crate) fn recovery(&self) -> Option<ConsoleRecovery> {
+        match self {
+            Self::NeedsTailscaleLogin => Some(ConsoleRecovery::AuthenticateTailscale),
+            Self::TailscaleCliUnavailable { .. } => Some(ConsoleRecovery::InstallTailscale),
+            Self::TailscaleDaemonUnavailable { .. } => Some(ConsoleRecovery::StartTailscale),
+            Self::TailscalePermissionDenied { .. } => Some(ConsoleRecovery::RestoreTailscaleAccess),
+            Self::TailscaleUnsupported { .. } => Some(ConsoleRecovery::UpdateTailscale),
+            Self::PeerOffline { .. } => Some(ConsoleRecovery::BringPeerOnline),
+            Self::NeedsUnixUser { machine, .. } => {
+                Some(ConsoleRecovery::RetryWithUnixUser { machine: machine.clone() })
+            }
+            Self::NeedsSshAuthentication { .. } => Some(ConsoleRecovery::AuthenticateSsh),
+            Self::RemoteFailure {
+                kind:
+                    RemoteFailureKind::HostKeyMismatch
+                    | RemoteFailureKind::Transport
+                    | RemoteFailureKind::Timeout,
+                ..
+            } => Some(ConsoleRecovery::BringPeerOnline),
+            Self::RemoteFailure {
+                kind:
+                    RemoteFailureKind::RemoteCommand
+                    | RemoteFailureKind::EmptyOutput
+                    | RemoteFailureKind::Decode,
+                ..
+            } => Some(ConsoleRecovery::RunSetup),
+            Self::RemoteFailure { .. } => Some(ConsoleRecovery::InspectAndRetry),
+            Self::KitUnavailable { .. } => Some(ConsoleRecovery::InstallKit),
+            Self::NotInstalled { .. }
+            | Self::Stopped { .. }
+            | Self::ServiceFailed { .. }
+            | Self::SocketMissing { .. }
+            | Self::SocketStale { .. } => Some(ConsoleRecovery::RunSetup),
+            Self::ServiceUnavailable { .. } => Some(ConsoleRecovery::RestoreServiceManager),
+            Self::WrongOwner { .. } => Some(ConsoleRecovery::RemoveForeignServiceDefinition),
+            Self::SocketRejected { .. } => Some(ConsoleRecovery::RemoveRejectedSocket),
+            Self::CodecIncompatible { .. } => Some(ConsoleRecovery::InspectServiceLog),
+            Self::BuildIncompatible { sessions: Some(0), .. } => {
+                Some(ConsoleRecovery::UpdateRemoteKit)
+            }
+            Self::BuildIncompatible { .. } | Self::ActivationDeferred { .. } => {
+                Some(ConsoleRecovery::CloseSessions)
+            }
+            Self::RepairBusy { .. } => Some(ConsoleRecovery::Retry),
+            Self::MuxUnavailable { .. } => Some(ConsoleRecovery::RunSetup),
+            Self::Ready { .. } => None,
         }
     }
 }
@@ -258,6 +358,7 @@ impl RemoteFailureKind {
     pub const fn label(self) -> &'static str {
         match self {
             Self::OpenSshUnavailable => "OpenSSH unavailable",
+            Self::HostKeyMismatch => "remote host key changed",
             Self::Transport => "connection failed",
             Self::RemoteCommand => "remote command failed",
             Self::EmptyOutput => "remote command returned no status",
@@ -288,9 +389,9 @@ mod tests {
     fn remote_failure_wire_state_preserves_the_failing_layer_and_evidence() {
         let status = ConsoleStatus::RemoteFailure {
             machine: "tvxm".to_owned(),
+            stage: super::ConsoleStage::RemoteCommand,
             kind: RemoteFailureKind::RemoteCommand,
             detail: "Decode limit exceeded".to_owned(),
-            action: "repair Console".to_owned(),
         };
         let encoded = serde_json::to_string(&status).unwrap();
         let decoded = serde_json::from_str::<ConsoleStatus>(&encoded).unwrap();

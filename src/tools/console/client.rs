@@ -28,7 +28,7 @@ use wezterm_mux::tab::PaneNode;
 use wezterm_mux::{Mux, DEFAULT_WORKSPACE};
 use wezterm_term::{
     Line, MouseButton as WeztermMouseButton, MouseEvent as WeztermMouseEvent,
-    MouseEventKind as WeztermMouseEventKind, TerminalSize,
+    MouseEventKind as WeztermMouseEventKind, StableRowIndex, TerminalSize,
 };
 
 use super::activity::{self, ActivityTracker, AgentEvidence, AgentPresentation};
@@ -98,6 +98,7 @@ pub struct SessionView {
 pub struct TerminalView {
     pub pane_id: usize,
     pub title: String,
+    pub first_row: StableRowIndex,
     pub cols: usize,
     pub rows: usize,
     pub cursor_x: usize,
@@ -117,6 +118,7 @@ pub struct ConsoleSnapshot {
 pub(super) struct ActivityRefresh {
     pub changed: bool,
     pub revisit: bool,
+    pub ready: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -154,17 +156,17 @@ pub(crate) fn unix_domain() -> Result<UnixDomain> {
     })
 }
 
-pub(crate) fn local_connection_owner() -> Result<ConnectionOwner> {
-    ConnectionOwner::start(ClientDomainConfig::Unix(unix_domain()?))
+pub(crate) fn connection_owner() -> Result<ConnectionOwner> {
+    ConnectionOwner::start()
 }
 
-pub(crate) fn remote_connection_owner(socket_path: PathBuf) -> Result<ConnectionOwner> {
-    ConnectionOwner::start(ClientDomainConfig::Unix(UnixDomain {
+fn remote_domain(socket_path: PathBuf) -> ClientDomainConfig {
+    ClientDomainConfig::Unix(UnixDomain {
         name: "kit-console-remote".to_owned(),
         socket_path: Some(socket_path),
         no_serve_automatically: true,
         ..Default::default()
-    }))
+    })
 }
 
 fn validate_owned_private_socket(path: &Path, metadata: &Metadata) -> Result<()> {
@@ -290,8 +292,14 @@ impl ConsoleClient {
     pub(crate) async fn connect(owner: &ConnectionOwner) -> Result<Self> {
         match probe_console_socket()? {
             ConsoleSocketProbe::Ready => {
-                Self::connect_once(owner, Some(super::build_identity()?), CONNECT_TIMEOUT, None)
-                    .await
+                Self::connect_once(
+                    owner,
+                    ClientDomainConfig::Unix(unix_domain()?),
+                    Some(super::build_identity()?),
+                    CONNECT_TIMEOUT,
+                    None,
+                )
+                .await
             }
             ConsoleSocketProbe::Missing { .. } => bail!("the local Console agent is not running"),
             ConsoleSocketProbe::WrongOwner { path, expected_uid, actual_uid } => bail!(
@@ -307,7 +315,14 @@ impl ConsoleClient {
     pub(crate) async fn connect_for_service_management(owner: &ConnectionOwner) -> Result<Self> {
         match probe_console_socket()? {
             ConsoleSocketProbe::Ready => {
-                Self::connect_once(owner, None, CONNECT_TIMEOUT, None).await
+                Self::connect_once(
+                    owner,
+                    ClientDomainConfig::Unix(unix_domain()?),
+                    None,
+                    CONNECT_TIMEOUT,
+                    None,
+                )
+                .await
             }
             ConsoleSocketProbe::Missing { .. } => bail!("the local Console agent is not running"),
             ConsoleSocketProbe::WrongOwner { path, expected_uid, actual_uid } => bail!(
@@ -322,6 +337,7 @@ impl ConsoleClient {
 
     async fn connect_once(
         owner: &ConnectionOwner,
+        domain: ClientDomainConfig,
         expected_build_identity: Option<wezterm_codec::BuildIdentity>,
         timeout: Duration,
         remote_status: Option<watch::Receiver<Option<super::service::ConsoleStatus>>>,
@@ -329,6 +345,7 @@ impl ConsoleClient {
         let reconnect_attempt_limit = remote_status.as_ref().map(|_| REMOTE_RECONNECT_ATTEMPTS);
         let connection = owner
             .attach(AttachmentPolicy::new(
+                domain,
                 expected_build_identity,
                 timeout,
                 reconnect_attempt_limit,
@@ -360,10 +377,12 @@ impl ConsoleClient {
 
     pub(crate) async fn connect_to_relay(
         owner: &ConnectionOwner,
+        socket_path: PathBuf,
         remote_status: watch::Receiver<Option<super::service::ConsoleStatus>>,
     ) -> Result<Self> {
         Self::connect_once(
             owner,
+            remote_domain(socket_path),
             Some(super::build_identity()?),
             REMOTE_CONNECT_TIMEOUT,
             Some(remote_status),
@@ -392,6 +411,7 @@ impl ConsoleClient {
         let mut tracker = self.activity.lock().unwrap();
         let mut changed = false;
         let mut revisit = false;
+        let mut ready = false;
         let now = Instant::now();
         for session in sessions.iter_mut() {
             let terminal = selected_terminal.filter(|terminal| terminal.pane_id == session.pane_id);
@@ -404,13 +424,14 @@ impl ConsoleClient {
             )?;
             let agent = observation.presentation;
             revisit |= observation.revisit;
+            ready |= matches!(observation.transition, Some(activity::AgentTransition::Ready(_)));
             changed |= session.agent != agent;
             session.agent = agent;
         }
         tracker.retain(|session_id| {
             sessions.binary_search_by_key(&session_id, |session| session.id).is_ok()
         });
-        Ok(ActivityRefresh { changed, revisit })
+        Ok(ActivityRefresh { changed, revisit, ready })
     }
 
     pub fn project_terminal(&self, remote_pane_id: usize) -> Result<Option<TerminalView>> {
@@ -419,6 +440,10 @@ impl ConsoleClient {
 
     pub fn local_pane_id(&self, remote_pane_id: usize) -> Result<Option<usize>> {
         Ok(self.connection.domain()?.remote_to_local_pane_id(remote_pane_id))
+    }
+
+    pub(super) fn connection_mux(&self) -> Result<Arc<Mux>> {
+        self.connection.mux()
     }
 
     pub async fn create_session(&self, cols: u16, rows: u16) -> Result<SessionId> {
@@ -664,7 +689,7 @@ impl ConsoleClient {
         let Some(local_pane_id) = self.local_pane_id(remote_pane_id)? else {
             return Ok(None);
         };
-        let Some(pane) = Mux::get().get_pane(local_pane_id) else {
+        let Some(pane) = self.connection.mux()?.get_pane(local_pane_id) else {
             return Ok(None);
         };
         let dimensions = pane.get_dimensions();
@@ -678,12 +703,13 @@ impl ConsoleClient {
         // The request is owned and deduplicated by ClientPane; a later snapshot observes it.
         let content_sequence = pane.get_current_seqno();
         let _ = pane.get_changed_since(start..end, content_sequence);
-        let (_, lines) = pane.get_lines(start..end);
+        let (first_row, lines) = pane.get_lines(start..end);
         let cursor = pane.get_cursor_position();
         let cursor_y = cursor.y.saturating_sub(dimensions.physical_top).max(0) as usize;
         Ok(Some(TerminalView {
             pane_id: remote_pane_id,
             title: pane.get_title(),
+            first_row,
             cols: dimensions.cols,
             rows: dimensions.viewport_rows,
             cursor_x: cursor.x,
@@ -742,8 +768,12 @@ impl ConsoleClient {
                 },
             ));
         };
-        let Some(pane) = Mux::get().get_pane(local_pane_id) else {
-            return Ok(activity::ActivityObservation { presentation: None, revisit: false });
+        let Some(pane) = self.connection.mux()?.get_pane(local_pane_id) else {
+            return Ok(activity::ActivityObservation {
+                presentation: None,
+                revisit: false,
+                transition: None,
+            });
         };
         let content_sequence = pane.get_current_seqno();
         let title = pane.get_title();

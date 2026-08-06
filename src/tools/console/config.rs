@@ -15,6 +15,7 @@ use crate::{
 const TOOL: &str = "console";
 const SIDEBAR_WIDTH: SettingId = SettingId("sidebar_width");
 const SIDEBAR_SPLIT_RATIO: &str = "sidebar_split_ratio";
+const READY_NOTIFICATION: SettingId = SettingId("ready_notification");
 const SELECTED_MACHINE: &str = "selected_machine";
 const PREFIX: SettingId = SettingId("prefix");
 const NEW_SESSION: SettingId = SettingId("new_session");
@@ -31,6 +32,7 @@ const WIDE_SIDEBAR: SplitRatio = SplitRatio::new(360);
 pub(super) struct Config {
     store: ConfigStore,
     sidebar_split_ratio: SplitRatio,
+    ready_notification: ReadyNotification,
     keybindings: Keybindings,
     users: BTreeMap<String, String>,
     selected_machine: Option<String>,
@@ -40,6 +42,8 @@ pub(super) struct Config {
 struct Stored {
     #[serde(default = "default_sidebar_split_ratio")]
     sidebar_split_ratio: SplitRatio,
+    #[serde(default = "default_ready_notification")]
+    ready_notification: ReadyNotification,
     #[serde(default)]
     keybindings: Keybindings,
     #[serde(default)]
@@ -52,6 +56,7 @@ impl Default for Stored {
     fn default() -> Self {
         Self {
             sidebar_split_ratio: default_sidebar_split_ratio(),
+            ready_notification: default_ready_notification(),
             keybindings: Keybindings::default(),
             users: BTreeMap::new(),
             selected_machine: None,
@@ -150,6 +155,7 @@ impl Config {
         Ok(Self {
             store,
             sidebar_split_ratio: stored.sidebar_split_ratio,
+            ready_notification: stored.ready_notification,
             keybindings: stored.keybindings,
             users: stored.users,
             selected_machine: stored.selected_machine,
@@ -162,6 +168,10 @@ impl Config {
 
     pub(super) const fn keybindings(&self) -> &Keybindings {
         &self.keybindings
+    }
+
+    pub(super) const fn ready_notification(&self) -> ReadyNotification {
+        self.ready_notification
     }
 
     pub(super) fn store(&self) -> ConfigStore {
@@ -227,6 +237,46 @@ impl Config {
     fn set_sidebar_width(&mut self, width: SidebarWidth) -> Result<()> {
         self.set_sidebar_split_ratio(width.ratio())
     }
+
+    fn set_ready_notification(&mut self, notification: ReadyNotification) -> Result<()> {
+        self.store.set(
+            TOOL,
+            READY_NOTIFICATION.0,
+            ConfigValue::String(notification.as_str().to_owned()),
+        )?;
+        self.ready_notification = notification;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(super) enum ReadyNotification {
+    Off,
+    TerminalBell,
+}
+
+impl ReadyNotification {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::TerminalBell => "terminal-bell",
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::TerminalBell => "Terminal bell",
+        }
+    }
+
+    const fn toggled(self) -> Self {
+        match self {
+            Self::Off => Self::TerminalBell,
+            Self::TerminalBell => Self::Off,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -288,6 +338,12 @@ impl EditableSettings for Config {
                     "Choose the initial sidebar width; divider dragging saves the exact ratio.",
                 selected: self.sidebar_width().label(),
             },
+            SettingField::Choice {
+                id: READY_NOTIFICATION,
+                label: "Ready notification",
+                description: "Ring the viewing terminal once when an agent finishes working.",
+                selected: self.ready_notification.label(),
+            },
             keybinding_field(
                 PREFIX,
                 "Prefix",
@@ -339,6 +395,13 @@ impl EditableSettings for Config {
                 self.set_sidebar_split_ratio(default_sidebar_split_ratio())
             }
             (
+                READY_NOTIFICATION,
+                SettingEdit::Activate | SettingEdit::Next | SettingEdit::Previous,
+            ) => self.set_ready_notification(self.ready_notification.toggled()),
+            (READY_NOTIFICATION, SettingEdit::Reset) => {
+                self.set_ready_notification(default_ready_notification())
+            }
+            (
                 PREFIX | NEW_SESSION | TOGGLE_SESSIONS | COMMAND_PALETTE | HELP | QUIT,
                 SettingEdit::SetKeybinding(value),
             ) => self.set_keybinding(id, value.parse()?),
@@ -377,6 +440,10 @@ pub(super) fn settings() -> SettingsSection {
 
 const fn default_sidebar_split_ratio() -> SplitRatio {
     BALANCED_SIDEBAR
+}
+
+const fn default_ready_notification() -> ReadyNotification {
+    ReadyNotification::TerminalBell
 }
 
 fn default_prefix() -> KeyChord {
@@ -426,6 +493,7 @@ mod tests {
 
         assert_eq!(config.sidebar_split_ratio(), SplitRatio::new(260));
         assert_eq!(config.sidebar_width(), SidebarWidth::Balanced);
+        assert_eq!(config.ready_notification(), ReadyNotification::TerminalBell);
         assert_eq!(config.keybindings().prefix.to_string(), "Ctrl+B");
         assert_eq!(config.keybindings().new_session.to_string(), "n");
         assert_eq!(config.keybindings().command_palette.to_string(), "Ctrl+P");
@@ -541,6 +609,25 @@ mod tests {
     }
 
     #[test]
+    fn ready_notification_can_be_disabled_and_reset() -> Result<()> {
+        let store = store();
+        let mut config = Config::load(store.clone())?;
+
+        config.edit(READY_NOTIFICATION, SettingEdit::Next)?;
+        assert_eq!(config.ready_notification(), ReadyNotification::Off);
+        assert!(std::fs::read_to_string(store.path(TOOL))?.contains("ready_notification = \"off\""));
+
+        let reloaded = Config::load(store.clone())?;
+        assert_eq!(reloaded.ready_notification(), ReadyNotification::Off);
+
+        config.edit(READY_NOTIFICATION, SettingEdit::Reset)?;
+        assert_eq!(config.ready_notification(), ReadyNotification::TerminalBell);
+
+        cleanup(&store);
+        Ok(())
+    }
+
+    #[test]
     fn invalid_persisted_ratio_is_rejected() -> Result<()> {
         let store = store();
         std::fs::create_dir_all(store.path(TOOL).parent().expect("Console config parent"))?;
@@ -575,13 +662,22 @@ mod tests {
 
         assert_eq!(section.meta.id, TOOL);
         assert_eq!(section.meta.title, "Console");
-        assert_eq!(config.fields().len(), 6);
+        assert_eq!(config.fields().len(), 8);
         assert!(matches!(
             &config.fields()[0],
             SettingField::Choice {
                 id: SIDEBAR_WIDTH,
                 label: "Sidebar width",
                 selected: "Balanced",
+                ..
+            }
+        ));
+        assert!(matches!(
+            &config.fields()[1],
+            SettingField::Choice {
+                id: READY_NOTIFICATION,
+                label: "Ready notification",
+                selected: "Terminal bell",
                 ..
             }
         ));

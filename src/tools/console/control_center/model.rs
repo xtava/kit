@@ -1,6 +1,10 @@
-use crate::{release::UpdateAvailability, tailscale::Node, tui::ActionId};
+use crate::{
+    release::UpdateAvailability,
+    tailscale::{Node, OperatingSystem},
+    tui::ActionId,
+};
 
-use super::super::service::{ConsoleStatus, RemoteFailureKind};
+use super::super::service::ConsoleStatus;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ControlCenterState {
@@ -21,7 +25,7 @@ pub(crate) enum MachineDiscoveryState {
 pub(crate) struct MachineState {
     pub(crate) identity: MachineIdentity,
     pub(crate) role: MachineRole,
-    pub(crate) operating_system: MachineOperatingSystem,
+    pub(crate) operating_system: OperatingSystem,
     pub(crate) reachability: MachineReachability,
     pub(crate) unix_user: UnixUserState,
     pub(crate) console: ConsoleProbeState,
@@ -40,14 +44,6 @@ pub(crate) struct MachineIdentity {
 pub(crate) enum MachineRole {
     ThisMachine,
     Peer,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum MachineOperatingSystem {
-    Linux,
-    Macos,
-    Unsupported(String),
-    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -126,6 +122,8 @@ pub(crate) enum MachineAction {
     AuthenticateTailscale,
     AuthenticateOpenSsh,
     SetUnixUser,
+    InstallKit,
+    StartConsole,
     SetupOrRepair,
     UpdateKit,
     RestartService,
@@ -135,13 +133,15 @@ pub(crate) enum MachineAction {
 }
 
 impl MachineAction {
-    pub(super) const ALL: [Self; 12] = [
+    pub(super) const ALL: [Self; 14] = [
         Self::Connect,
         Self::NewSession,
         Self::Refresh,
         Self::AuthenticateTailscale,
         Self::AuthenticateOpenSsh,
         Self::SetUnixUser,
+        Self::InstallKit,
+        Self::StartConsole,
         Self::SetupOrRepair,
         Self::UpdateKit,
         Self::RestartService,
@@ -279,7 +279,7 @@ impl MachineState {
                 selector,
             },
             role,
-            operating_system: MachineOperatingSystem::from_tailnet_label(&node.os),
+            operating_system: node.operating_system.clone(),
             reachability: if role == MachineRole::ThisMachine || node.online {
                 MachineReachability::Online
             } else {
@@ -363,7 +363,7 @@ impl MachineState {
                 MachineRole::Peer => "peer",
             }),
             operating_system: (width != MachineRowWidth::Compact)
-                .then(|| self.operating_system.label()),
+                .then(|| self.operating_system.label().to_owned()),
             status,
             sessions: (width != MachineRowWidth::Compact).then_some(sessions).flatten(),
             unix_user: (width == MachineRowWidth::Wide).then(|| self.unix_user.label()),
@@ -384,7 +384,7 @@ impl MachineState {
                 }
                 .to_owned(),
             ),
-            ("Operating system", self.operating_system.label()),
+            ("Operating system", self.operating_system.label().to_owned()),
             ("Status", self.status_label().to_owned()),
             ("Unix user", self.unix_user.label()),
         ];
@@ -393,9 +393,11 @@ impl MachineState {
                 details.push(("Sessions", sessions.to_string()));
                 details.push(("Kit build", build_label(build)));
             }
-            Some(ConsoleStatus::RemoteFailure { detail, action, .. }) => {
+            Some(status @ ConsoleStatus::RemoteFailure { detail, .. }) => {
                 details.push(("Problem", detail.clone()));
-                details.push(("Next step", action.clone()));
+                if let Some(recovery) = status.recovery() {
+                    details.push(("Next step", recovery.to_string()));
+                }
             }
             _ => {}
         }
@@ -445,26 +447,6 @@ impl MachineState {
     }
 }
 
-impl MachineOperatingSystem {
-    fn from_tailnet_label(label: &str) -> Self {
-        match label.to_ascii_lowercase().as_str() {
-            "linux" => Self::Linux,
-            "macos" | "darwin" => Self::Macos,
-            "" => Self::Unknown,
-            _ => Self::Unsupported(label.to_owned()),
-        }
-    }
-
-    fn label(&self) -> String {
-        match self {
-            Self::Linux => "Linux".to_owned(),
-            Self::Macos => "macOS".to_owned(),
-            Self::Unsupported(label) => label.clone(),
-            Self::Unknown => "unknown OS".to_owned(),
-        }
-    }
-}
-
 impl UnixUserState {
     fn label(&self) -> String {
         match self {
@@ -484,6 +466,8 @@ impl MachineAction {
             Self::AuthenticateTailscale => "console.machine.authenticateTailscale",
             Self::AuthenticateOpenSsh => "console.machine.authenticateOpenSsh",
             Self::SetUnixUser => "console.machine.setUnixUser",
+            Self::InstallKit => "console.machine.installKit",
+            Self::StartConsole => "console.machine.startConsole",
             Self::SetupOrRepair => "console.machine.setupOrRepair",
             Self::UpdateKit => "console.machine.updateKit",
             Self::RestartService => "console.machine.restartService",
@@ -536,6 +520,20 @@ impl MachineAction {
                 ActionEffectOwner::ControlCenter,
                 Some(MachineOperation::ConfigureUser),
                 ActionResultKind::RemainInControlCenter,
+            ),
+            Self::InstallKit => (
+                "Install Kit and start Console",
+                ActionKeyboardAccess::Primary,
+                ActionEffectOwner::KitUpdater,
+                Some(MachineOperation::SetupOrRepair),
+                ActionResultKind::ConfirmThenRefresh,
+            ),
+            Self::StartConsole => (
+                "Start Console",
+                ActionKeyboardAccess::Primary,
+                ActionEffectOwner::ConsoleService,
+                Some(MachineOperation::SetupOrRepair),
+                ActionResultKind::ConfirmThenRefresh,
             ),
             Self::SetupOrRepair => (
                 "Setup or repair Console",
@@ -595,48 +593,47 @@ impl MachineAction {
 }
 
 fn primary_action_for_status(status: &ConsoleStatus) -> MachineAction {
-    match status {
-        ConsoleStatus::Ready { .. } => MachineAction::Connect,
-        ConsoleStatus::NeedsTailscaleLogin { .. } => MachineAction::AuthenticateTailscale,
-        ConsoleStatus::NeedsUnixUser { .. } => MachineAction::SetUnixUser,
-        ConsoleStatus::NeedsSshAuthentication { .. } => MachineAction::AuthenticateOpenSsh,
-        ConsoleStatus::PeerOffline { .. }
-        | ConsoleStatus::TailscaleCliUnavailable { .. }
-        | ConsoleStatus::TailscaleDaemonUnavailable { .. }
-        | ConsoleStatus::TailscalePermissionDenied { .. }
-        | ConsoleStatus::TailscaleUnsupported { .. } => MachineAction::Refresh,
-        ConsoleStatus::RemoteFailure {
-            kind: RemoteFailureKind::Transport | RemoteFailureKind::Timeout,
-            ..
-        } => MachineAction::Refresh,
-        ConsoleStatus::RemoteFailure {
-            kind:
-                RemoteFailureKind::RemoteCommand
-                | RemoteFailureKind::EmptyOutput
-                | RemoteFailureKind::Decode,
-            ..
-        } => MachineAction::SetupOrRepair,
-        ConsoleStatus::RemoteFailure { .. } => MachineAction::ShowDetails,
-        ConsoleStatus::BuildIncompatible { sessions: Some(0), .. } => MachineAction::UpdateKit,
-        ConsoleStatus::CodecIncompatible { .. } | ConsoleStatus::BuildIncompatible { .. } => {
-            MachineAction::ShowDetails
+    use super::super::service::ConsoleRecovery;
+
+    match status.recovery() {
+        None => MachineAction::Connect,
+        Some(ConsoleRecovery::AuthenticateTailscale) => MachineAction::AuthenticateTailscale,
+        Some(ConsoleRecovery::RetryWithUnixUser { .. }) => MachineAction::SetUnixUser,
+        Some(ConsoleRecovery::AuthenticateSsh) => MachineAction::AuthenticateOpenSsh,
+        Some(
+            ConsoleRecovery::InstallTailscale
+            | ConsoleRecovery::StartTailscale
+            | ConsoleRecovery::RestoreTailscaleAccess
+            | ConsoleRecovery::UpdateTailscale
+            | ConsoleRecovery::BringPeerOnline
+            | ConsoleRecovery::Retry,
+        ) => MachineAction::Refresh,
+        Some(ConsoleRecovery::InstallKit) => MachineAction::InstallKit,
+        Some(ConsoleRecovery::UpdateRemoteKit) => MachineAction::UpdateKit,
+        Some(
+            ConsoleRecovery::RunSetup
+            | ConsoleRecovery::RestoreServiceManager
+            | ConsoleRecovery::RemoveForeignServiceDefinition
+            | ConsoleRecovery::RemoveRejectedSocket,
+        ) => {
+            if matches!(status, ConsoleStatus::Stopped { .. }) {
+                MachineAction::StartConsole
+            } else {
+                MachineAction::SetupOrRepair
+            }
         }
-        ConsoleStatus::NotInstalled { .. }
-        | ConsoleStatus::Stopped { .. }
-        | ConsoleStatus::ServiceFailed { .. }
-        | ConsoleStatus::ServiceUnavailable { .. }
-        | ConsoleStatus::WrongOwner { .. }
-        | ConsoleStatus::SocketMissing { .. }
-        | ConsoleStatus::SocketStale { .. }
-        | ConsoleStatus::SocketRejected { .. }
-        | ConsoleStatus::MuxUnavailable { .. } => MachineAction::SetupOrRepair,
+        Some(
+            ConsoleRecovery::InspectAndRetry
+            | ConsoleRecovery::InspectServiceLog
+            | ConsoleRecovery::CloseSessions,
+        ) => MachineAction::ShowDetails,
     }
 }
 
 fn status_label(status: &ConsoleStatus) -> &'static str {
     match status {
         ConsoleStatus::Ready { .. } => "ready",
-        ConsoleStatus::NeedsTailscaleLogin { .. } => "login required",
+        ConsoleStatus::NeedsTailscaleLogin => "login required",
         ConsoleStatus::TailscaleCliUnavailable { .. } => "Tailscale unavailable",
         ConsoleStatus::TailscaleDaemonUnavailable { .. } => "Tailscale stopped",
         ConsoleStatus::TailscalePermissionDenied { .. } => "permission denied",
@@ -645,6 +642,7 @@ fn status_label(status: &ConsoleStatus) -> &'static str {
         ConsoleStatus::NeedsUnixUser { .. } => "user required",
         ConsoleStatus::NeedsSshAuthentication { .. } => "SSH login required",
         ConsoleStatus::RemoteFailure { kind, .. } => kind.label(),
+        ConsoleStatus::KitUnavailable { .. } => "setup required",
         ConsoleStatus::NotInstalled { .. } => "setup required",
         ConsoleStatus::Stopped { .. } => "stopped",
         ConsoleStatus::ServiceFailed { .. } => "service failed",
@@ -655,6 +653,8 @@ fn status_label(status: &ConsoleStatus) -> &'static str {
         ConsoleStatus::SocketRejected { .. } => "socket rejected",
         ConsoleStatus::CodecIncompatible { .. } => "update required",
         ConsoleStatus::BuildIncompatible { .. } => "different build",
+        ConsoleStatus::ActivationDeferred { .. } => "activation deferred",
+        ConsoleStatus::RepairBusy { .. } => "repair busy",
         ConsoleStatus::MuxUnavailable { .. } => "terminal unavailable",
     }
 }

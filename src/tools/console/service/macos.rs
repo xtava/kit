@@ -7,6 +7,7 @@ use std::{
         fs::{MetadataExt, PermissionsExt},
     },
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use anyhow::{bail, Context, Result};
@@ -25,6 +26,8 @@ const LABEL: &str = "io.xtava.kit.console.agent";
 const PLIST_FILE: &str = "io.xtava.kit.console.agent.plist";
 const LAUNCHCTL: &str = "/bin/launchctl";
 const PLUTIL: &str = "/usr/bin/plutil";
+const UNREGISTER_TIMEOUT: Duration = Duration::from_secs(5);
+const UNREGISTER_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug)]
 struct EffectiveUser {
@@ -224,19 +227,7 @@ pub async fn stop(processes: &ProcessSupervisor) -> Result<()> {
             command_detail(&disable.stdout, &disable.stderr)
         );
     }
-    let output = launchctl(
-        processes,
-        "stop Console macOS LaunchAgent",
-        [OsString::from("bootout"), target(&user)],
-    )
-    .await?;
-    if output.success || missing_service(&command_detail(&output.stdout, &output.stderr)) {
-        return Ok(());
-    }
-    bail!(
-        "stop Console macOS LaunchAgent failed: {}",
-        command_detail(&output.stdout, &output.stderr)
-    )
+    bootout_if_registered(processes, &user).await
 }
 
 async fn launchctl(
@@ -482,13 +473,39 @@ async fn bootout_if_registered(processes: &ProcessSupervisor, user: &EffectiveUs
         [OsString::from("bootout"), target(user)],
     )
     .await?;
-    if output.success || missing_service(&command_detail(&output.stdout, &output.stderr)) {
+    if !output.success && !missing_service(&command_detail(&output.stdout, &output.stderr)) {
+        bail!(
+            "unregister existing Console macOS LaunchAgent failed: {}",
+            command_detail(&output.stdout, &output.stderr)
+        );
+    }
+    if !output.success {
         return Ok(());
     }
-    bail!(
-        "unregister existing Console macOS LaunchAgent failed: {}",
-        command_detail(&output.stdout, &output.stderr)
-    )
+
+    let started = tokio::time::Instant::now();
+    loop {
+        let inspection = launchctl(
+            processes,
+            "confirm Console macOS LaunchAgent unregistration",
+            [OsString::from("print"), target(user)],
+        )
+        .await?;
+        let detail = command_detail(&inspection.stdout, &inspection.stderr);
+        if !inspection.success && missing_service(&detail) {
+            return Ok(());
+        }
+        if !inspection.success {
+            bail!("confirm Console macOS LaunchAgent unregistration failed: {detail}");
+        }
+        if started.elapsed() >= UNREGISTER_TIMEOUT {
+            bail!(
+                "Console macOS LaunchAgent remained registered for {} seconds after bootout",
+                UNREGISTER_TIMEOUT.as_secs()
+            );
+        }
+        tokio::time::sleep(UNREGISTER_INTERVAL).await;
+    }
 }
 
 async fn validate_plist(processes: &ProcessSupervisor, path: &Path) -> Result<()> {

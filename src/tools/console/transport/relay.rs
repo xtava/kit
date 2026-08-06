@@ -18,22 +18,44 @@ use tokio::{
 };
 
 use crate::framework::process::{
-    CommandSpec, ContainmentRequirement, EnvironmentBase, InputPolicy, OutputPolicy,
-    ProcessByteEvent, ProcessDeadline, ProcessEnvironment, ProcessInputHandle, ProcessLabel,
-    ProcessOutputHandle, ProcessSession, ProcessSpec, ProcessSupervisor, StreamPolicy,
-    TerminationPolicy,
-};
-
-use super::model::{
-    RelayEpochFailure, RelayEpochOutcome, RelayEpochOutcomeKind, RelayTarget, RelayTargetError,
+    CaptureOverflow, CapturePolicy, CommandSpec, ContainmentRequirement, EnvironmentBase,
+    InputPolicy, LeaderExitObservation, OutputPolicy, ProcessByteEvent, ProcessDeadline,
+    ProcessEnvironment, ProcessFailureKind, ProcessInputHandle, ProcessLabel, ProcessOutputHandle,
+    ProcessSession, ProcessSpec, ProcessSupervisor, StreamPolicy, TerminationPolicy,
 };
 
 const COPY_BUFFER_BYTES: usize = 32 * 1024;
 const STREAM_BUDGET: NonZeroUsize = NonZeroUsize::new(256 * 1024).unwrap();
 const TERMINATION_GRACE: Duration = Duration::from_secs(3);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RelayEpochOutcome {
+    epoch: u64,
+    kind: RelayEpochOutcomeKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RelayEpochOutcomeKind {
+    TransportExited { exit: LeaderExitObservation },
+    LocalDisconnected,
+    Cancelled,
+    Failed(RelayEpochFailure),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RelayEpochFailure {
+    Preflight,
+    Start,
+    LocalIo,
+    TransportInput,
+    TransportOutput,
+    Supervision(ProcessFailureKind),
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum SshRelayError {
+    #[error("the initial Console relay preflight failed")]
+    InitialPreflight,
     #[error("prepare private Console relay storage: {0}")]
     Prepare(String),
     #[error("create private Console relay workspace: {0}")]
@@ -56,13 +78,21 @@ pub(crate) enum SshRelayError {
     Accept(#[source] std::io::Error),
     #[error("Console relay owner task failed: {0}")]
     Owner(String),
-    #[error(transparent)]
-    Target(#[from] RelayTargetError),
 }
 
 #[async_trait]
 pub(crate) trait RelayEpochProvider: Send + Sync {
-    async fn prepare(&self) -> Result<RelayTarget, RelayEpochFailure>;
+    async fn prepare(&self) -> Result<PreparedRelayEpoch, RelayEpochFailure>;
+}
+
+pub(crate) struct PreparedRelayEpoch {
+    arguments: Vec<OsString>,
+}
+
+impl PreparedRelayEpoch {
+    pub(crate) fn new(arguments: Vec<OsString>) -> Self {
+        Self { arguments }
+    }
 }
 
 /// One stable, private relay listener whose owner serializes OpenSSH transport epochs.
@@ -80,6 +110,14 @@ struct RelaySocketLease {
 struct RelayListener {
     listener: UnixListener,
     socket: RelaySocketLease,
+}
+
+struct RelayOwner {
+    processes: ProcessSupervisor,
+    provider: Arc<dyn RelayEpochProvider>,
+    initial_epoch: PreparedRelayEpoch,
+    program: OsString,
+    workspace: crate::framework::process::ProcessWorkspace,
 }
 
 impl Drop for RelaySocketLease {
@@ -101,6 +139,8 @@ impl SshRelay {
         provider: Arc<dyn RelayEpochProvider>,
         program: OsString,
     ) -> Result<Self, SshRelayError> {
+        let initial_epoch =
+            provider.prepare().await.map_err(|_| SshRelayError::InitialPreflight)?;
         let prepared =
             processes.prepare().map_err(|error| SshRelayError::Prepare(error.to_string()))?;
         let workspace = prepared
@@ -115,16 +155,14 @@ impl SshRelay {
         let (outcome_sender, outcomes) = watch::channel(None);
         let process_owner = processes.clone();
         let owner = tokio::spawn(async move {
-            run_owner(
-                listener,
-                process_owner,
+            let owner = RelayOwner {
+                processes: process_owner,
                 provider,
+                initial_epoch,
                 program,
                 workspace,
-                cancel_receiver,
-                outcome_sender,
-            )
-            .await
+            };
+            run_owner(listener, owner, cancel_receiver, outcome_sender).await
         });
 
         Ok(Self { socket_path, outcomes, cancel, owner: Some(owner) })
@@ -151,51 +189,47 @@ impl Drop for SshRelay {
 
 async fn run_owner(
     relay: RelayListener,
-    processes: ProcessSupervisor,
-    provider: Arc<dyn RelayEpochProvider>,
-    program: OsString,
-    workspace: crate::framework::process::ProcessWorkspace,
+    owner: RelayOwner,
     mut cancel: watch::Receiver<bool>,
     outcomes: watch::Sender<Option<RelayEpochOutcome>>,
 ) -> Result<(), SshRelayError> {
+    let RelayOwner { processes, provider, initial_epoch, program, workspace } = owner;
     let RelayListener { listener, socket } = relay;
     let working_directory = workspace.as_path().to_owned();
     let _workspace = workspace;
     let _socket = socket;
     let mut epoch = 0u64;
+    let mut initial_epoch = Some(initial_epoch);
     loop {
         let socket = tokio::select! {
             accepted = listener.accept() => accepted.map_err(SshRelayError::Accept)?.0,
             _ = cancelled(&mut cancel) => return Ok(()),
         };
         epoch = epoch.saturating_add(1);
-        let target = match provider.prepare().await {
-            Ok(target) => target,
-            Err(failure) => {
-                outcomes.send_replace(Some(RelayEpochOutcome {
-                    epoch,
-                    kind: RelayEpochOutcomeKind::Failed(failure),
-                }));
-                drop(socket);
-                continue;
-            }
-        };
-        let arguments = match target.ssh_arguments(&["kit", "console", "__bridge"]) {
-            Ok(arguments) => arguments,
-            Err(_) => {
-                outcomes.send_replace(Some(RelayEpochOutcome {
-                    epoch,
-                    kind: RelayEpochOutcomeKind::Failed(RelayEpochFailure::Start),
-                }));
-                drop(socket);
-                continue;
+        let prepared = if let Some(prepared) = initial_epoch.take() {
+            prepared
+        } else {
+            let preparation = tokio::select! {
+                prepared = provider.prepare() => prepared,
+                _ = cancelled(&mut cancel) => return Ok(()),
+            };
+            match preparation {
+                Ok(prepared) => prepared,
+                Err(failure) => {
+                    outcomes.send_replace(Some(RelayEpochOutcome {
+                        epoch,
+                        kind: RelayEpochOutcomeKind::Failed(failure),
+                    }));
+                    drop(socket);
+                    continue;
+                }
             }
         };
         let kind = run_epoch(
             &processes,
             socket,
             program.clone(),
-            arguments.clone(),
+            prepared.arguments,
             &working_directory,
             &mut cancel,
         )
@@ -406,7 +440,10 @@ fn ssh_spec(
         command,
         InputPolicy::Writable,
         OutputPolicy::Stream(StreamPolicy::new(STREAM_BUDGET)),
-        OutputPolicy::Discard,
+        OutputPolicy::Capture(CapturePolicy::new(
+            STREAM_BUDGET,
+            CaptureOverflow::TruncateWithEvidence,
+        )),
         ContainmentRequirement::ExplicitProcessGroup,
         ProcessDeadline::Unlimited,
         TerminationPolicy::new(TERMINATION_GRACE),
@@ -427,7 +464,7 @@ async fn cancelled(receiver: &mut watch::Receiver<bool>) {
 #[cfg(test)]
 mod tests {
     use std::{
-        net::IpAddr,
+        ffi::OsString,
         os::unix::fs::{MetadataExt, PermissionsExt},
         sync::{
             atomic::{AtomicUsize, Ordering},
@@ -439,19 +476,18 @@ mod tests {
     use async_trait::async_trait;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    use super::{RelayEpochFailure, RelayEpochProvider, RelayTarget, SshRelay};
+    use super::{PreparedRelayEpoch, RelayEpochFailure, RelayEpochProvider, SshRelay};
     use crate::framework::process::ProcessSupervisor;
 
     struct StaticTarget {
-        target: RelayTarget,
         preparations: Arc<AtomicUsize>,
     }
 
     #[async_trait]
     impl RelayEpochProvider for StaticTarget {
-        async fn prepare(&self) -> Result<RelayTarget, RelayEpochFailure> {
+        async fn prepare(&self) -> Result<PreparedRelayEpoch, RelayEpochFailure> {
             self.preparations.fetch_add(1, Ordering::AcqRel);
-            Ok(self.target.clone())
+            Ok(PreparedRelayEpoch::new(Vec::<OsString>::new()))
         }
     }
 
@@ -466,10 +502,9 @@ mod tests {
         std::fs::write(&fake_ssh, "#!/bin/sh\ncat\n")?;
         std::fs::set_permissions(&fake_ssh, std::fs::Permissions::from_mode(0o700))?;
         let processes = ProcessSupervisor::for_test(state)?;
-        let target = RelayTarget::new("node-1", "tvx", "100.64.0.2".parse::<IpAddr>()?)?;
         let preparations = Arc::new(AtomicUsize::new(0));
         let provider: Arc<dyn RelayEpochProvider> =
-            Arc::new(StaticTarget { target, preparations: Arc::clone(&preparations) });
+            Arc::new(StaticTarget { preparations: Arc::clone(&preparations) });
         let relay =
             SshRelay::start_with_program(&processes, provider, fake_ssh.into_os_string()).await?;
         let socket_path = relay.socket_path().to_owned();

@@ -17,11 +17,11 @@ pub(super) struct ConsoleInvalidations {
 }
 
 impl ConsoleInvalidations {
-    pub fn subscribe() -> Self {
+    pub fn subscribe(mux: Arc<Mux>) -> Self {
         let (sender, receiver) = mpsc::channel(1);
         let state = Arc::new(InvalidationState::default());
         let subscriber_state = Arc::clone(&state);
-        Mux::get().subscribe(move |notification| {
+        mux.subscribe(move |notification| {
             if subscriber_state.closed.load(Ordering::Acquire) {
                 return false;
             }

@@ -10,14 +10,19 @@ mod connection;
 mod control_center;
 mod interaction;
 mod invalidation;
+mod panels;
 mod perf_trace;
 mod remote;
 mod runtime;
+mod scroll;
 mod service;
 mod transport;
 mod tui;
 
-use std::ffi::{OsStr, OsString};
+use std::{
+    ffi::{OsStr, OsString},
+    sync::Arc,
+};
 
 use anyhow::{bail, Context as _, Result};
 use async_trait::async_trait;
@@ -41,7 +46,7 @@ enum HiddenEntry {
 #[command(name = "console", about = "Persistent terminal sessions across your tailnet")]
 struct ConsoleArgs {
     /// Tailnet machine, or `this-machine` for the direct local path.
-    #[arg(value_name = "MACHINE")]
+    #[arg(value_name = "MACHINE", value_parser = parse_machine_selector)]
     machine: Option<String>,
     /// Create a new session immediately after connecting.
     #[arg(long)]
@@ -57,6 +62,14 @@ enum ConsoleCommand {
         /// Tailnet machine. Omit it to configure this machine.
         machine: Option<String>,
     },
+    /// Restart the native Console service without losing sessions by default.
+    Restart {
+        /// Tailnet machine. Omit it to restart Console on this machine.
+        machine: Option<String>,
+        /// Close every remaining session before restarting the service.
+        #[arg(long)]
+        force: bool,
+    },
     /// Report the native service, socket, and mux state.
     Status {
         /// Tailnet machine. Omit it to inspect this machine.
@@ -70,6 +83,14 @@ enum ConsoleCommand {
         #[arg(long)]
         force: bool,
     },
+}
+
+fn parse_machine_selector(value: &str) -> Result<String, String> {
+    if value == "start" {
+        Err("`console start` was removed; use `console setup`".to_owned())
+    } else {
+        Ok(value.to_owned())
+    }
 }
 
 /// Run the exact hidden agent entry before Kit constructs its ordinary application runtime.
@@ -159,6 +180,7 @@ impl Tool for ConsoleTool {
                         let status =
                             match remote::resolve(&cx.processes, &mut config, &machine).await? {
                                 remote::Resolution::Ready(target) => {
+                                    target.persist_unix_user(&mut config)?;
                                     remote::setup(&cx.processes, &target).await?
                                 }
                                 remote::Resolution::Status(status) => status,
@@ -166,6 +188,22 @@ impl Tool for ConsoleTool {
                         print_status(cx, &status)
                     } else {
                         print_status(cx, &service::setup(&cx.processes).await?)
+                    }
+                }
+                ConsoleCommand::Restart { machine, force } => {
+                    if let Some(machine) = machine {
+                        let mut config = config::Config::load(cx.config.clone())?;
+                        let status =
+                            match remote::resolve(&cx.processes, &mut config, &machine).await? {
+                                remote::Resolution::Ready(target) => {
+                                    target.persist_unix_user(&mut config)?;
+                                    remote::restart(&cx.processes, &target, force).await?
+                                }
+                                remote::Resolution::Status(status) => status,
+                            };
+                        print_status(cx, &status)
+                    } else {
+                        print_status(cx, &service::restart(&cx.processes, force).await?)
                     }
                 }
                 ConsoleCommand::Status { machine } => {
@@ -207,6 +245,7 @@ impl Tool for ConsoleTool {
             bail!("kit console is an interactive TUI and does not emit JSON");
         }
 
+        let connection_owner = Arc::new(client::connection_owner()?);
         if let Some(machine) = args.machine {
             let request = if machine == "this-machine" {
                 control_center::MachineConnectionRequest::Local { create_session: args.new }
@@ -216,15 +255,15 @@ impl Tool for ConsoleTool {
                     create_session: args.new,
                 }
             };
-            let _ = run_connection(cx, request).await?;
+            let _ = run_connection(cx, &connection_owner, request).await?;
             return Ok(());
         }
 
         loop {
             let config = config::Config::load(cx.config.clone())?;
-            match control_center::run(cx, config).await? {
+            match control_center::run(cx, config, Arc::clone(&connection_owner)).await? {
                 control_center::ControlCenterOutcome::Connect(request) => {
-                    match run_connection(cx, request).await? {
+                    match run_connection(cx, &connection_owner, request).await? {
                         control_center::ConnectedSessionOutcome::ReturnToControlCenter => {}
                         control_center::ConnectedSessionOutcome::Quit => return Ok(()),
                     }
@@ -237,13 +276,13 @@ impl Tool for ConsoleTool {
 
 async fn run_connection(
     cx: &Context,
+    connection_owner: &connection::ConnectionOwner,
     request: control_center::MachineConnectionRequest,
 ) -> Result<control_center::ConnectedSessionOutcome> {
     let config = config::Config::load(cx.config.clone())?;
     match request {
         control_center::MachineConnectionRequest::Local { create_session } => {
-            let connection_owner = client::local_connection_owner()?;
-            let client = client::ConsoleClient::connect(&connection_owner).await?;
+            let client = client::ConsoleClient::connect(connection_owner).await?;
             if create_session {
                 client.create_session(120, 32).await?;
             }
@@ -254,7 +293,7 @@ async fn run_connection(
             let mut resolution = remote::resolve(&cx.processes, &mut config, &selector).await?;
             if matches!(
                 &resolution,
-                remote::Resolution::Status(service::ConsoleStatus::NeedsTailscaleLogin { .. })
+                remote::Resolution::Status(service::ConsoleStatus::NeedsTailscaleLogin)
             ) {
                 remote::login(&cx.processes).await?;
                 resolution = remote::resolve(&cx.processes, &mut config, &selector).await?;
@@ -267,10 +306,12 @@ async fn run_connection(
             let relay_socket = relay.socket_path().to_owned();
             let relay_status = relay.status_receiver();
             let result = async {
-                let connection_owner = client::remote_connection_owner(relay_socket)?;
-                let client =
-                    client::ConsoleClient::connect_to_relay(&connection_owner, relay_status)
-                        .await?;
+                let client = client::ConsoleClient::connect_to_relay(
+                    connection_owner,
+                    relay_socket,
+                    relay_status,
+                )
+                .await?;
                 if create_session {
                     client.create_session(120, 32).await?;
                 }
@@ -329,6 +370,21 @@ mod tests {
 
         let stop = ConsoleArgs::try_parse_from(["console", "stop", "--force"]).unwrap();
         assert!(matches!(stop.command, Some(ConsoleCommand::Stop { machine: None, force: true })));
+
+        let restart =
+            ConsoleArgs::try_parse_from(["console", "restart", "tvxm", "--force"]).unwrap();
+        assert!(matches!(
+            restart.command,
+            Some(ConsoleCommand::Restart { machine, force: true }) if machine.as_deref() == Some("tvxm")
+        ));
+
+        let gentle = ConsoleArgs::try_parse_from(["console", "restart"]).unwrap();
+        assert!(matches!(
+            gentle.command,
+            Some(ConsoleCommand::Restart { machine: None, force: false })
+        ));
+
+        assert!(ConsoleArgs::try_parse_from(["console", "start"]).is_err());
     }
 
     #[test]

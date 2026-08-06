@@ -78,6 +78,13 @@ impl Session {
         // The escape bytes desync ratatui's diff buffer; force the next draw to repaint in full.
         self.terminal.clear().context("repaint after clipboard write")
     }
+
+    /// Ring the terminal bell through the same ordered output stream used for TUI frames.
+    pub fn ring_bell(&mut self) -> Result<()> {
+        let backend = self.terminal.backend_mut();
+        backend.write_all(b"\x07").context("write terminal bell")?;
+        backend.flush().context("flush terminal bell")
+    }
 }
 
 impl Drop for Session {

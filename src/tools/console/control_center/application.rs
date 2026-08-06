@@ -19,6 +19,7 @@ use crate::{
 use super::super::{
     build_identity,
     config::{self, Config},
+    connection::ConnectionOwner,
     remote,
     service::{self, ConsoleStatus},
 };
@@ -79,9 +80,14 @@ pub(super) struct ControlCenterApp {
     pub(super) tailscale_login_cancel: Option<tokio::sync::watch::Sender<bool>>,
     pub(super) notice: Option<String>,
     history: NavigationHistory<String>,
+    connection_owner: Arc<ConnectionOwner>,
 }
 
-pub(crate) async fn run(cx: &Context, config: Config) -> Result<ControlCenterOutcome> {
+pub(crate) async fn run(
+    cx: &Context,
+    config: Config,
+    connection_owner: Arc<ConnectionOwner>,
+) -> Result<ControlCenterOutcome> {
     let expected_build = build_identity()?;
     let (update_sender, mut updates) = mpsc::unbounded_channel();
     let mut app = ControlCenterApp {
@@ -101,6 +107,7 @@ pub(crate) async fn run(cx: &Context, config: Config) -> Result<ControlCenterOut
         tailscale_login_cancel: None,
         notice: None,
         history: NavigationHistory::default(),
+        connection_owner,
     };
     app.refresh(cx.processes.clone())?;
 
@@ -336,14 +343,27 @@ impl ControlCenterApp {
             MachineRole::ThisMachine,
             UnixUserState::Current(current_user),
         )];
-        machines.extend(status.peers.iter().map(|node| {
-            let unix_user = self
-                .config
-                .unix_user(&node.id)
-                .map(|user| UnixUserState::Configured(user.to_owned()))
-                .unwrap_or(UnixUserState::Missing);
-            MachineState::from_tailnet_node(node, MachineRole::Peer, unix_user)
-        }));
+        machines.extend(
+            status
+                .peers
+                .iter()
+                .filter(|node| {
+                    node.online
+                        || !status.peers.iter().any(|candidate| {
+                            candidate.online
+                                && candidate.id != node.id
+                                && candidate.host_name.eq_ignore_ascii_case(&node.host_name)
+                        })
+                })
+                .map(|node| {
+                    let unix_user = self
+                        .config
+                        .unix_user(&node.id)
+                        .map(|user| UnixUserState::Configured(user.to_owned()))
+                        .unwrap_or(UnixUserState::Missing);
+                    MachineState::from_tailnet_node(node, MachineRole::Peer, unix_user)
+                }),
+        );
         self.state.machines = machines;
         self.state.selected_machine = selected
             .filter(|selected| {
@@ -373,9 +393,11 @@ impl ControlCenterApp {
         let sender = self.update_sender.clone();
         let local_id = status.local.id.clone();
         let local_processes = processes.clone();
+        let connection_owner = Arc::clone(&self.connection_owner);
         tokio::spawn(async move {
-            let result =
-                service::status(&local_processes).await.map_err(|error| format!("{error:#}"));
+            let result = service::status_with_owner(&local_processes, &connection_owner)
+                .await
+                .map_err(|error| format!("{error:#}"));
             let _ = sender.send(ControlCenterUpdate::ProbeCompleted {
                 generation,
                 stable_node_id: local_id,
@@ -390,7 +412,7 @@ impl ControlCenterApp {
             let Some(user) = self.config.unix_user(&node.id).map(str::to_owned) else {
                 continue;
             };
-            let mut config = self.config.clone();
+            let config = self.config.clone();
             let sender = self.update_sender.clone();
             let processes = processes.clone();
             let semaphore = Arc::clone(&semaphore);
@@ -400,7 +422,8 @@ impl ControlCenterApp {
                         .acquire_owned()
                         .await
                         .map_err(|_| "machine probe coordinator stopped".to_owned())?;
-                    match remote::resolve_node(&mut config, &node, Some(&user))
+                    match remote::resolve_node(&processes, &config, &node, Some(&user))
+                        .await
                         .map_err(|error| format!("{error:#}"))?
                     {
                         remote::Resolution::Ready(target) => remote::status(&processes, &target)
@@ -867,7 +890,9 @@ impl ControlCenterApp {
                 }
                 Ok(None)
             }
-            MachineAction::SetupOrRepair => {
+            MachineAction::InstallKit
+            | MachineAction::StartConsole
+            | MachineAction::SetupOrRepair => {
                 self.start_service_operation(processes, MachineOperation::SetupOrRepair)?;
                 Ok(None)
             }
@@ -914,6 +939,7 @@ impl ControlCenterApp {
         let mut config = self.config.clone();
         let generation = self.generation;
         let sender = self.update_sender.clone();
+        let connection_owner = Arc::clone(&self.connection_owner);
         if let Some(machine) = self
             .state
             .machines
@@ -927,7 +953,7 @@ impl ControlCenterApp {
             let result = async {
                 match role {
                     MachineRole::ThisMachine => {
-                        run_local_service_operation(&processes, operation).await
+                        run_local_service_operation(&processes, &connection_owner, operation).await
                     }
                     MachineRole::Peer => {
                         let target = match remote::resolve(&processes, &mut config, &selector)
@@ -979,11 +1005,12 @@ impl ControlCenterApp {
             let result = async {
                 match role {
                     MachineRole::ThisMachine => {
-                        ReleaseUpdater::new()
-                            .install(false)
+                        let update = ReleaseUpdater::new()
+                            .install_managed(&processes, false)
                             .await
                             .map_err(|error| format!("{error:#}"))?;
-                        service::setup(&processes).await.map_err(|error| format!("{error:#}"))
+                        serde_json::from_slice(&update.console_status)
+                            .map_err(|error| format!("decode updated Console status: {error}"))
                     }
                     MachineRole::Peer => {
                         let target = match remote::resolve(&processes, &mut config, &selector)
@@ -996,7 +1023,7 @@ impl ControlCenterApp {
                         remote::update(&processes, &target)
                             .await
                             .map_err(|error| format!("{error:#}"))?;
-                        remote::setup(&processes, &target)
+                        remote::status(&processes, &target)
                             .await
                             .map_err(|error| format!("{error:#}"))
                     }
@@ -1030,18 +1057,20 @@ impl ControlCenterApp {
 
 async fn run_local_service_operation(
     processes: &ProcessSupervisor,
+    connection_owner: &ConnectionOwner,
     operation: MachineOperation,
 ) -> Result<ConsoleStatus, String> {
     match operation {
-        MachineOperation::SetupOrRepair => {
-            service::setup(processes).await.map_err(|error| format!("{error:#}"))
-        }
-        MachineOperation::Stop => {
-            service::stop(processes, false).await.map_err(|error| format!("{error:#}"))
-        }
+        MachineOperation::SetupOrRepair => service::setup_with_owner(processes, connection_owner)
+            .await
+            .map_err(|error| format!("{error:#}")),
+        MachineOperation::Stop => service::stop_with_owner(processes, connection_owner, false)
+            .await
+            .map_err(|error| format!("{error:#}")),
         MachineOperation::Restart => {
-            service::stop(processes, false).await.map_err(|error| format!("{error:#}"))?;
-            service::setup(processes).await.map_err(|error| format!("{error:#}"))
+            service::restart_with_owner(processes, connection_owner, false)
+                .await
+                .map_err(|error| format!("{error:#}"))
         }
         _ => Err(format!("{} is not a service operation", operation.label())),
     }

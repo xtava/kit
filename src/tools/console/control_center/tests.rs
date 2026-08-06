@@ -1,8 +1,10 @@
 use std::path::PathBuf;
 
 use crate::{
-    tailscale::Node,
-    tools::console::service::{ConsoleServicePlatform, ConsoleStatus, RemoteFailureKind},
+    tailscale::{Node, OperatingSystem},
+    tools::console::service::{
+        ConsoleServicePlatform, ConsoleStage, ConsoleStatus, RemoteFailureKind,
+    },
 };
 
 use super::model::{
@@ -16,7 +18,7 @@ fn peer(online: bool) -> Node {
         id: "node-mac".to_owned(),
         dns_name: "tvxm.tail.example".to_owned(),
         host_name: "tvxm".to_owned(),
-        os: "macOS".to_owned(),
+        operating_system: OperatingSystem::Macos,
         online,
         addresses: vec!["100.64.0.2".parse().unwrap()],
     }
@@ -86,41 +88,22 @@ fn primary_action_covers_every_service_state() {
     let expected = build("0.2.0", &"a".repeat(40), false);
     let actual = build("0.1.0", &"c".repeat(40), false);
     let cases = [
+        (ConsoleStatus::NeedsTailscaleLogin, MachineAction::AuthenticateTailscale),
+        (ConsoleStatus::TailscaleCliUnavailable { detail: String::new() }, MachineAction::Refresh),
         (
-            ConsoleStatus::NeedsTailscaleLogin { action: String::new() },
-            MachineAction::AuthenticateTailscale,
-        ),
-        (
-            ConsoleStatus::TailscaleCliUnavailable { detail: String::new(), action: String::new() },
+            ConsoleStatus::TailscaleDaemonUnavailable { detail: String::new() },
             MachineAction::Refresh,
         ),
         (
-            ConsoleStatus::TailscaleDaemonUnavailable {
-                detail: String::new(),
-                action: String::new(),
-            },
+            ConsoleStatus::TailscalePermissionDenied { detail: String::new() },
             MachineAction::Refresh,
         ),
-        (
-            ConsoleStatus::TailscalePermissionDenied {
-                detail: String::new(),
-                action: String::new(),
-            },
-            MachineAction::Refresh,
-        ),
-        (
-            ConsoleStatus::TailscaleUnsupported { detail: String::new(), action: String::new() },
-            MachineAction::Refresh,
-        ),
-        (
-            ConsoleStatus::PeerOffline { machine: "tvxm".to_owned(), action: String::new() },
-            MachineAction::Refresh,
-        ),
+        (ConsoleStatus::TailscaleUnsupported { detail: String::new() }, MachineAction::Refresh),
+        (ConsoleStatus::PeerOffline { machine: "tvxm".to_owned() }, MachineAction::Refresh),
         (
             ConsoleStatus::NeedsUnixUser {
                 machine: "tvxm".to_owned(),
                 stable_node_id: "node-mac".to_owned(),
-                action: String::new(),
             },
             MachineAction::SetUnixUser,
         ),
@@ -128,43 +111,35 @@ fn primary_action_covers_every_service_state() {
             ConsoleStatus::NeedsSshAuthentication {
                 machine: "tvxm".to_owned(),
                 url: "https://example.test".to_owned(),
-                action: String::new(),
             },
             MachineAction::AuthenticateOpenSsh,
         ),
         (
             ConsoleStatus::RemoteFailure {
                 machine: "tvxm".to_owned(),
+                stage: ConsoleStage::Transport,
                 kind: RemoteFailureKind::Transport,
                 detail: String::new(),
-                action: String::new(),
             },
             MachineAction::Refresh,
         ),
         (
             ConsoleStatus::RemoteFailure {
                 machine: "tvxm".to_owned(),
+                stage: ConsoleStage::Supervision,
                 kind: RemoteFailureKind::Timeout,
                 detail: String::new(),
-                action: String::new(),
             },
             MachineAction::Refresh,
         ),
+        (ConsoleStatus::NotInstalled { platform }, MachineAction::SetupOrRepair),
+        (ConsoleStatus::Stopped { platform }, MachineAction::StartConsole),
         (
-            ConsoleStatus::NotInstalled { platform, action: String::new() },
-            MachineAction::SetupOrRepair,
-        ),
-        (ConsoleStatus::Stopped { platform, action: String::new() }, MachineAction::SetupOrRepair),
-        (
-            ConsoleStatus::ServiceFailed { platform, detail: String::new(), action: String::new() },
+            ConsoleStatus::ServiceFailed { platform, detail: String::new() },
             MachineAction::SetupOrRepair,
         ),
         (
-            ConsoleStatus::ServiceUnavailable {
-                platform,
-                detail: String::new(),
-                action: String::new(),
-            },
+            ConsoleStatus::ServiceUnavailable { platform, detail: String::new() },
             MachineAction::SetupOrRepair,
         ),
         (
@@ -173,30 +148,19 @@ fn primary_action_covers_every_service_state() {
                 path: path.clone(),
                 expected_uid: 1,
                 actual_uid: 2,
-                action: String::new(),
             },
             MachineAction::SetupOrRepair,
         ),
         (
-            ConsoleStatus::SocketMissing { platform, path: path.clone(), action: String::new() },
+            ConsoleStatus::SocketMissing { platform, path: path.clone() },
             MachineAction::SetupOrRepair,
         ),
         (
-            ConsoleStatus::SocketStale {
-                platform,
-                path: path.clone(),
-                detail: String::new(),
-                action: String::new(),
-            },
+            ConsoleStatus::SocketStale { platform, path: path.clone(), detail: String::new() },
             MachineAction::SetupOrRepair,
         ),
         (
-            ConsoleStatus::SocketRejected {
-                platform,
-                path,
-                detail: String::new(),
-                action: String::new(),
-            },
+            ConsoleStatus::SocketRejected { platform, path, detail: String::new() },
             MachineAction::SetupOrRepair,
         ),
         (
@@ -204,28 +168,18 @@ fn primary_action_covers_every_service_state() {
                 platform,
                 server_version: "0.1.0".to_owned(),
                 server_codec: 1,
-                action: String::new(),
             },
             MachineAction::ShowDetails,
         ),
         (
-            ConsoleStatus::BuildIncompatible {
-                platform,
-                sessions: Some(0),
-                expected,
-                actual,
-                action: String::new(),
-            },
+            ConsoleStatus::BuildIncompatible { platform, sessions: Some(0), expected, actual },
             MachineAction::UpdateKit,
         ),
         (
-            ConsoleStatus::MuxUnavailable {
-                platform,
-                detail: String::new(),
-                action: String::new(),
-            },
+            ConsoleStatus::MuxUnavailable { platform, detail: String::new() },
             MachineAction::SetupOrRepair,
         ),
+        (ConsoleStatus::RepairBusy { platform }, MachineAction::Refresh),
         (
             ConsoleStatus::Ready {
                 platform,

@@ -252,6 +252,12 @@ pub struct AgentFingerprint<'a> {
 pub struct ActivityObservation {
     pub presentation: Option<AgentPresentation>,
     pub revisit: bool,
+    pub transition: Option<AgentTransition>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentTransition {
+    Ready(AgentKind),
 }
 
 struct TrackedSession {
@@ -340,8 +346,9 @@ impl ActivityTracker {
 
         let Some(detection) = session.detection else {
             session.agent = None;
-            return ActivityObservation { presentation: None, revisit };
+            return ActivityObservation { presentation: None, revisit, transition: None };
         };
+        let mut transition = None;
         let tracked = session.agent.get_or_insert(TrackedAgent {
             kind: detection.kind,
             activity: detection.activity,
@@ -359,12 +366,12 @@ impl ActivityTracker {
         } else if should_hold_idle(*tracked, detection) {
             tracked.pending_idle_observations = tracked.pending_idle_observations.saturating_add(1);
             if tracked.pending_idle_observations >= CONFIRMED_IDLE_OBSERVATIONS {
-                apply_activity(tracked, detection.activity, selected);
+                transition = apply_activity(tracked, detection.activity, selected);
             } else {
                 revisit = true;
             }
         } else {
-            apply_activity(tracked, detection.activity, selected);
+            transition = apply_activity(tracked, detection.activity, selected);
         }
 
         if selected {
@@ -377,6 +384,7 @@ impl ActivityTracker {
                 seen: tracked.seen,
             }),
             revisit,
+            transition,
         }
     }
 
@@ -392,7 +400,11 @@ fn should_hold_idle(tracked: TrackedAgent, detection: AgentDetection) -> bool {
         && tracked.pending_idle_observations < CONFIRMED_IDLE_OBSERVATIONS
 }
 
-fn apply_activity(tracked: &mut TrackedAgent, activity: AgentActivity, selected: bool) {
+fn apply_activity(
+    tracked: &mut TrackedAgent,
+    activity: AgentActivity,
+    selected: bool,
+) -> Option<AgentTransition> {
     let previous = tracked.activity;
     tracked.activity = activity;
     tracked.pending_idle_observations = 0;
@@ -402,6 +414,8 @@ fn apply_activity(tracked: &mut TrackedAgent, activity: AgentActivity, selected:
         AgentActivity::Idle if previous != AgentActivity::Idle => selected,
         AgentActivity::Idle => tracked.seen || selected,
     };
+    (previous == AgentActivity::Working && activity == AgentActivity::Idle)
+        .then_some(AgentTransition::Ready(tracked.kind))
 }
 
 #[cfg(test)]
@@ -426,20 +440,28 @@ mod tests {
         detection: Option<AgentDetection>,
         selected: bool,
     ) -> Option<AgentPresentation> {
+        observe_result(tracker, session_id, content_sequence, detection, selected).presentation
+    }
+
+    fn observe_result(
+        tracker: &mut ActivityTracker,
+        session_id: SessionId,
+        content_sequence: usize,
+        detection: Option<AgentDetection>,
+        selected: bool,
+    ) -> ActivityObservation {
         let now = Instant::now() + Duration::from_secs(content_sequence as u64);
-        tracker
-            .observe_with(
-                session_id,
-                AgentFingerprint {
-                    content_sequence: Some(content_sequence),
-                    foreground_process_name: Some("agent"),
-                    title: "agent",
-                },
-                selected,
-                now,
-                || DetectionUpdate::Replace(detection),
-            )
-            .presentation
+        tracker.observe_with(
+            session_id,
+            AgentFingerprint {
+                content_sequence: Some(content_sequence),
+                foreground_process_name: Some("agent"),
+                title: "agent",
+            },
+            selected,
+            now,
+            || DetectionUpdate::Replace(detection),
+        )
     }
 
     #[test]
@@ -596,6 +618,50 @@ mod tests {
         let presentation = observe(&mut tracker, 11, 2, Some(plain_idle), false).unwrap();
         assert_eq!(presentation.activity, AgentActivity::Idle);
         assert!(!presentation.seen);
+    }
+
+    #[test]
+    fn ready_transition_emits_once_after_confirmed_completion() {
+        let mut tracker = ActivityTracker::default();
+        let working = AgentDetection {
+            kind: AgentKind::Codex,
+            activity: AgentActivity::Working,
+            visible_idle: false,
+        };
+        let plain_idle = AgentDetection {
+            kind: AgentKind::Codex,
+            activity: AgentActivity::Idle,
+            visible_idle: false,
+        };
+
+        let initial = observe_result(&mut tracker, 12, 1, Some(working), false);
+        assert_eq!(initial.transition, None);
+        for observation in 0..2 {
+            let held = observe_result(&mut tracker, 12, 2, Some(plain_idle), false);
+            assert_eq!(held.transition, None, "observation {observation} was not confirmed");
+        }
+        let ready = observe_result(&mut tracker, 12, 2, Some(plain_idle), false);
+        assert_eq!(ready.transition, Some(AgentTransition::Ready(AgentKind::Codex)));
+
+        let repeated = observe_result(&mut tracker, 12, 2, Some(plain_idle), false);
+        assert_eq!(repeated.transition, None);
+        let selected = observe_result(&mut tracker, 12, 2, Some(plain_idle), true);
+        assert_eq!(selected.transition, None);
+    }
+
+    #[test]
+    fn initial_idle_does_not_emit_ready_transition() {
+        let mut tracker = ActivityTracker::default();
+        let idle = AgentDetection {
+            kind: AgentKind::Claude,
+            activity: AgentActivity::Idle,
+            visible_idle: true,
+        };
+
+        let initial = observe_result(&mut tracker, 13, 1, Some(idle), false);
+        assert_eq!(initial.transition, None);
+        let repeated = observe_result(&mut tracker, 13, 2, Some(idle), false);
+        assert_eq!(repeated.transition, None);
     }
 
     #[test]
