@@ -25,4 +25,6 @@ pub mod swarm;
 pub mod sync;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod tail;
+#[cfg(target_os = "linux")]
+pub mod tsgo;
 pub mod update;
