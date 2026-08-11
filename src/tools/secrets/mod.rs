@@ -3,6 +3,7 @@
 //! 1Password owns encryption, synchronization, authorization, and vault data. This leaf tool owns
 //! only process orchestration, ephemeral interaction state, and presentation.
 
+mod actions;
 mod model;
 pub(crate) mod op;
 mod sensitive;

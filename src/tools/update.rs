@@ -1,13 +1,13 @@
 //! `update` — discover and install signed-for-transport Kit release binaries.
 
+mod actions;
+
 use std::env;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use clap::{ArgMatches, Command, CommandFactory, FromArgMatches, Parser};
-use crossterm::event::{
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
-};
+use crossterm::event::{Event, MouseButton, MouseEventKind};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Position, Rect},
     style::{Modifier, Style},
@@ -19,8 +19,13 @@ use ratatui::{
 use crate::{
     framework::{Context, Terminal, Tool, ToolMeta},
     release::{ReleaseUpdater, UpdateAvailability, UpdateOutcome},
-    tui::{theme::NORD, EventReader, Session, SessionOptions},
+    tui::{
+        theme::NORD, ActionInvocation, EventReader, KeyChord, KeybindingResolution,
+        KeybindingState, Session, SessionOptions,
+    },
 };
+
+use actions::{PromptActionContext, PromptActionRegistry, PromptCommand, CHOICES};
 
 const RELEASES_URL: &str = "https://github.com/xtava/kit/releases";
 
@@ -147,44 +152,58 @@ enum UpdateChoice {
 
 impl UpdateChoice {
     const ALL: [Self; 3] = [Self::UpdateNow, Self::Later, Self::SkipVersion];
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::UpdateNow => "Update now",
-            Self::Later => "Later",
-            Self::SkipVersion => "Skip this version",
-        }
-    }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct PromptRegions {
-    choices: [Rect; 3],
+    choices: Vec<(Rect, crate::tui::ActionId)>,
 }
 
 async fn prompt(latest: &str) -> Result<UpdateChoice> {
     let mut session =
         Session::open(SessionOptions { mouse_capture: true, bracketed_paste: false })?;
-    let mut input = EventReader::start();
     let mut selected = 0;
     let mut regions = PromptRegions::default();
+    let registry = actions::registry()?;
+    let mut keybinding_state = KeybindingState::default();
 
     loop {
-        session.draw(|frame| regions = render_prompt(frame, latest, selected))?;
-        let Some(event) = input.recv().await else {
+        session.draw(|frame| regions = render_prompt(frame, latest, selected, &registry))?;
+        let Some(event) = EventReader::read_once().await else {
             return Ok(UpdateChoice::Later);
         };
         match event {
-            Event::Key(key) => match prompt_key(key, &mut selected) {
-                PromptAction::Continue => {}
-                PromptAction::Choose(choice) => return Ok(choice),
-            },
+            Event::Key(key) => {
+                let Some(chord) = KeyChord::from_event(key) else { continue };
+                let context = PromptActionContext { selected };
+                let invocation =
+                    match registry.resolve_keybinding(&mut keybinding_state, chord, context) {
+                        KeybindingResolution::Invoke(invocation) => invocation,
+                        KeybindingResolution::Pending
+                        | KeybindingResolution::Unmatched
+                        | KeybindingResolution::UnmatchedSequence { .. } => continue,
+                    };
+                if let Some(choice) =
+                    execute_prompt_command(registry.command_for(&invocation)?, &mut selected)
+                {
+                    return Ok(choice);
+                }
+            }
             Event::Mouse(mouse) => {
                 let point = Position { x: mouse.column, y: mouse.row };
-                if let Some(index) = regions.choices.iter().position(|area| area.contains(point)) {
+                if let Some((index, (_, action))) =
+                    regions.choices.iter().enumerate().find(|(_, (area, _))| area.contains(point))
+                {
                     selected = index;
                     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-                        return Ok(UpdateChoice::ALL[index]);
+                        let invocation =
+                            ActionInvocation::new(*action, PromptActionContext { selected });
+                        if let Some(choice) = execute_prompt_command(
+                            registry.command_for(&invocation)?,
+                            &mut selected,
+                        ) {
+                            return Ok(choice);
+                        }
                     }
                 }
             }
@@ -193,40 +212,26 @@ async fn prompt(latest: &str) -> Result<UpdateChoice> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PromptAction {
-    Continue,
-    Choose(UpdateChoice),
+fn execute_prompt_command(command: PromptCommand, selected: &mut usize) -> Option<UpdateChoice> {
+    match command {
+        PromptCommand::MoveUp => *selected = selected.saturating_sub(1),
+        PromptCommand::MoveDown => {
+            *selected = selected.saturating_add(1).min(UpdateChoice::ALL.len() - 1)
+        }
+        PromptCommand::ChooseNow => return Some(UpdateChoice::UpdateNow),
+        PromptCommand::ChooseLater | PromptCommand::Dismiss => return Some(UpdateChoice::Later),
+        PromptCommand::ChooseSkip => return Some(UpdateChoice::SkipVersion),
+        PromptCommand::Activate => return Some(UpdateChoice::ALL[*selected]),
+    }
+    None
 }
 
-fn prompt_key(key: KeyEvent, selected: &mut usize) -> PromptAction {
-    if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-        return PromptAction::Continue;
-    }
-    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c' | 'd'))
-    {
-        return PromptAction::Choose(UpdateChoice::Later);
-    }
-
-    match key.code {
-        KeyCode::Up | KeyCode::Char('k') => {
-            *selected = selected.saturating_sub(1);
-            PromptAction::Continue
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            *selected = (*selected + 1).min(UpdateChoice::ALL.len() - 1);
-            PromptAction::Continue
-        }
-        KeyCode::Char('1') => PromptAction::Choose(UpdateChoice::UpdateNow),
-        KeyCode::Char('2') => PromptAction::Choose(UpdateChoice::Later),
-        KeyCode::Char('3') => PromptAction::Choose(UpdateChoice::SkipVersion),
-        KeyCode::Enter => PromptAction::Choose(UpdateChoice::ALL[*selected]),
-        KeyCode::Esc => PromptAction::Choose(UpdateChoice::Later),
-        _ => PromptAction::Continue,
-    }
-}
-
-fn render_prompt(frame: &mut Frame<'_>, latest: &str, selected: usize) -> PromptRegions {
+fn render_prompt(
+    frame: &mut Frame<'_>,
+    latest: &str,
+    selected: usize,
+    registry: &PromptActionRegistry,
+) -> PromptRegions {
     let area = centered_rect(frame.area(), 68, 15);
     frame.render_widget(Clear, area);
     frame.render_widget(
@@ -275,8 +280,9 @@ fn render_prompt(frame: &mut Frame<'_>, latest: &str, selected: usize) -> Prompt
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1); 3])
         .split(rows[3]);
-    for (index, choice) in UpdateChoice::ALL.into_iter().enumerate() {
-        regions.choices[index] = choices[index];
+    let resolved = registry.resolve_menu(CHOICES, &PromptActionContext { selected });
+    for (index, action) in resolved.items().iter().enumerate() {
+        regions.choices.push((choices[index], action.id));
         let active = index == selected;
         let marker = if active { "› " } else { "  " };
         let style = if active {
@@ -285,18 +291,30 @@ fn render_prompt(frame: &mut Frame<'_>, latest: &str, selected: usize) -> Prompt
             Style::default().fg(NORD.text)
         };
         frame.render_widget(
-            Paragraph::new(format!("{marker}{}", choice.label())).style(style),
+            Paragraph::new(format!("{marker}{}", action.title)).style(style),
             choices[index],
         );
     }
 
     frame.render_widget(
-        Paragraph::new("↑↓ select  ·  Enter confirm  ·  mouse click  ·  Esc later")
+        Paragraph::new(prompt_help(registry, selected))
             .style(Style::default().fg(NORD.text_muted))
             .alignment(Alignment::Center),
         rows[4],
     );
     regions
+}
+
+fn prompt_help(registry: &PromptActionRegistry, selected: usize) -> String {
+    registry
+        .resolve_command_palette(&PromptActionContext { selected })
+        .items()
+        .iter()
+        .filter_map(|action| {
+            action.primary_keybinding().map(|binding| format!("{binding} {}", action.title))
+        })
+        .collect::<Vec<_>>()
+        .join("  ")
 }
 
 fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
@@ -313,8 +331,6 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
-
-    use crossterm::event::{KeyEvent, KeyEventKind, KeyEventState};
 
     use super::*;
 
@@ -341,26 +357,20 @@ mod tests {
 
     #[test]
     fn prompt_navigation_is_bounded_and_selects_the_active_choice() {
-        let key = |code| KeyEvent {
-            code,
-            modifiers: KeyModifiers::NONE,
-            kind: KeyEventKind::Press,
-            state: KeyEventState::NONE,
-        };
         let mut selected = 0;
-        assert_eq!(prompt_key(key(KeyCode::Up), &mut selected), PromptAction::Continue);
+        assert_eq!(execute_prompt_command(PromptCommand::MoveUp, &mut selected), None);
         assert_eq!(selected, 0);
-        prompt_key(key(KeyCode::Down), &mut selected);
-        prompt_key(key(KeyCode::Down), &mut selected);
-        prompt_key(key(KeyCode::Down), &mut selected);
+        execute_prompt_command(PromptCommand::MoveDown, &mut selected);
+        execute_prompt_command(PromptCommand::MoveDown, &mut selected);
+        execute_prompt_command(PromptCommand::MoveDown, &mut selected);
         assert_eq!(selected, 2);
         assert_eq!(
-            prompt_key(key(KeyCode::Enter), &mut selected),
-            PromptAction::Choose(UpdateChoice::SkipVersion)
+            execute_prompt_command(PromptCommand::Activate, &mut selected),
+            Some(UpdateChoice::SkipVersion)
         );
         assert_eq!(
-            prompt_key(key(KeyCode::Esc), &mut selected),
-            PromptAction::Choose(UpdateChoice::Later)
+            execute_prompt_command(PromptCommand::Dismiss, &mut selected),
+            Some(UpdateChoice::Later)
         );
     }
 }

@@ -12,7 +12,8 @@ use crate::{
     tui::{
         theme::NORD, ActionInvocation, ActionRegistry, ActionUnavailable, CommandPalette,
         CommandPaletteOutcome, ContextMenu, ContextMenuOutcome, EventReader, KeyChord, LineEditor,
-        NavigationHistory, Session, SessionOptions, SettingsEditor, SettingsFlow,
+        NavigationHistory, ScrollbarDrag, SelectionOutcome, Session, SessionOptions,
+        SettingsEditor, SettingsFlow, TextSelection, Viewport, ViewportMetrics,
     },
 };
 
@@ -67,6 +68,12 @@ pub(super) enum ControlCenterOverlay {
     UnixUser { stable_node_id: String, input: LineEditor, notice: Option<String> },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ControlCenterSelectionSurface {
+    DiscoveryDetail,
+    MachineDetails,
+}
+
 pub(super) struct ControlCenterApp {
     pub(super) state: ControlCenterState,
     config: Config,
@@ -81,6 +88,11 @@ pub(super) struct ControlCenterApp {
     pub(super) notice: Option<String>,
     history: NavigationHistory<String>,
     connection_owner: Arc<ConnectionOwner>,
+    pub(super) machine_viewport: Viewport,
+    pub(super) machine_metrics: ViewportMetrics,
+    pub(super) machine_scrollbar_drag: Option<ScrollbarDrag>,
+    pub(super) selection: TextSelection<ControlCenterSelectionSurface>,
+    pub(super) content_revision: u64,
 }
 
 pub(crate) async fn run(
@@ -108,6 +120,11 @@ pub(crate) async fn run(
         notice: None,
         history: NavigationHistory::default(),
         connection_owner,
+        machine_viewport: Viewport::default(),
+        machine_metrics: ViewportMetrics::default(),
+        machine_scrollbar_drag: None,
+        selection: TextSelection::default(),
+        content_revision: 0,
     };
     app.refresh(cx.processes.clone())?;
 
@@ -130,7 +147,7 @@ pub(crate) async fn run(
                     return Ok(ControlCenterOutcome::Quit);
                 };
                 if let Some(outcome) =
-                    app.handle_event(cx.processes.clone(), event, &regions)?
+                    app.handle_event(cx.processes.clone(), event, &regions, &mut terminal)?
                 {
                     return Ok(outcome);
                 }
@@ -172,6 +189,7 @@ impl ControlCenterApp {
         processes: ProcessSupervisor,
         update: ControlCenterUpdate,
     ) -> Result<()> {
+        self.content_revision = self.content_revision.wrapping_add(1);
         match update {
             ControlCenterUpdate::DiscoveryCompleted { generation, .. }
                 if generation != self.generation =>
@@ -447,8 +465,25 @@ impl ControlCenterApp {
         processes: ProcessSupervisor,
         event: Event,
         regions: &ControlCenterRegions,
+        terminal: &mut Session,
     ) -> Result<Option<ControlCenterOutcome>> {
         if matches!(self.overlay, Some(ControlCenterOverlay::Details { .. })) {
+            if let Event::Key(key) = &event {
+                match self.selection.on_key(*key) {
+                    SelectionOutcome::CopyReady(text) => {
+                        terminal.copy(&text)?;
+                        return Ok(None);
+                    }
+                    SelectionOutcome::Captured | SelectionOutcome::Changed => return Ok(None),
+                    SelectionOutcome::Unhandled | SelectionOutcome::EdgeScroll { .. } => {}
+                }
+            }
+            if let Event::Mouse(mouse) = &event {
+                let selection = self.selection.on_mouse(*mouse);
+                if !matches!(selection, SelectionOutcome::Unhandled) {
+                    return Ok(None);
+                }
+            }
             if matches!(
                 event,
                 Event::Key(key)
@@ -556,6 +591,16 @@ impl ControlCenterApp {
         if matches!(self.overlay, Some(ControlCenterOverlay::UnixUser { .. })) {
             return self.handle_unix_user_event(processes, event);
         }
+        if let Event::Key(key) = &event {
+            match self.selection.on_key(*key) {
+                SelectionOutcome::CopyReady(text) => {
+                    terminal.copy(&text)?;
+                    return Ok(None);
+                }
+                SelectionOutcome::Captured | SelectionOutcome::Changed => return Ok(None),
+                SelectionOutcome::Unhandled | SelectionOutcome::EdgeScroll { .. } => {}
+            }
+        }
         match event {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                 let Some(chord) = KeyChord::from_event(key) else {
@@ -607,11 +652,44 @@ impl ControlCenterApp {
             }
             Event::Mouse(mouse) => {
                 let position = Position::new(mouse.column, mouse.row);
-                if matches!(mouse.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) {
+                if let Some(drag) = self.machine_scrollbar_drag {
+                    match mouse.kind {
+                        MouseEventKind::Drag(MouseButton::Left) => {
+                            if let Some(scrollbar) = regions.machine_scrollbar {
+                                let top = drag.top_for_row(scrollbar, position.y);
+                                self.machine_viewport.set_top(top, self.machine_metrics);
+                                self.select_index(top)?;
+                            }
+                            return Ok(None);
+                        }
+                        MouseEventKind::Up(MouseButton::Left) => {
+                            self.machine_scrollbar_drag = None;
+                            return Ok(None);
+                        }
+                        _ => return Ok(None),
+                    }
+                }
+                if let Some(scrollbar) =
+                    regions.machine_scrollbar.filter(|scrollbar| scrollbar.contains(position))
+                {
+                    if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                        if let Some(drag) = ScrollbarDrag::begin(scrollbar, position) {
+                            self.machine_scrollbar_drag = Some(drag);
+                        } else {
+                            let top = scrollbar.top_for_track_row(position.y);
+                            self.machine_viewport.set_top(top, self.machine_metrics);
+                            self.select_index(top)?;
+                        }
+                    }
+                    return Ok(None);
+                }
+                if matches!(mouse.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown)
+                    && regions.machine_list.is_some_and(|area| area.contains(position))
+                {
                     self.select_relative(if mouse.kind == MouseEventKind::ScrollUp {
-                        -1
+                        -3
                     } else {
-                        1
+                        3
                     })?;
                 } else if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
                     if let Some((_, stable_node_id)) =
@@ -625,6 +703,8 @@ impl ControlCenterApp {
                         return Ok(self.connection_outcome(true));
                     } else if regions.refresh_action.is_some_and(|area| area.contains(position)) {
                         self.refresh(processes)?;
+                    } else {
+                        let _ = self.selection.on_mouse(mouse);
                     }
                 } else if mouse.kind == MouseEventKind::Down(MouseButton::Right) {
                     if let Some((_, stable_node_id)) =
@@ -636,9 +716,20 @@ impl ControlCenterApp {
                             self.action_registry.resolve_menu(MACHINE_CONTEXT_MENU, &context);
                         self.overlay = ContextMenu::open(position, context, items)
                             .map(ControlCenterOverlay::ContextMenu);
+                        self.selection.clear();
                     }
+                } else if self.selection.is_dragging()
+                    || matches!(
+                        mouse.kind,
+                        MouseEventKind::Down(MouseButton::Left)
+                            | MouseEventKind::Drag(MouseButton::Left)
+                            | MouseEventKind::Up(MouseButton::Left)
+                    )
+                {
+                    let _ = self.selection.on_mouse(mouse);
                 }
             }
+            Event::Resize(_, _) => self.machine_scrollbar_drag = None,
             _ => {}
         }
         Ok(None)
@@ -722,6 +813,7 @@ impl ControlCenterApp {
     }
 
     fn open_command_palette(&mut self) {
+        self.selection.clear();
         let context = self.action_context();
         self.overlay = Some(ControlCenterOverlay::CommandPalette(CommandPalette::open(
             context,
@@ -909,10 +1001,11 @@ impl ControlCenterApp {
                 Ok(None)
             }
             MachineAction::ShowDetails => {
-                if let Some(machine) = self.selected_machine() {
-                    self.overlay = Some(ControlCenterOverlay::Details {
-                        stable_node_id: machine.identity.stable_node_id.clone(),
-                    });
+                if let Some(stable_node_id) =
+                    self.selected_machine().map(|machine| machine.identity.stable_node_id.clone())
+                {
+                    self.selection.clear();
+                    self.overlay = Some(ControlCenterOverlay::Details { stable_node_id });
                 }
                 Ok(None)
             }

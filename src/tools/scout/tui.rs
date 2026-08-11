@@ -6,8 +6,8 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use crossterm::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, ListState, Padding, Paragraph};
@@ -19,13 +19,20 @@ use super::format::{human, role_breakdown, target_groups};
 use super::model::{Survey, TargetKind};
 use super::proc::total_pss;
 use super::survey;
-use crate::tui::{EventReader, Session, SessionOptions};
+use crate::tui::{
+    render_vertical_scrollbar, EventReader, KeyChord, KeybindingResolution, KeybindingState,
+    ScrollbarDrag, ScrollbarLayout, ScrollbarStyle, SelectableRegion, SelectionOutcome, Session,
+    SessionOptions, TextSelection, Viewport, ViewportMetrics,
+};
+
+use super::actions::{self, ScoutActionRegistry, ScoutCommand};
 
 const REFRESH: Duration = Duration::from_secs(4);
 const DELTA_FLOOR_KIB: i64 = 512;
 
 pub async fn run(marker: String) -> Result<()> {
-    let mut session = Session::open(SessionOptions::default())?;
+    let mut session =
+        Session::open(SessionOptions { mouse_capture: true, bracketed_paste: false })?;
     let mut events = EventReader::start();
     let (tx, mut rx) = mpsc::unbounded_channel::<Survey>();
 
@@ -33,9 +40,10 @@ pub async fn run(marker: String) -> Result<()> {
     app.loading = true;
     spawn_survey(app.marker.clone(), tx.clone());
     let mut tick = time::interval(REFRESH);
+    let mut regions = UiRegions::default();
 
     loop {
-        session.draw(|frame| render(frame, &mut app))?;
+        session.draw(|frame| regions = render(frame, &mut app))?;
 
         tokio::select! {
             _ = tick.tick() => {
@@ -47,18 +55,31 @@ pub async fn run(marker: String) -> Result<()> {
             Some(survey) = rx.recv() => app.ingest(survey),
             event = events.recv() => match event {
                 Some(Event::Key(key)) => match app.on_key(key) {
-                    Action::Quit => break,
-                    Action::Refresh => {
+                    ScoutCommand::Quit => break,
+                    ScoutCommand::Refresh => {
                         if !app.loading {
                             app.loading = true;
                             spawn_survey(app.marker.clone(), tx.clone());
                         }
                     }
-                    Action::None => {}
+                    ScoutCommand::Previous | ScoutCommand::Next | ScoutCommand::Toggle => {}
+                },
+                Some(Event::Mouse(mouse)) => match app.on_mouse(mouse, &regions) {
+                    Some(ScoutCommand::Quit) => break,
+                    Some(ScoutCommand::Refresh) => {
+                        if !app.loading {
+                            app.loading = true;
+                            spawn_survey(app.marker.clone(), tx.clone());
+                        }
+                    }
+                    _ => {}
                 },
                 None => break,
                 _ => {}
             },
+        }
+        if let Some(text) = app.pending_copy.take() {
+            session.copy(&text)?;
         }
     }
     Ok(())
@@ -70,10 +91,17 @@ fn spawn_survey(marker: String, tx: UnboundedSender<Survey>) {
     });
 }
 
-enum Action {
-    None,
-    Quit,
-    Refresh,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SelectionSurface {
+    ChildDetails,
+}
+
+#[derive(Default)]
+struct UiRegions {
+    tree: Option<Rect>,
+    rows: Vec<(Rect, usize)>,
+    scrollbar: Option<ScrollbarLayout>,
+    selectable: Vec<SelectableRegion<SelectionSurface>>,
 }
 
 struct App {
@@ -85,6 +113,14 @@ struct App {
     selected: usize,
     list: ListState,
     loading: bool,
+    registry: ScoutActionRegistry,
+    keybindings: KeybindingState,
+    viewport: Viewport,
+    metrics: ViewportMetrics,
+    scrollbar_drag: Option<ScrollbarDrag>,
+    selection: TextSelection<SelectionSurface>,
+    revision: u64,
+    pending_copy: Option<String>,
 }
 
 struct Row {
@@ -106,10 +142,20 @@ impl App {
             selected: 0,
             list: ListState::default(),
             loading: false,
+            registry: actions::registry().expect("valid Scout action registry"),
+            keybindings: KeybindingState::default(),
+            viewport: Viewport::default(),
+            metrics: ViewportMetrics::default(),
+            scrollbar_drag: None,
+            selection: TextSelection::default(),
+            revision: 0,
+            pending_copy: None,
         }
     }
 
     fn ingest(&mut self, survey: Survey) {
+        self.selection.clear();
+        self.revision = self.revision.wrapping_add(1);
         if self.survey.is_none() {
             if let Some(first) = survey.instances.first() {
                 self.expanded.insert(first.name.clone());
@@ -124,27 +170,32 @@ impl App {
         }
     }
 
-    fn on_key(&mut self, key: KeyEvent) -> Action {
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            return Action::Quit;
+    fn on_key(&mut self, key: crossterm::event::KeyEvent) -> ScoutCommand {
+        match self.selection.on_key(key) {
+            SelectionOutcome::CopyReady(text) => {
+                self.pending_copy = Some(text);
+                return ScoutCommand::Toggle;
+            }
+            SelectionOutcome::Captured | SelectionOutcome::Changed => return ScoutCommand::Toggle,
+            SelectionOutcome::Unhandled | SelectionOutcome::EdgeScroll { .. } => {}
         }
-        match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
-            KeyCode::Char('r') => Action::Refresh,
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.move_selection(-1);
-                Action::None
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.move_selection(1);
-                Action::None
-            }
-            KeyCode::Enter | KeyCode::Char(' ') => {
-                self.toggle();
-                Action::None
-            }
-            _ => Action::None,
+        let Some(chord) = KeyChord::from_event(key) else {
+            return ScoutCommand::Toggle;
+        };
+        let invocation = match self.registry.resolve_keybinding(&mut self.keybindings, chord, ()) {
+            KeybindingResolution::Invoke(invocation) => invocation,
+            _ => return ScoutCommand::Toggle,
+        };
+        let Ok(command) = self.registry.command_for(&invocation) else {
+            return ScoutCommand::Toggle;
+        };
+        match command {
+            ScoutCommand::Previous => self.move_selection(-1),
+            ScoutCommand::Next => self.move_selection(1),
+            ScoutCommand::Toggle => self.toggle(),
+            ScoutCommand::Quit | ScoutCommand::Refresh => {}
         }
+        command
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -153,6 +204,59 @@ impl App {
         }
         let bound = self.rows.len() as isize - 1;
         self.selected = (self.selected as isize + delta).clamp(0, bound) as usize;
+    }
+
+    fn on_mouse(&mut self, mouse: MouseEvent, regions: &UiRegions) -> Option<ScoutCommand> {
+        let position = Position::new(mouse.column, mouse.row);
+        if let Some(drag) = self.scrollbar_drag {
+            match mouse.kind {
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    if let Some(scrollbar) = regions.scrollbar {
+                        let top = drag.top_for_row(scrollbar, position.y);
+                        self.viewport.set_top(top, self.metrics);
+                        self.selected = top;
+                    }
+                }
+                MouseEventKind::Up(MouseButton::Left) => self.scrollbar_drag = None,
+                _ => {}
+            }
+            return None;
+        }
+        if let Some(scrollbar) = regions.scrollbar.filter(|scrollbar| scrollbar.contains(position))
+        {
+            if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                if let Some(drag) = ScrollbarDrag::begin(scrollbar, position) {
+                    self.scrollbar_drag = Some(drag);
+                } else {
+                    let top = scrollbar.top_for_track_row(position.y);
+                    self.viewport.set_top(top, self.metrics);
+                    self.selected = top;
+                }
+            }
+            return None;
+        }
+        if matches!(mouse.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown)
+            && regions.tree.is_some_and(|area| area.contains(position))
+        {
+            self.move_selection(if mouse.kind == MouseEventKind::ScrollUp { -3 } else { 3 });
+            return None;
+        }
+        if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+            if let Some((_, index)) = regions.rows.iter().find(|(area, _)| area.contains(position))
+            {
+                self.selected = *index;
+                if self.rows[*index].instance.is_some() {
+                    self.toggle();
+                    return None;
+                }
+            }
+        }
+        match self.selection.on_mouse(mouse) {
+            SelectionOutcome::CopyReady(text) => self.pending_copy = Some(text),
+            SelectionOutcome::EdgeScroll { lines, .. } => self.move_selection(lines),
+            _ => {}
+        }
+        None
     }
 
     fn toggle(&mut self) {
@@ -225,13 +329,21 @@ impl Row {
     }
 }
 
-fn render(frame: &mut Frame, app: &mut App) {
+fn render(frame: &mut Frame, app: &mut App) -> UiRegions {
     let chunks =
         Layout::vertical([Constraint::Length(3), Constraint::Min(1), Constraint::Length(1)])
             .split(frame.area());
     render_header(frame, chunks[0], app);
-    render_tree(frame, chunks[1], app);
-    render_footer(frame, chunks[2]);
+    let mut regions = UiRegions::default();
+    render_tree(frame, chunks[1], app, &mut regions);
+    render_footer(frame, chunks[2], &app.registry);
+    let selectable = regions.selectable.clone();
+    app.selection.capture_frame(
+        frame,
+        &selectable,
+        Style::default().bg(Color::Rgb(40, 44, 52)).add_modifier(Modifier::REVERSED),
+    );
+    regions
 }
 
 fn render_header(frame: &mut Frame, area: Rect, app: &App) {
@@ -260,28 +372,77 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(header, area);
 }
 
-fn render_tree(frame: &mut Frame, area: Rect, app: &mut App) {
+fn render_tree(frame: &mut Frame, area: Rect, app: &mut App, regions: &mut UiRegions) {
     let width = area.width.saturating_sub(4) as usize;
+    let inner = panel(" fleet ").inner(area);
+    app.metrics = ViewportMetrics::new(app.rows.len(), usize::from(inner.height));
+    app.viewport.ensure_visible(app.selected, app.metrics);
+    let visible = app.viewport.visible_range(app.metrics);
+    let top = visible.start;
     let items: Vec<ListItem> =
-        app.rows.iter().map(|row| ListItem::new(row_line(row, width))).collect();
+        app.rows[visible.clone()].iter().map(|row| ListItem::new(row_line(row, width))).collect();
     let list = List::new(items)
         .block(panel(" fleet "))
         .highlight_style(Style::default().bg(Color::Rgb(40, 44, 52)).add_modifier(Modifier::BOLD))
         .highlight_symbol("▌ ");
-    app.list.select(if app.rows.is_empty() { None } else { Some(app.selected) });
+    app.list.select(if app.rows.is_empty() { None } else { Some(app.selected - top) });
     frame.render_stateful_widget(list, area, &mut app.list);
+    regions.tree = Some(inner);
+    regions.rows = visible
+        .clone()
+        .enumerate()
+        .map(|(offset, index)| (Rect::new(inner.x, inner.y + offset as u16, inner.width, 1), index))
+        .collect();
+    for (offset, index) in visible.enumerate() {
+        if app.rows[index].instance.is_none() {
+            regions.selectable.push(SelectableRegion::new(
+                SelectionSurface::ChildDetails,
+                Rect::new(inner.x, inner.y + offset as u16, inner.width, 1),
+                index as i64,
+                0,
+                app.revision,
+            ));
+        }
+    }
+    regions.scrollbar = ScrollbarLayout::vertical_right(inner, app.metrics, top);
+    if let Some(scrollbar) = regions.scrollbar {
+        render_vertical_scrollbar(
+            frame,
+            scrollbar,
+            app.scrollbar_drag.is_some(),
+            ScrollbarStyle {
+                track_color: Color::DarkGray,
+                thumb_color: Color::Gray,
+                active_thumb_color: Color::Cyan,
+                track_symbol: "│",
+                thumb_symbol: "┃",
+            },
+        );
+    }
 }
 
-fn render_footer(frame: &mut Frame, area: Rect) {
+fn render_footer(frame: &mut Frame, area: Rect, registry: &ScoutActionRegistry) {
+    let actions = registry.resolve_command_palette(&());
+    let title = |command| {
+        actions
+            .items()
+            .iter()
+            .find(|action| {
+                registry.command_for(&crate::tui::ActionInvocation::new(action.id, ())).ok()
+                    == Some(command)
+            })
+            .map(|action| action.title)
+            .unwrap_or("")
+    };
     let footer = Paragraph::new(Line::from(vec![
         key("↑↓"),
-        Span::raw(" nav  "),
+        Span::raw(format!(" {}  ", title(ScoutCommand::Next))),
         key("⏎"),
-        Span::raw(" expand  "),
+        Span::raw(format!(" {}  ", title(ScoutCommand::Toggle))),
         key("r"),
-        Span::raw(" refresh  "),
+        Span::raw(format!(" {}  ", title(ScoutCommand::Refresh))),
         key("q"),
-        Span::raw(" quit"),
+        Span::raw(format!(" {}", title(ScoutCommand::Quit))),
     ]))
     .style(Style::default().fg(Color::DarkGray))
     .alignment(Alignment::Center);

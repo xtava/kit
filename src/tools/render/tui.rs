@@ -11,7 +11,7 @@ use crossterm::event::{
 };
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use ratatui::{
-    layout::{Alignment, Constraint, Layout, Rect},
+    layout::{Alignment, Constraint, Layout, Position, Rect},
     style::{Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, BorderType, Borders, Padding, Paragraph},
@@ -26,17 +26,21 @@ use unicode_width::UnicodeWidthStr;
 use url::Url;
 
 use super::{
+    actions::{self, RenderActionContext, RenderActionRegistry, RenderCommand, RenderTarget},
     config::{self, Config},
     search::SearchIndex,
 };
 use crate::tui::{
     fuzzy,
     markdown::{has_heading, MarkdownHeading, MarkdownLink, MarkdownRenderer, MarkdownSearchLine},
-    render_split_divider,
+    render_split_divider, render_vertical_scrollbar,
     theme::{self, TuiTheme},
-    CommandSet, CommandSpec, EventReader, Frecency, FrecencyStore, LineEditor, NavigationHistory,
-    ParsedInput, Session, SessionOptions, SettingsEditor, SettingsFlow, SplitDividerStyle,
-    SplitDrag, SplitFrame, SplitMinimums, SplitRatio, Suggestion, SuggestionMenu,
+    ActionInvocation, CommandSet, CommandSpec, EventReader, Frecency, FrecencyStore, KeyChord,
+    KeybindingResolution, KeybindingState, LineEditor, NavigationHistory, ParsedInput,
+    ScrollbarDrag, ScrollbarLayout, ScrollbarStyle, SelectableRegion, SelectionOutcome, Session,
+    SessionOptions, SettingsEditor, SettingsFlow, SplitDividerStyle, SplitDrag, SplitFrame,
+    SplitMinimums, SplitRatio, Suggestion, SuggestionMenu, TextSelection, Viewport,
+    ViewportMetrics,
 };
 
 const SUGGESTION_ROWS: usize = 8;
@@ -101,8 +105,13 @@ pub async fn run(
             event = events.recv() => match event {
                 Some(Event::Key(key)) if key.is_press() => {
                     let previous_document = app.document_path().map(Path::to_path_buf);
-                    if matches!(app.on_key(key), Flow::Quit) {
-                        break;
+                    match app.on_key(key) {
+                        Flow::Continue => {}
+                        Flow::Copy(text) => {
+                            session.copy(&text)?;
+                app.notice = Notice::info(format!("copied {} line(s)", text.lines().count()));
+                        }
+                        Flow::Quit => break,
                     }
                     if app.document_path() != previous_document.as_deref() {
                         reload_at = None;
@@ -122,7 +131,7 @@ pub async fn run(
                     }
                 }
                 Some(Event::Resize(_, _)) => {
-                    app.cancel_toc_drag();
+                    app.cancel_pointer_drags();
                 }
                 None => break,
                 _ => {}
@@ -201,10 +210,23 @@ impl DocumentWatch {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum Flow {
     Continue,
+    Copy(String),
     Quit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RenderSurface {
+    Document,
+    Contents,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScrollSurface {
+    Document,
+    Contents,
 }
 
 enum Surface {
@@ -219,11 +241,21 @@ struct App {
     config: Config,
     theme_spec: String,
     theme: TuiTheme,
+    actions: RenderActionRegistry,
+    keybinding_state: KeybindingState,
     surface: Surface,
     document: Option<Document>,
-    scroll_top: usize,
-    content_height: usize,
-    viewport_height: usize,
+    viewport: Viewport,
+    viewport_metrics: ViewportMetrics,
+    selection: TextSelection<RenderSurface>,
+    document_revision: u64,
+    document_selectable: Option<SelectableRegion<RenderSurface>>,
+    document_scrollbar: Option<ScrollbarLayout>,
+    toc_viewport: Viewport,
+    toc_metrics: ViewportMetrics,
+    toc_selectable: Option<SelectableRegion<RenderSurface>>,
+    toc_scrollbar: Option<ScrollbarLayout>,
+    scrollbar_drag: Option<(ScrollSurface, ScrollbarDrag)>,
     input: LineEditor,
     suggestions: Option<SuggestionMenu>,
     search: Option<DocumentSearch>,
@@ -285,11 +317,21 @@ impl App {
             config,
             theme_spec,
             theme,
+            actions: actions::registry().context("build Render action registry")?,
+            keybinding_state: KeybindingState::default(),
             surface: Surface::Viewer,
             document: None,
-            scroll_top: 0,
-            content_height: 0,
-            viewport_height: 0,
+            viewport: Viewport::default(),
+            viewport_metrics: ViewportMetrics::default(),
+            selection: TextSelection::default(),
+            document_revision: 0,
+            document_selectable: None,
+            document_scrollbar: None,
+            toc_viewport: Viewport::default(),
+            toc_metrics: ViewportMetrics::default(),
+            toc_selectable: None,
+            toc_scrollbar: None,
+            scrollbar_drag: None,
             input: LineEditor::default(),
             suggestions: None,
             search: None,
@@ -313,11 +355,6 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyEvent) -> Flow {
-        if key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char('c' | 'd'))
-        {
-            return Flow::Quit;
-        }
         if let Surface::Settings(editor) = &mut self.surface {
             if editor.on_key(key) == SettingsFlow::Exit {
                 self.leave_settings();
@@ -330,83 +367,22 @@ impl App {
             }
             return Flow::Continue;
         }
-        if self.input.value().is_empty()
-            && key.modifiers == KeyModifiers::CONTROL
-            && key.code == KeyCode::Char('t')
-            && self.toc_toggle_hit.is_some()
+        match self.selection.on_key(key) {
+            SelectionOutcome::CopyReady(text) => return Flow::Copy(text),
+            SelectionOutcome::Captured | SelectionOutcome::Changed => return Flow::Continue,
+            SelectionOutcome::Unhandled | SelectionOutcome::EdgeScroll { .. } => {}
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('c' | 'd'))
         {
-            self.toggle_toc();
-            return Flow::Continue;
+            return Flow::Quit;
         }
-        if self.input.value().is_empty() && self.toc_split_frame.separator.width > 0 {
-            match key.code {
-                KeyCode::Char('<') => {
-                    self.resize_toc_split(-5);
-                    return Flow::Continue;
-                }
-                KeyCode::Char('>') => {
-                    self.resize_toc_split(5);
-                    return Flow::Continue;
-                }
-                KeyCode::Char('=') if key.modifiers.is_empty() => {
-                    self.reset_toc_split();
-                    self.notice = Notice::info("reset contents panel width".to_owned());
-                    return Flow::Continue;
-                }
-                _ => {}
-            }
-        }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('u') {
-            self.clear_search();
-            return Flow::Continue;
-        }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('f') {
-            self.open_document_search();
-            return Flow::Continue;
-        }
-        if key.modifiers.is_empty()
-            && key.code == KeyCode::Char('r')
-            && self.input.value().is_empty()
-        {
-            self.refresh_index();
-            return Flow::Continue;
-        }
-
         let menu = self.suggestions.is_some();
         let engaged = self.suggestions.as_ref().is_some_and(SuggestionMenu::is_engaged);
+        if let Some(flow) = self.on_action_key(key) {
+            return flow;
+        }
         match key.code {
-            KeyCode::Up
-                if key.modifiers == KeyModifiers::SHIFT && self.input.value().is_empty() =>
-            {
-                self.scroll_top = 0;
-            }
-            KeyCode::Down
-                if key.modifiers == KeyModifiers::SHIFT && self.input.value().is_empty() =>
-            {
-                self.scroll_top = self.max_scroll();
-            }
-            KeyCode::Char('n')
-                if key.modifiers.is_empty()
-                    && self.input.value().is_empty()
-                    && self.search.is_some() =>
-            {
-                self.move_search(1);
-            }
-            KeyCode::Char('N')
-                if (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
-                    && self.input.value().is_empty()
-                    && self.search.is_some() =>
-            {
-                self.move_search(-1);
-            }
-            KeyCode::Left if key.modifiers.is_empty() && self.input.value().is_empty() && !menu => {
-                self.move_history(-1);
-            }
-            KeyCode::Right
-                if key.modifiers.is_empty() && self.input.value().is_empty() && !menu =>
-            {
-                self.move_history(1);
-            }
             KeyCode::Enter if engaged => return self.submit_selected(),
             KeyCode::Enter => return self.submit_typed(),
             KeyCode::Tab if menu => self.cycle_selection(1),
@@ -417,18 +393,12 @@ impl App {
             }
             KeyCode::Down if menu => self.cycle_selection(1),
             KeyCode::Up if menu => self.cycle_selection(-1),
-            KeyCode::Down if self.input.value().is_empty() => self.scroll_by(1),
-            KeyCode::Up if self.input.value().is_empty() => self.scroll_by(-1),
             KeyCode::Right if engaged => self.complete_selected(),
             KeyCode::Right
                 if self.input.cursor() == self.input.value().len() && self.ghost().is_some() =>
             {
                 self.accept_ghost()
             }
-            KeyCode::PageDown => self.page_by(1),
-            KeyCode::PageUp => self.page_by(-1),
-            KeyCode::Home if self.input.value().is_empty() => self.scroll_top = 0,
-            KeyCode::End if self.input.value().is_empty() => self.scroll_top = self.max_scroll(),
             KeyCode::Esc if engaged => {
                 if let Some(menu) = &mut self.suggestions {
                     menu.disengage();
@@ -445,20 +415,170 @@ impl App {
         Flow::Continue
     }
 
+    fn action_context(&self, target: RenderTarget) -> RenderActionContext {
+        RenderActionContext {
+            target,
+            input_empty: self.input.value().is_empty(),
+            menu_open: self.suggestions.is_some(),
+            search_active: self.search.is_some(),
+            contents_available: self.toc_toggle_hit.is_some(),
+            split_available: self.toc_split_frame.separator.width > 0,
+        }
+    }
+
+    fn action_help(&self) -> String {
+        let context = self.action_context(RenderTarget::Viewer);
+        let bindings = self
+            .actions
+            .resolve_command_palette(&context)
+            .items()
+            .iter()
+            .filter_map(|action| {
+                action.primary_keybinding().map(|binding| format!("{binding} {}", action.title))
+            })
+            .collect::<Vec<_>>()
+            .join(" · ");
+        format!("{bindings} · mouse: click targets, drag text/scrollbars/divider")
+    }
+
+    fn on_action_key(&mut self, key: KeyEvent) -> Option<Flow> {
+        let chord = KeyChord::from_event(key)?;
+        let context = self.action_context(RenderTarget::Viewer);
+        match self.actions.resolve_keybinding(&mut self.keybinding_state, chord, context) {
+            KeybindingResolution::Invoke(invocation) => Some(self.invoke_action(invocation)),
+            KeybindingResolution::Pending | KeybindingResolution::UnmatchedSequence { .. } => {
+                Some(Flow::Continue)
+            }
+            KeybindingResolution::Unmatched => None,
+        }
+    }
+
+    fn invoke_action(&mut self, invocation: ActionInvocation<RenderActionContext>) -> Flow {
+        let command = match self.actions.command_for(&invocation) {
+            Ok(command) => command,
+            Err(error) => {
+                self.notice = Notice::error(error.to_string());
+                return Flow::Continue;
+            }
+        };
+        match command {
+            RenderCommand::OpenTarget => match invocation.context.target {
+                RenderTarget::Link(destination) => self.open_link(&destination),
+                RenderTarget::Heading(line) => {
+                    self.selection.clear();
+                    self.viewport.set_top(line, self.viewport_metrics);
+                    self.notice = Notice::info("jumped to heading".to_owned());
+                }
+                RenderTarget::Viewer => {}
+            },
+            RenderCommand::Find => self.open_document_search(),
+            RenderCommand::ClearInput => self.clear_search(),
+            RenderCommand::Refresh => self.refresh_index(),
+            RenderCommand::SearchNext => self.move_search(1),
+            RenderCommand::SearchPrevious => self.move_search(-1),
+            RenderCommand::HistoryBack => self.move_history(-1),
+            RenderCommand::HistoryForward => self.move_history(1),
+            RenderCommand::ScrollUp => self.scroll_by(-1),
+            RenderCommand::ScrollDown => self.scroll_by(1),
+            RenderCommand::PageUp => self.page_by(-1),
+            RenderCommand::PageDown => self.page_by(1),
+            RenderCommand::Home => self.viewport.home(),
+            RenderCommand::End => self.viewport.end(self.viewport_metrics),
+            RenderCommand::ToggleContents => self.toggle_toc(),
+            RenderCommand::NarrowDocument => self.resize_toc_split(-5),
+            RenderCommand::WidenDocument => self.resize_toc_split(5),
+            RenderCommand::ResetSplit => {
+                self.reset_toc_split();
+                self.notice = Notice::info("reset contents panel width".to_owned());
+            }
+        }
+        Flow::Continue
+    }
+
     fn on_mouse(&mut self, mouse: MouseEvent) {
-        if matches!(self.surface, Surface::Settings(_)) {
+        if let Surface::Settings(editor) = &mut self.surface {
+            if editor.on_mouse(mouse) == SettingsFlow::Exit {
+                self.leave_settings();
+            }
             return;
         }
+        if self.toc_drag.is_some() {
+            match mouse.kind {
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    self.update_toc_drag(mouse.column);
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    self.finish_toc_drag();
+                }
+                _ => {}
+            }
+            return;
+        }
+        if let Some((surface, drag)) = self.scrollbar_drag {
+            match mouse.kind {
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    if let Some(layout) = self.scrollbar_layout(surface) {
+                        let top = drag.top_for_row(layout, mouse.row);
+                        self.set_scroll_top(surface, top);
+                    }
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    self.scrollbar_drag = None;
+                }
+                _ => {}
+            }
+            return;
+        }
+        if self.selection.is_dragging() {
+            match self.selection.on_mouse(mouse) {
+                SelectionOutcome::Captured | SelectionOutcome::Changed => return,
+                SelectionOutcome::EdgeScroll { surface, lines } => {
+                    match surface {
+                        RenderSurface::Document => {
+                            self.viewport.scroll_by(lines, self.viewport_metrics)
+                        }
+                        RenderSurface::Contents => {
+                            self.toc_viewport.scroll_by(lines, self.toc_metrics)
+                        }
+                    }
+                    return;
+                }
+                SelectionOutcome::Unhandled | SelectionOutcome::CopyReady(_) => {}
+            }
+        }
+        let position = Position::new(mouse.column, mouse.row);
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 if self
                     .toc_toggle_hit
                     .is_some_and(|area| rect_contains(area, mouse.column, mouse.row))
                 {
-                    self.toggle_toc();
+                    let context = self.action_context(RenderTarget::Viewer);
+                    let _ = self
+                        .invoke_action(ActionInvocation::new(actions::TOGGLE_CONTENTS, context));
                     return;
                 }
                 if self.begin_toc_drag(mouse.column, mouse.row) {
+                    return;
+                }
+                let scrollbar = [
+                    (ScrollSurface::Document, self.document_scrollbar),
+                    (ScrollSurface::Contents, self.toc_scrollbar),
+                ]
+                .into_iter()
+                .find_map(|(surface, layout)| {
+                    layout
+                        .filter(|layout| layout.contains(position))
+                        .map(|layout| (surface, layout))
+                });
+                if let Some((surface, layout)) = scrollbar {
+                    self.selection.clear();
+                    if let Some(drag) = ScrollbarDrag::begin(layout, position) {
+                        self.scrollbar_drag = Some((surface, drag));
+                    } else {
+                        let top = layout.top_for_track_row(mouse.row);
+                        self.set_scroll_top(surface, top);
+                    }
                     return;
                 }
                 if let Some(destination) = self
@@ -467,7 +587,9 @@ impl App {
                     .find(|hit| rect_contains(hit.area, mouse.column, mouse.row))
                     .map(|hit| hit.destination.clone())
                 {
-                    self.open_link(&destination);
+                    let context = self.action_context(RenderTarget::Link(destination));
+                    let _ =
+                        self.invoke_action(ActionInvocation::new(actions::OPEN_TARGET, context));
                     return;
                 }
                 if let Some(line) = self
@@ -476,18 +598,43 @@ impl App {
                     .find(|hit| rect_contains(hit.area, mouse.column, mouse.row))
                     .map(|hit| hit.line)
                 {
-                    self.scroll_top = line.min(self.max_scroll());
-                    self.notice = Notice::info("jumped to heading".to_owned());
+                    let context = self.action_context(RenderTarget::Heading(line));
+                    let _ =
+                        self.invoke_action(ActionInvocation::new(actions::OPEN_TARGET, context));
+                    return;
                 }
+                let _ = self.selection.on_mouse(mouse);
             }
-            MouseEventKind::Drag(MouseButton::Left) => {
-                self.update_toc_drag(mouse.column);
+            MouseEventKind::Drag(MouseButton::Left) => {}
+            MouseEventKind::Up(MouseButton::Left) => {}
+            MouseEventKind::ScrollUp
+                if self
+                    .document_selectable
+                    .is_some_and(|region| region.area.contains(position)) =>
+            {
+                self.selection.clear();
+                self.scroll_by(-SCROLL_STEP);
             }
-            MouseEventKind::Up(MouseButton::Left) => {
-                self.finish_toc_drag();
+            MouseEventKind::ScrollDown
+                if self
+                    .document_selectable
+                    .is_some_and(|region| region.area.contains(position)) =>
+            {
+                self.selection.clear();
+                self.scroll_by(SCROLL_STEP);
             }
-            MouseEventKind::ScrollUp => self.scroll_by(-SCROLL_STEP),
-            MouseEventKind::ScrollDown => self.scroll_by(SCROLL_STEP),
+            MouseEventKind::ScrollUp
+                if self.toc_selectable.is_some_and(|region| region.area.contains(position)) =>
+            {
+                self.selection.clear();
+                self.toc_viewport.scroll_by(-SCROLL_STEP, self.toc_metrics);
+            }
+            MouseEventKind::ScrollDown
+                if self.toc_selectable.is_some_and(|region| region.area.contains(position)) =>
+            {
+                self.selection.clear();
+                self.toc_viewport.scroll_by(SCROLL_STEP, self.toc_metrics);
+            }
             _ => {}
         }
     }
@@ -621,6 +768,7 @@ impl App {
     fn dispatch_command(&mut self, name: &str, args: &str) -> Flow {
         match name {
             "configure" if args.trim().is_empty() => {
+                self.selection.clear();
                 self.surface = Surface::Settings(SettingsEditor::open(
                     self.config.store(),
                     vec![config::settings()],
@@ -653,10 +801,7 @@ impl App {
             "help" => {
                 self.input.clear();
                 self.suggestions = None;
-                self.notice = Notice::info(
-                    "/find searches · n/N moves · Ctrl-T toggles contents · drag or </> resizes · = resets · /quit exits"
-                        .to_owned(),
-                );
+                self.notice = Notice::info(self.action_help());
                 Flow::Continue
             }
             "quit" => Flow::Quit,
@@ -725,7 +870,7 @@ impl App {
         let line = search.matches.get(search.selected).copied();
         if jump_to_first {
             if let Some(line) = line {
-                self.scroll_top = line.min(self.max_scroll());
+                self.viewport.set_top(line, self.viewport_metrics);
             }
         }
     }
@@ -740,7 +885,7 @@ impl App {
         search.selected =
             (search.selected as isize + delta).rem_euclid(search.matches.len() as isize) as usize;
         let line = search.matches[search.selected];
-        self.scroll_top = line.min(self.max_scroll());
+        self.viewport.set_top(line, self.viewport_metrics);
     }
 
     fn clear_document_search(&mut self) {
@@ -857,6 +1002,8 @@ impl App {
             Ok(document) => {
                 self.notice = Notice::info(format!("reloaded {}", document.display));
                 self.document = Some(document);
+                self.document_revision = self.document_revision.wrapping_add(1);
+                self.selection.clear();
                 true
             }
             Err(error) => {
@@ -899,8 +1046,11 @@ impl App {
             document.display
         ));
         self.document = Some(document);
+        self.document_revision = self.document_revision.wrapping_add(1);
+        self.selection.clear();
         self.search = None;
-        self.scroll_top = 0;
+        self.viewport.home();
+        self.toc_viewport.home();
         self.input.clear();
         self.suggestions = None;
     }
@@ -1033,22 +1183,39 @@ impl App {
     }
 
     fn set_geometry(&mut self, content_height: usize, viewport_height: usize) {
-        self.content_height = content_height;
-        self.viewport_height = viewport_height;
-        self.scroll_top = self.scroll_top.min(self.max_scroll());
+        self.viewport_metrics = ViewportMetrics::new(content_height, viewport_height);
+        self.viewport.normalize(self.viewport_metrics);
     }
 
     fn max_scroll(&self) -> usize {
-        self.content_height.saturating_sub(self.viewport_height).min(u16::MAX as usize)
+        self.viewport_metrics.max_top()
     }
 
     fn scroll_by(&mut self, delta: isize) {
-        self.scroll_top =
-            (self.scroll_top as isize + delta).clamp(0, self.max_scroll() as isize) as usize;
+        self.viewport.scroll_by(delta, self.viewport_metrics);
     }
 
     fn page_by(&mut self, direction: isize) {
-        self.scroll_by(direction.saturating_mul(self.viewport_height.max(1) as isize));
+        self.viewport.page_by(direction, self.viewport_metrics);
+    }
+
+    fn cancel_pointer_drags(&mut self) {
+        self.cancel_toc_drag();
+        self.scrollbar_drag = None;
+    }
+
+    fn scrollbar_layout(&self, surface: ScrollSurface) -> Option<ScrollbarLayout> {
+        match surface {
+            ScrollSurface::Document => self.document_scrollbar,
+            ScrollSurface::Contents => self.toc_scrollbar,
+        }
+    }
+
+    fn set_scroll_top(&mut self, surface: ScrollSurface, top: usize) {
+        match surface {
+            ScrollSurface::Document => self.viewport.set_top(top, self.viewport_metrics),
+            ScrollSurface::Contents => self.toc_viewport.set_top(top, self.toc_metrics),
+        }
     }
 }
 
@@ -1106,6 +1273,13 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     .split(area);
 
     render_document(frame, chunks[0], app);
+    let selectable =
+        [app.document_selectable, app.toc_selectable].into_iter().flatten().collect::<Vec<_>>();
+    app.selection.capture_frame(
+        frame,
+        &selectable,
+        Style::default().bg(app.theme.selection).add_modifier(Modifier::REVERSED),
+    );
     if let Some(menu) = &app.suggestions {
         menu.render(frame, chunks[1], shown, 44, app.theme);
     }
@@ -1117,6 +1291,10 @@ fn render_document(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     app.toc_toggle_hit = None;
     app.link_hits.clear();
     app.toc_split_frame = SplitFrame::default();
+    app.document_selectable = None;
+    app.document_scrollbar = None;
+    app.toc_selectable = None;
+    app.toc_scrollbar = None;
     let Some(document) = &app.document else {
         let body = vec![
             Line::from(""),
@@ -1134,6 +1312,19 @@ fn render_document(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         ];
         app.set_geometry(body.len(), area.height.saturating_sub(2) as usize);
         frame.render_widget(Paragraph::new(body).block(panel(" markdown ", app.theme)), area);
+        let content_area = Rect::new(
+            area.x.saturating_add(2),
+            area.y.saturating_add(1),
+            area.width.saturating_sub(4),
+            area.height.saturating_sub(2),
+        );
+        app.document_selectable = Some(SelectableRegion::new(
+            RenderSurface::Document,
+            content_area,
+            0,
+            0,
+            app.document_revision,
+        ));
         return;
     };
 
@@ -1166,23 +1357,22 @@ fn render_document(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let search_lines = rendered.search_lines;
     let content_height = text.lines.len();
     let viewport_height = document_area.height.saturating_sub(2) as usize;
-    app.content_height = content_height;
-    app.viewport_height = viewport_height;
-    let max_scroll = content_height.saturating_sub(viewport_height).min(u16::MAX as usize);
-    app.scroll_top = app.scroll_top.min(max_scroll);
+    app.set_geometry(content_height, viewport_height);
+    let max_scroll = app.max_scroll();
     if let Some(query) = app.search.as_ref().map(|search| search.query.clone()) {
         app.sync_document_search(matching_document_lines(&text, &search_lines, &query));
     }
     if let Some(search) = &app.search {
         highlight_document_matches(&mut text, search, app.theme);
     }
-    app.link_hits = rendered_link_hits(document_area, app.scroll_top, viewport_height, &links);
+    let scroll_top = app.viewport.top(app.viewport_metrics);
+    app.link_hits = rendered_link_hits(document_area, scroll_top, viewport_height, &links);
     let title = if max_scroll == 0 {
         " markdown ".to_owned()
     } else {
-        format!(" markdown ─ {}/{} ", app.scroll_top + 1, max_scroll + 1)
+        format!(" markdown ─ {}/{} ", scroll_top + 1, max_scroll + 1)
     };
-    let scroll = app.scroll_top.min(u16::MAX as usize) as u16;
+    let scroll = scroll_top.min(u16::MAX as usize) as u16;
     let mut document_panel = panel(title, app.theme);
     if toc_available && app.toc_collapsed {
         let toggle_title = " contents [+] ";
@@ -1201,10 +1391,85 @@ fn render_document(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         Paragraph::new(text).block(document_panel).scroll((scroll, 0)),
         document_area,
     );
+    let content_area = Rect::new(
+        document_area.x.saturating_add(2),
+        document_area.y.saturating_add(1),
+        document_area.width.saturating_sub(4),
+        document_area.height.saturating_sub(2),
+    );
+    app.document_selectable = Some(SelectableRegion::new(
+        RenderSurface::Document,
+        content_area,
+        i64::try_from(scroll_top).unwrap_or(i64::MAX),
+        0,
+        app.document_revision,
+    ));
+    let scrollbar_area = Rect::new(
+        document_area.x.saturating_add(1),
+        document_area.y.saturating_add(1),
+        document_area.width.saturating_sub(2),
+        document_area.height.saturating_sub(2),
+    );
+    app.document_scrollbar =
+        ScrollbarLayout::vertical_right(scrollbar_area, app.viewport_metrics, scroll_top);
+    if let Some(layout) = app.document_scrollbar {
+        render_vertical_scrollbar(
+            frame,
+            layout,
+            app.scrollbar_drag.is_some_and(|(surface, _)| surface == ScrollSurface::Document),
+            ScrollbarStyle {
+                track_color: app.theme.border,
+                thumb_color: app.theme.text_muted,
+                active_thumb_color: app.theme.accent,
+                track_symbol: "│",
+                thumb_symbol: "┃",
+            },
+        );
+    }
     if let Some(toc_area) = toc_area {
-        let (hits, toggle_hit) = render_toc(frame, toc_area, &headings, app.scroll_top, app.theme);
+        let visible_rows = toc_area.height.saturating_sub(2) as usize;
+        app.toc_metrics = ViewportMetrics::new(headings.len(), visible_rows);
+        app.toc_viewport.normalize(app.toc_metrics);
+        let toc_top = app.toc_viewport.top(app.toc_metrics);
+        let (hits, toggle_hit) =
+            render_toc(frame, toc_area, &headings, toc_top, scroll_top, app.theme);
         app.toc_hits = hits;
         app.toc_toggle_hit = Some(toggle_hit);
+        let toc_content_area = Rect::new(
+            toc_area.x.saturating_add(1),
+            toc_area.y.saturating_add(1),
+            toc_area.width.saturating_sub(3),
+            toc_area.height.saturating_sub(2),
+        );
+        app.toc_selectable = Some(SelectableRegion::new(
+            RenderSurface::Contents,
+            toc_content_area,
+            i64::try_from(toc_top).unwrap_or(i64::MAX),
+            0,
+            app.document_revision,
+        ));
+        let toc_scrollbar_area = Rect::new(
+            toc_area.x.saturating_add(1),
+            toc_area.y.saturating_add(1),
+            toc_area.width.saturating_sub(2),
+            toc_area.height.saturating_sub(2),
+        );
+        app.toc_scrollbar =
+            ScrollbarLayout::vertical_right(toc_scrollbar_area, app.toc_metrics, toc_top);
+        if let Some(layout) = app.toc_scrollbar {
+            render_vertical_scrollbar(
+                frame,
+                layout,
+                app.scrollbar_drag.is_some_and(|(surface, _)| surface == ScrollSurface::Contents),
+                ScrollbarStyle {
+                    track_color: app.theme.border,
+                    thumb_color: app.theme.text_muted,
+                    active_thumb_color: app.theme.accent,
+                    track_symbol: "│",
+                    thumb_symbol: "┃",
+                },
+            );
+        }
         render_split_divider(
             frame,
             app.toc_split_frame,
@@ -1255,15 +1520,13 @@ fn render_toc(
     frame: &mut Frame<'_>,
     area: Rect,
     headings: &[MarkdownHeading],
-    scroll_top: usize,
+    toc_top: usize,
+    document_top: usize,
     theme: TuiTheme,
 ) -> (Vec<TocHit>, Rect) {
-    let active = headings.iter().rposition(|heading| heading.line <= scroll_top);
+    let active = headings.iter().rposition(|heading| heading.line <= document_top);
     let visible_rows = area.height.saturating_sub(2) as usize;
-    let start = active
-        .unwrap_or_default()
-        .saturating_sub(visible_rows / 2)
-        .min(headings.len().saturating_sub(visible_rows));
+    let start = toc_top.min(headings.len().saturating_sub(visible_rows));
     let lines = headings
         .iter()
         .enumerate()
@@ -1565,7 +1828,7 @@ mod tests {
         )
         .unwrap();
         app.set_geometry(100, 20);
-        app.scroll_top = 12;
+        app.viewport = Viewport::new(12);
         fs::write(path, "# After").unwrap();
         fs::write(temp.0.join("new.md"), "# Newly indexed").unwrap();
 
@@ -1578,7 +1841,7 @@ mod tests {
             app.document.as_ref().map(|document| document.markdown.as_str()),
             Some("# After")
         );
-        assert_eq!(app.scroll_top, 12);
+        assert_eq!(app.viewport.top(app.viewport_metrics), 12);
         assert_eq!(app.index.len(), 2);
         assert!(app.input.value().is_empty());
         assert_eq!(app.notice.text, "refreshed README.md · indexed 2 Markdown files");
@@ -1950,8 +2213,8 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         });
 
-        assert_eq!(app.scroll_top, hit.line.min(app.max_scroll()));
-        assert!(app.scroll_top > 0);
+        assert_eq!(app.viewport.top(app.viewport_metrics), hit.line.min(app.max_scroll()));
+        assert!(app.viewport.top(app.viewport_metrics) > 0);
     }
 
     #[test]
@@ -2078,12 +2341,12 @@ mod tests {
         let search = app.search.as_ref().unwrap();
         assert_eq!(search.matches.len(), 2);
         assert_eq!(search.selected, 0);
-        assert_eq!(app.scroll_top, search.matches[0]);
+        assert_eq!(app.viewport.top(app.viewport_metrics), search.matches[0]);
 
         app.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
         let search = app.search.as_ref().unwrap();
         assert_eq!(search.selected, 1);
-        assert_eq!(app.scroll_top, search.matches[1].min(app.max_scroll()));
+        assert_eq!(app.viewport.top(app.viewport_metrics), search.matches[1].min(app.max_scroll()));
 
         app.on_key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT));
         assert_eq!(app.search.as_ref().unwrap().selected, 0);
@@ -2241,13 +2504,13 @@ mod tests {
         .unwrap();
         app.set_geometry(100, 20);
         app.scroll_by(10_000);
-        assert_eq!(app.scroll_top, 80);
+        assert_eq!(app.viewport.top(app.viewport_metrics), 80);
         app.page_by(-1);
-        assert_eq!(app.scroll_top, 60);
+        assert_eq!(app.viewport.top(app.viewport_metrics), 60);
 
         app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT));
-        assert_eq!(app.scroll_top, 0);
+        assert_eq!(app.viewport.top(app.viewport_metrics), 0);
         app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
-        assert_eq!(app.scroll_top, 80);
+        assert_eq!(app.viewport.top(app.viewport_metrics), 80);
     }
 }

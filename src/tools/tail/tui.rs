@@ -30,8 +30,9 @@ use crate::{
         render_split_divider, ActionId, ActionInvocation, ActionState, ActionUnavailable,
         ContextMenu, ContextMenuLayout, ContextMenuOutcome, ContextMenuStyle, EventReader,
         KeyChord, KeybindingResolution, KeybindingState, NavigationHistory, NavigationMap,
-        NavigationRegion, ResolvedAction, Session, SessionOptions, SplitDividerStyle, SplitDrag,
-        SplitFrame, SplitMinimums, SplitRatio,
+        NavigationRegion, ResolvedAction, SelectableRegion, SelectionOutcome, Session,
+        SessionOptions, SplitDividerStyle, SplitDrag, SplitFrame, SplitMinimums, SplitRatio,
+        TextSelection,
     },
 };
 
@@ -81,6 +82,11 @@ enum Flow {
     NavigateHistory(isize),
     PersistSplitRatio(SplitRatio),
     Quit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TailSelectionSurface {
+    Detail,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -247,6 +253,7 @@ struct UiRegions {
     inline_actions: Vec<(Rect, ActionId)>,
     split: Option<SplitFrame>,
     context_menu: Option<ContextMenuLayout>,
+    selectable: Vec<SelectableRegion<TailSelectionSurface>>,
 }
 
 impl UiRegions {
@@ -348,9 +355,18 @@ pub async fn run(
         receiver = Some(start_receiver(&client, &cache, &receiver_tx, app.receiver_generation));
     }
     let mut regions = UiRegions::default();
+    let mut selection = TextSelection::<TailSelectionSurface>::default();
 
     loop {
-        session.draw(|frame| regions = render(frame, &app))?;
+        session.draw(|frame| {
+            regions = render(frame, &app);
+            let selectable = regions.selectable.clone();
+            selection.capture_frame(
+                frame,
+                &selectable,
+                Style::default().bg(ACCENT).add_modifier(Modifier::REVERSED),
+            );
+        })?;
         tokio::select! {
             _ = tick.tick(), if operation.is_some()
                 || (receiver.is_some() && app.receiver_state.animated())
@@ -365,6 +381,28 @@ pub async fn run(
                 if matches!(event, Event::Key(_) | Event::Mouse(_) | Event::Paste(_)) {
                     app.notice = None;
                 }
+                if app.overlay.is_none() {
+                    if let Event::Key(key) = &event {
+                        match selection.on_key(*key) {
+                            SelectionOutcome::CopyReady(text) => {
+                                session.copy(&text)?;
+                                continue;
+                            }
+                            SelectionOutcome::Captured | SelectionOutcome::Changed => continue,
+                            SelectionOutcome::Unhandled | SelectionOutcome::EdgeScroll { .. } => {}
+                        }
+                    }
+                    if let Event::Mouse(mouse) = &event {
+                        if selection.is_dragging() {
+                            let _ = selection.on_mouse(*mouse);
+                            continue;
+                        }
+                    }
+                }
+                let selection_mouse = match &event {
+                    Event::Mouse(mouse) => Some(*mouse),
+                    _ => None,
+                };
                 let mut actions = ActionDispatch {
                     session: &mut session,
                     processes: &processes,
@@ -416,6 +454,11 @@ pub async fn run(
                     _ => Flow::Continue,
                     }
                 };
+                if matches!(&flow, Flow::Continue) && app.overlay.is_none() {
+                    if let Some(mouse) = selection_mouse {
+                        let _ = selection.on_mouse(mouse);
+                    }
+                }
                 match flow {
                     Flow::Continue => {}
                     Flow::Invoke(invocation) => {
@@ -2474,7 +2517,20 @@ fn render(frame: &mut Frame<'_>, app: &App) -> UiRegions {
         Mode::Ambiguous { input, .. } => render_ambiguous(frame, body, input),
         Mode::Search => render_browser(frame, body, app, &mut regions),
         Mode::Detail { preview } => {
-            render_detail(frame, body, app, preview.as_ref().map(|text| text.as_str()))
+            render_detail(frame, body, app, preview.as_ref().map(|text| text.as_str()));
+            let inner = Rect::new(
+                body.x.saturating_add(1),
+                body.y.saturating_add(1),
+                body.width.saturating_sub(2),
+                body.height.saturating_sub(2),
+            );
+            regions.selectable.push(SelectableRegion::new(
+                TailSelectionSurface::Detail,
+                inner,
+                0,
+                0,
+                app.receiver_generation.wrapping_add(app.item_index as u64),
+            ));
         }
         Mode::ConfirmDelete => render_confirm_delete(frame, body, app),
         Mode::ConfirmQuit(_) => render_confirm_quit(frame, body, app),
@@ -2502,6 +2558,7 @@ fn render(frame: &mut Frame<'_>, app: &App) -> UiRegions {
         let layout = menu.layout(frame.area());
         menu.render(frame, &layout, ContextMenuStyle::default());
         regions.context_menu = Some(layout);
+        regions.selectable.clear();
     }
     regions
 }
@@ -2832,7 +2889,7 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, app: &App, preview: Option<&
             );
             if item.kind == ItemKind::Text {
                 format!(
-                    "{}\n\n{}\n\n────────────────────\n{}\n\nc  Copy to clipboard",
+                    "{}\n\n{}\n\n────────────────────\n{}",
                     item.name,
                     preview.unwrap_or("Text preview unavailable"),
                     details,

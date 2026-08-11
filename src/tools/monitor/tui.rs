@@ -20,8 +20,9 @@ use tokio::sync::mpsc;
 use crate::tui::{
     theme::NORD, ActionId, ActionInvocation, ActionUnavailable, ContextMenu, ContextMenuLayout,
     ContextMenuOutcome, ContextMenuStyle, EventReader, KeyChord, KeybindingResolution,
-    KeybindingState, NavigationMap, NavigationRegion, ResolvedAction, Session, SessionOptions,
-    SplitFrame, SplitMinimums, SplitRatio,
+    KeybindingState, NavigationMap, NavigationRegion, ResolvedAction, SelectableRegion,
+    SelectionOutcome, Session, SessionOptions, SplitFrame, SplitMinimums, SplitRatio,
+    TextSelection,
 };
 
 use super::{
@@ -48,11 +49,17 @@ enum ActiveRegion {
     Secondary,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum Flow {
     Continue,
+    Copy(String),
     Quit,
     Refresh,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MonitorSurface {
+    Inspector,
 }
 
 enum MonitorOverlay {
@@ -68,6 +75,7 @@ struct UiRegions {
     rows: Vec<(Rect, usize)>,
     inline_actions: Vec<(Rect, ActionId)>,
     context_menu: Option<ContextMenuLayout>,
+    selectable: Vec<SelectableRegion<MonitorSurface>>,
 }
 
 impl UiRegions {
@@ -99,6 +107,7 @@ struct App {
     overlay: Option<MonitorOverlay>,
     notice: Option<String>,
     mouse: bool,
+    selection: TextSelection<MonitorSurface>,
 }
 
 pub async fn run(
@@ -124,12 +133,13 @@ pub async fn run(
     let mut regions = UiRegions::default();
 
     loop {
-        session.draw(|frame| regions = render(frame, &app))?;
+        session.draw(|frame| regions = render(frame, &mut app))?;
         tokio::select! {
             event = events.recv() => match event {
                 Some(event) => {
                     let flow = app.on_event(event, &regions);
                     match flow {
+                        Flow::Copy(text) => session.copy(&text)?,
                         Flow::Quit => break,
                         Flow::Refresh => start_refresh(
                             &mut app,
@@ -240,10 +250,22 @@ impl App {
             overlay: None,
             notice: None,
             mouse,
+            selection: TextSelection::default(),
         }
     }
 
     fn on_event(&mut self, event: Event, regions: &UiRegions) -> Flow {
+        if self.overlay.is_none() {
+            if let Event::Key(key) = &event {
+                match self.selection.on_key(*key) {
+                    SelectionOutcome::CopyReady(text) => return Flow::Copy(text),
+                    SelectionOutcome::Captured | SelectionOutcome::Changed => {
+                        return Flow::Continue
+                    }
+                    SelectionOutcome::Unhandled | SelectionOutcome::EdgeScroll { .. } => {}
+                }
+            }
+        }
         if matches!(
             &event,
             Event::Key(KeyEvent {
@@ -260,7 +282,12 @@ impl App {
         }
         match event {
             Event::Key(key) if key.is_press() => self.on_key(key, regions),
-            Event::Mouse(mouse) if self.mouse => self.on_mouse(mouse, regions),
+            Event::Mouse(mouse) if self.mouse => {
+                if self.selection.is_dragging() {
+                    return self.on_selection_mouse(mouse);
+                }
+                self.on_mouse(mouse, regions)
+            }
             Event::Resize(_, _) => Flow::Continue,
             _ => Flow::Continue,
         }
@@ -355,10 +382,12 @@ impl App {
                 }
             }
             KeyCode::Char('/') => {
+                self.selection.clear();
                 self.filtering = true;
                 Flow::Continue
             }
             KeyCode::Char('?') => {
+                self.selection.clear();
                 self.overlay = Some(MonitorOverlay::Help);
                 Flow::Continue
             }
@@ -437,6 +466,7 @@ impl App {
             {
                 self.set_selection(*index);
                 self.active_region = ActiveRegion::Primary;
+                self.selection.clear();
                 return Flow::Continue;
             }
             if regions.secondary.is_some_and(|area| area.contains(position)) {
@@ -453,6 +483,7 @@ impl App {
                 let items = self.registry.resolve_menu(ITEM_CONTEXT, &context);
                 self.overlay =
                     ContextMenu::open(position, context, items).map(MonitorOverlay::ContextMenu);
+                self.selection.clear();
             }
         }
         match mouse.kind {
@@ -460,7 +491,17 @@ impl App {
             MouseEventKind::ScrollDown => self.move_selection(3),
             _ => {}
         }
-        Flow::Continue
+        self.on_selection_mouse(mouse)
+    }
+
+    fn on_selection_mouse(&mut self, mouse: MouseEvent) -> Flow {
+        match self.selection.on_mouse(mouse) {
+            SelectionOutcome::CopyReady(text) => Flow::Copy(text),
+            SelectionOutcome::Captured
+            | SelectionOutcome::Changed
+            | SelectionOutcome::Unhandled
+            | SelectionOutcome::EdgeScroll { .. } => Flow::Continue,
+        }
     }
 
     fn invoke_action(&mut self, invocation: ActionInvocation<MonitorActionContext>) -> Flow {
@@ -717,7 +758,7 @@ impl App {
     }
 }
 
-fn render(frame: &mut Frame<'_>, app: &App) -> UiRegions {
+fn render(frame: &mut Frame<'_>, app: &mut App) -> UiRegions {
     frame.render_widget(Block::new().style(Style::default().bg(NORD.background)), frame.area());
     let rows = Layout::vertical([
         Constraint::Length(1),
@@ -745,6 +786,15 @@ fn render(frame: &mut Frame<'_>, app: &App) -> UiRegions {
         Some(MonitorOverlay::Help) => render_help(frame, app),
         None => {}
     }
+    if app.overlay.is_some() {
+        regions.selectable.clear();
+    }
+    let selectable = regions.selectable.clone();
+    app.selection.capture_frame(
+        frame,
+        &selectable,
+        Style::default().bg(NORD.selection).add_modifier(Modifier::REVERSED),
+    );
     regions
 }
 
@@ -1027,6 +1077,13 @@ fn render_inspector(
         render_metric_inspector(frame, chunks[0], app);
     } else {
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), chunks[0]);
+        regions.selectable.push(SelectableRegion::new(
+            MonitorSurface::Inspector,
+            chunks[0],
+            0,
+            0,
+            app.snapshot_generation,
+        ));
     }
     let context = app.action_context();
     let mut actions = app.registry.resolve_menu(ITEM_INLINE, &context).items().to_vec();
@@ -1633,13 +1690,13 @@ mod tests {
 
     #[test]
     fn tabs_are_the_first_rendered_row() {
-        let app =
+        let mut app =
             App::new(snapshot(), contributions::registry().unwrap(), false, "monitor.toml".into());
         let backend = TestBackend::new(140, 36);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                let _ = render(frame, &app);
+                let _ = render(frame, &mut app);
             })
             .unwrap();
         let first_row = (0..140)
@@ -1661,7 +1718,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                let _ = render(frame, &app);
+                let _ = render(frame, &mut app);
             })
             .unwrap();
         let rendered = terminal

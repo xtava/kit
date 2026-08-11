@@ -14,8 +14,10 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-use ratatui::layout::{Constraint, Layout, Rect};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
@@ -24,7 +26,11 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::time;
 
 use crate::cdp::{Source, TargetKind, TimelineEvent, TrackKind};
-use crate::tui::{fuzzy, EventReader, LineEditor, Session, SessionOptions, SuggestionMenu};
+use crate::tui::{
+    fuzzy, render_vertical_scrollbar, EventReader, FollowViewport, LineEditor, ScrollbarDrag,
+    ScrollbarLayout, ScrollbarStyle, SelectableRegion, SelectionOutcome, Session, SessionOptions,
+    SuggestionMenu, TextSelection, ViewportMetrics,
+};
 
 use super::protocol::{Command, Frame, Reply, SubscriptionOverload, TargetActivity};
 use super::registry::Record;
@@ -46,7 +52,8 @@ pub async fn run(runtime: client::Runtime<'_>, app: Option<&str>) -> Result<()> 
     let mut frames = client::subscribe(&record, BACKFILL_MS).await?;
     let (async_tx, mut async_rx) = mpsc::unbounded_channel::<Async>();
 
-    let mut session = Session::open(SessionOptions::default())?;
+    let mut session =
+        Session::open(SessionOptions { mouse_capture: true, bracketed_paste: false })?;
     let mut events = EventReader::start();
     let mut repl = Repl::new(record);
     {
@@ -57,9 +64,10 @@ pub async fn run(runtime: client::Runtime<'_>, app: Option<&str>) -> Result<()> 
         });
     }
     let mut redraw = time::interval(REDRAW);
+    let mut regions = UiRegions::default();
 
     loop {
-        session.draw(|frame| render(frame, &mut repl))?;
+        session.draw(|frame| regions = render(frame, &mut repl))?;
 
         tokio::select! {
             _ = redraw.tick() => {}
@@ -73,6 +81,8 @@ pub async fn run(runtime: client::Runtime<'_>, app: Option<&str>) -> Result<()> 
                     Flow::Quit => break,
                     Flow::Continue => {}
                 },
+                Some(Event::Mouse(mouse)) => repl.on_mouse(mouse, &regions),
+                Some(Event::Resize(_, _)) => repl.scrollbar_drag = None,
                 None => break,
                 _ => {}
             },
@@ -91,6 +101,18 @@ pub async fn run(runtime: client::Runtime<'_>, app: Option<&str>) -> Result<()> 
 enum Flow {
     Continue,
     Quit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SelectionSurface {
+    Timeline,
+}
+
+#[derive(Default)]
+struct UiRegions {
+    feed: Option<Rect>,
+    scrollbar: Option<ScrollbarLayout>,
+    selectable: Vec<SelectableRegion<SelectionSurface>>,
 }
 
 /// Work that finished off the UI thread and came back over the channel.
@@ -121,8 +143,7 @@ struct Repl {
     view_tracks: Option<Vec<TrackKind>>,
     view_source: Option<Source>,
     feed: Vec<FeedItem>,
-    /// Absolute top line of the viewport. `None` = pinned to the bottom (following live).
-    view_top: Option<usize>,
+    viewport: FollowViewport,
     /// Horizontal pan, in columns — for reading lines wider than the pane (long ws frames, urls).
     view_left: u16,
     /// Rendered feed geometry from the last frame — what scrolling needs to clamp against.
@@ -144,6 +165,9 @@ struct Repl {
     suggestions: Option<SuggestionMenu>,
     /// Word start Esc silenced — the menu stays hidden until the cursor enters a new word.
     muted_at: Option<usize>,
+    selection: TextSelection<SelectionSurface>,
+    scrollbar_drag: Option<ScrollbarDrag>,
+    feed_revision: u64,
 }
 
 impl Repl {
@@ -156,7 +180,7 @@ impl Repl {
             view_tracks: None,
             view_source: None,
             feed: Vec::new(),
-            view_top: None,
+            viewport: FollowViewport::default(),
             view_left: 0,
             feed_height: 0,
             feed_total: 0,
@@ -177,6 +201,9 @@ impl Repl {
             },
             suggestions: None,
             muted_at: None,
+            selection: TextSelection::default(),
+            scrollbar_drag: None,
+            feed_revision: 0,
         }
     }
 
@@ -230,7 +257,9 @@ impl Repl {
         if self.feed.len() > FEED_CAP {
             let overflow = self.feed.len() - FEED_CAP;
             self.feed.drain(0..overflow);
-            self.view_top = None;
+            self.viewport.end();
+            self.selection.clear();
+            self.feed_revision = self.feed_revision.wrapping_add(1);
         }
     }
 
@@ -241,6 +270,14 @@ impl Repl {
     // --- keys ---
 
     fn on_key(&mut self, key: KeyEvent, async_tx: &UnboundedSender<Async>) -> Flow {
+        match self.selection.on_key(key) {
+            SelectionOutcome::CopyReady(text) => {
+                self.pending_copy = Some(text);
+                return Flow::Continue;
+            }
+            SelectionOutcome::Captured | SelectionOutcome::Changed => return Flow::Continue,
+            SelectionOutcome::Unhandled | SelectionOutcome::EdgeScroll { .. } => {}
+        }
         if self.picker.is_some() {
             return self.picker_key(key);
         }
@@ -259,7 +296,9 @@ impl Repl {
                 KeyCode::Char('d') => Flow::Quit,
                 KeyCode::Char('l') => {
                     self.feed.clear();
-                    self.view_top = None;
+                    self.viewport.end();
+                    self.selection.clear();
+                    self.feed_revision = self.feed_revision.wrapping_add(1);
                     Flow::Continue
                 }
                 // Command history — the readline pairing, kept off the arrows so it never contends
@@ -279,7 +318,7 @@ impl Repl {
         }
         // While scrolled (reviewing history), `c`/`y` yank the view — they can't shadow typing here
         // because the prompt isn't in compose mode. Pinned to live, they're ordinary characters.
-        if self.view_top.is_some() && matches!(key.code, KeyCode::Char('c' | 'y')) {
+        if !self.viewport.is_live() && matches!(key.code, KeyCode::Char('c' | 'y')) {
             self.copy_view();
             return Flow::Continue;
         }
@@ -314,10 +353,10 @@ impl Repl {
             {
                 self.accept_ghost()
             }
-            KeyCode::Left if self.view_top.is_some() => {
+            KeyCode::Left if !self.viewport.is_live() => {
                 self.view_left = self.view_left.saturating_sub(PAN_STEP)
             }
-            KeyCode::Right if self.view_top.is_some() => {
+            KeyCode::Right if !self.viewport.is_live() => {
                 self.view_left = self.view_left.saturating_add(PAN_STEP)
             }
             KeyCode::PageUp => self.page_up(),
@@ -326,7 +365,7 @@ impl Repl {
             KeyCode::Esc if engaged => self.disengage(),
             KeyCode::Esc if menu => self.mute_suggestions(),
             KeyCode::End | KeyCode::Esc => {
-                self.view_top = None;
+                self.viewport.end();
                 self.view_left = 0;
             }
             _ => {
@@ -367,17 +406,26 @@ impl Repl {
             Meta::Track(tracks) => {
                 let shown = describe_tracks(&tracks);
                 self.view_tracks = tracks;
+                self.selection.clear();
+                self.feed_revision = self.feed_revision.wrapping_add(1);
                 self.notice(format!("tracks → {shown}"));
             }
             Meta::Source(source) => {
                 self.view_source = source;
+                self.selection.clear();
+                self.feed_revision = self.feed_revision.wrapping_add(1);
                 self.notice(format!("source → {}", describe_source(source)));
             }
             Meta::Clear => {
                 self.feed.clear();
-                self.view_top = None;
+                self.viewport.end();
+                self.selection.clear();
+                self.feed_revision = self.feed_revision.wrapping_add(1);
             }
-            Meta::Help => self.help_open = true,
+            Meta::Help => {
+                self.selection.clear();
+                self.help_open = true;
+            }
             Meta::Quit | Meta::PickTarget => {}
         }
     }
@@ -385,6 +433,8 @@ impl Repl {
     fn set_target(&mut self, target: Option<String>) {
         let shown = target.clone().unwrap_or_else(|| "all targets".to_owned());
         self.target = target;
+        self.selection.clear();
+        self.feed_revision = self.feed_revision.wrapping_add(1);
         self.notice(format!("focus → {shown}"));
     }
 
@@ -512,6 +562,7 @@ impl Repl {
     // --- target picker ---
 
     fn open_picker(&mut self, async_tx: &UnboundedSender<Async>) {
+        self.selection.clear();
         self.picker = Some(Picker::loading());
         let record = self.record.clone();
         let async_tx = async_tx.clone();
@@ -639,31 +690,81 @@ impl Repl {
 
     // --- scroll + view ---
 
-    /// The topmost line index when pinned to the bottom — the anchor scrolling moves away from.
-    fn max_top(&self) -> usize {
-        self.feed_total.saturating_sub(self.feed_height)
+    fn viewport_metrics(&self) -> ViewportMetrics {
+        ViewportMetrics::new(self.feed_total, self.feed_height)
     }
 
     fn page_up(&mut self) {
-        self.scroll_by(-(self.feed_height.max(1) as isize));
+        self.viewport.page_by(-1, self.viewport_metrics());
     }
 
     fn page_down(&mut self) {
-        self.scroll_by(self.feed_height.max(1) as isize);
+        self.viewport.page_by(1, self.viewport_metrics());
     }
 
-    /// Move the viewport by `delta` lines (negative = toward older). Reaching the bottom re-pins so
-    /// the feed follows live again; `None` view_top always means pinned.
     fn scroll_by(&mut self, delta: isize) {
-        self.view_top = scrolled(self.view_top, self.max_top(), delta);
+        self.viewport.scroll_by(delta, self.viewport_metrics());
+    }
+
+    fn on_mouse(&mut self, mouse: MouseEvent, regions: &UiRegions) {
+        let position = Position::new(mouse.column, mouse.row);
+        if let Some(drag) = self.scrollbar_drag {
+            match mouse.kind {
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    if let Some(scrollbar) = regions.scrollbar {
+                        self.viewport.set_top(
+                            drag.top_for_row(scrollbar, position.y),
+                            self.viewport_metrics(),
+                        );
+                    }
+                }
+                MouseEventKind::Up(MouseButton::Left) => self.scrollbar_drag = None,
+                _ => {}
+            }
+            return;
+        }
+        if let Some(scrollbar) = regions.scrollbar.filter(|scrollbar| scrollbar.contains(position))
+        {
+            if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                if let Some(drag) = ScrollbarDrag::begin(scrollbar, position) {
+                    self.scrollbar_drag = Some(drag);
+                } else {
+                    self.viewport
+                        .set_top(scrollbar.top_for_track_row(position.y), self.viewport_metrics());
+                }
+            }
+            return;
+        }
+        if regions.feed.is_some_and(|area| area.contains(position)) {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    self.scroll_by(-3);
+                    return;
+                }
+                MouseEventKind::ScrollDown => {
+                    self.scroll_by(3);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        match self.selection.on_mouse(mouse) {
+            SelectionOutcome::CopyReady(text) => self.pending_copy = Some(text),
+            SelectionOutcome::EdgeScroll { lines, .. } => self.scroll_by(lines),
+            SelectionOutcome::Unhandled
+            | SelectionOutcome::Captured
+            | SelectionOutcome::Changed => {}
+        }
     }
 
     /// Queue a yank of the current timeline view — exactly the lines on screen, as plain text. The
     /// event loop performs the OSC 52 write (it owns the terminal) and reports the outcome.
     fn copy_view(&mut self) {
+        let lines = self.visible_lines();
         let text = self
-            .visible_lines()
-            .iter()
+            .viewport
+            .visible_range(ViewportMetrics::new(lines.len(), self.feed_height))
+            .map(|index| &lines[index])
             .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n");
@@ -704,14 +805,6 @@ impl Repl {
             && self.view_tracks.as_ref().is_none_or(|tracks| tracks.contains(&event.track.kind()))
             && self.target.as_ref().is_none_or(|focus| label_matches(&event.target, focus))
     }
-}
-
-/// New viewport top after moving `delta` lines from `view_top` (`None` = pinned at `max_top`).
-/// Clamps to `[0, max_top]` and returns `None` once the move reaches the bottom, re-pinning to live.
-fn scrolled(view_top: Option<usize>, max_top: usize, delta: isize) -> Option<usize> {
-    let current = view_top.unwrap_or(max_top) as isize;
-    let next = (current + delta).clamp(0, max_top as isize) as usize;
-    (next < max_top).then_some(next)
 }
 
 /// Fill a command's `--target` with the focused target when the line didn't specify one.
@@ -976,7 +1069,7 @@ fn parse_source_filter(rest: &[String]) -> Result<Option<Source>, String> {
 
 // --- rendering ---
 
-fn render(frame: &mut TuiFrame, repl: &mut Repl) {
+fn render(frame: &mut TuiFrame, repl: &mut Repl) -> UiRegions {
     let area = frame.area();
     let shown = repl.suggestions.as_ref().map_or(0, |menu| menu.visible_rows(area, 8, 8));
     let menu_height = if shown == 0 { 0 } else { shown as u16 + 1 };
@@ -992,7 +1085,8 @@ fn render(frame: &mut TuiFrame, repl: &mut Repl) {
     let lines = repl.visible_lines();
     repl.feed_height = chunks[1].height.saturating_sub(2) as usize;
     repl.feed_total = lines.len();
-    render_feed(frame, chunks[1], repl, lines);
+    let mut regions = UiRegions::default();
+    render_feed(frame, chunks[1], repl, lines, &mut regions);
     if shown > 0 {
         if let Some(menu) = &repl.suggestions {
             menu.render(frame, chunks[2], shown, 24, crate::tui::theme::NORD);
@@ -1006,6 +1100,16 @@ fn render(frame: &mut TuiFrame, repl: &mut Repl) {
     if let Some(picker) = &repl.picker {
         render_picker(frame, area, picker);
     }
+    if repl.help_open || repl.picker.is_some() {
+        regions.selectable.clear();
+    }
+    let selectable = regions.selectable.clone();
+    repl.selection.capture_frame(
+        frame,
+        &selectable,
+        Style::default().bg(crate::tui::theme::NORD.selection).add_modifier(Modifier::REVERSED),
+    );
+    regions
 }
 
 fn render_header(frame: &mut TuiFrame, area: Rect, repl: &Repl) {
@@ -1035,20 +1139,55 @@ fn render_header(frame: &mut TuiFrame, area: Rect, repl: &Repl) {
     frame.render_widget(Paragraph::new(body).block(panel(" kit cdp ")), area);
 }
 
-fn render_feed(frame: &mut TuiFrame, area: Rect, repl: &Repl, lines: Vec<Line<'static>>) {
-    let inner_height = area.height.saturating_sub(2) as usize;
-    let max_top = lines.len().saturating_sub(inner_height);
-    let top = repl.view_top.map_or(max_top, |top| top.min(max_top));
-    let below = max_top - top;
+fn render_feed(
+    frame: &mut TuiFrame,
+    area: Rect,
+    repl: &mut Repl,
+    lines: Vec<Line<'static>>,
+    regions: &mut UiRegions,
+) {
+    let block = panel_titled(String::new());
+    let inner = block.inner(area);
+    let metrics = ViewportMetrics::new(lines.len(), usize::from(inner.height));
+    repl.viewport.normalize(metrics);
+    let top = repl.viewport.top(metrics);
+    let below = metrics.max_top().saturating_sub(top);
 
     let vertical = if below == 0 { "● live".to_owned() } else { format!("▲ {below} below") };
     let pan =
         if repl.view_left > 0 { format!(" ─ → {}", repl.view_left) } else { String::new() };
     let title = format!(" timeline ─ {vertical}{pan} ");
 
-    let feed =
-        Paragraph::new(lines).block(panel_titled(title)).scroll((top as u16, repl.view_left));
+    let feed = Paragraph::new(lines)
+        .block(panel_titled(title))
+        .scroll((u16::try_from(top).unwrap_or(u16::MAX), repl.view_left));
     frame.render_widget(feed, area);
+    regions.feed = Some(inner);
+    regions.scrollbar = ScrollbarLayout::vertical_right(inner, metrics, top);
+    let selectable_width = inner.width.saturating_sub(u16::from(regions.scrollbar.is_some()));
+    if selectable_width > 0 && inner.height > 0 {
+        regions.selectable.push(SelectableRegion::new(
+            SelectionSurface::Timeline,
+            Rect::new(inner.x, inner.y, selectable_width, inner.height),
+            top as i64,
+            usize::from(repl.view_left),
+            repl.feed_revision,
+        ));
+    }
+    if let Some(scrollbar) = regions.scrollbar {
+        render_vertical_scrollbar(
+            frame,
+            scrollbar,
+            repl.scrollbar_drag.is_some(),
+            ScrollbarStyle {
+                track_color: crate::tui::theme::NORD.border,
+                thumb_color: crate::tui::theme::NORD.text_muted,
+                active_thumb_color: crate::tui::theme::NORD.accent,
+                track_symbol: "│",
+                thumb_symbol: "┃",
+            },
+        );
+    }
 }
 
 fn render_input(frame: &mut TuiFrame, area: Rect, repl: &Repl) {
@@ -1184,7 +1323,7 @@ fn render_help(frame: &mut TuiFrame, area: Rect) {
         entry("←→", "pan to read lines wider than the pane"),
         entry("^P · ^N", "previous / next command in history"),
         entry("c · y  (while reviewing)", "yank the timeline view to the clipboard"),
-        entry("drag to select", "the mouse is free — copy any line natively"),
+        entry("drag · Ctrl+C", "select and copy rendered timeline text"),
         Line::from(""),
         Line::from(Span::styled("  any key to dismiss", Style::default().fg(Color::DarkGray))),
     ];
@@ -1432,19 +1571,5 @@ mod tests {
         assert!(label_matches("mine - workspace - modular", "workspace"));
         assert!(label_matches("VSCODE-WEBVIEW://abc", "webview"));
         assert!(!label_matches("modular://background-worker", "workspace"));
-    }
-
-    #[test]
-    fn scrolling_up_from_pinned_actually_moves() {
-        // The bug: pinned (None) scrolled up did nothing because it clamped back to the bottom.
-        assert_eq!(scrolled(None, 10, -1), Some(9));
-        assert_eq!(scrolled(None, 10, -3), Some(7));
-    }
-
-    #[test]
-    fn scrolling_clamps_and_repins() {
-        assert_eq!(scrolled(Some(2), 10, -5), Some(0)); // clamp at the top
-        assert_eq!(scrolled(Some(8), 10, 5), None); // reaching the bottom re-pins to live
-        assert_eq!(scrolled(None, 0, -1), None); // nothing to scroll when it all fits
     }
 }

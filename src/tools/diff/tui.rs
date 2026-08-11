@@ -3,16 +3,17 @@ use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{anyhow, Context as _, Result};
-use crossterm::event::{
-    Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-};
-use ratatui::layout::{Constraint, Direction as LayoutDirection, Layout, Rect};
+#[cfg(test)]
+use crossterm::event::KeyCode;
+use crossterm::event::{Event, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::{Constraint, Direction as LayoutDirection, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use super::actions::{self, DiffActionContext, DiffActionRegistry, DiffCommand};
 use super::config::LineNumbers;
 use super::git::{load_repository, stage_document, unstage_document};
 use super::model::{
@@ -21,7 +22,10 @@ use super::model::{
 };
 use crate::tui::theme::TuiTheme;
 use crate::tui::{
-    Direction, EventReader, NavigationMap, NavigationRegion, Session, SessionOptions,
+    render_vertical_scrollbar, ActionInvocation, Direction, EventReader, KeyChord,
+    KeybindingResolution, KeybindingState, NavigationMap, NavigationRegion, ScrollbarDrag,
+    ScrollbarLayout, ScrollbarStyle, SelectableRegion, SelectionOutcome, Session, SessionOptions,
+    TextSelection, Viewport, ViewportMetrics,
 };
 
 const WIDE_MIN_WIDTH: u16 = 84;
@@ -108,6 +112,7 @@ pub async fn run(
             }
         };
         match flow {
+            Flow::Copy(text) => session.copy(&text)?,
             Flow::Quit => break,
             Flow::Refresh if repository_task.is_none() => {
                 let operation = RepositoryOperation::Refresh;
@@ -147,15 +152,19 @@ fn handle_terminal_event(app: &mut DiffApp, event: Option<Event>) -> Flow {
     match event {
         Some(Event::Key(key)) if key.is_press() => app.on_key(key),
         Some(Event::Mouse(mouse)) => app.on_mouse(mouse),
-        Some(Event::Resize(_, _)) => Flow::Continue,
+        Some(Event::Resize(_, _)) => {
+            app.cancel_pointer_drags();
+            Flow::Continue
+        }
         None => Flow::Quit,
         _ => Flow::Continue,
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum Flow {
     Continue,
+    Copy(String),
     Refresh,
     ToggleStage,
     Quit,
@@ -267,11 +276,23 @@ struct DocumentProjection {
 }
 
 struct DiffApp {
+    actions: DiffActionRegistry,
+    keybinding_state: KeybindingState,
     documents: Vec<DiffDocument>,
     selected: Option<usize>,
     expanded: HashSet<(ChangeGroup, PathBuf)>,
-    tree_scroll: usize,
-    content_scroll: usize,
+    tree_viewport: Viewport,
+    tree_metrics: ViewportMetrics,
+    tree_scrollbar: Option<ScrollbarLayout>,
+    tree_scroll_drag: Option<ScrollbarDrag>,
+    tree_reveal_selected: bool,
+    content_viewport: Viewport,
+    content_metrics: ViewportMetrics,
+    content_scrollbar: Option<ScrollbarLayout>,
+    content_scroll_drag: Option<ScrollbarDrag>,
+    selection: TextSelection<ActiveRegion>,
+    document_revision: u64,
+    content_selectable: Option<SelectableRegion<ActiveRegion>>,
     old_horizontal_scroll: usize,
     new_horizontal_scroll: usize,
     selected_hunk: usize,
@@ -303,12 +324,25 @@ impl DiffApp {
         line_numbers: LineNumbers,
     ) -> Self {
         let expanded = directory_keys(&documents).into_iter().collect();
+        let has_documents = !documents.is_empty();
         Self {
-            selected: (!documents.is_empty()).then_some(0),
+            actions: actions::registry().expect("Diff action contributions are valid"),
+            keybinding_state: KeybindingState::default(),
+            selected: has_documents.then_some(0),
             documents,
             expanded,
-            tree_scroll: 0,
-            content_scroll: 0,
+            tree_viewport: Viewport::default(),
+            tree_metrics: ViewportMetrics::default(),
+            tree_scrollbar: None,
+            tree_scroll_drag: None,
+            tree_reveal_selected: has_documents,
+            content_viewport: Viewport::default(),
+            content_metrics: ViewportMetrics::default(),
+            content_scrollbar: None,
+            content_scroll_drag: None,
+            selection: TextSelection::default(),
+            document_revision: 0,
+            content_selectable: None,
             old_horizontal_scroll: 0,
             new_horizontal_scroll: 0,
             selected_hunk: 0,
@@ -329,50 +363,78 @@ impl DiffApp {
     }
 
     fn on_key(&mut self, key: KeyEvent) -> Flow {
-        if key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char('c' | 'd'))
-        {
-            return Flow::Quit;
+        match self.selection.on_key(key) {
+            SelectionOutcome::CopyReady(text) => return Flow::Copy(text),
+            SelectionOutcome::Captured | SelectionOutcome::Changed => return Flow::Continue,
+            SelectionOutcome::Unhandled | SelectionOutcome::EdgeScroll { .. } => {}
         }
-        match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => return Flow::Quit,
-            KeyCode::Char('r') if key.modifiers.is_empty() => return Flow::Refresh,
-            KeyCode::Char('s') if key.modifiers.is_empty() => return Flow::ToggleStage,
-            KeyCode::Down | KeyCode::Char('j') => match self.active_region {
+        let Some(chord) = KeyChord::from_event(key) else {
+            return Flow::Continue;
+        };
+        let context = DiffActionContext {
+            has_document: self.selected.is_some(),
+            repository_idle: !matches!(self.repository_status, Some(RepositoryStatus::Running(_))),
+            filename: None,
+        };
+        let invocation =
+            match self.actions.resolve_keybinding(&mut self.keybinding_state, chord, context) {
+                KeybindingResolution::Invoke(invocation) => invocation,
+                KeybindingResolution::Pending | KeybindingResolution::UnmatchedSequence { .. } => {
+                    return Flow::Continue
+                }
+                KeybindingResolution::Unmatched => return Flow::Continue,
+            };
+        self.invoke_action(invocation)
+    }
+
+    fn invoke_action(&mut self, invocation: ActionInvocation<DiffActionContext>) -> Flow {
+        let command = match self.actions.command_for(&invocation) {
+            Ok(command) => command,
+            Err(error) => {
+                self.repository_status = Some(RepositoryStatus::Error(error.to_string()));
+                return Flow::Continue;
+            }
+        };
+        match command {
+            DiffCommand::Quit => return Flow::Quit,
+            DiffCommand::Refresh => return Flow::Refresh,
+            DiffCommand::ToggleStage => return Flow::ToggleStage,
+            DiffCommand::CopyFilename => {
+                return invocation.context.filename.map(Flow::Copy).unwrap_or(Flow::Continue)
+            }
+            DiffCommand::MoveDown => match self.active_region {
                 ActiveRegion::Changes => self.select_relative(1),
                 ActiveRegion::Old | ActiveRegion::New => self.scroll_content(1),
             },
-            KeyCode::Up | KeyCode::Char('k') => match self.active_region {
+            DiffCommand::MoveUp => match self.active_region {
                 ActiveRegion::Changes => self.select_relative(-1),
                 ActiveRegion::Old | ActiveRegion::New => self.scroll_content(-1),
             },
-            KeyCode::PageDown => self.scroll_content(self.regions.content_area.height as isize - 2),
-            KeyCode::PageUp => {
+            DiffCommand::PageDown => {
+                self.scroll_content(self.regions.content_area.height as isize - 2)
+            }
+            DiffCommand::PageUp => {
                 self.scroll_content(-(self.regions.content_area.height as isize - 2))
             }
-            KeyCode::Char('n') | KeyCode::Char(']') => self.select_hunk(1),
-            KeyCode::Char('N') | KeyCode::Char('[') => self.select_hunk(-1),
-            KeyCode::Char('v') => self.toggle_mode(),
-            KeyCode::Tab => self.move_tab(1),
-            KeyCode::BackTab => self.move_tab(-1),
-            KeyCode::Right => self.move_region(Direction::Right),
-            KeyCode::Left => self.move_region(Direction::Left),
-            KeyCode::Char('l') => self.pan(4),
-            KeyCode::Char('h') => self.pan(-4),
-            KeyCode::Home => {
-                self.content_scroll = 0;
+            DiffCommand::NextHunk => self.select_hunk(1),
+            DiffCommand::PreviousHunk => self.select_hunk(-1),
+            DiffCommand::ToggleMode => self.toggle_mode(),
+            DiffCommand::NextRegion => self.move_tab(1),
+            DiffCommand::PreviousRegion => self.move_tab(-1),
+            DiffCommand::RegionRight => self.move_region(Direction::Right),
+            DiffCommand::RegionLeft => self.move_region(Direction::Left),
+            DiffCommand::PanRight => self.pan(4),
+            DiffCommand::PanLeft => self.pan(-4),
+            DiffCommand::Home => {
+                self.content_viewport.home();
                 self.old_horizontal_scroll = 0;
                 self.new_horizontal_scroll = 0;
                 self.sync_anchor_from_scroll();
             }
-            KeyCode::End => {
-                self.content_scroll = self
-                    .document_projection
-                    .as_ref()
-                    .map_or(0, |projection| projection.lines.len().saturating_sub(1));
+            DiffCommand::End => {
+                self.content_viewport.end(self.content_metrics);
                 self.sync_anchor_from_scroll();
             }
-            _ => {}
         }
         Flow::Continue
     }
@@ -428,12 +490,18 @@ impl DiffApp {
             });
         self.reset_document_position();
         if self.selected.is_none() {
-            self.tree_scroll = 0;
+            self.tree_viewport.home();
+        } else {
+            self.tree_reveal_selected = true;
         }
     }
 
     fn reset_document_position(&mut self) {
-        self.content_scroll = 0;
+        self.content_viewport.home();
+        self.content_metrics = ViewportMetrics::default();
+        self.content_scroll_drag = None;
+        self.selection.clear();
+        self.document_revision = self.document_revision.wrapping_add(1);
         self.old_horizontal_scroll = 0;
         self.new_horizontal_scroll = 0;
         self.selected_hunk = 0;
@@ -444,7 +512,59 @@ impl DiffApp {
         self.dragging_divider = false;
     }
 
+    fn cancel_pointer_drags(&mut self) {
+        self.dragging_divider = false;
+        self.tree_scroll_drag = None;
+        self.content_scroll_drag = None;
+    }
+
     fn on_mouse(&mut self, mouse: MouseEvent) -> Flow {
+        if self.dragging_divider {
+            match mouse.kind {
+                MouseEventKind::Drag(MouseButton::Left) => self.drag_divider(mouse.column),
+                MouseEventKind::Up(MouseButton::Left) => self.dragging_divider = false,
+                _ => {}
+            }
+            return Flow::Continue;
+        }
+        if let Some(drag) = self.tree_scroll_drag {
+            match mouse.kind {
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    if let Some(layout) = self.tree_scrollbar {
+                        let top = drag.top_for_row(layout, mouse.row);
+                        self.tree_viewport.set_top(top, self.tree_metrics);
+                    }
+                }
+                MouseEventKind::Up(MouseButton::Left) => self.tree_scroll_drag = None,
+                _ => {}
+            }
+            return Flow::Continue;
+        }
+        if let Some(drag) = self.content_scroll_drag {
+            match mouse.kind {
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    if let Some(layout) = self.content_scrollbar {
+                        let top = drag.top_for_row(layout, mouse.row);
+                        self.content_viewport.set_top(top, self.content_metrics);
+                        self.sync_anchor_from_scroll();
+                    }
+                }
+                MouseEventKind::Up(MouseButton::Left) => self.content_scroll_drag = None,
+                _ => {}
+            }
+            return Flow::Continue;
+        }
+        if self.selection.is_dragging() {
+            match self.selection.on_mouse(mouse) {
+                SelectionOutcome::Captured | SelectionOutcome::Changed => return Flow::Continue,
+                SelectionOutcome::EdgeScroll { lines, .. } => {
+                    self.scroll_content(lines);
+                    return Flow::Continue;
+                }
+                SelectionOutcome::Unhandled | SelectionOutcome::CopyReady(_) => {}
+            }
+        }
+        let position = Position::new(mouse.column, mouse.row);
         let point = Rect::new(mouse.column, mouse.row, 1, 1);
         match mouse.kind {
             MouseEventKind::Moved => {
@@ -468,10 +588,44 @@ impl DiffApp {
                     .map(|(_, index)| *index)
                 {
                     self.select(index);
-                    return Flow::ToggleStage;
+                    let context = DiffActionContext {
+                        has_document: self.selected.is_some(),
+                        repository_idle: !matches!(
+                            self.repository_status,
+                            Some(RepositoryStatus::Running(_))
+                        ),
+                        filename: None,
+                    };
+                    return self
+                        .invoke_action(ActionInvocation::new(actions::TOGGLE_STAGE, context));
+                }
+                if let Some(layout) = self.tree_scrollbar.filter(|layout| layout.contains(position))
+                {
+                    self.selection.clear();
+                    self.tree_reveal_selected = false;
+                    if let Some(drag) = ScrollbarDrag::begin(layout, position) {
+                        self.tree_scroll_drag = Some(drag);
+                    } else {
+                        let top = layout.top_for_track_row(mouse.row);
+                        self.tree_viewport.set_top(top, self.tree_metrics);
+                    }
+                    return Flow::Continue;
                 }
                 if self.regions.divider.is_some_and(|area| area.intersects(point)) {
                     self.dragging_divider = true;
+                    return Flow::Continue;
+                }
+                if let Some(layout) =
+                    self.content_scrollbar.filter(|layout| layout.contains(position))
+                {
+                    self.selection.clear();
+                    if let Some(drag) = ScrollbarDrag::begin(layout, position) {
+                        self.content_scroll_drag = Some(drag);
+                    } else {
+                        let top = layout.top_for_track_row(mouse.row);
+                        self.content_viewport.set_top(top, self.content_metrics);
+                        self.sync_anchor_from_scroll();
+                    }
                     return Flow::Continue;
                 }
                 if let Some(target) = self
@@ -490,22 +644,53 @@ impl DiffApp {
                         } else {
                             ActiveRegion::New
                         };
+                    let _ = self.selection.on_mouse(mouse);
                 }
             }
-            MouseEventKind::Drag(MouseButton::Left) if self.dragging_divider => {
-                self.drag_divider(mouse.column)
+            MouseEventKind::Down(MouseButton::Right) => {
+                let filename = self
+                    .regions
+                    .tree
+                    .iter()
+                    .find(|(area, target)| {
+                        area.intersects(point) && matches!(target, TreeTarget::File(_))
+                    })
+                    .and_then(|(_, target)| match target {
+                        TreeTarget::File(index) => self
+                            .documents
+                            .get(*index)
+                            .and_then(DiffDocument::display_path)
+                            .map(display_path),
+                        TreeTarget::Group(_) | TreeTarget::Directory(_, _) => None,
+                    });
+                if let Some(filename) = filename {
+                    let context = DiffActionContext {
+                        has_document: self.selected.is_some(),
+                        repository_idle: !matches!(
+                            self.repository_status,
+                            Some(RepositoryStatus::Running(_))
+                        ),
+                        filename: Some(filename),
+                    };
+                    return self
+                        .invoke_action(ActionInvocation::new(actions::COPY_FILENAME, context));
+                }
             }
-            MouseEventKind::Up(MouseButton::Left) => self.dragging_divider = false,
             MouseEventKind::ScrollDown if self.regions.tree_area.intersects(point) => {
+                self.selection.clear();
                 self.hovered_file = None;
-                self.tree_scroll = self.tree_scroll.saturating_add(1)
+                self.tree_reveal_selected = false;
+                self.tree_viewport.scroll_by(1, self.tree_metrics)
             }
             MouseEventKind::ScrollUp if self.regions.tree_area.intersects(point) => {
+                self.selection.clear();
                 self.hovered_file = None;
-                self.tree_scroll = self.tree_scroll.saturating_sub(1)
+                self.tree_reveal_selected = false;
+                self.tree_viewport.scroll_by(-1, self.tree_metrics)
             }
             MouseEventKind::ScrollDown if self.regions.content_area.intersects(point) => {
                 self.hovered_file = None;
+                self.selection.clear();
                 if mouse.modifiers.contains(KeyModifiers::SHIFT) {
                     self.pan(4)
                 } else {
@@ -514,6 +699,7 @@ impl DiffApp {
             }
             MouseEventKind::ScrollUp if self.regions.content_area.intersects(point) => {
                 self.hovered_file = None;
+                self.selection.clear();
                 if mouse.modifiers.contains(KeyModifiers::SHIFT) {
                     self.pan(-4)
                 } else {
@@ -559,6 +745,7 @@ impl DiffApp {
             self.restore_anchor = true;
         }
         self.reveal(index);
+        self.tree_reveal_selected = true;
     }
 
     fn reveal(&mut self, index: usize) {
@@ -578,7 +765,7 @@ impl DiffApp {
     }
 
     fn scroll_content(&mut self, delta: isize) {
-        self.content_scroll = self.content_scroll.saturating_add_signed(delta);
+        self.content_viewport.scroll_by(delta, self.content_metrics);
         self.sync_anchor_from_scroll();
     }
 
@@ -641,10 +828,11 @@ impl DiffApp {
 
     fn sync_anchor_from_scroll(&mut self) {
         if let Some(projection) = &self.document_projection {
-            if let Some(line) = projection
-                .lines
-                .get(self.content_scroll.min(projection.lines.len().saturating_sub(1)))
-            {
+            if let Some(line) = projection.lines.get(
+                self.content_viewport
+                    .top(self.content_metrics)
+                    .min(projection.lines.len().saturating_sub(1)),
+            ) {
                 self.anchor = line.anchor;
                 self.selected_hunk = line.anchor.hunk;
             }
@@ -716,6 +904,26 @@ impl DiffApp {
             self.active_region = region;
         }
     }
+
+    fn action_help(&self) -> String {
+        let context = DiffActionContext {
+            has_document: self.selected.is_some(),
+            repository_idle: !matches!(self.repository_status, Some(RepositoryStatus::Running(_))),
+            filename: None,
+        };
+        let bindings = self
+            .actions
+            .resolve_command_palette(&context)
+            .items()
+            .iter()
+            .filter_map(|action| {
+                action.primary_keybinding().map(|binding| format!("{binding} {}", action.title))
+            })
+            .take(12)
+            .collect::<Vec<_>>()
+            .join(" · ");
+        format!(" {bindings} · mouse click/drag/wheel · right-click filename copies ")
+    }
 }
 
 fn one_sided_document(document: &DiffDocument) -> bool {
@@ -725,6 +933,9 @@ fn one_sided_document(document: &DiffDocument) -> bool {
 fn render(frame: &mut Frame<'_>, app: &mut DiffApp) {
     let area = frame.area();
     app.regions = UiRegions::default();
+    app.tree_scrollbar = None;
+    app.content_selectable = None;
+    app.content_scrollbar = None;
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         frame.render_widget(
             Paragraph::new("kit diff needs at least 30 columns × 8 rows")
@@ -752,6 +963,12 @@ fn render(frame: &mut Frame<'_>, app: &mut DiffApp) {
     app.regions.content_area = content_area;
     render_tree(frame, tree_area, app);
     render_document(frame, content_area, app);
+    let selectable = app.content_selectable.into_iter().collect::<Vec<_>>();
+    app.selection.capture_frame(
+        frame,
+        &selectable,
+        Style::default().bg(app.theme.selection).add_modifier(Modifier::REVERSED),
+    );
     app.normalize_active_region();
 }
 
@@ -769,25 +986,29 @@ fn render_tree(frame: &mut Frame<'_>, area: Rect, app: &mut DiffApp) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let rows = tree_rows(&app.documents, &app.expanded);
-    if let Some(selected) = app.selected {
-        if let Some(position) = rows
-            .iter()
-            .position(|row| matches!(row.target, TreeTarget::File(index) if index == selected))
-        {
-            let height = inner.height as usize;
-            if position < app.tree_scroll {
-                app.tree_scroll = position;
-            } else if position >= app.tree_scroll.saturating_add(height) {
-                app.tree_scroll = position.saturating_sub(height.saturating_sub(1));
-            }
+    app.tree_metrics = ViewportMetrics::new(rows.len(), inner.height as usize);
+    app.tree_viewport.normalize(app.tree_metrics);
+    if app.tree_reveal_selected {
+        app.tree_reveal_selected = false;
+        let selected_position = app.selected.and_then(|selected| {
+            rows.iter()
+                .position(|row| matches!(row.target, TreeTarget::File(index) if index == selected))
+        });
+        if let Some(position) = selected_position {
+            app.tree_viewport.ensure_visible(position, app.tree_metrics);
         }
     }
-    app.tree_scroll = app.tree_scroll.min(rows.len().saturating_sub(inner.height as usize));
-
+    let tree_top = app.tree_viewport.top(app.tree_metrics);
+    app.tree_scrollbar = ScrollbarLayout::vertical_right(inner, app.tree_metrics, tree_top);
+    let content_inner = if app.tree_scrollbar.is_some() {
+        Rect::new(inner.x, inner.y, inner.width.saturating_sub(1), inner.height)
+    } else {
+        inner
+    };
     let lines = rows
         .iter()
-        .skip(app.tree_scroll)
-        .take(inner.height as usize)
+        .skip(tree_top)
+        .take(content_inner.height as usize)
         .enumerate()
         .map(|(visible_index, row)| {
             let selected =
@@ -797,7 +1018,12 @@ fn render_tree(frame: &mut Frame<'_>, area: Rect, app: &mut DiffApp) {
             } else {
                 Style::default().fg(app.theme.text)
             };
-            let row_area = Rect::new(inner.x, inner.y + visible_index as u16, inner.width, 1);
+            let row_area = Rect::new(
+                content_inner.x,
+                content_inner.y + visible_index as u16,
+                content_inner.width,
+                1,
+            );
             app.regions.tree.push((row_area, row.target.clone()));
             let hover_action = match row.target {
                 TreeTarget::File(index) if app.hovered_file == Some(index) => {
@@ -817,10 +1043,31 @@ fn render_tree(frame: &mut Frame<'_>, area: Rect, app: &mut DiffApp) {
                     *index,
                 ));
             }
-            tree_line(row, inner.width as usize, style, &app.expanded, hover_action, app.theme)
+            tree_line(
+                row,
+                content_inner.width as usize,
+                style,
+                &app.expanded,
+                hover_action,
+                app.theme,
+            )
         })
         .collect::<Vec<_>>();
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(Paragraph::new(lines), content_inner);
+    if let Some(layout) = app.tree_scrollbar {
+        render_vertical_scrollbar(
+            frame,
+            layout,
+            app.tree_scroll_drag.is_some(),
+            ScrollbarStyle {
+                track_color: app.theme.border,
+                thumb_color: app.theme.text_muted,
+                active_thumb_color: app.theme.accent,
+                track_symbol: "│",
+                thumb_symbol: "┃",
+            },
+        );
+    }
 }
 
 fn tree_line(
@@ -908,19 +1155,8 @@ fn change_glyph(kind: Option<ChangeKind>) -> &'static str {
 }
 
 fn render_document(frame: &mut Frame<'_>, area: Rect, app: &mut DiffApp) {
-    let effective = app.effective_mode(area.width.saturating_sub(2));
-    let controls = match effective {
-        EffectiveMode::Single => {
-            " ↑↓ move  ←→ region  h/l pan  n/N change  s stage/unstage  r refresh  q quit "
-        }
-        EffectiveMode::Inline => {
-            " ↑↓ move  ←→ region  h/l pan  n/N change  v view  s stage/unstage  r refresh  q quit "
-        }
-        EffectiveMode::Split => {
-            " ↑↓ move  ←→ region  h/l pan  n/N change  v view  Tab cycle  s stage/unstage  r refresh  q quit "
-        }
-    };
-    let footer = repository_footer(app, controls);
+    let controls = app.action_help();
+    let footer = repository_footer(app, &controls);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -971,8 +1207,10 @@ fn render_document(frame: &mut Frame<'_>, area: Rect, app: &mut DiffApp) {
         app.document_projection = Some(DocumentProjection { key, lines });
     }
     let projection = app.document_projection.as_ref().expect("projection was initialized");
+    app.content_metrics = ViewportMetrics::new(projection.lines.len(), inner.height as usize);
+    app.content_viewport.normalize(app.content_metrics);
     if app.restore_anchor {
-        app.content_scroll =
+        let top =
             projection.lines.iter().position(|line| line.anchor == app.anchor).unwrap_or_else(
                 || {
                     projection
@@ -982,10 +1220,10 @@ fn render_document(frame: &mut Frame<'_>, area: Rect, app: &mut DiffApp) {
                         .unwrap_or(0)
                 },
             );
+        app.content_viewport.set_top(top, app.content_metrics);
         app.restore_anchor = false;
     }
-    let max_scroll = projection.lines.len().saturating_sub(inner.height as usize);
-    app.content_scroll = app.content_scroll.min(max_scroll);
+    let content_top = app.content_viewport.top(app.content_metrics);
     if effective == EffectiveMode::Split {
         let left_width =
             split_widths(inner.width as usize, app.divider_percent, app.line_numbers.show(true)).0;
@@ -995,16 +1233,40 @@ fn render_document(frame: &mut Frame<'_>, area: Rect, app: &mut DiffApp) {
     let visible = projection
         .lines
         .iter()
-        .skip(app.content_scroll)
+        .skip(content_top)
         .take(inner.height as usize)
         .map(|rendered| rendered.line.clone())
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(visible), inner);
+    let selectable_area = Rect::new(inner.x, inner.y, inner.width.saturating_sub(1), inner.height);
+    app.content_selectable = Some(SelectableRegion::new(
+        ActiveRegion::New,
+        selectable_area,
+        i64::try_from(content_top).unwrap_or(i64::MAX),
+        0,
+        app.document_revision,
+    ));
+    app.content_scrollbar =
+        ScrollbarLayout::vertical_right(inner, app.content_metrics, content_top);
+    if let Some(layout) = app.content_scrollbar {
+        render_vertical_scrollbar(
+            frame,
+            layout,
+            app.content_scroll_drag.is_some(),
+            ScrollbarStyle {
+                track_color: app.theme.border,
+                thumb_color: app.theme.text_muted,
+                active_thumb_color: app.theme.accent,
+                track_symbol: "│",
+                thumb_symbol: "┃",
+            },
+        );
+    }
 }
 
-fn repository_footer(app: &DiffApp, controls: &'static str) -> Line<'static> {
+fn repository_footer(app: &DiffApp, controls: &str) -> Line<'static> {
     let Some(status) = &app.repository_status else {
-        return Line::from(controls);
+        return Line::from(controls.to_owned());
     };
     let (message, color) = match status {
         RepositoryStatus::Running(label) => (format!(" {label} "), app.theme.warning),
@@ -1013,7 +1275,10 @@ fn repository_footer(app: &DiffApp, controls: &'static str) -> Line<'static> {
             (format!(" operation failed: {error} "), app.theme.danger)
         }
     };
-    Line::from(vec![Span::styled(message, Style::default().fg(color)), Span::raw(controls)])
+    Line::from(vec![
+        Span::styled(message, Style::default().fg(color)),
+        Span::raw(controls.to_owned()),
+    ])
 }
 
 fn document_title(app: &DiffApp) -> Line<'static> {
@@ -1841,7 +2106,11 @@ mod tests {
 
     #[test]
     fn refresh_key_is_an_explicit_runtime_action() {
-        let mut app = DiffApp::new(Vec::new(), NORD, ViewMode::Inline);
+        let mut app = DiffApp::new(
+            vec![document(ChangeGroup::Changes, "src/lib.rs", "old\n", "new\n")],
+            NORD,
+            ViewMode::Inline,
+        );
 
         assert_eq!(
             app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
@@ -1909,7 +2178,7 @@ mod tests {
         let mut app = DiffApp::new(documents, NORD, ViewMode::Inline);
         app.select(1);
         app.expanded.remove(&(ChangeGroup::Changes, "src/nested".into()));
-        app.content_scroll = 12;
+        app.content_viewport = Viewport::new(12);
 
         app.finish_repository_operation(Ok((
             vec![
@@ -1923,7 +2192,7 @@ mod tests {
         assert_eq!(selected.display_path(), Some(Path::new("src/nested/keep.rs")));
         assert!(!app.expanded.contains(&(ChangeGroup::Changes, "src/nested".into())));
         assert!(app.expanded.contains(&(ChangeGroup::Changes, "fresh/deep".into())));
-        assert_eq!(app.content_scroll, 0);
+        assert_eq!(app.content_viewport, Viewport::default());
         assert_eq!(app.repository_status, Some(RepositoryStatus::Success("refreshed")));
     }
 
@@ -1966,7 +2235,7 @@ mod tests {
     #[test]
     fn region_navigation_uses_arrows_tabs_and_local_scroll_without_stealing_selection() {
         let old = (0..40).map(|index| format!("old {index}\n")).collect::<String>();
-        let new = old.replace("old 20\n", "new 20\n");
+        let new = old.replace("old", "new");
         let documents = vec![
             document(ChangeGroup::Staged, "src/a.rs", "a\n", "A\n"),
             document(ChangeGroup::Changes, "src/b.rs", &old, &new),
@@ -1988,10 +2257,10 @@ mod tests {
         let selected = app.selected;
         app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(app.selected, selected);
-        assert_eq!(app.content_scroll, 1);
+        assert_eq!(app.content_viewport.top(app.content_metrics), 0);
 
-        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
-        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
         assert_eq!(app.active_region, ActiveRegion::Changes);
         app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(app.selected, Some(1));
@@ -2028,6 +2297,8 @@ mod tests {
         let mut app = DiffApp::new(Vec::new(), NORD, ViewMode::Inline);
         app.regions.tree_area = Rect::new(0, 0, 20, 10);
         app.regions.content_area = Rect::new(20, 0, 20, 10);
+        app.tree_metrics = ViewportMetrics::new(20, 10);
+        app.content_metrics = ViewportMetrics::new(20, 10);
 
         app.on_mouse(MouseEvent {
             kind: MouseEventKind::ScrollDown,
@@ -2041,8 +2312,8 @@ mod tests {
             row: 5,
             modifiers: KeyModifiers::NONE,
         });
-        assert_eq!(app.tree_scroll, 1);
-        assert_eq!(app.content_scroll, 1);
+        assert_eq!(app.tree_viewport.top(app.tree_metrics), 1);
+        assert_eq!(app.content_viewport.top(app.content_metrics), 1);
 
         app.on_mouse(MouseEvent {
             kind: MouseEventKind::ScrollUp,
@@ -2056,8 +2327,8 @@ mod tests {
             row: 5,
             modifiers: KeyModifiers::NONE,
         });
-        assert_eq!(app.tree_scroll, 0);
-        assert_eq!(app.content_scroll, 0);
+        assert_eq!(app.tree_viewport.top(app.tree_metrics), 0);
+        assert_eq!(app.content_viewport.top(app.content_metrics), 0);
     }
 
     #[test]
@@ -2094,7 +2365,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = DiffApp::new(documents, NORD, ViewMode::Inline);
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        app.content_scroll = app
+        let top = app
             .document_projection
             .as_ref()
             .unwrap()
@@ -2102,6 +2373,7 @@ mod tests {
             .iter()
             .position(|line| line.anchor.row == Some(2))
             .expect("canonical changed-row anchor");
+        app.content_viewport.set_top(top, app.content_metrics);
         app.sync_anchor_from_scroll();
         let anchor = app.anchor;
 

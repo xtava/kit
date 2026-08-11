@@ -4,8 +4,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context as AnyhowContext, Result};
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
@@ -20,7 +22,9 @@ use crate::framework::process::{
     StartedProcess, StreamPolicy,
 };
 use crate::tui::{
-    fuzzy, EventReader, LineEditor, Session, SessionOptions, Suggestion, SuggestionMenu,
+    fuzzy, render_vertical_scrollbar, EventReader, FollowViewport, LineEditor, ScrollbarDrag,
+    ScrollbarLayout, ScrollbarStyle, SelectableRegion, SelectionOutcome, Session, SessionOptions,
+    Suggestion, SuggestionMenu, TextSelection, ViewportMetrics,
 };
 
 use super::{
@@ -36,7 +40,8 @@ const OUTPUT_IN_FLIGHT_BYTES: NonZeroUsize = NonZeroUsize::new(256 * 1024).unwra
 const LINE_FRAGMENT_BYTES: usize = 64 * 1024;
 
 pub async fn run(processes: ProcessSupervisor, repo: PathBuf, scenario: String) -> Result<()> {
-    let mut session = Session::open(SessionOptions::default())?;
+    let mut session =
+        Session::open(SessionOptions { mouse_capture: true, bracketed_paste: false })?;
     let mut events = EventReader::start();
     let (tx, mut rx) = mpsc::channel::<Async>(512);
     let mut app = App::new(processes, repo, scenario);
@@ -44,9 +49,10 @@ pub async fn run(processes: ProcessSupervisor, repo: PathBuf, scenario: String) 
         "ready — start, stop, cancel, replay, status, events, artifacts, rename, help".to_owned(),
     );
     let mut redraw = time::interval(REDRAW);
+    let mut regions = UiRegions::default();
 
     loop {
-        session.draw(|frame| render(frame, &mut app))?;
+        session.draw(|frame| regions = render(frame, &mut app))?;
 
         tokio::select! {
             _ = redraw.tick() => {}
@@ -56,12 +62,22 @@ pub async fn run(processes: ProcessSupervisor, repo: PathBuf, scenario: String) 
                     Flow::Quit => break,
                     Flow::Continue => {}
                 },
+                Some(Event::Mouse(mouse)) => app.on_mouse(mouse, &regions),
+                Some(Event::Resize(_, _)) => app.scrollbar_drag = None,
                 None => {
                     app.close_active_windows().await?;
                     break;
                 }
                 _ => {}
             },
+        }
+        if let Some(text) = app.pending_copy.take() {
+            match session.copy(&text) {
+                Ok(()) => {
+                    app.notice(format!("copied {} line(s) to clipboard", text.lines().count()))
+                }
+                Err(error) => app.notice(format!("clipboard write failed: {error}")),
+            }
         }
     }
 
@@ -71,6 +87,18 @@ pub async fn run(processes: ProcessSupervisor, repo: PathBuf, scenario: String) 
 enum Flow {
     Continue,
     Quit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SelectionSurface {
+    Feed,
+}
+
+#[derive(Default)]
+struct UiRegions {
+    feed: Option<Rect>,
+    scrollbar: Option<ScrollbarLayout>,
+    selectable: Vec<SelectableRegion<SelectionSurface>>,
 }
 
 enum Async {
@@ -127,7 +155,7 @@ struct App {
     repo: PathBuf,
     scenario: String,
     feed: Vec<FeedItem>,
-    view_top: Option<usize>,
+    viewport: FollowViewport,
     feed_height: usize,
     feed_total: usize,
     input: LineEditor,
@@ -140,6 +168,10 @@ struct App {
     active_processes: Vec<ActiveProcess>,
     suggestions: Option<SuggestionMenu>,
     muted_at: Option<usize>,
+    selection: TextSelection<SelectionSurface>,
+    scrollbar_drag: Option<ScrollbarDrag>,
+    feed_revision: u64,
+    pending_copy: Option<String>,
 }
 
 impl App {
@@ -149,7 +181,7 @@ impl App {
             repo,
             scenario,
             feed: Vec::new(),
-            view_top: None,
+            viewport: FollowViewport::default(),
             feed_height: 0,
             feed_total: 0,
             input: LineEditor::default(),
@@ -162,10 +194,22 @@ impl App {
             active_processes: Vec::new(),
             suggestions: None,
             muted_at: None,
+            selection: TextSelection::default(),
+            scrollbar_drag: None,
+            feed_revision: 0,
+            pending_copy: None,
         }
     }
 
     async fn on_key(&mut self, key: KeyEvent, tx: &Sender<Async>) -> Result<Flow> {
+        match self.selection.on_key(key) {
+            SelectionOutcome::CopyReady(text) => {
+                self.pending_copy = Some(text);
+                return Ok(Flow::Continue);
+            }
+            SelectionOutcome::Captured | SelectionOutcome::Changed => return Ok(Flow::Continue),
+            SelectionOutcome::Unhandled | SelectionOutcome::EdgeScroll { .. } => {}
+        }
         if self.help_open {
             self.help_open = false;
             return Ok(Flow::Continue);
@@ -188,7 +232,9 @@ impl App {
                 }
                 KeyCode::Char('l') => {
                     self.feed.clear();
-                    self.view_top = None;
+                    self.viewport.end();
+                    self.selection.clear();
+                    self.feed_revision = self.feed_revision.wrapping_add(1);
                     Ok(Flow::Continue)
                 }
                 KeyCode::Char('p') => {
@@ -231,7 +277,7 @@ impl App {
             KeyCode::PageDown => self.scroll_by(self.feed_height.max(1) as isize),
             KeyCode::Esc if self.engaged() => self.disengage(),
             KeyCode::Esc if self.suggestions.is_some() => self.mute_suggestions(),
-            KeyCode::Esc | KeyCode::End => self.view_top = None,
+            KeyCode::Esc | KeyCode::End => self.viewport.end(),
             _ => {
                 self.input.apply_key(key);
                 self.refresh_suggestions();
@@ -263,10 +309,15 @@ impl App {
 
         match tokens[0].as_str() {
             "q" | "quit" | "exit" => return Ok(Flow::Quit),
-            "h" | "help" | "?" => self.help_open = true,
+            "h" | "help" | "?" => {
+                self.selection.clear();
+                self.help_open = true;
+            }
             "clear" => {
                 self.feed.clear();
-                self.view_top = None;
+                self.viewport.end();
+                self.selection.clear();
+                self.feed_revision = self.feed_revision.wrapping_add(1);
             }
             "repo" => self.set_repo(&tokens[1..], line),
             "scenario" => self.set_scenario(&tokens[1..], line),
@@ -801,7 +852,9 @@ impl App {
         if self.feed.len() > FEED_CAP {
             let overflow = self.feed.len() - FEED_CAP;
             self.feed.drain(0..overflow);
-            self.view_top = None;
+            self.viewport.end();
+            self.selection.clear();
+            self.feed_revision = self.feed_revision.wrapping_add(1);
         }
     }
 
@@ -846,10 +899,55 @@ impl App {
     }
 
     fn scroll_by(&mut self, delta: isize) {
-        let max_top = self.feed_total.saturating_sub(self.feed_height);
-        let current = self.view_top.unwrap_or(max_top) as isize;
-        let next = (current + delta).clamp(0, max_top as isize) as usize;
-        self.view_top = (next < max_top).then_some(next);
+        self.viewport.scroll_by(delta, ViewportMetrics::new(self.feed_total, self.feed_height));
+    }
+
+    fn on_mouse(&mut self, mouse: MouseEvent, regions: &UiRegions) {
+        let position = Position::new(mouse.column, mouse.row);
+        let metrics = ViewportMetrics::new(self.feed_total, self.feed_height);
+        if let Some(drag) = self.scrollbar_drag {
+            match mouse.kind {
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    if let Some(scrollbar) = regions.scrollbar {
+                        self.viewport.set_top(drag.top_for_row(scrollbar, position.y), metrics);
+                    }
+                }
+                MouseEventKind::Up(MouseButton::Left) => self.scrollbar_drag = None,
+                _ => {}
+            }
+            return;
+        }
+        if let Some(scrollbar) = regions.scrollbar.filter(|scrollbar| scrollbar.contains(position))
+        {
+            if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                if let Some(drag) = ScrollbarDrag::begin(scrollbar, position) {
+                    self.scrollbar_drag = Some(drag);
+                } else {
+                    self.viewport.set_top(scrollbar.top_for_track_row(position.y), metrics);
+                }
+            }
+            return;
+        }
+        if regions.feed.is_some_and(|area| area.contains(position)) {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    self.scroll_by(-3);
+                    return;
+                }
+                MouseEventKind::ScrollDown => {
+                    self.scroll_by(3);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        match self.selection.on_mouse(mouse) {
+            SelectionOutcome::CopyReady(text) => self.pending_copy = Some(text),
+            SelectionOutcome::EdgeScroll { lines, .. } => self.scroll_by(lines),
+            SelectionOutcome::Unhandled
+            | SelectionOutcome::Captured
+            | SelectionOutcome::Changed => {}
+        }
     }
 
     fn visible_lines(&self) -> Vec<Line<'static>> {
@@ -1071,7 +1169,7 @@ fn starts_with_ci(text: &str, prefix: &str) -> bool {
     text.len() >= prefix.len() && text[..prefix.len()].eq_ignore_ascii_case(prefix)
 }
 
-fn render(frame: &mut Frame<'_>, app: &mut App) {
+fn render(frame: &mut Frame<'_>, app: &mut App) -> UiRegions {
     let area = frame.area();
     let shown = app.suggestions.as_ref().map_or(0, |menu| menu.visible_rows(area, 6, 7));
     let menu_height = if shown == 0 { 0 } else { shown as u16 + 1 };
@@ -1087,7 +1185,8 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     let lines = app.visible_lines();
     app.feed_height = chunks[1].height.saturating_sub(2) as usize;
     app.feed_total = lines.len();
-    render_feed(frame, chunks[1], app, lines);
+    let mut regions = UiRegions::default();
+    render_feed(frame, chunks[1], app, lines, &mut regions);
     if shown > 0 {
         if let Some(menu) = &app.suggestions {
             menu.render(frame, chunks[2], shown, 28, crate::tui::theme::NORD);
@@ -1097,7 +1196,15 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
 
     if app.help_open {
         render_help(frame, area);
+        regions.selectable.clear();
     }
+    let selectable = regions.selectable.clone();
+    app.selection.capture_frame(
+        frame,
+        &selectable,
+        Style::default().bg(crate::tui::theme::NORD.selection).add_modifier(Modifier::REVERSED),
+    );
+    regions
 }
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -1128,11 +1235,18 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(body).block(panel(" kit record ")), area);
 }
 
-fn render_feed(frame: &mut Frame<'_>, area: Rect, app: &App, lines: Vec<Line<'static>>) {
-    let inner_height = area.height.saturating_sub(2) as usize;
-    let max_top = lines.len().saturating_sub(inner_height);
-    let top = app.view_top.map_or(max_top, |top| top.min(max_top));
-    let below = max_top - top;
+fn render_feed(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &mut App,
+    lines: Vec<Line<'static>>,
+    regions: &mut UiRegions,
+) {
+    let inner = panel_titled(String::new()).inner(area);
+    let metrics = ViewportMetrics::new(lines.len(), usize::from(inner.height));
+    app.viewport.normalize(metrics);
+    let top = app.viewport.top(metrics);
+    let below = metrics.max_top().saturating_sub(top);
     let title = if below == 0 {
         " feed ─ ● live ".to_owned()
     } else {
@@ -1140,9 +1254,37 @@ fn render_feed(frame: &mut Frame<'_>, area: Rect, app: &App, lines: Vec<Line<'st
     };
 
     frame.render_widget(
-        Paragraph::new(lines).block(panel_titled(title)).scroll((top as u16, 0)),
+        Paragraph::new(lines)
+            .block(panel_titled(title))
+            .scroll((u16::try_from(top).unwrap_or(u16::MAX), 0)),
         area,
     );
+    regions.feed = Some(inner);
+    regions.scrollbar = ScrollbarLayout::vertical_right(inner, metrics, top);
+    let selectable_width = inner.width.saturating_sub(u16::from(regions.scrollbar.is_some()));
+    if selectable_width > 0 && inner.height > 0 {
+        regions.selectable.push(SelectableRegion::new(
+            SelectionSurface::Feed,
+            Rect::new(inner.x, inner.y, selectable_width, inner.height),
+            top as i64,
+            0,
+            app.feed_revision,
+        ));
+    }
+    if let Some(scrollbar) = regions.scrollbar {
+        render_vertical_scrollbar(
+            frame,
+            scrollbar,
+            app.scrollbar_drag.is_some(),
+            ScrollbarStyle {
+                track_color: crate::tui::theme::NORD.border,
+                thumb_color: crate::tui::theme::NORD.text_muted,
+                active_thumb_color: crate::tui::theme::NORD.accent,
+                track_symbol: "│",
+                thumb_symbol: "┃",
+            },
+        );
+    }
 }
 
 fn render_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -1210,7 +1352,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         ]),
         Line::from(""),
         Line::from(Span::styled(
-            "Tab suggestions · Right ghost · Ctrl-C cancel/quit · PgUp/PgDn scroll · Esc live",
+            "Tab suggestions · Right ghost · drag/Ctrl-C copy · PgUp/PgDn scroll · Esc live",
             Style::default().fg(Color::DarkGray),
         )),
     ];

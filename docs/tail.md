@@ -106,7 +106,6 @@ name and receive time.
 
 - Linux: `xdg-open`
 - macOS: `open`
-- Windows: `rundll32.exe url.dll,FileProtocolHandler`
 
 All Tailscale subprocesses run through Kit's process supervisor. Targets and paths are passed as
 process arguments, never interpolated into a shell command.

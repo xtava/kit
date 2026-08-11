@@ -10,9 +10,9 @@ use std::{
 };
 
 use anyhow::{anyhow, Result};
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, List, ListItem, Paragraph, Wrap},
@@ -25,16 +25,23 @@ use tokio::{
 use unicode_width::UnicodeWidthStr as _;
 
 use super::{
+    actions::{self, BuildActionContext, BuildActionMode, BuildActionRegistry, BuildCommand},
     build_presentation_channel, build_runtime_availability, evidence, execute_build,
-    load_interactive_manifest, manifest::WorkflowAction, BuildControl, BuildFailureEvidence,
-    BuildInvocation, BuildRuntimeAvailability, BuildTerminal, BuildTranscriptTails, BuildUpdate,
+    load_interactive_manifest,
+    manifest::WorkflowAction,
+    BuildControl, BuildFailureEvidence, BuildInvocation, BuildRuntimeAvailability, BuildTerminal,
+    BuildTranscriptTails, BuildUpdate,
 };
 use crate::{
     framework::{
         process::ProcessSupervisor, start_external, Context, ExternalCommand, ExternalTarget,
     },
     tui::theme::NORD,
-    tui::{EventReader, Session, SessionOptions},
+    tui::{
+        render_vertical_scrollbar, EventReader, FollowViewport, KeyChord, KeybindingResolution,
+        KeybindingState, ScrollbarDrag, ScrollbarLayout, ScrollbarStyle, SelectableRegion,
+        SelectionOutcome, Session, SessionOptions, TextSelection, ViewportMetrics,
+    },
 };
 
 const TICK: Duration = Duration::from_millis(80);
@@ -74,8 +81,14 @@ async fn run_session(
             event = input.recv() => {
                 let Some(event) = event else { return app.exit_result(); };
                 if app.view == View::Evidence {
-                    if app.active_key(event, true) == ActiveAction::Quit {
-                        return app.exit_result();
+                    match app.active_key(event, true) {
+                        ActiveAction::Quit => return app.exit_result(),
+                        ActiveAction::Copy(text) => session.copy(&text)?,
+                        ActiveAction::None
+                        | ActiveAction::Cancel
+                        | ActiveAction::ChooseWorkflow
+                        | ActiveAction::Evidence
+                        | ActiveAction::RunConfigured(_) => {}
                     }
                     apply_evidence_action(app);
                     continue;
@@ -203,6 +216,7 @@ async fn run_active(
                 let terminal_ready = app.terminal.is_some();
                 match app.active_key(event, terminal_ready) {
                     ActiveAction::None => {}
+                    ActiveAction::Copy(text) => session.copy(&text)?,
                     ActiveAction::Cancel => request_cancel(&controls, app),
                     ActiveAction::Quit => {
                         if !terminal_ready {
@@ -310,7 +324,7 @@ enum ActiveExit {
     ChooseWorkflow,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum SelectAction {
     None,
     Quit,
@@ -318,9 +332,10 @@ enum SelectAction {
     Start(usize),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum ActiveAction {
     None,
+    Copy(String),
     Cancel,
     Quit,
     ChooseWorkflow,
@@ -396,55 +411,24 @@ enum RunPane {
     Terminal,
 }
 
-#[derive(Clone, Debug)]
-struct ScrollState {
-    offset: usize,
-    total_rows: usize,
-    viewport_rows: usize,
-    follow: bool,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BuildSurface {
+    Stages,
+    Events,
+    Stdout,
+    Stderr,
+    Terminal,
+    Evidence,
 }
 
-impl ScrollState {
-    fn following() -> Self {
-        Self { offset: 0, total_rows: 0, viewport_rows: 1, follow: true }
-    }
-
-    fn at_top() -> Self {
-        Self { offset: 0, total_rows: 0, viewport_rows: 1, follow: false }
-    }
-
-    fn update_layout(&mut self, total_rows: usize, viewport_rows: usize) {
-        self.total_rows = total_rows;
-        self.viewport_rows = viewport_rows.max(1);
-        let bottom = self.bottom();
-        self.offset = if self.follow { bottom } else { self.offset.min(bottom) };
-    }
-
-    fn scroll_up(&mut self, rows: usize) {
-        self.follow = false;
-        self.offset = self.offset.saturating_sub(rows);
-    }
-
-    fn scroll_down(&mut self, rows: usize) {
-        let bottom = self.bottom();
-        self.offset = self.offset.saturating_add(rows).min(bottom);
-        self.follow = self.offset == bottom;
-    }
-
-    fn reset(&mut self) {
-        self.offset = 0;
-        self.total_rows = 0;
-        self.viewport_rows = 1;
-        self.follow = true;
-    }
-
-    fn offset_u16(&self) -> u16 {
-        u16::try_from(self.offset).unwrap_or(u16::MAX)
-    }
-
-    fn bottom(&self) -> usize {
-        self.total_rows.saturating_sub(self.viewport_rows)
-    }
+#[derive(Default)]
+struct UiRegions {
+    workflows: Vec<(Rect, usize)>,
+    run_panes: Vec<(Rect, RunPane)>,
+    evidence_records: Vec<(Rect, usize)>,
+    evidence_inspect: Option<Rect>,
+    selectable: Vec<SelectableRegion<BuildSurface>>,
+    scrollbars: Vec<(BuildSurface, ScrollbarLayout)>,
 }
 
 #[derive(Clone, Debug)]
@@ -461,6 +445,8 @@ enum EvidenceAction {
 }
 
 struct App {
+    actions: BuildActionRegistry,
+    keybinding_state: KeybindingState,
     root: String,
     manifest: String,
     workflows: Vec<WorkflowRow>,
@@ -474,11 +460,16 @@ struct App {
     stdout: Arc<str>,
     stderr: Arc<str>,
     run_pane: RunPane,
-    stage_scroll: ScrollState,
-    event_scroll: ScrollState,
-    stdout_scroll: ScrollState,
-    stderr_scroll: ScrollState,
-    terminal_scroll: ScrollState,
+    stage_scroll: FollowViewport,
+    stage_metrics: ViewportMetrics,
+    event_scroll: FollowViewport,
+    event_metrics: ViewportMetrics,
+    stdout_scroll: FollowViewport,
+    stdout_metrics: ViewportMetrics,
+    stderr_scroll: FollowViewport,
+    stderr_metrics: ViewportMetrics,
+    terminal_scroll: FollowViewport,
+    terminal_metrics: ViewportMetrics,
     notice: String,
     terminal: Option<BuildTerminal>,
     configured_actions: Vec<WorkflowAction>,
@@ -486,7 +477,12 @@ struct App {
     evidence: Vec<evidence::TuiEvidenceRecord>,
     selected_evidence: usize,
     evidence_mode: EvidenceMode,
-    evidence_inspect_scroll: ScrollState,
+    evidence_inspect_scroll: FollowViewport,
+    evidence_inspect_metrics: ViewportMetrics,
+    selection: TextSelection<BuildSurface>,
+    content_revision: u64,
+    regions: UiRegions,
+    scrollbar_drag: Option<(BuildSurface, ScrollbarDrag)>,
 }
 
 impl App {
@@ -507,6 +503,8 @@ impl App {
         let selected_workflow =
             workflows.iter().position(|workflow| workflow.availability.ready()).unwrap_or(0);
         Self {
+            actions: actions::registry().expect("Build action contributions are valid"),
+            keybinding_state: KeybindingState::default(),
             root: root.as_path().display().to_string(),
             manifest: manifest.path.display().to_string(),
             workflows,
@@ -520,11 +518,16 @@ impl App {
             stdout: Arc::from(""),
             stderr: Arc::from(""),
             run_pane: RunPane::Stages,
-            stage_scroll: ScrollState::following(),
-            event_scroll: ScrollState::following(),
-            stdout_scroll: ScrollState::following(),
-            stderr_scroll: ScrollState::following(),
-            terminal_scroll: ScrollState::at_top(),
+            stage_scroll: FollowViewport::default(),
+            stage_metrics: ViewportMetrics::default(),
+            event_scroll: FollowViewport::default(),
+            event_metrics: ViewportMetrics::default(),
+            stdout_scroll: FollowViewport::default(),
+            stdout_metrics: ViewportMetrics::default(),
+            stderr_scroll: FollowViewport::default(),
+            stderr_metrics: ViewportMetrics::default(),
+            terminal_scroll: FollowViewport::at_top(),
+            terminal_metrics: ViewportMetrics::default(),
             notice: "Select a workflow. Build eligibility is evaluated on this host.".to_owned(),
             terminal: None,
             configured_actions: Vec::new(),
@@ -532,7 +535,12 @@ impl App {
             evidence: Vec::new(),
             selected_evidence: 0,
             evidence_mode: EvidenceMode::List,
-            evidence_inspect_scroll: ScrollState::at_top(),
+            evidence_inspect_scroll: FollowViewport::at_top(),
+            evidence_inspect_metrics: ViewportMetrics::default(),
+            selection: TextSelection::default(),
+            content_revision: 0,
+            regions: UiRegions::default(),
+            scrollbar_drag: None,
         }
     }
 
@@ -543,6 +551,9 @@ impl App {
     }
 
     fn begin_run(&mut self, configured_actions: Vec<WorkflowAction>) {
+        self.selection.clear();
+        self.scrollbar_drag = None;
+        self.content_revision = self.content_revision.wrapping_add(1);
         self.view = View::Running;
         self.run_started = Some(Instant::now());
         self.run_id.clear();
@@ -552,11 +563,16 @@ impl App {
         self.stdout = Arc::from("");
         self.stderr = Arc::from("");
         self.run_pane = RunPane::Stages;
-        self.stage_scroll.reset();
-        self.event_scroll.reset();
-        self.stdout_scroll.reset();
-        self.stderr_scroll.reset();
-        self.terminal_scroll = ScrollState::at_top();
+        self.stage_scroll = FollowViewport::default();
+        self.stage_metrics = ViewportMetrics::default();
+        self.event_scroll = FollowViewport::default();
+        self.event_metrics = ViewportMetrics::default();
+        self.stdout_scroll = FollowViewport::default();
+        self.stdout_metrics = ViewportMetrics::default();
+        self.stderr_scroll = FollowViewport::default();
+        self.stderr_metrics = ViewportMetrics::default();
+        self.terminal_scroll = FollowViewport::at_top();
+        self.terminal_metrics = ViewportMetrics::default();
         self.notice = "preparing private workspace and supervisor".to_owned();
         self.terminal = None;
         self.configured_actions = configured_actions;
@@ -564,26 +580,96 @@ impl App {
 
     fn tick(&mut self) {}
 
-    fn select_key(&mut self, event: Event) -> SelectAction {
-        let Event::Key(key) = event else {
-            return SelectAction::None;
+    fn action_context(&self) -> BuildActionContext {
+        let mode = match (&self.view, &self.evidence_mode) {
+            (View::Select, _) => BuildActionMode::Select,
+            (View::Running, _) => BuildActionMode::Running,
+            (View::Terminal, _) => BuildActionMode::Terminal,
+            (View::Evidence, EvidenceMode::List | EvidenceMode::ForgetReady(_)) => {
+                BuildActionMode::EvidenceList
+            }
+            (View::Evidence, EvidenceMode::Inspect(_)) => BuildActionMode::EvidenceInspect,
+            (View::Evidence, EvidenceMode::ConfirmForget(_)) => BuildActionMode::EvidenceConfirm,
         };
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            return SelectAction::Quit;
+        let activate_available = match mode {
+            BuildActionMode::Select => self
+                .workflows
+                .get(self.selected_workflow)
+                .is_some_and(|workflow| workflow.availability.ready()),
+            BuildActionMode::EvidenceList => self.evidence.get(self.selected_evidence).is_some(),
+            BuildActionMode::Running
+            | BuildActionMode::Terminal
+            | BuildActionMode::EvidenceInspect
+            | BuildActionMode::EvidenceConfirm => false,
+        };
+        BuildActionContext { mode, activate_available }
+    }
+
+    fn resolve_action_key(&mut self, key: KeyEvent) -> Option<BuildCommand> {
+        let chord = KeyChord::from_event(key)?;
+        let context = self.action_context();
+        let invocation =
+            match self.actions.resolve_keybinding(&mut self.keybinding_state, chord, context) {
+                KeybindingResolution::Invoke(invocation) => invocation,
+                KeybindingResolution::Pending | KeybindingResolution::UnmatchedSequence { .. } => {
+                    return None
+                }
+                KeybindingResolution::Unmatched => return None,
+            };
+        match self.actions.command_for(&invocation) {
+            Ok(command) => Some(command),
+            Err(error) => {
+                self.notice = error.to_string();
+                None
+            }
         }
-        match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => SelectAction::Quit,
-            KeyCode::Char('e') => SelectAction::Evidence,
-            KeyCode::Up | KeyCode::Char('k') => {
+    }
+
+    fn select_key(&mut self, event: Event) -> SelectAction {
+        let key = match event {
+            Event::Key(key) => key,
+            Event::Mouse(mouse) => {
+                let position = Position::new(mouse.column, mouse.row);
+                match mouse.kind {
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        if let Some(index) = self
+                            .regions
+                            .workflows
+                            .iter()
+                            .find(|(area, _)| area.contains(position))
+                            .map(|(_, index)| *index)
+                        {
+                            self.selected_workflow = index;
+                        }
+                    }
+                    MouseEventKind::ScrollUp => {
+                        self.selected_workflow = self.selected_workflow.saturating_sub(1)
+                    }
+                    MouseEventKind::ScrollDown => {
+                        self.selected_workflow =
+                            (self.selected_workflow + 1).min(self.workflows.len().saturating_sub(1))
+                    }
+                    _ => {}
+                }
+                return SelectAction::None;
+            }
+            _ => return SelectAction::None,
+        };
+        match self.resolve_action_key(key) {
+            Some(BuildCommand::Quit | BuildCommand::CancelOrQuit | BuildCommand::Escape) => {
+                SelectAction::Quit
+            }
+            Some(BuildCommand::OpenEvidence) => SelectAction::Evidence,
+            Some(BuildCommand::MoveUp) => {
                 self.selected_workflow = self.selected_workflow.saturating_sub(1);
                 SelectAction::None
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            Some(BuildCommand::MoveDown) => {
                 self.selected_workflow =
                     (self.selected_workflow + 1).min(self.workflows.len().saturating_sub(1));
                 SelectAction::None
             }
-            KeyCode::Enter => match self.workflows.get(self.selected_workflow) {
+            Some(BuildCommand::Activate) => match self.workflows.get(self.selected_workflow) {
                 Some(workflow) if workflow.availability.ready() => {
                     SelectAction::Start(self.selected_workflow)
                 }
@@ -598,50 +684,41 @@ impl App {
                 None => SelectAction::None,
                 Some(_) => SelectAction::None,
             },
-            _ => SelectAction::None,
+            Some(
+                BuildCommand::PageUp
+                | BuildCommand::PageDown
+                | BuildCommand::NextPane
+                | BuildCommand::PreviousPane
+                | BuildCommand::Cancel
+                | BuildCommand::ChooseWorkflow
+                | BuildCommand::Back
+                | BuildCommand::Forget
+                | BuildCommand::Confirm
+                | BuildCommand::Decline,
+            )
+            | None => SelectAction::None,
         }
     }
 
     fn active_key(&mut self, event: Event, terminal_ready: bool) -> ActiveAction {
-        let Event::Key(key) = event else {
-            return ActiveAction::None;
+        let key = match event {
+            Event::Key(key) => key,
+            Event::Mouse(mouse) => return self.active_mouse(mouse),
+            Event::Resize(_, _) => {
+                self.scrollbar_drag = None;
+                return ActiveAction::None;
+            }
+            _ => return ActiveAction::None,
         };
-        if self.view == View::Evidence {
-            return self.evidence_key(key);
+        match self.selection.on_key(key) {
+            SelectionOutcome::CopyReady(text) => return ActiveAction::Copy(text),
+            SelectionOutcome::Captured | SelectionOutcome::Changed => return ActiveAction::None,
+            SelectionOutcome::Unhandled | SelectionOutcome::EdgeScroll { .. } => {}
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            return if terminal_ready { ActiveAction::Quit } else { ActiveAction::Cancel };
+        if let Some(command) = self.resolve_action_key(key) {
+            return self.execute_active_command(command, terminal_ready);
         }
         match key.code {
-            KeyCode::Char('q') => ActiveAction::Quit,
-            KeyCode::Char('c') if !terminal_ready => ActiveAction::Cancel,
-            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
-                self.cycle_run_pane(true);
-                ActiveAction::None
-            }
-            KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
-                self.cycle_run_pane(false);
-                ActiveAction::None
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.scroll_active_pane(false, 1);
-                ActiveAction::None
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.scroll_active_pane(true, 1);
-                ActiveAction::None
-            }
-            KeyCode::PageUp => {
-                self.scroll_active_pane(false, PAGE_ROWS);
-                ActiveAction::None
-            }
-            KeyCode::PageDown => {
-                self.scroll_active_pane(true, PAGE_ROWS);
-                ActiveAction::None
-            }
-            KeyCode::Char('e') if terminal_ready => ActiveAction::Evidence,
-            KeyCode::Char('r') if terminal_ready => ActiveAction::ChooseWorkflow,
-            KeyCode::Esc if terminal_ready => ActiveAction::ChooseWorkflow,
             KeyCode::Char(key) if terminal_ready => self
                 .configured_action_index(key)
                 .map(ActiveAction::RunConfigured)
@@ -650,85 +727,284 @@ impl App {
         }
     }
 
-    fn evidence_key(&mut self, key: KeyEvent) -> ActiveAction {
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            return ActiveAction::Quit;
-        }
-        match &self.evidence_mode {
-            EvidenceMode::ConfirmForget(run_id) => match key.code {
-                KeyCode::Char('y') => {
-                    self.notice = format!("forgetting evidence {run_id}");
-                    self.evidence_mode = EvidenceMode::ForgetReady(run_id.clone());
-                    ActiveAction::None
+    fn execute_active_command(
+        &mut self,
+        command: BuildCommand,
+        terminal_ready: bool,
+    ) -> ActiveAction {
+        match command {
+            BuildCommand::Quit => ActiveAction::Quit,
+            BuildCommand::CancelOrQuit => {
+                if terminal_ready {
+                    ActiveAction::Quit
+                } else {
+                    ActiveAction::Cancel
                 }
-                KeyCode::Char('n') | KeyCode::Esc => {
+            }
+            BuildCommand::Escape | BuildCommand::Back => match &self.evidence_mode {
+                EvidenceMode::ConfirmForget(_) => {
                     self.evidence_mode = EvidenceMode::List;
                     ActiveAction::None
                 }
-                _ => ActiveAction::None,
-            },
-            EvidenceMode::Inspect(_) => match key.code {
-                KeyCode::Esc | KeyCode::Char('b') => {
+                EvidenceMode::Inspect(_) if self.view == View::Evidence => {
                     self.evidence_mode = EvidenceMode::List;
                     ActiveAction::None
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.evidence_inspect_scroll.scroll_up(1);
-                    ActiveAction::None
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.evidence_inspect_scroll.scroll_down(1);
-                    ActiveAction::None
-                }
-                KeyCode::PageUp => {
-                    self.evidence_inspect_scroll.scroll_up(PAGE_ROWS);
-                    ActiveAction::None
-                }
-                KeyCode::PageDown => {
-                    self.evidence_inspect_scroll.scroll_down(PAGE_ROWS);
-                    ActiveAction::None
-                }
-                _ => ActiveAction::None,
-            },
-            EvidenceMode::List => match key.code {
-                KeyCode::Char('q') => ActiveAction::Quit,
-                KeyCode::Esc | KeyCode::Char('b') => {
+                EvidenceMode::List if self.view == View::Evidence => {
                     self.close_evidence();
                     ActiveAction::None
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.selected_evidence = self.selected_evidence.saturating_sub(1);
-                    ActiveAction::None
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.selected_evidence =
-                        (self.selected_evidence + 1).min(self.evidence.len().saturating_sub(1));
-                    ActiveAction::None
-                }
-                KeyCode::Char('i') | KeyCode::Enter => {
-                    if let Some(record) = self.evidence.get(self.selected_evidence) {
-                        match evidence::tui_inspect(&record.run_id) {
-                            Ok(contents) => {
-                                self.evidence_inspect_scroll = ScrollState::at_top();
-                                self.evidence_mode = EvidenceMode::Inspect(contents);
-                            }
-                            Err(error) => {
-                                self.notice = format!("could not inspect evidence: {error:#}")
-                            }
-                        }
-                    }
-                    ActiveAction::None
-                }
-                KeyCode::Char('f') => {
-                    if let Some(record) = self.evidence.get(self.selected_evidence) {
-                        self.evidence_mode = EvidenceMode::ConfirmForget(record.run_id.clone());
-                    }
-                    ActiveAction::None
-                }
+                _ if terminal_ready => ActiveAction::ChooseWorkflow,
                 _ => ActiveAction::None,
             },
-            EvidenceMode::ForgetReady(_) => ActiveAction::None,
+            BuildCommand::OpenEvidence if terminal_ready => ActiveAction::Evidence,
+            BuildCommand::OpenEvidence => ActiveAction::None,
+            BuildCommand::NextPane => {
+                self.cycle_run_pane(true);
+                ActiveAction::None
+            }
+            BuildCommand::PreviousPane => {
+                self.cycle_run_pane(false);
+                ActiveAction::None
+            }
+            BuildCommand::MoveUp => {
+                match &self.evidence_mode {
+                    EvidenceMode::List if self.view == View::Evidence => {
+                        self.selected_evidence = self.selected_evidence.saturating_sub(1)
+                    }
+                    EvidenceMode::Inspect(_) if self.view == View::Evidence => {
+                        self.scroll_surface(BuildSurface::Evidence, -1)
+                    }
+                    _ => self.scroll_active_pane(false, 1),
+                }
+                ActiveAction::None
+            }
+            BuildCommand::MoveDown => {
+                match &self.evidence_mode {
+                    EvidenceMode::List if self.view == View::Evidence => {
+                        self.selected_evidence =
+                            (self.selected_evidence + 1).min(self.evidence.len().saturating_sub(1))
+                    }
+                    EvidenceMode::Inspect(_) if self.view == View::Evidence => {
+                        self.scroll_surface(BuildSurface::Evidence, 1)
+                    }
+                    _ => self.scroll_active_pane(true, 1),
+                }
+                ActiveAction::None
+            }
+            BuildCommand::PageUp => {
+                if matches!(self.evidence_mode, EvidenceMode::Inspect(_))
+                    && self.view == View::Evidence
+                {
+                    self.evidence_inspect_scroll.page_by(-1, self.evidence_inspect_metrics);
+                } else {
+                    self.scroll_active_pane(false, PAGE_ROWS);
+                }
+                ActiveAction::None
+            }
+            BuildCommand::PageDown => {
+                if matches!(self.evidence_mode, EvidenceMode::Inspect(_))
+                    && self.view == View::Evidence
+                {
+                    self.evidence_inspect_scroll.page_by(1, self.evidence_inspect_metrics);
+                } else {
+                    self.scroll_active_pane(true, PAGE_ROWS);
+                }
+                ActiveAction::None
+            }
+            BuildCommand::Cancel => {
+                if terminal_ready {
+                    ActiveAction::None
+                } else {
+                    ActiveAction::Cancel
+                }
+            }
+            BuildCommand::ChooseWorkflow => {
+                if terminal_ready {
+                    ActiveAction::ChooseWorkflow
+                } else {
+                    ActiveAction::None
+                }
+            }
+            BuildCommand::Activate => {
+                if let Some(record) = self.evidence.get(self.selected_evidence) {
+                    match evidence::tui_inspect(&record.run_id) {
+                        Ok(contents) => {
+                            self.selection.clear();
+                            self.content_revision = self.content_revision.wrapping_add(1);
+                            self.evidence_inspect_scroll = FollowViewport::at_top();
+                            self.evidence_inspect_metrics = ViewportMetrics::default();
+                            self.evidence_mode = EvidenceMode::Inspect(contents);
+                        }
+                        Err(error) => {
+                            self.notice = format!("could not inspect evidence: {error:#}")
+                        }
+                    }
+                }
+                ActiveAction::None
+            }
+            BuildCommand::Forget => {
+                if let Some(record) = self.evidence.get(self.selected_evidence) {
+                    self.evidence_mode = EvidenceMode::ConfirmForget(record.run_id.clone());
+                }
+                ActiveAction::None
+            }
+            BuildCommand::Confirm => {
+                if let EvidenceMode::ConfirmForget(run_id) = &self.evidence_mode {
+                    self.notice = format!("forgetting evidence {run_id}");
+                    self.evidence_mode = EvidenceMode::ForgetReady(run_id.clone());
+                }
+                ActiveAction::None
+            }
+            BuildCommand::Decline => {
+                self.evidence_mode = EvidenceMode::List;
+                ActiveAction::None
+            }
         }
+    }
+
+    fn active_mouse(&mut self, mouse: MouseEvent) -> ActiveAction {
+        if let Some((surface, drag)) = self.scrollbar_drag {
+            match mouse.kind {
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    if let Some(layout) = self
+                        .regions
+                        .scrollbars
+                        .iter()
+                        .find(|(candidate, _)| *candidate == surface)
+                        .map(|(_, layout)| *layout)
+                    {
+                        let top = drag.top_for_row(layout, mouse.row);
+                        self.set_surface_top(surface, top);
+                    }
+                }
+                MouseEventKind::Up(MouseButton::Left) => self.scrollbar_drag = None,
+                _ => {}
+            }
+            return ActiveAction::None;
+        }
+        if self.selection.is_dragging() {
+            match self.selection.on_mouse(mouse) {
+                SelectionOutcome::CopyReady(text) => return ActiveAction::Copy(text),
+                SelectionOutcome::Captured | SelectionOutcome::Changed => {
+                    return ActiveAction::None
+                }
+                SelectionOutcome::EdgeScroll { surface, lines } => {
+                    self.scroll_surface(surface, lines);
+                    return ActiveAction::None;
+                }
+                SelectionOutcome::Unhandled => {}
+            }
+        }
+        let position = Position::new(mouse.column, mouse.row);
+        if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+            if let Some((surface, layout)) = self
+                .regions
+                .scrollbars
+                .iter()
+                .find(|(_, layout)| layout.contains(position))
+                .copied()
+            {
+                self.selection.clear();
+                if let Some(drag) = ScrollbarDrag::begin(layout, position) {
+                    self.scrollbar_drag = Some((surface, drag));
+                } else {
+                    self.set_surface_top(surface, layout.top_for_track_row(mouse.row));
+                }
+                return ActiveAction::None;
+            }
+        }
+        if self.view == View::Evidence {
+            match (&self.evidence_mode, mouse.kind) {
+                (EvidenceMode::List, MouseEventKind::Down(MouseButton::Left)) => {
+                    if let Some(index) = self
+                        .regions
+                        .evidence_records
+                        .iter()
+                        .find(|(area, _)| area.contains(position))
+                        .map(|(_, index)| *index)
+                    {
+                        self.selected_evidence = index;
+                    }
+                }
+                (EvidenceMode::List, MouseEventKind::ScrollUp) => {
+                    self.selected_evidence = self.selected_evidence.saturating_sub(1)
+                }
+                (EvidenceMode::List, MouseEventKind::ScrollDown) => {
+                    self.selected_evidence =
+                        (self.selected_evidence + 1).min(self.evidence.len().saturating_sub(1))
+                }
+                (EvidenceMode::Inspect(_), MouseEventKind::ScrollUp) => {
+                    self.scroll_surface(BuildSurface::Evidence, -1)
+                }
+                (EvidenceMode::Inspect(_), MouseEventKind::ScrollDown) => {
+                    self.scroll_surface(BuildSurface::Evidence, 1)
+                }
+                (EvidenceMode::Inspect(_), MouseEventKind::Down(MouseButton::Left)) => {
+                    let _ = self.selection.on_mouse(mouse);
+                }
+                _ => {}
+            }
+            return ActiveAction::None;
+        }
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(pane) = self
+                    .regions
+                    .run_panes
+                    .iter()
+                    .find(|(area, _)| area.contains(position))
+                    .map(|(_, pane)| *pane)
+                {
+                    self.run_pane = pane;
+                }
+                let _ = self.selection.on_mouse(mouse);
+            }
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                if let Some(pane) = self
+                    .regions
+                    .run_panes
+                    .iter()
+                    .find(|(area, _)| area.contains(position))
+                    .map(|(_, pane)| *pane)
+                {
+                    self.run_pane = pane;
+                    self.scroll_active_pane(matches!(mouse.kind, MouseEventKind::ScrollDown), 1);
+                    self.selection.clear();
+                }
+            }
+            _ => {}
+        }
+        ActiveAction::None
+    }
+
+    fn scroll_surface(&mut self, surface: BuildSurface, lines: isize) {
+        let (viewport, metrics) = match surface {
+            BuildSurface::Stages => (&mut self.stage_scroll, self.stage_metrics),
+            BuildSurface::Events => (&mut self.event_scroll, self.event_metrics),
+            BuildSurface::Stdout => (&mut self.stdout_scroll, self.stdout_metrics),
+            BuildSurface::Stderr => (&mut self.stderr_scroll, self.stderr_metrics),
+            BuildSurface::Terminal => (&mut self.terminal_scroll, self.terminal_metrics),
+            BuildSurface::Evidence => {
+                (&mut self.evidence_inspect_scroll, self.evidence_inspect_metrics)
+            }
+        };
+        viewport.scroll_by(lines, metrics);
+    }
+
+    fn set_surface_top(&mut self, surface: BuildSurface, top: usize) {
+        let (viewport, metrics) = match surface {
+            BuildSurface::Stages => (&mut self.stage_scroll, self.stage_metrics),
+            BuildSurface::Events => (&mut self.event_scroll, self.event_metrics),
+            BuildSurface::Stdout => (&mut self.stdout_scroll, self.stdout_metrics),
+            BuildSurface::Stderr => (&mut self.stderr_scroll, self.stderr_metrics),
+            BuildSurface::Terminal => (&mut self.terminal_scroll, self.terminal_metrics),
+            BuildSurface::Evidence => {
+                (&mut self.evidence_inspect_scroll, self.evidence_inspect_metrics)
+            }
+        };
+        viewport.set_top(top, metrics);
     }
 
     fn ingest_update(&mut self, update: BuildUpdate) {
@@ -783,9 +1059,10 @@ impl App {
                 while self.stage_order.len() > MAX_STAGE_ROWS {
                     if let Some(expired) = self.stage_order.pop_front() {
                         self.stages.remove(&expired);
-                        if !self.stage_scroll.follow {
-                            self.stage_scroll.offset = self.stage_scroll.offset.saturating_sub(1);
+                        if let FollowViewport::Historical(top) = &mut self.stage_scroll {
+                            *top = top.saturating_sub(1);
                         }
+                        self.content_revision = self.content_revision.wrapping_add(1);
                     }
                 }
                 self.push_event(format!(
@@ -844,9 +1121,10 @@ impl App {
         self.events.push_back(line);
         while self.events.len() > MAX_EVENT_LINES {
             self.events.pop_front();
-            if !self.event_scroll.follow {
-                self.event_scroll.offset = self.event_scroll.offset.saturating_sub(1);
+            if let FollowViewport::Historical(top) = &mut self.event_scroll {
+                *top = top.saturating_sub(1);
             }
+            self.content_revision = self.content_revision.wrapping_add(1);
         }
     }
 
@@ -871,6 +1149,8 @@ impl App {
     }
 
     fn open_evidence(&mut self) {
+        self.selection.clear();
+        self.scrollbar_drag = None;
         self.evidence = match evidence::tui_records() {
             Ok(records) => records,
             Err(error) => {
@@ -884,6 +1164,8 @@ impl App {
     }
 
     fn close_evidence(&mut self) {
+        self.selection.clear();
+        self.scrollbar_drag = None;
         self.view = if self.terminal.is_some() { View::Terminal } else { View::Select };
         self.evidence_mode = EvidenceMode::List;
     }
@@ -908,12 +1190,7 @@ impl App {
     }
 
     fn terminal_controls(&self) -> String {
-        let mut controls = vec![
-            "Tab/h/l focus".to_owned(),
-            "j/k or PgUp/PgDn scroll".to_owned(),
-            "r workflows".to_owned(),
-            "e evidence".to_owned(),
-        ];
+        let mut controls = vec![self.action_help()];
         if self.terminal.is_some() {
             controls.extend(
                 self.configured_actions
@@ -921,8 +1198,20 @@ impl App {
                     .map(|action| format!("{} {}", action.key, action.label.as_str())),
             );
         }
-        controls.push("q quit".to_owned());
         controls.join("  ")
+    }
+
+    fn action_help(&self) -> String {
+        let context = self.action_context();
+        self.actions
+            .resolve_command_palette(&context)
+            .items()
+            .iter()
+            .filter_map(|action| {
+                action.primary_keybinding().map(|binding| format!("{binding} {}", action.title))
+            })
+            .collect::<Vec<_>>()
+            .join("  ")
     }
 
     fn elapsed(&self) -> String {
@@ -963,18 +1252,15 @@ impl App {
     }
 
     fn scroll_active_pane(&mut self, down: bool, rows: usize) {
-        let scroll = match self.run_pane {
-            RunPane::Stages => &mut self.stage_scroll,
-            RunPane::Events => &mut self.event_scroll,
-            RunPane::Stdout => &mut self.stdout_scroll,
-            RunPane::Stderr => &mut self.stderr_scroll,
-            RunPane::Terminal => &mut self.terminal_scroll,
+        let (scroll, metrics) = match self.run_pane {
+            RunPane::Stages => (&mut self.stage_scroll, self.stage_metrics),
+            RunPane::Events => (&mut self.event_scroll, self.event_metrics),
+            RunPane::Stdout => (&mut self.stdout_scroll, self.stdout_metrics),
+            RunPane::Stderr => (&mut self.stderr_scroll, self.stderr_metrics),
+            RunPane::Terminal => (&mut self.terminal_scroll, self.terminal_metrics),
         };
-        if down {
-            scroll.scroll_down(rows);
-        } else {
-            scroll.scroll_up(rows);
-        }
+        let delta = isize::try_from(rows).unwrap_or(isize::MAX);
+        scroll.scroll_by(if down { delta } else { -delta }, metrics);
     }
 
     fn exit_result(&self) -> Result<()> {
@@ -1033,12 +1319,34 @@ fn wrapped_rows(text: &str, width: u16) -> usize {
         .fold(0usize, usize::saturating_add)
 }
 
+fn update_follow_layout(
+    viewport: &mut FollowViewport,
+    metrics: &mut ViewportMetrics,
+    total_rows: usize,
+    viewport_rows: usize,
+) -> usize {
+    *metrics = ViewportMetrics::new(total_rows, viewport_rows.max(1));
+    viewport.normalize(*metrics);
+    viewport.top(*metrics)
+}
+
+fn scroll_row(top: usize) -> u16 {
+    u16::try_from(top).unwrap_or(u16::MAX)
+}
+
 fn render(frame: &mut Frame<'_>, app: &mut App) {
+    app.regions = UiRegions::default();
     match app.view {
         View::Select => render_selection(frame, app),
         View::Running | View::Terminal => render_run(frame, app),
         View::Evidence => render_evidence(frame, app),
     }
+    let selectable = app.regions.selectable.clone();
+    app.selection.capture_frame(
+        frame,
+        &selectable,
+        Style::default().bg(NORD.selection).add_modifier(Modifier::REVERSED),
+    );
 }
 
 fn block(title: &str) -> Block<'_> {
@@ -1054,10 +1362,58 @@ fn pane_block(title: &str, focused: bool) -> Block<'_> {
     block(title).border_style(Style::default().fg(color))
 }
 
-fn render_selection(frame: &mut Frame<'_>, app: &App) {
+fn content_rect(area: Rect) -> Rect {
+    Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    )
+}
+
+fn selectable_content_rect(area: Rect, metrics: ViewportMetrics) -> Rect {
+    let inner = content_rect(area);
+    Rect::new(
+        inner.x,
+        inner.y,
+        inner.width.saturating_sub(u16::from(metrics.has_overflow())),
+        inner.height,
+    )
+}
+
+fn render_scrollbar(
+    frame: &mut Frame<'_>,
+    regions: &mut UiRegions,
+    surface: BuildSurface,
+    area: Rect,
+    viewport: FollowViewport,
+    metrics: ViewportMetrics,
+    dragging: bool,
+) {
+    let Some(layout) =
+        ScrollbarLayout::vertical_right(content_rect(area), metrics, viewport.top(metrics))
+    else {
+        return;
+    };
+    regions.scrollbars.push((surface, layout));
+    render_vertical_scrollbar(
+        frame,
+        layout,
+        dragging,
+        ScrollbarStyle {
+            track_color: NORD.border,
+            thumb_color: NORD.text_muted,
+            active_thumb_color: NORD.accent,
+            track_symbol: "│",
+            thumb_symbol: "┃",
+        },
+    );
+}
+
+fn render_selection(frame: &mut Frame<'_>, app: &mut App) {
     let areas = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(4), Constraint::Min(6), Constraint::Length(3)])
+        .constraints([Constraint::Length(4), Constraint::Min(6), Constraint::Length(4)])
         .split(frame.area());
     let header = vec![
         Line::from(Span::styled(
@@ -1070,6 +1426,20 @@ fn render_selection(frame: &mut Frame<'_>, app: &App) {
     let workflow_capacity = usize::from(areas[1].height.saturating_sub(2));
     let workflow_start =
         viewport_start(app.selected_workflow, app.workflows.len(), workflow_capacity);
+    let workflow_inner = content_rect(areas[1]);
+    for (visible_row, index) in
+        (workflow_start..app.workflows.len()).take(workflow_capacity).enumerate()
+    {
+        app.regions.workflows.push((
+            Rect::new(
+                workflow_inner.x,
+                workflow_inner.y.saturating_add(visible_row as u16),
+                workflow_inner.width,
+                1,
+            ),
+            index,
+        ));
+    }
     let items = app
         .workflows
         .iter()
@@ -1101,10 +1471,7 @@ fn render_selection(frame: &mut Frame<'_>, app: &App) {
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(app.notice.as_str()),
-            Line::from(Span::styled(
-                "Enter run  j/k select  e evidence  q quit",
-                Style::default().fg(NORD.text_muted),
-            )),
+            Line::from(Span::styled(app.action_help(), Style::default().fg(NORD.text_muted))),
         ])
         .block(block("Build console")),
         areas[2],
@@ -1165,8 +1532,20 @@ fn render_run(frame: &mut Frame<'_>, app: &mut App) {
         .constraints([Constraint::Percentage(52), Constraint::Percentage(48)])
         .split(areas[1]);
     let stage_capacity = usize::from(top[0].height.saturating_sub(2));
-    app.stage_scroll.update_layout(app.stage_order.len(), stage_capacity);
-    let stage_start = app.stage_scroll.offset;
+    let stage_start = update_follow_layout(
+        &mut app.stage_scroll,
+        &mut app.stage_metrics,
+        app.stage_order.len(),
+        stage_capacity,
+    );
+    app.regions.run_panes.push((top[0], RunPane::Stages));
+    app.regions.selectable.push(SelectableRegion::new(
+        BuildSurface::Stages,
+        selectable_content_rect(top[0], app.stage_metrics),
+        i64::try_from(stage_start).unwrap_or(i64::MAX),
+        0,
+        app.content_revision,
+    ));
     let stages = app
         .stage_order
         .iter()
@@ -1194,9 +1573,30 @@ fn render_run(frame: &mut Frame<'_>, app: &mut App) {
         )),
         top[0],
     );
+    render_scrollbar(
+        frame,
+        &mut app.regions,
+        BuildSurface::Stages,
+        top[0],
+        app.stage_scroll,
+        app.stage_metrics,
+        app.scrollbar_drag.is_some_and(|(surface, _)| surface == BuildSurface::Stages),
+    );
     let event_capacity = usize::from(top[1].height.saturating_sub(2));
-    app.event_scroll.update_layout(app.events.len(), event_capacity);
-    let event_start = app.event_scroll.offset;
+    let event_start = update_follow_layout(
+        &mut app.event_scroll,
+        &mut app.event_metrics,
+        app.events.len(),
+        event_capacity,
+    );
+    app.regions.run_panes.push((top[1], RunPane::Events));
+    app.regions.selectable.push(SelectableRegion::new(
+        BuildSurface::Events,
+        selectable_content_rect(top[1], app.event_metrics),
+        i64::try_from(event_start).unwrap_or(i64::MAX),
+        0,
+        app.content_revision,
+    ));
     let event_lines = app
         .events
         .iter()
@@ -1211,21 +1611,49 @@ fn render_run(frame: &mut Frame<'_>, app: &mut App) {
         )),
         top[1],
     );
+    render_scrollbar(
+        frame,
+        &mut app.regions,
+        BuildSurface::Events,
+        top[1],
+        app.event_scroll,
+        app.event_metrics,
+        app.scrollbar_drag.is_some_and(|(surface, _)| surface == BuildSurface::Events),
+    );
 
     let terminal_area = terminal_visible.then_some(areas[2]);
     if let Some(area) = terminal_area {
         let terminal = app.terminal.as_ref().expect("terminal visibility follows terminal state");
         let message = terminal_message(terminal);
-        app.terminal_scroll.update_layout(
+        let terminal_top = update_follow_layout(
+            &mut app.terminal_scroll,
+            &mut app.terminal_metrics,
             wrapped_rows(message, area.width.saturating_sub(2)),
             usize::from(area.height.saturating_sub(2)),
         );
+        app.regions.run_panes.push((area, RunPane::Terminal));
+        app.regions.selectable.push(SelectableRegion::new(
+            BuildSurface::Terminal,
+            selectable_content_rect(area, app.terminal_metrics),
+            i64::try_from(terminal_top).unwrap_or(i64::MAX),
+            0,
+            app.content_revision,
+        ));
         frame.render_widget(
             Paragraph::new(message)
                 .block(pane_block("Terminal truth", app.run_pane == RunPane::Terminal))
                 .wrap(Wrap { trim: false })
-                .scroll((app.terminal_scroll.offset_u16(), 0)),
+                .scroll((scroll_row(terminal_top), 0)),
             area,
+        );
+        render_scrollbar(
+            frame,
+            &mut app.regions,
+            BuildSurface::Terminal,
+            area,
+            app.terminal_scroll,
+            app.terminal_metrics,
+            app.scrollbar_drag.is_some_and(|(surface, _)| surface == BuildSurface::Terminal),
         );
     }
     let tails_area = if terminal_visible { areas[3] } else { areas[2] };
@@ -1234,34 +1662,68 @@ fn render_run(frame: &mut Frame<'_>, app: &mut App) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(tails_area);
-    app.stdout_scroll.update_layout(
+    let stdout_top = update_follow_layout(
+        &mut app.stdout_scroll,
+        &mut app.stdout_metrics,
         wrapped_rows(app.stdout.as_ref(), tails[0].width.saturating_sub(2)),
         usize::from(tails[0].height.saturating_sub(2)),
     );
-    app.stderr_scroll.update_layout(
+    let stderr_top = update_follow_layout(
+        &mut app.stderr_scroll,
+        &mut app.stderr_metrics,
         wrapped_rows(app.stderr.as_ref(), tails[1].width.saturating_sub(2)),
         usize::from(tails[1].height.saturating_sub(2)),
     );
+    app.regions.run_panes.push((tails[0], RunPane::Stdout));
+    app.regions.run_panes.push((tails[1], RunPane::Stderr));
+    app.regions.selectable.push(SelectableRegion::new(
+        BuildSurface::Stdout,
+        selectable_content_rect(tails[0], app.stdout_metrics),
+        i64::try_from(stdout_top).unwrap_or(i64::MAX),
+        0,
+        app.content_revision,
+    ));
+    app.regions.selectable.push(SelectableRegion::new(
+        BuildSurface::Stderr,
+        selectable_content_rect(tails[1], app.stderr_metrics),
+        i64::try_from(stderr_top).unwrap_or(i64::MAX),
+        0,
+        app.content_revision,
+    ));
     frame.render_widget(
         Paragraph::new(if app.stdout.is_empty() { "<no stdout yet>" } else { app.stdout.as_ref() })
             .block(pane_block("stdout tail (bounded)", app.run_pane == RunPane::Stdout))
             .wrap(Wrap { trim: false })
-            .scroll((app.stdout_scroll.offset_u16(), 0)),
+            .scroll((scroll_row(stdout_top), 0)),
         tails[0],
+    );
+    render_scrollbar(
+        frame,
+        &mut app.regions,
+        BuildSurface::Stdout,
+        tails[0],
+        app.stdout_scroll,
+        app.stdout_metrics,
+        app.scrollbar_drag.is_some_and(|(surface, _)| surface == BuildSurface::Stdout),
     );
     frame.render_widget(
         Paragraph::new(if app.stderr.is_empty() { "<no stderr yet>" } else { app.stderr.as_ref() })
             .block(pane_block("stderr tail (bounded)", app.run_pane == RunPane::Stderr))
             .wrap(Wrap { trim: false })
-            .scroll((app.stderr_scroll.offset_u16(), 0)),
+            .scroll((scroll_row(stderr_top), 0)),
         tails[1],
     );
+    render_scrollbar(
+        frame,
+        &mut app.regions,
+        BuildSurface::Stderr,
+        tails[1],
+        app.stderr_scroll,
+        app.stderr_metrics,
+        app.scrollbar_drag.is_some_and(|(surface, _)| surface == BuildSurface::Stderr),
+    );
 
-    let help = if app.view == View::Running {
-        "Tab/h/l focus  j/k or PgUp/PgDn scroll  c cancel  q cancel and quit".to_owned()
-    } else {
-        app.terminal_controls()
-    };
+    let help = if app.view == View::Running { app.action_help() } else { app.terminal_controls() };
     frame.render_widget(Paragraph::new(help).block(block("Controls")), controls_area);
 }
 
@@ -1287,6 +1749,18 @@ fn render_evidence(frame: &mut Frame<'_>, app: &mut App) {
         EvidenceMode::List => {
             let capacity = usize::from(areas[1].height.saturating_sub(2));
             let start = viewport_start(app.selected_evidence, app.evidence.len(), capacity);
+            let records_inner = content_rect(areas[1]);
+            for (visible_row, index) in (start..app.evidence.len()).take(capacity).enumerate() {
+                app.regions.evidence_records.push((
+                    Rect::new(
+                        records_inner.x,
+                        records_inner.y.saturating_add(visible_row as u16),
+                        records_inner.width,
+                        1,
+                    ),
+                    index,
+                ));
+            }
             let items = app
                 .evidence
                 .iter()
@@ -1321,32 +1795,51 @@ fn render_evidence(frame: &mut Frame<'_>, app: &mut App) {
             };
             frame.render_widget(content.block(block("Records")), areas[1]);
             frame.render_widget(
-                Paragraph::new("j/k select  Enter/i inspect  f forget (confirm)  b back")
-                    .block(block("Controls")),
+                Paragraph::new(app.action_help()).block(block("Controls")),
                 areas[2],
             );
         }
         EvidenceMode::Inspect(contents) => {
-            app.evidence_inspect_scroll.update_layout(
+            let evidence_top = update_follow_layout(
+                &mut app.evidence_inspect_scroll,
+                &mut app.evidence_inspect_metrics,
                 wrapped_rows(contents, areas[1].width.saturating_sub(2)),
                 usize::from(areas[1].height.saturating_sub(2)),
             );
+            let evidence_area = content_rect(areas[1]);
+            app.regions.evidence_inspect = Some(evidence_area);
+            app.regions.selectable.push(SelectableRegion::new(
+                BuildSurface::Evidence,
+                selectable_content_rect(areas[1], app.evidence_inspect_metrics),
+                i64::try_from(evidence_top).unwrap_or(i64::MAX),
+                0,
+                app.content_revision,
+            ));
             frame.render_widget(
                 Paragraph::new(contents.as_str())
                     .block(block("Validated evidence record"))
                     .wrap(Wrap { trim: false })
-                    .scroll((app.evidence_inspect_scroll.offset_u16(), 0)),
+                    .scroll((scroll_row(evidence_top), 0)),
                 areas[1],
             );
+            render_scrollbar(
+                frame,
+                &mut app.regions,
+                BuildSurface::Evidence,
+                areas[1],
+                app.evidence_inspect_scroll,
+                app.evidence_inspect_metrics,
+                app.scrollbar_drag.is_some_and(|(surface, _)| surface == BuildSurface::Evidence),
+            );
             frame.render_widget(
-                Paragraph::new("j/k or PgUp/PgDn scroll  b or Esc back").block(block("Controls")),
+                Paragraph::new(app.action_help()).block(block("Controls")),
                 areas[2],
             );
         }
         EvidenceMode::ConfirmForget(run_id) => {
             frame.render_widget(Paragraph::new(format!("Forget Build evidence {run_id}? This removes only this exact retained record.\n\ny confirm  n cancel")).block(block("Confirm deliberate removal")), areas[1]);
             frame.render_widget(
-                Paragraph::new("y forget  n cancel").block(block("Controls")),
+                Paragraph::new(app.action_help()).block(block("Controls")),
                 areas[2],
             );
         }

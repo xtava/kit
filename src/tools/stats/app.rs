@@ -20,7 +20,7 @@ use super::render::UiRegions;
 use super::tree::{FamilyView, ProcessForest, TreeQuery, TreeSort};
 use crate::tui::{
     ActionInvocation, ContextMenu, ContextMenuOutcome, Direction, KeyChord, KeybindingResolution,
-    KeybindingState, LineEditor, SplitDrag, SplitRatio,
+    KeybindingState, LineEditor, SplitDrag, SplitRatio, Viewport, ViewportMetrics,
 };
 
 const HISTORY: usize = 120;
@@ -229,8 +229,8 @@ pub(super) struct CommandViewer {
     pub(super) name: String,
     pub(super) pid: u32,
     pub(super) command: String,
-    pub(super) row_offset: usize,
-    pub(super) column_offset: usize,
+    pub(super) rows: Viewport,
+    pub(super) columns: Viewport,
 }
 
 pub(super) enum StatsOverlay {
@@ -948,6 +948,24 @@ impl StatsApp {
                     && regions.command_close.is_some_and(|area| contains(area, point))
                 {
                     self.overlay = None;
+                    return Action::None;
+                }
+                if self.pointer_enabled
+                    && regions.command_content.is_some_and(|area| contains(area, point))
+                    && matches!(mouse.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown)
+                {
+                    let Some(StatsOverlay::CommandViewer(viewer)) = self.overlay.as_mut() else {
+                        return Action::None;
+                    };
+                    let viewport = regions.command_content.unwrap_or_default();
+                    let metrics = ViewportMetrics::new(
+                        viewer.command.lines().count().max(1),
+                        usize::from(viewport.height.max(1)),
+                    );
+                    viewer.rows.scroll_by(
+                        if mouse.kind == MouseEventKind::ScrollUp { -3 } else { 3 },
+                        metrics,
+                    );
                 }
                 Action::None
             }
@@ -1485,29 +1503,18 @@ impl StatsApp {
         let line_count = viewer.command.lines().count().max(1);
         let longest =
             viewer.command.lines().map(|line| line.chars().count()).max().unwrap_or_default();
+        let row_metrics = ViewportMetrics::new(line_count, height);
+        let column_metrics = ViewportMetrics::new(longest, width);
         match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                viewer.row_offset = viewer.row_offset.saturating_sub(1)
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                viewer.row_offset =
-                    viewer.row_offset.saturating_add(1).min(line_count.saturating_sub(height))
-            }
-            KeyCode::PageUp => viewer.row_offset = viewer.row_offset.saturating_sub(height),
-            KeyCode::PageDown => {
-                viewer.row_offset =
-                    viewer.row_offset.saturating_add(height).min(line_count.saturating_sub(height))
-            }
-            KeyCode::Left | KeyCode::Char('h') => {
-                viewer.column_offset = viewer.column_offset.saturating_sub(4)
-            }
-            KeyCode::Right | KeyCode::Char('l') => {
-                viewer.column_offset =
-                    viewer.column_offset.saturating_add(4).min(longest.saturating_sub(width))
-            }
+            KeyCode::Up | KeyCode::Char('k') => viewer.rows.scroll_by(-1, row_metrics),
+            KeyCode::Down | KeyCode::Char('j') => viewer.rows.scroll_by(1, row_metrics),
+            KeyCode::PageUp => viewer.rows.page_by(-1, row_metrics),
+            KeyCode::PageDown => viewer.rows.page_by(1, row_metrics),
+            KeyCode::Left | KeyCode::Char('h') => viewer.columns.scroll_by(-4, column_metrics),
+            KeyCode::Right | KeyCode::Char('l') => viewer.columns.scroll_by(4, column_metrics),
             KeyCode::Home => {
-                viewer.row_offset = 0;
-                viewer.column_offset = 0;
+                viewer.rows.home();
+                viewer.columns.home();
             }
             _ => {}
         }
@@ -1523,8 +1530,8 @@ impl StatsApp {
             name: process.name.clone(),
             pid: process.identity.pid(),
             command: process.command.clone(),
-            row_offset: 0,
-            column_offset: 0,
+            rows: Viewport::default(),
+            columns: Viewport::default(),
         };
         self.overlay = Some(StatsOverlay::CommandViewer(viewer));
     }

@@ -1,9 +1,11 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::{
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Padding, Paragraph, Wrap},
@@ -18,7 +20,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use super::config::{Config, FavoriteAdd};
 use super::engine::{expand_domains, CheckClient, CheckResult, Disposition, Listing, Verdict};
 use crate::tui::{
-    CommandSet, CommandSpec, EventReader, LineEditor, ParsedInput, Session, SessionOptions,
+    render_vertical_scrollbar, CommandSet, CommandSpec, EventReader, LineEditor, ParsedInput,
+    ScrollbarDrag, ScrollbarLayout, ScrollbarStyle, SelectableRegion, SelectionOutcome, Session,
+    SessionOptions, TextSelection, Viewport, ViewportMetrics,
 };
 
 const HISTORY_LIMIT: usize = 200;
@@ -53,15 +57,17 @@ const COMMANDS: CommandSet = CommandSet::new(&[
 ]);
 
 pub async fn run(config: Config) -> Result<()> {
-    let mut terminal = Session::open(SessionOptions::default())?;
+    let mut terminal =
+        Session::open(SessionOptions { mouse_capture: true, bracketed_paste: false })?;
     let mut input = EventReader::start();
     let client = CheckClient::new()?;
     let (result_tx, mut result_rx) = mpsc::unbounded_channel();
     let mut app = App::new(config);
     let mut tick = time::interval(Duration::from_millis(90));
+    let mut regions = UiRegions::default();
 
     loop {
-        terminal.draw(|frame| render(frame, &app))?;
+        terminal.draw(|frame| regions = render(frame, &mut app))?;
 
         tokio::select! {
             _ = tick.tick() => {
@@ -74,7 +80,7 @@ pub async fn run(config: Config) -> Result<()> {
                     app.quit = true;
                     continue;
                 };
-                handle_event(event, &mut app, &client, &result_tx);
+                handle_event(event, &mut app, &client, &result_tx, &regions);
             }
             Some(result) = result_rx.recv() => {
                 if result.generation == app.generation {
@@ -82,8 +88,13 @@ pub async fn run(config: Config) -> Result<()> {
                         query: result.query,
                         results: result.results,
                     };
+                    app.selection.clear();
                 }
             }
+        }
+
+        if let Some(text) = app.pending_copy.take() {
+            terminal.copy(&text)?;
         }
 
         if app.quit {
@@ -94,15 +105,38 @@ pub async fn run(config: Config) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SelectionSurface {
+    Results,
+}
+
+#[derive(Default)]
+struct UiRegions {
+    results: Option<Rect>,
+    scrollbar: Option<ScrollbarLayout>,
+    selectable: Vec<SelectableRegion<SelectionSurface>>,
+}
+
 fn handle_event(
     event: Event,
     app: &mut App,
     client: &CheckClient,
     result_tx: &UnboundedSender<QueryResult>,
+    regions: &UiRegions,
 ) {
-    let Event::Key(key) = event else {
+    if let Event::Mouse(mouse) = event {
+        app.handle_mouse(mouse, regions);
         return;
-    };
+    }
+    let Event::Key(key) = event else { return };
+    match app.selection.on_key(key) {
+        SelectionOutcome::CopyReady(text) => {
+            app.pending_copy = Some(text);
+            return;
+        }
+        SelectionOutcome::Captured | SelectionOutcome::Changed => return,
+        SelectionOutcome::Unhandled | SelectionOutcome::EdgeScroll { .. } => {}
+    }
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         app.quit = true;
@@ -215,7 +249,7 @@ fn handle_tlds_key(key: KeyEvent, app: &mut App) {
     }
 }
 
-fn render(frame: &mut Frame<'_>, app: &App) {
+fn render(frame: &mut Frame<'_>, app: &mut App) -> UiRegions {
     let area = frame.area();
     let vertical = Layout::default()
         .direction(Direction::Vertical)
@@ -223,8 +257,16 @@ fn render(frame: &mut Frame<'_>, app: &App) {
         .split(area);
 
     render_header(frame, vertical[0]);
-    render_results(frame, vertical[1], app);
+    let mut regions = UiRegions::default();
+    render_results(frame, vertical[1], app, &mut regions);
     render_input(frame, vertical[2], app);
+    let selectable = regions.selectable.clone();
+    app.selection.capture_frame(
+        frame,
+        &selectable,
+        Style::default().bg(Color::DarkGray).add_modifier(Modifier::REVERSED),
+    );
+    regions
 }
 
 fn render_header(frame: &mut Frame<'_>, area: Rect) {
@@ -244,16 +286,46 @@ fn render_header(frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(header, area);
 }
 
-fn render_results(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn render_results(frame: &mut Frame<'_>, area: Rect, app: &mut App, regions: &mut UiRegions) {
     let block = panel(app.results_title());
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let lines = app.result_lines(inner.width as usize);
-    let paragraph =
-        Paragraph::new(lines).wrap(Wrap { trim: false }).style(Style::default().fg(Color::White));
+    app.result_metrics = ViewportMetrics::new(lines.len(), usize::from(inner.height));
+    app.result_viewport.normalize(app.result_metrics);
+    let top = app.result_viewport.top(app.result_metrics);
+    let paragraph = Paragraph::new(lines)
+        .scroll((u16::try_from(top).unwrap_or(u16::MAX), 0))
+        .style(Style::default().fg(Color::White));
 
     frame.render_widget(paragraph, inner);
+    regions.results = Some(inner);
+    regions.scrollbar = ScrollbarLayout::vertical_right(inner, app.result_metrics, top);
+    let width = inner.width.saturating_sub(u16::from(regions.scrollbar.is_some()));
+    if width > 0 && inner.height > 0 {
+        regions.selectable.push(SelectableRegion::new(
+            SelectionSurface::Results,
+            Rect::new(inner.x, inner.y, width, inner.height),
+            top as i64,
+            0,
+            app.generation,
+        ));
+    }
+    if let Some(scrollbar) = regions.scrollbar {
+        render_vertical_scrollbar(
+            frame,
+            scrollbar,
+            app.scrollbar_drag.is_some(),
+            ScrollbarStyle {
+                track_color: Color::DarkGray,
+                thumb_color: Color::Gray,
+                active_thumb_color: Color::Cyan,
+                track_symbol: "│",
+                thumb_symbol: "┃",
+            },
+        );
+    }
 }
 
 fn render_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -330,6 +402,11 @@ struct App {
     spinner: usize,
     quit: bool,
     notice: Option<String>,
+    result_viewport: Viewport,
+    result_metrics: ViewportMetrics,
+    scrollbar_drag: Option<ScrollbarDrag>,
+    selection: TextSelection<SelectionSurface>,
+    pending_copy: Option<String>,
 }
 
 impl App {
@@ -346,6 +423,60 @@ impl App {
             spinner: 0,
             quit: false,
             notice: None,
+            result_viewport: Viewport::default(),
+            result_metrics: ViewportMetrics::default(),
+            scrollbar_drag: None,
+            selection: TextSelection::default(),
+            pending_copy: None,
+        }
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent, regions: &UiRegions) {
+        let position = Position::new(mouse.column, mouse.row);
+        if let Some(drag) = self.scrollbar_drag {
+            match mouse.kind {
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    if let Some(scrollbar) = regions.scrollbar {
+                        self.result_viewport
+                            .set_top(drag.top_for_row(scrollbar, position.y), self.result_metrics);
+                    }
+                }
+                MouseEventKind::Up(MouseButton::Left) => self.scrollbar_drag = None,
+                _ => {}
+            }
+            return;
+        }
+        if let Some(scrollbar) = regions.scrollbar.filter(|scrollbar| scrollbar.contains(position))
+        {
+            if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                if let Some(drag) = ScrollbarDrag::begin(scrollbar, position) {
+                    self.scrollbar_drag = Some(drag);
+                } else {
+                    self.result_viewport
+                        .set_top(scrollbar.top_for_track_row(position.y), self.result_metrics);
+                }
+            }
+            return;
+        }
+        if regions.results.is_some_and(|area| area.contains(position)) {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    self.result_viewport.scroll_by(-3, self.result_metrics);
+                    return;
+                }
+                MouseEventKind::ScrollDown => {
+                    self.result_viewport.scroll_by(3, self.result_metrics);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        match self.selection.on_mouse(mouse) {
+            SelectionOutcome::CopyReady(text) => self.pending_copy = Some(text),
+            SelectionOutcome::EdgeScroll { lines, .. } => {
+                self.result_viewport.scroll_by(lines, self.result_metrics)
+            }
+            _ => {}
         }
     }
 

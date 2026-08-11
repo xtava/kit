@@ -7,11 +7,13 @@ use ratatui::{
 };
 
 use crate::tui::{
-    theme::NORD, CommandPaletteLayout, ContextMenuLayout, ContextMenuStyle, LineEditor,
+    render_vertical_scrollbar, theme::NORD, CommandPaletteLayout, ContextMenuLayout,
+    ContextMenuStyle, LineEditor, ScrollbarLayout, ScrollbarStyle, SelectableRegion,
+    ViewportMetrics,
 };
 
 use super::{
-    application::{ControlCenterApp, ControlCenterOverlay},
+    application::{ControlCenterApp, ControlCenterOverlay, ControlCenterSelectionSurface},
     model::{
         ControlCenterStory, MachineAction, MachineDiscoveryState, MachineRowProjection,
         MachineRowWidth,
@@ -23,12 +25,15 @@ const WIDE_WIDTH: u16 = 118;
 
 #[derive(Default)]
 pub(super) struct ControlCenterRegions {
+    pub(super) machine_list: Option<Rect>,
     pub(super) machine_rows: Vec<(Rect, String)>,
+    pub(super) machine_scrollbar: Option<ScrollbarLayout>,
     pub(super) primary_action: Option<Rect>,
     pub(super) new_session_action: Option<Rect>,
     pub(super) refresh_action: Option<Rect>,
     pub(super) command_palette: Option<CommandPaletteLayout>,
     pub(super) context_menu: Option<ContextMenuLayout>,
+    pub(super) selectable: Vec<SelectableRegion<ControlCenterSelectionSurface>>,
 }
 
 pub(super) fn render(frame: &mut Frame<'_>, app: &mut ControlCenterApp) -> ControlCenterRegions {
@@ -68,24 +73,36 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut ControlCenterApp) -> Contr
             } else {
                 MachineRowWidth::Compact
             };
+            app.machine_metrics =
+                ViewportMetrics::new(app.state.machines.len(), usize::from(sections[1].height));
+            if let Some(selected) = app.selected_index() {
+                app.machine_viewport.ensure_visible(selected, app.machine_metrics);
+            } else {
+                app.machine_viewport.normalize(app.machine_metrics);
+            }
+            let visible = app.machine_viewport.visible_range(app.machine_metrics);
+            let top = visible.start;
             let items = app
                 .state
                 .machines
+                .get(visible.clone())
+                .unwrap_or_default()
                 .iter()
                 .map(|machine| ListItem::new(machine_row_line(machine.row(row_width))))
                 .collect::<Vec<_>>();
             let mut list_state = ListState::default();
-            list_state.select(app.selected_index());
+            list_state.select(app.selected_index().and_then(|index| index.checked_sub(top)));
             let list = List::new(items)
                 .highlight_symbol("› ")
                 .highlight_style(Style::default().bg(NORD.selection).add_modifier(Modifier::BOLD));
             frame.render_stateful_widget(list, sections[1], &mut list_state);
-            let visible_rows = usize::from(sections[1].height).min(app.state.machines.len());
+            regions.machine_list = Some(sections[1]);
             regions.machine_rows = app
                 .state
                 .machines
+                .get(visible.clone())
+                .unwrap_or_default()
                 .iter()
-                .take(visible_rows)
                 .enumerate()
                 .map(|(index, machine)| {
                     (
@@ -99,6 +116,22 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut ControlCenterApp) -> Contr
                     )
                 })
                 .collect();
+            regions.machine_scrollbar =
+                ScrollbarLayout::vertical_right(sections[1], app.machine_metrics, top);
+            if let Some(scrollbar) = regions.machine_scrollbar {
+                render_vertical_scrollbar(
+                    frame,
+                    scrollbar,
+                    app.machine_scrollbar_drag.is_some(),
+                    ScrollbarStyle {
+                        track_color: NORD.border,
+                        thumb_color: NORD.text_muted,
+                        active_thumb_color: NORD.accent,
+                        track_symbol: "│",
+                        thumb_symbol: "┃",
+                    },
+                );
+            }
         }
         ControlCenterStory::Discovering => {
             frame.render_widget(
@@ -129,6 +162,13 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut ControlCenterApp) -> Contr
                 ]),
                 sections[1],
             );
+            regions.selectable.push(SelectableRegion::new(
+                ControlCenterSelectionSurface::DiscoveryDetail,
+                sections[1],
+                0,
+                0,
+                app.content_revision,
+            ));
         }
     }
 
@@ -151,7 +191,13 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut ControlCenterApp) -> Contr
                 .iter()
                 .find(|machine| &machine.identity.stable_node_id == stable_node_id)
             {
-                render_machine_details(frame, area, machine.details());
+                render_machine_details(
+                    frame,
+                    area,
+                    machine.details(),
+                    app.content_revision,
+                    &mut regions,
+                );
             }
         }
         Some(ControlCenterOverlay::Settings(settings)) => {
@@ -162,10 +208,25 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut ControlCenterApp) -> Contr
         }
         None => {}
     }
+    if app.overlay.is_some() && !matches!(app.overlay, Some(ControlCenterOverlay::Details { .. })) {
+        regions.selectable.clear();
+    }
+    let selectable = regions.selectable.clone();
+    app.selection.capture_frame(
+        frame,
+        &selectable,
+        Style::default().bg(NORD.selection).add_modifier(Modifier::REVERSED),
+    );
     regions
 }
 
-fn render_machine_details(frame: &mut Frame<'_>, area: Rect, details: Vec<(&'static str, String)>) {
+fn render_machine_details(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    details: Vec<(&'static str, String)>,
+    revision: u64,
+    regions: &mut ControlCenterRegions,
+) {
     let width = area.width.saturating_sub(4).min(76);
     let height = (details.len() as u16 + 4).min(area.height.saturating_sub(2));
     let horizontal =
@@ -194,6 +255,15 @@ fn render_machine_details(frame: &mut Frame<'_>, area: Rect, details: Vec<(&'sta
         .collect::<Vec<_>>();
     lines.push(Line::styled("Enter or Esc closes", Style::default().fg(NORD.text_muted)));
     frame.render_widget(Paragraph::new(lines), inner);
+    if inner.height > 1 {
+        regions.selectable.push(SelectableRegion::new(
+            ControlCenterSelectionSurface::MachineDetails,
+            Rect::new(inner.x, inner.y, inner.width, inner.height.saturating_sub(1)),
+            0,
+            0,
+            revision,
+        ));
+    }
 }
 
 fn render_unix_user(frame: &mut Frame<'_>, area: Rect, input: &LineEditor, notice: Option<&str>) {

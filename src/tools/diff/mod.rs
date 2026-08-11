@@ -1,5 +1,6 @@
 //! `diff` — Git working-tree comparison and index review.
 
+mod actions;
 mod config;
 mod git;
 mod model;

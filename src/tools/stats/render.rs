@@ -19,7 +19,8 @@ use super::model::{
 use super::report;
 use crate::tui::{
     render_split_divider, theme::NORD, ActionId, ActionState, ContextMenuLayout, ContextMenuStyle,
-    NavigationMap, NavigationRegion, ResolvedAction, SplitDividerStyle, SplitFrame, SplitMinimums,
+    NavigationMap, NavigationRegion, ResolvedAction, SelectableRegion, SplitDividerStyle,
+    SplitFrame, SplitMinimums, ViewportMetrics,
 };
 
 const BACKGROUND: Color = NORD.background;
@@ -52,6 +53,11 @@ pub(super) struct InlineActionRegion {
     pub(super) identity: ProcessIdentity,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum StatsSurface {
+    Inspector,
+}
+
 #[derive(Default)]
 pub(super) struct UiRegions {
     pub(super) views: Vec<(Rect, StatsView)>,
@@ -71,6 +77,7 @@ pub(super) struct UiRegions {
     pub(super) command_close: Option<Rect>,
     pub(super) back: Option<Rect>,
     pub(super) confirmation_choices: Vec<(Rect, ConfirmationChoice)>,
+    pub(super) selectable: Vec<SelectableRegion<StatsSurface>>,
 }
 
 impl UiRegions {
@@ -142,6 +149,9 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &StatsApp) -> UiRegions {
             regions.context_menu = Some(layout);
         }
         None => {}
+    }
+    if app.overlay.is_some() {
+        regions.selectable.clear();
     }
     regions
 }
@@ -762,6 +772,23 @@ fn render_inspector(
         InspectorTab::Profile => (profile_lines(app), None),
     };
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), content);
+    let selectable = match (app.inspector_tab, command_actions) {
+        (InspectorTab::Overview, Some(actions)) => {
+            Rect::new(content.x, content.y, content.width, actions.y.saturating_sub(content.y))
+        }
+        (InspectorTab::Resources | InspectorTab::Profile, _) => content,
+        (InspectorTab::Family | InspectorTab::Threads, _) => Rect::default(),
+        (InspectorTab::Overview, None) => content,
+    };
+    if selectable.width > 0 && selectable.height > 0 {
+        regions.selectable.push(SelectableRegion::new(
+            StatsSurface::Inspector,
+            selectable,
+            0,
+            0,
+            app.snapshot.sequence,
+        ));
+    }
     if let Some(command_actions) = command_actions {
         let context = app.action_context(process.identity);
         let actions = app.registry.resolve_menu(PROCESS_COMMAND_INLINE, &context);
@@ -1431,12 +1458,19 @@ fn render_command_viewer(
     } else {
         viewer.command.lines().map(str::to_owned).collect::<Vec<_>>()
     };
+    let row_metrics = ViewportMetrics::new(command_lines.len(), usize::from(chunks[1].height));
+    let longest = command_lines.iter().map(|line| line.chars().count()).max().unwrap_or_default();
+    let column_metrics = ViewportMetrics::new(longest, usize::from(chunks[1].width));
     let lines = command_lines
         .iter()
-        .skip(viewer.row_offset)
+        .skip(viewer.rows.top(row_metrics))
         .take(chunks[1].height as usize)
         .map(|line| {
-            Line::from(horizontal_slice(line, viewer.column_offset, chunks[1].width as usize))
+            Line::from(horizontal_slice(
+                line,
+                viewer.columns.top(column_metrics),
+                chunks[1].width as usize,
+            ))
         })
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(lines).style(Style::default().fg(TEXT)), chunks[1]);

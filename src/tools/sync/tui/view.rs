@@ -10,14 +10,14 @@ use unicode_width::UnicodeWidthStr;
 use crate::tui::{
     render_split_divider,
     theme::{TuiTheme, NORD},
-    ContextMenuStyle, SplitDividerStyle, SplitFrame, SplitMinimums,
+    ContextMenuStyle, SelectableRegion, SplitDividerStyle, SplitFrame, SplitMinimums,
 };
 
 use super::{
     super::controller::CheckStatus,
     form::{AddField, AddProjectForm, AddProjectLayout, ConfirmationLayout},
-    App, ProjectState, SessionHealth, Surface, SyncRegion, UiRegions, DASHBOARD_ACTIONS,
-    MIN_DETAILS_WIDTH, MIN_PROJECTS_WIDTH,
+    App, ProjectState, SessionHealth, Surface, SyncRegion, SyncSelectionSurface, UiRegions,
+    DASHBOARD_ACTIONS, MIN_DETAILS_WIDTH, MIN_PROJECTS_WIDTH,
 };
 
 pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) -> UiRegions {
@@ -78,6 +78,9 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) -> UiRegions {
             regions.confirmation = Some(render_confirmation(frame, area, &name, confirm, NORD));
         }
         Surface::Normal | Surface::Settings(_) => {}
+    }
+    if !matches!(&app.surface, Surface::Normal) || app.menu.is_some() {
+        regions.selectable.clear();
     }
     regions
 }
@@ -223,6 +226,19 @@ fn render_details(frame: &mut Frame<'_>, area: Rect, app: &mut App, regions: &mu
         if let Some(project) = &doctor.project {
             render_text(frame, inner, &mut y, &project.detail, check_color(project.status, NORD));
         }
+    }
+    let mut selectable_bottom = y;
+    if app.notice.is_some() {
+        selectable_bottom = selectable_bottom.min(inner.bottom().saturating_sub(2));
+    }
+    if selectable_bottom > inner.y {
+        regions.selectable.push(SelectableRegion::new(
+            SyncSelectionSurface::Details,
+            Rect::new(inner.x, inner.y, inner.width, selectable_bottom.saturating_sub(inner.y)),
+            0,
+            0,
+            1,
+        ));
     }
     y = y.saturating_add(1);
     let context = app.action_context(regions);

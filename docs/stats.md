@@ -21,6 +21,7 @@ open terminal windows or PTY sessions unless interactive validation is explicitl
 
 | Action | Keyboard | Mouse |
 | --- | --- | --- |
+| Open File Watchers | `w`; `w` or `Esc` returns to Processes | click **WATCHERS** or **PROCESSES** |
 | Select process | `↑`/`↓`, `j`/`k`, `PageUp`/`PageDown` | click row or scroll |
 | Jump to the hottest/top row | `Home` | click a sort header to reorder from the top |
 | Expand/collapse a process family | `Space`, `←`/`→` | click the disclosure marker |
@@ -39,6 +40,27 @@ open terminal windows or PTY sessions unless interactive validation is explicitl
 | Force kill | `X`, or `f` in confirmation | choose force in confirmation |
 | Open process actions | use the action shortcuts above | right-click a process row or the process inspector |
 | Quit | `q` or `Ctrl-C` | — |
+
+## File watchers
+
+The top-level **WATCHERS** view attributes Linux inotify resources to their generation-verified
+owning processes. It finds Parcel, rspack, Electron, and other watcher implementations from kernel
+state rather than process names or command-line guesses. Rows are ranked by watch count and show
+the current process CPU and memory alongside:
+
+- **DESCRIPTORS** — open file descriptors that refer to inotify instances;
+- **WATCHES** — watch records reported by those descriptors.
+
+The summary shows the observed totals and the host's configured per-user limits for watches,
+instances, and queued events. A duplicated descriptor may refer to the same underlying inotify
+instance, so Kit labels the observed descriptor count precisely instead of claiming it is an exact
+instance count.
+
+Watcher collection is lazy and cooperative. Stats scans only while the WATCHERS view is active and
+yields to the normal overview refresh between processes. Processes that exit, reuse a PID, or
+cannot be inspected are excluded from attribution and reported in the partial-sample count.
+Individual watched paths are not exposed by Linux fdinfo and are not inferred from inode numbers.
+macOS and Windows display the watcher capability as unsupported rather than reporting zero.
 
 ## Process actions
 
@@ -120,6 +142,7 @@ process environments, memory contents, socket payloads, or individual descriptor
 | Stable process generation | `/proc` start ticks | `proc_pidinfo` start time | creation `FILETIME` |
 | Threads | native task records, including last-observed core | libproc thread records; core unavailable | Toolhelp thread records; name/state/core unavailable |
 | Resources | executable, cwd, virtual bytes, process I/O, file descriptors | executable, virtual bytes, file descriptors | executable, process I/O, handles |
+| File watchers | per-process inotify descriptors and watch records; configured user limits | unsupported | unsupported |
 | Process action | pidfd graceful and force termination | read-only | verified-handle force termination |
 | Code profile | unavailable on this host: local perf emitted no actionable DWARF stacks | unavailable: no atomic generation-bound attach | unavailable: no bounded non-elevated generation-bound collector |
 
@@ -131,10 +154,11 @@ back to a PID-only or system-wide capture.
 ## Safety and performance
 
 The overview keeps one persistent `sysinfo::System`, publishes only the latest snapshot, and does
-not scan every thread or collect unused per-process resources. Threads, Resources, and focused-core
-attribution are separate typed requests with bounded cadences and explicit warming, unavailable, and
-error states. Late detail responses cannot overwrite a newer request. The default overview cadence
-is two seconds; `--interval` remains available for an explicit faster cadence.
+not scan every thread, file descriptor, or unused per-process resource. Threads, Resources,
+File Watchers, and focused-core attribution are separate typed requests with bounded cadences and
+explicit warming, partial, unavailable, and error states. Late detail responses cannot overwrite a
+newer request. The default overview cadence is two seconds; `--interval` remains available for an
+explicit faster cadence.
 
 Process control has no PID-only fallback. Host adapters expose their capabilities explicitly and
 revalidate stable process identity before acting. On Linux, Kit opens a pidfd, rechecks the process

@@ -1,5 +1,6 @@
 //! deploy — interactive, config-driven deployment launcher with version history and rollback.
 
+mod actions;
 mod annotations;
 mod artifact;
 mod cloudflare;

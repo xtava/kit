@@ -4,6 +4,7 @@
 //! validation. The repository provider owns every build decision: graph, cache, artifacts,
 //! verification, concurrency, and resume policy.
 
+mod actions;
 mod evidence;
 mod manifest;
 mod protocol;

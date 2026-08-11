@@ -25,6 +25,14 @@ impl EventReader {
         Self { core: ReaderCore::new(EventStream::new()) }
     }
 
+    /// Reads one terminal event without retaining Crossterm's asynchronous reader.
+    ///
+    /// Short-lived prompts that hand control to another TUI must use this path so no prior event
+    /// stream can consume the next session's cursor-position response.
+    pub async fn read_once() -> Option<Event> {
+        tokio::task::spawn_blocking(crossterm::event::read).await.ok()?.ok()
+    }
+
     /// Awaits the next terminal event. `None` after crossterm closes or reports an error.
     pub async fn recv(&mut self) -> Option<Event> {
         self.core.recv().await

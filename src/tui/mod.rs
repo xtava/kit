@@ -17,12 +17,14 @@ mod history;
 pub mod markdown;
 mod navigation;
 mod search;
+mod selection;
 mod session;
 pub mod settings;
 mod split;
 mod suggestions;
 pub mod syntax;
 pub mod theme;
+mod viewport;
 
 pub use actions::{
     ActionId, ActionInvocation, ActionRegistry, ActionRegistryBuilder, ActionRegistryError,
@@ -40,9 +42,14 @@ pub use events::EventReader;
 pub use history::NavigationHistory;
 pub use navigation::{Direction, NavigationMap, NavigationRegion};
 pub use search::{Frecency, FrecencyError, FrecencyStore, FuzzyIndex, SearchMatch, SearchMode};
+pub use selection::{SelectableRegion, SelectionMode, SelectionOutcome, TextPoint, TextSelection};
 pub use session::{Session, SessionOptions};
 pub use settings::{SettingsEditor, SettingsFlow};
 pub use split::{
     render_split_divider, SplitDividerStyle, SplitDrag, SplitFrame, SplitMinimums, SplitRatio,
 };
 pub use suggestions::{Suggestion, SuggestionMenu};
+pub use viewport::{
+    render_vertical_scrollbar, FollowViewport, ScrollbarDrag, ScrollbarLayout, ScrollbarStyle,
+    Viewport, ViewportMetrics,
+};

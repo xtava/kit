@@ -1,5 +1,6 @@
 //! `render` — an interactive Markdown file viewer and fuzzy workspace file switcher.
 
+mod actions;
 mod config;
 mod search;
 mod tui;

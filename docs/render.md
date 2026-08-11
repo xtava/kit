@@ -44,6 +44,8 @@ do not need one of those extensions.
 - `PageUp` / `PageDown` scrolls one viewport.
 - `Home` / `End` jumps to the beginning or end when the prompt is empty.
 - The mouse wheel scrolls the document.
+- `Ctrl-T` collapses or expands the table of contents when it is available.
+- Click `[−]` / `[+]` in the contents control to collapse or expand it with the mouse.
 - `Ctrl-U` clears the file prompt.
 - `Esc` disengages suggestions, clears the prompt, then exits.
 - `Ctrl-C` / `Ctrl-D` exits immediately.

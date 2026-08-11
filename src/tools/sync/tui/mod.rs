@@ -4,15 +4,18 @@ use anyhow::{Context as _, Result};
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use ratatui::layout::{Position, Rect};
+use ratatui::{
+    layout::{Position, Rect},
+    style::{Modifier, Style},
+};
 use tokio::task::JoinSet;
 
 use crate::tui::{
     theme::NORD, ActionId, ActionInvocation, CommandPalette, CommandPaletteLayout,
     CommandPaletteOutcome, ContextMenu, ContextMenuLayout, ContextMenuOutcome, EventReader,
     KeyChord, KeybindingResolution, KeybindingState, NavigationHistory, NavigationMap,
-    NavigationRegion, Session, SessionOptions, SettingsEditor, SettingsFlow, SplitDrag, SplitFrame,
-    SplitRatio,
+    NavigationRegion, SelectableRegion, SelectionOutcome, Session, SessionOptions, SettingsEditor,
+    SettingsFlow, SplitDrag, SplitFrame, SplitRatio, TextSelection,
 };
 
 use super::{
@@ -54,13 +57,51 @@ pub(super) async fn run(controller: SyncController) -> Result<()> {
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     interval.tick().await;
     let mut regions = UiRegions::default();
+    let mut selection = TextSelection::<SyncSelectionSurface>::default();
 
     loop {
-        terminal.draw(|frame| regions = render(frame, &mut app))?;
+        terminal.draw(|frame| {
+            regions = render(frame, &mut app);
+            let selectable = regions.selectable.clone();
+            selection.capture_frame(
+                frame,
+                &selectable,
+                Style::default().bg(NORD.selection).add_modifier(Modifier::REVERSED),
+            );
+        })?;
         tokio::select! {
             event = events.recv() => {
                 let Some(event) = event else { break };
-                match app.on_event(event, &regions)? {
+                if let Event::Key(key) = &event {
+                    match selection.on_key(*key) {
+                        SelectionOutcome::CopyReady(text) => {
+                            terminal.copy(&text)?;
+                            continue;
+                        }
+                        SelectionOutcome::Captured | SelectionOutcome::Changed => continue,
+                        SelectionOutcome::Unhandled | SelectionOutcome::EdgeScroll { .. } => {}
+                    }
+                }
+                if let Event::Mouse(mouse) = &event {
+                    if selection.is_dragging() {
+                        let _ = selection.on_mouse(*mouse);
+                        continue;
+                    }
+                }
+                let selection_mouse = match &event {
+                    Event::Mouse(mouse) => Some(*mouse),
+                    _ => None,
+                };
+                let flow = app.on_event(event, &regions)?;
+                if matches!(&flow, Flow::Continue)
+                    && matches!(&app.surface, Surface::Normal)
+                    && app.menu.is_none()
+                {
+                    if let Some(mouse) = selection_mouse {
+                        let _ = selection.on_mouse(mouse);
+                    }
+                }
+                match flow {
                     Flow::Continue => {}
                     Flow::Quit => break,
                     Flow::Start(operation) => {
@@ -117,6 +158,11 @@ enum SurfaceKind {
     ConfirmRemove,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SyncSelectionSurface {
+    Details,
+}
+
 enum Surface {
     Normal,
     CommandPalette(CommandPalette<SyncActionContext>),
@@ -155,6 +201,7 @@ struct UiRegions {
     command_palette: Option<CommandPaletteLayout>,
     add_project: Option<AddProjectLayout>,
     confirmation: Option<ConfirmationLayout>,
+    selectable: Vec<SelectableRegion<SyncSelectionSurface>>,
 }
 
 impl UiRegions {

@@ -5,6 +5,7 @@
 //! to the windows/webviews they render via CDP. Headless table or `--json`; a live TUI otherwise.
 //! `scout dive` hands a window to memlab for deep heap forensics.
 
+mod actions;
 mod cdp;
 mod dive;
 mod format;

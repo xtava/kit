@@ -31,7 +31,9 @@ Keys are intentionally small and uniform:
   terminal state before leaving the console.
 - Terminal build: the same pane keys include the terminal-diagnostics pane; `r`/`Esc` returns to
   workflow selection, `e` opens evidence, and `q` exits with the build's truthful success/failure
-  status after the alternate screen has been restored.
+  status after the alternate screen has been restored. After any terminal result, the controls also
+  show every action declared by that workflow; pressing its configured key runs its launcher. This
+  keeps diagnostic actions available when a packaged artifact exists but a later verification fails.
 - Evidence: `j`/`k` selects a record, `Enter`/`i` validates and views it, `f` asks for an exact
   record deletion confirmation, `y` confirms, `b`/`Esc` goes back, and `q`/`Ctrl-C` exits the
   console. Evidence navigation never sends another process-control request after the Build is
@@ -70,7 +72,21 @@ platforms = ["linux", "macos", "windows"]
 id = "release-linux"
 label = "Build and verify the Linux release"
 platforms = ["linux"]
+
+[[workflows.actions]]
+key = "o"
+label = "open app"
+program = "gtk-launch"
+args = ["example-app"]
 ```
+
+Workflow actions are optional terminal launchers. Each workflow may declare up to eight actions
+with a unique ASCII letter or number, a printable ASCII label of at most 32 characters, and the same
+bare-executable or repository-relative command shape as the provider. The Build console reserves
+`c`, `e`, `h`, `j`, `k`, `l`, `q`, and `r` for its fixed controls. Actions are hidden while the
+workflow is running and become available after success or failure. Kit starts at most one action at a time, from the repository root,
+without an implicit shell; the launcher inherits the environment while its standard streams are
+detached from the TUI.
 
 Run a workflow from anywhere below the worktree root:
 
@@ -159,7 +175,8 @@ models, all derived from the Rust types Kit actually reads.
 The manifest schema requires version 1, a provider program containing at least one non-whitespace
 character, and at least one workflow. Workflow IDs contain 1 to 64 letters, numbers, `-`, or `_`; labels
 must contain a non-space printable ASCII character and contain at most 128 printable ASCII
-characters; and every workflow has at least one supported platform. This deliberately portable
+characters; and every workflow has at least one supported platform. Optional workflow actions obey
+the key, label, cardinality, and command constraints described above. This deliberately portable
 label alphabet keeps Rust, JSON Schema, JavaScript/Zod, TOML tooling, and terminal rendering
 acceptance-equivalent. The same `ProcessLabel` domain boundary enforces the general display-label
 constraints at runtime. Platform entries are

@@ -2,13 +2,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use crossterm::event::Event;
+use ratatui::style::{Modifier, Style};
 
 use super::actions::ActionController;
 use super::app::{Action, StatsApp};
 use super::contributions::{self, StatsActionRegistry};
-use super::render::{render, UiRegions};
+use super::render::{render, StatsSurface, UiRegions};
 use super::sampler::{Sampler, SamplerWorker};
-use crate::tui::{EventReader, Session, SessionOptions};
+use crate::tui::{
+    theme::NORD, EventReader, SelectionOutcome, Session, SessionOptions, TextSelection,
+};
 
 pub async fn run(interval: Duration, mouse_capture: bool) -> Result<()> {
     let registry = contributions::registry()?;
@@ -28,12 +32,21 @@ async fn run_validated(
     let mut events = EventReader::start();
     let mut actions = ActionController::new();
     let mut hit_map = UiRegions::default();
+    let mut selection = TextSelection::<StatsSurface>::default();
     if let Some(intent) = app.reconcile_detail_intent() {
         worker.set_detail(intent.request());
     }
 
     loop {
-        session.draw(|frame| hit_map = render(frame, &app))?;
+        session.draw(|frame| {
+            hit_map = render(frame, &app);
+            let selectable = hit_map.selectable.clone();
+            selection.capture_frame(
+                frame,
+                &selectable,
+                Style::default().bg(NORD.selection).add_modifier(Modifier::REVERSED),
+            );
+        })?;
         app.viewport_rows = hit_map.rows.len();
         tokio::select! {
             changed = snapshots.changed() => {
@@ -50,7 +63,29 @@ async fn run_validated(
             }
             event = events.recv() => {
                 let Some(event) = event else { break };
-                match app.on_event(event, &hit_map) {
+                if let Event::Key(key) = &event {
+                    match selection.on_key(*key) {
+                        SelectionOutcome::CopyReady(text) => {
+                            session.copy(&text)?;
+                            continue;
+                        }
+                        SelectionOutcome::Captured | SelectionOutcome::Changed => continue,
+                        SelectionOutcome::Unhandled | SelectionOutcome::EdgeScroll { .. } => {}
+                    }
+                }
+                if let Event::Mouse(mouse) = &event {
+                    if selection.is_dragging() {
+                        let _ = selection.on_mouse(*mouse);
+                        continue;
+                    }
+                }
+                let action = app.on_event(event.clone(), &hit_map);
+                if matches!(action, Action::None) {
+                    if let Event::Mouse(mouse) = event {
+                        let _ = selection.on_mouse(mouse);
+                    }
+                }
+                match action {
                     Action::Quit => break,
                     Action::Process(key, requested) => {
                         match actions.start(key, requested) {
@@ -1113,7 +1148,7 @@ mod tests {
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         let regions = draw_app(&mut terminal, &app);
         app.on_event(event_key(KeyCode::Right), &regions);
-        assert!(command_viewer(&app).unwrap().column_offset > 0);
+        assert_ne!(command_viewer(&app).unwrap().columns, crate::tui::Viewport::default());
         app.on_event(event_key(KeyCode::Esc), &regions);
         assert!(command_viewer(&app).is_none());
     }

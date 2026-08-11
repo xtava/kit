@@ -51,7 +51,7 @@ impl Tool for SettingsTool {
             .with_context(|| format!("load Settings theme {:?}", args.theme))?;
         let mut editor = SettingsEditor::open(cx.config.clone(), self.sections.clone(), theme);
         let mut session =
-            Session::open(SessionOptions { mouse_capture: false, bracketed_paste: false })?;
+            Session::open(SessionOptions { mouse_capture: true, bracketed_paste: false })?;
         let mut events = EventReader::start();
         loop {
             session.draw(|frame| editor.render(frame, frame.area()))?;
@@ -61,6 +61,7 @@ impl Tool for SettingsTool {
                 {
                     break;
                 }
+                Some(Event::Mouse(mouse)) if editor.on_mouse(mouse) == SettingsFlow::Exit => break,
                 Some(Event::Resize(_, _)) => {}
                 None => break,
                 _ => {}

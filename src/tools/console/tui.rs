@@ -23,9 +23,9 @@ use crate::tui::{
     CommandPaletteLayout, CommandPaletteOutcome, CommandPalettePlacement, ContextMenu,
     ContextMenuLayout, ContextMenuOutcome, ContextMenuStyle, Direction, EventReader, KeyChord,
     Keybinding, KeybindingPlacement, KeybindingResolution, KeybindingState, LineEditor, MenuId,
-    MenuPlacement, NavigationHistory, NavigationMap, NavigationRegion, Session, SessionOptions,
-    SettingsEditor, SettingsFlow, SplitDividerStyle, SplitDrag, SplitFrame, SplitMinimums,
-    SplitRatio,
+    MenuPlacement, NavigationHistory, NavigationMap, NavigationRegion, SelectableRegion,
+    SelectionOutcome, Session, SessionOptions, SettingsEditor, SettingsFlow, SplitDividerStyle,
+    SplitDrag, SplitFrame, SplitMinimums, SplitRatio, TextSelection,
 };
 
 use super::activity::{AgentActivity, AgentPresentation};
@@ -401,55 +401,6 @@ struct TerminalRegion {
     content: Rect,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct TerminalSelection {
-    anchor_line: StableRowIndex,
-    anchor_column: usize,
-    focus_line: StableRowIndex,
-    focus_column: usize,
-}
-
-impl TerminalSelection {
-    fn point(line: StableRowIndex, column: usize) -> Self {
-        Self { anchor_line: line, anchor_column: column, focus_line: line, focus_column: column }
-    }
-
-    fn update(&mut self, line: StableRowIndex, column: usize) {
-        self.focus_line = line;
-        self.focus_column = column;
-    }
-
-    fn ordered(self) -> ((StableRowIndex, usize), (StableRowIndex, usize)) {
-        let anchor = (self.anchor_line, self.anchor_column);
-        let focus = (self.focus_line, self.focus_column);
-        if anchor <= focus {
-            (anchor, focus)
-        } else {
-            (focus, anchor)
-        }
-    }
-
-    fn contains(self, line: StableRowIndex, column: usize) -> bool {
-        let (start, end) = self.ordered();
-        (line, column) >= start && (line, column) <= end
-    }
-}
-
-fn selection_outside_projection(
-    selection: Option<TerminalSelection>,
-    terminal: &TerminalView,
-) -> bool {
-    let projected_end = terminal
-        .first_row
-        .saturating_add(StableRowIndex::try_from(terminal.lines.len()).unwrap_or_default());
-    selection.is_some_and(|selection| {
-        selection.anchor_line < terminal.first_row
-            || selection.anchor_line >= projected_end
-            || selection.focus_line < terminal.first_row
-            || selection.focus_line >= projected_end
-    })
-}
-
 #[derive(Default)]
 struct UiRegions {
     split: Option<SplitFrame>,
@@ -459,6 +410,7 @@ struct UiRegions {
     action_hits: Vec<ActionHitTarget>,
     context_menu: Option<ContextMenuLayout>,
     command_palette: Option<CommandPaletteLayout>,
+    selectable: Vec<SelectableRegion<PanelSlot>>,
 }
 
 impl UiRegions {
@@ -493,7 +445,6 @@ struct SecondaryPanel {
     session_id: SessionId,
     terminal: Option<TerminalView>,
     scroll: ScrollState,
-    selection: Option<TerminalSelection>,
     last_terminal_size: Option<(usize, u16, u16)>,
 }
 
@@ -520,7 +471,7 @@ struct App {
     last_terminal_size: Option<(usize, u16, u16)>,
     last_session_click: Option<(SessionId, Instant)>,
     scroll: ScrollState,
-    selection: Option<TerminalSelection>,
+    selection: TextSelection<PanelSlot>,
     secondary: Option<SecondaryPanel>,
     notice: Option<String>,
     connection_generation: u64,
@@ -566,7 +517,7 @@ impl App {
             last_terminal_size: None,
             last_session_click: None,
             scroll: ScrollState::default(),
-            selection: None,
+            selection: TextSelection::default(),
             secondary: None,
             notice: None,
             connection_generation,
@@ -664,13 +615,13 @@ impl App {
                 self.selected = Some(secondary.session_id);
                 self.snapshot.terminal = secondary.terminal;
                 self.scroll = secondary.scroll;
-                self.selection = secondary.selection;
+                self.selection.clear();
                 self.last_terminal_size = secondary.last_terminal_size;
                 self.focused_panel = PanelSlot::Primary;
             } else {
                 self.selected = self.snapshot.sessions.first().map(|session| session.id);
                 self.scroll.reset();
-                self.selection = None;
+                self.selection.clear();
             }
             if let Some(selected) = self.selected {
                 self.history.replace_current(selected);
@@ -798,24 +749,16 @@ impl App {
             let metrics =
                 ScrollMetrics::new(terminal.first_row, terminal.lines.len(), terminal.rows);
             self.scroll.normalize(metrics);
-            if selection_outside_projection(self.selection, terminal) {
-                self.selection = None;
-            }
         } else {
             self.scroll.reset();
-            self.selection = None;
         }
         if let Some(panel) = self.secondary.as_mut() {
             if let Some(terminal) = panel.terminal.as_ref() {
                 let metrics =
                     ScrollMetrics::new(terminal.first_row, terminal.lines.len(), terminal.rows);
                 panel.scroll.normalize(metrics);
-                if selection_outside_projection(panel.selection, terminal) {
-                    panel.selection = None;
-                }
             } else {
                 panel.scroll.reset();
-                panel.selection = None;
             }
         }
     }
@@ -870,13 +813,6 @@ impl App {
         }
     }
 
-    fn panel_selection(&self, slot: PanelSlot) -> Option<TerminalSelection> {
-        match slot {
-            PanelSlot::Primary => self.selection,
-            PanelSlot::Secondary => self.secondary.as_ref().and_then(|panel| panel.selection),
-        }
-    }
-
     fn focus_panel(&mut self, slot: PanelSlot) {
         if slot == PanelSlot::Secondary && self.secondary.is_none() {
             return;
@@ -914,15 +850,15 @@ impl App {
                 PanelSlot::Primary => {
                     self.selected = Some(id);
                     self.scroll.reset();
-                    self.selection = None;
+                    self.selection.clear();
                 }
                 PanelSlot::Secondary => {
                     if let Some(panel) = self.secondary.as_mut() {
                         panel.session_id = id;
                         panel.scroll.reset();
-                        panel.selection = None;
                         panel.last_terminal_size = None;
                     }
+                    self.selection.clear();
                 }
             },
         }
@@ -958,7 +894,6 @@ impl App {
             session_id,
             terminal: None,
             scroll: ScrollState::default(),
-            selection: None,
             last_terminal_size: None,
         });
         self.focus_panel(PanelSlot::Secondary);
@@ -977,9 +912,9 @@ impl App {
             self.selected = Some(secondary.session_id);
             self.snapshot.terminal = secondary.terminal;
             self.scroll = secondary.scroll;
-            self.selection = secondary.selection;
             self.last_terminal_size = secondary.last_terminal_size;
         }
+        self.selection.clear();
         self.focused_panel = PanelSlot::Primary;
         self.active_region = ActiveRegion::PrimaryTerminal;
         true
@@ -1444,78 +1379,7 @@ impl App {
     }
 
     fn selected_or_visible_terminal_text(&self, visible_rows: usize) -> Option<String> {
-        self.selection_text().or_else(|| self.visible_terminal_text(visible_rows))
-    }
-
-    fn selection_text(&self) -> Option<String> {
-        let selection = self.panel_selection(self.focused_panel)?;
-        let terminal = self.panel_terminal(self.focused_panel)?;
-        if terminal.lines.is_empty() {
-            return None;
-        }
-        let (start, end) = selection.ordered();
-        let projected_end =
-            terminal.first_row.saturating_add(StableRowIndex::try_from(terminal.lines.len()).ok()?);
-        let first_selected = start.0.max(terminal.first_row);
-        let last_selected = end.0.min(projected_end.saturating_sub(1));
-        if first_selected > last_selected {
-            return None;
-        }
-        let mut selected_lines = Vec::new();
-        for stable_row in first_selected..=last_selected {
-            let line_index = usize::try_from(stable_row.saturating_sub(terminal.first_row)).ok()?;
-            let line = &terminal.lines[line_index];
-            let mut text = String::new();
-            for cell in line
-                .visible_cells()
-                .filter(|cell| selection.contains(stable_row, cell.cell_index()))
-            {
-                text.push_str(cell.str());
-            }
-            selected_lines.push(text.trim_end().to_owned());
-        }
-        let text = selected_lines.join("\n");
-        (!text.is_empty()).then_some(text)
-    }
-
-    fn begin_selection(&mut self, position: Position, content: Rect) {
-        let slot = self.focused_panel;
-        let Some((line, column)) =
-            terminal_point(self.panel_terminal(slot), content, self.panel_scroll(slot), position)
-        else {
-            return;
-        };
-        match slot {
-            PanelSlot::Primary => self.selection = Some(TerminalSelection::point(line, column)),
-            PanelSlot::Secondary => {
-                if let Some(panel) = self.secondary.as_mut() {
-                    panel.selection = Some(TerminalSelection::point(line, column));
-                }
-            }
-        }
-    }
-
-    fn update_selection(&mut self, position: Position, content: Rect) {
-        let slot = self.focused_panel;
-        let Some((line, column)) =
-            terminal_point(self.panel_terminal(slot), content, self.panel_scroll(slot), position)
-        else {
-            return;
-        };
-        match slot {
-            PanelSlot::Primary => {
-                if let Some(selection) = self.selection.as_mut() {
-                    selection.update(line, column);
-                }
-            }
-            PanelSlot::Secondary => {
-                if let Some(selection) =
-                    self.secondary.as_mut().and_then(|panel| panel.selection.as_mut())
-                {
-                    selection.update(line, column);
-                }
-            }
-        }
+        self.selection.copy_text().or_else(|| self.visible_terminal_text(visible_rows))
     }
 
     fn scroll_metrics(&self, slot: PanelSlot, visible_rows: usize) -> Option<ScrollMetrics> {
@@ -1553,29 +1417,21 @@ impl App {
     }
 
     fn clear_focused_selection(&mut self) {
-        match self.focused_panel {
-            PanelSlot::Primary => self.selection = None,
-            PanelSlot::Secondary => {
-                if let Some(panel) = self.secondary.as_mut() {
-                    panel.selection = None;
-                }
-            }
-        }
+        self.selection.clear();
     }
 
     fn reset_focused_terminal_state(&mut self) {
         match self.focused_panel {
             PanelSlot::Primary => {
                 self.scroll.reset();
-                self.selection = None;
             }
             PanelSlot::Secondary => {
                 if let Some(panel) = self.secondary.as_mut() {
                     panel.scroll.reset();
-                    panel.selection = None;
                 }
             }
         }
+        self.selection.clear();
     }
 
     fn sync_focused_panel_from_region(&mut self) {
@@ -1803,7 +1659,7 @@ async fn apply_effect(effect: Effect, app: &mut App, session: &mut Session) -> R
             app.history.visit(id);
             app.active_region = ActiveRegion::PrimaryTerminal;
             app.scroll.reset();
-            app.selection = None;
+            app.selection.clear();
             app.reconcile_topology().await?;
         }
         Effect::Rename { id, title } => {
@@ -1948,6 +1804,13 @@ fn handle_event(event: Event, app: &mut App, regions: &UiRegions) -> Result<Effe
 }
 
 fn handle_key(key: KeyEvent, app: &mut App, regions: &UiRegions) -> Result<Effect> {
+    if matches!(app.surface, Surface::Normal) {
+        match app.selection.on_key(key) {
+            SelectionOutcome::CopyReady(text) => return Ok(Effect::Copy(text)),
+            SelectionOutcome::Captured | SelectionOutcome::Changed => return Ok(Effect::None),
+            SelectionOutcome::Unhandled | SelectionOutcome::EdgeScroll { .. } => {}
+        }
+    }
     let Some(chord) = KeyChord::from_event(key) else {
         return Ok(Effect::None);
     };
@@ -2000,6 +1863,25 @@ fn handle_key(key: KeyEvent, app: &mut App, regions: &UiRegions) -> Result<Effec
 fn handle_mouse(mouse: MouseEvent, app: &mut App, regions: &UiRegions) -> Result<Effect> {
     let position = Position { x: mouse.column, y: mouse.row };
 
+    if app.selection.is_dragging() {
+        match app.selection.on_mouse(mouse) {
+            SelectionOutcome::Captured | SelectionOutcome::Changed => return Ok(Effect::None),
+            SelectionOutcome::EdgeScroll { surface, lines } => {
+                let Some(terminal) = regions.terminal(surface) else {
+                    return Ok(Effect::None);
+                };
+                app.focus_panel(surface);
+                if lines < 0 {
+                    app.scroll_up(lines.unsigned_abs(), usize::from(terminal.content.height));
+                } else {
+                    app.scroll_down(lines as usize, usize::from(terminal.content.height));
+                }
+                return Ok(Effect::None);
+            }
+            SelectionOutcome::Unhandled | SelectionOutcome::CopyReady(_) => {}
+        }
+    }
+
     if let Some(region) = regions.terminal_at(position) {
         let terminal = app.panel_terminal(region.slot);
         let session = app.panel_session_id(region.slot).and_then(|id| app.session(id));
@@ -2049,7 +1931,7 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App, regions: &UiRegions) -> Result
             }
             if let Some(terminal) = regions.terminal_at(position) {
                 app.focus_panel(terminal.slot);
-                app.begin_selection(position, terminal.content);
+                let _ = app.selection.on_mouse(mouse);
                 return app.invoke_action(ConsoleAction::Activate, None, regions);
             }
             if let Some(region) = regions.navigation().hit_test(mouse.column, mouse.row) {
@@ -2089,10 +1971,6 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App, regions: &UiRegions) -> Result
             }) {
                 let context = app.action_context(None, regions, Some(ratio));
                 return app.invoke(ActionInvocation::new(RESIZE_SIDEBAR, context), regions);
-            }
-            if let Some(terminal) = regions.terminal_at(position) {
-                app.focus_panel(terminal.slot);
-                app.update_selection(position, terminal.content);
             }
         }
         MouseEventKind::Up(MouseButton::Left) => {
@@ -2608,6 +2486,11 @@ fn render(frame: &mut Frame<'_>, app: &mut App) -> UiRegions {
             render_terminals(frame, area, app, &mut regions);
         }
     }
+    app.selection.capture_frame(
+        frame,
+        &regions.selectable,
+        Style::default().bg(NORD.focus).add_modifier(Modifier::REVERSED),
+    );
     if let Some(menu) = app.menu.as_ref() {
         let layout = menu.layout(area);
         menu.render(frame, &layout, ContextMenuStyle::from_theme(NORD));
@@ -2882,14 +2765,19 @@ fn render_terminal(
             usize::from(content.height),
         ));
         frame.render_widget(
-            TerminalCells {
-                terminal,
-                start: range.start,
-                query: app.search_query(),
-                selection: app.panel_selection(slot),
-            },
+            TerminalCells { terminal, start: range.start, query: app.search_query() },
             content,
         );
+        let row_origin = terminal
+            .first_row
+            .saturating_add(StableRowIndex::try_from(range.start).unwrap_or_default());
+        regions.selectable.push(SelectableRegion::new(
+            slot,
+            content,
+            i64::try_from(row_origin).unwrap_or(if row_origin < 0 { i64::MIN } else { i64::MAX }),
+            0,
+            u64::try_from(terminal.pane_id).unwrap_or(u64::MAX),
+        ));
         if focused
             && scroll.is_live()
             && terminal.cursor_x < usize::from(content.width)
@@ -2951,7 +2839,6 @@ struct TerminalCells<'a> {
     terminal: &'a TerminalView,
     start: usize,
     query: Option<&'a str>,
-    selection: Option<TerminalSelection>,
 }
 
 impl Widget for TerminalCells<'_> {
@@ -2959,11 +2846,6 @@ impl Widget for TerminalCells<'_> {
         for (row, line) in
             self.terminal.lines.iter().skip(self.start).take(usize::from(area.height)).enumerate()
         {
-            let line_index = self.start.saturating_add(row);
-            let stable_row = self
-                .terminal
-                .first_row
-                .saturating_add(StableRowIndex::try_from(line_index).unwrap_or_default());
             let matched = self.query.is_some_and(|query| line.as_str().contains(query));
             for cell in line.visible_cells() {
                 let column = cell.cell_index();
@@ -2976,9 +2858,7 @@ impl Widget for TerminalCells<'_> {
                 let x = area.x.saturating_add(column as u16);
                 let y = area.y.saturating_add(row as u16);
                 let mut style = cell_style(cell.attrs());
-                if self.selection.is_some_and(|selection| selection.contains(stable_row, column)) {
-                    style = style.bg(NORD.focus).add_modifier(Modifier::REVERSED);
-                } else if matched {
+                if matched {
                     style = style.bg(NORD.selection);
                 }
                 buffer[(x, y)].set_symbol(cell.str()).set_style(style);
@@ -2988,30 +2868,6 @@ impl Widget for TerminalCells<'_> {
             }
         }
     }
-}
-
-fn terminal_point(
-    terminal: Option<&TerminalView>,
-    content: Rect,
-    scroll: ScrollState,
-    position: Position,
-) -> Option<(StableRowIndex, usize)> {
-    let terminal = terminal?;
-    if !content.contains(position) {
-        return None;
-    }
-    let range = scroll.visible_range(ScrollMetrics::new(
-        terminal.first_row,
-        terminal.lines.len(),
-        usize::from(content.height),
-    ));
-    let line = range.start.checked_add(usize::from(position.y - content.y))?;
-    (line < range.end).then(|| {
-        (
-            terminal.first_row.saturating_add(StableRowIndex::try_from(line).unwrap_or_default()),
-            usize::from(position.x - content.x),
-        )
-    })
 }
 
 fn validated_rename(input: &LineEditor) -> Option<String> {
@@ -3443,10 +3299,10 @@ mod tests {
             content_sequence: 0,
         };
         let mut wide = Buffer::empty(Rect::new(0, 0, 12, 2));
-        TerminalCells { terminal: &terminal, start: 0, query: Some("hello"), selection: None }
+        TerminalCells { terminal: &terminal, start: 0, query: Some("hello") }
             .render(wide.area, &mut wide);
         let mut compact = Buffer::empty(Rect::new(0, 0, 5, 1));
-        TerminalCells { terminal: &terminal, start: 0, query: None, selection: None }
+        TerminalCells { terminal: &terminal, start: 0, query: None }
             .render(compact.area, &mut compact);
 
         assert_eq!(wide[(0, 0)].symbol(), "h");
@@ -3478,50 +3334,5 @@ mod tests {
 
         assert_eq!((agent_icon(blocked), agent_color(blocked)), ("◉", NORD.danger));
         assert_eq!((agent_icon(done), agent_color(done)), ("●", NORD.accent_alt));
-    }
-
-    #[test]
-    fn terminal_selection_maps_rendered_cells_to_authoritative_lines() {
-        let attrs = CellAttributes::default();
-        let terminal = TerminalView {
-            pane_id: 9,
-            title: "shell".to_owned(),
-            first_row: 100,
-            cols: 8,
-            rows: 2,
-            cursor_x: 0,
-            cursor_y: 0,
-            mouse_reporting: false,
-            content_sequence: 0,
-            lines: (0..6)
-                .map(|index| TerminalLine::from_text(&format!("line-{index}"), &attrs, 0, None))
-                .collect(),
-        };
-        let content = Rect::new(10, 4, 8, 2);
-
-        assert_eq!(
-            terminal_point(
-                Some(&terminal),
-                content,
-                ScrollState::default(),
-                Position { x: 12, y: 4 },
-            ),
-            Some((104, 2))
-        );
-        let mut scrolled = ScrollState::default();
-        scrolled.scroll_up(2, ScrollMetrics::new(terminal.first_row, terminal.lines.len(), 2));
-        assert_eq!(
-            terminal_point(Some(&terminal), content, scrolled, Position { x: 10, y: 5 }),
-            Some((103, 0))
-        );
-        assert_eq!(
-            terminal_point(
-                Some(&terminal),
-                content,
-                ScrollState::default(),
-                Position { x: 9, y: 4 },
-            ),
-            None
-        );
     }
 }

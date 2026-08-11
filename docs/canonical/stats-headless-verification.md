@@ -18,7 +18,7 @@ requests it.
 
 | Concern | Canonical owner |
 | --- | --- |
-| Raw system and process observations | `src/tools/stats/sampler.rs`, `src/tools/stats/host/` |
+| Raw system, process, and file-watcher observations | `src/tools/stats/sampler.rs`, `src/tools/stats/host/` |
 | History admission and recent-pressure derivation | `src/tools/stats/history.rs`, `src/tools/stats/app.rs` |
 | Terminal projection and semantic hit regions | `src/tools/stats/render.rs` |
 | Headless frame, input, resize, and overlay acceptance | `src/tools/stats/tui.rs` tests using Ratatui `TestBackend` |
@@ -53,8 +53,8 @@ After the relevant tests and a single locked install, capture one warmed snapsho
 binary:
 
 ```bash
-cargo install --locked -j 2 --path .
-kit --json stats --once --interval 1000
+./install.sh
+"$HOME/.local/bin/kit" --json stats --once --interval 1000
 ```
 
 The JSON snapshot proves live collection, named logical-core values, global CPU, and global process
@@ -71,6 +71,18 @@ process below a quiet parent. The acceptance assertions must prove:
 - `PRESSURE SOURCES NOW/RECENT` ranks processes globally rather than by tree position;
 - displayed `NOW` CPU remains the raw current sample while recent history controls only ranking;
 - refresh preserves a manually scrolled viewport anchor.
+
+### File-watcher regressions
+
+Use deterministic watcher detail with multiple owners, a partial observation count, and configured
+limits. The acceptance assertions must prove:
+
+- WATCHERS is a top-level view rather than a process-inspector tab;
+- collection is requested only while WATCHERS is active;
+- rows rank kernel-observed watch records without process-name classification;
+- a watcher row retains the exact stable process identity and can open its existing inspector;
+- wide and compact projections expose semantic view and row regions;
+- unsupported and partial observations remain explicit instead of becoming zero.
 
 ## Prohibited default verification
 

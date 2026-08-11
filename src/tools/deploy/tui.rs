@@ -2,11 +2,11 @@ use std::{collections::HashSet, ffi::OsString, path::Path, time::SystemTime};
 
 use ::time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use anyhow::{anyhow, Result};
-use crossterm::event::{
-    Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-};
+#[cfg(test)]
+use crossterm::event::KeyModifiers;
+use crossterm::event::{Event, KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
-    layout::{Alignment, Constraint, Layout, Rect},
+    layout::{Alignment, Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, List, ListItem, ListState, Padding, Paragraph, Wrap},
@@ -20,6 +20,7 @@ use tokio::{
 use unicode_width::UnicodeWidthStr;
 
 use super::{
+    actions::{self, DeployActionContext, DeployActionMode, DeployActionRegistry, DeployCommand},
     annotations::{Annotation, AnnotationStore, DeployAnnotations},
     cloudflare::{
         CloudflareDeployment, CloudflareEnvironment, CloudflarePagesClient, CloudflareStageStatus,
@@ -43,8 +44,10 @@ use crate::framework::{
 use crate::onepassword::OpClient;
 use crate::tailscale::find_login_url;
 use crate::tui::{
-    render_split_divider, Direction, EventReader, NavigationMap, NavigationRegion, Session,
-    SessionOptions, SplitDividerStyle,
+    render_split_divider, render_vertical_scrollbar, Direction, EventReader, KeyChord,
+    KeybindingResolution, KeybindingState, NavigationMap, NavigationRegion, ScrollbarDrag,
+    ScrollbarLayout, ScrollbarStyle, SelectableRegion, SelectionOutcome, Session, SessionOptions,
+    SplitDividerStyle, TextSelection, ViewportMetrics,
 };
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -86,6 +89,7 @@ pub async fn run(startup: Startup) -> Result<Option<RunOutcome>> {
         Session::open(SessionOptions { mouse_capture: true, bracketed_paste: false })?;
     let mut events = EventReader::start();
     let mut app = App::new(loaded, journal, annotations, layout);
+    let mut interaction = DeployInteraction::new()?;
     app.notice = layout_warning;
     let (_idle_tx, mut run_events) = tokio::sync::mpsc::channel(1);
     let (backend_tx, mut backend_events) = mpsc::channel(8);
@@ -103,7 +107,9 @@ pub async fn run(startup: Startup) -> Result<Option<RunOutcome>> {
     let mut tick = time::interval(std::time::Duration::from_millis(90));
 
     loop {
-        session.draw(|frame| render(frame, &mut app, journal_store.path().as_path()))?;
+        session.draw(|frame| {
+            render(frame, &mut app, journal_store.path().as_path(), &mut interaction)
+        })?;
 
         tokio::select! {
             _ = tick.tick() => {
@@ -211,7 +217,7 @@ pub async fn run(startup: Startup) -> Result<Option<RunOutcome>> {
             }
             event = events.recv() => {
                 let action = match event {
-                    Some(event) => handle_event(event, &mut app),
+                    Some(event) => handle_event(event, &mut app, &mut interaction),
                     None => {
                         if run_active {
                             if let Some(cancel) = &cancel {
@@ -227,6 +233,7 @@ pub async fn run(startup: Startup) -> Result<Option<RunOutcome>> {
 
                 match action {
                     UiAction::None => {}
+                    UiAction::Copy(text) => session.copy(&text)?,
                     UiAction::Quit => break,
                     UiAction::Cancel => {
                         if let Some(cancel) = &cancel {
@@ -371,6 +378,7 @@ pub async fn run(startup: Startup) -> Result<Option<RunOutcome>> {
 
 enum UiAction {
     None,
+    Copy(String),
     Quit,
     Start,
     Cancel,
@@ -382,47 +390,163 @@ enum UiAction {
     OpenUrl { url: String },
 }
 
-fn handle_event(event: Event, app: &mut App) -> UiAction {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeploySurface {
+    Progress,
+    LiveOutput,
+    SummaryOutput,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeployRow {
+    Target(usize),
+    Version(usize),
+}
+
+struct DeployInteraction {
+    actions: DeployActionRegistry,
+    keybinding_state: KeybindingState,
+    selection: TextSelection<DeploySurface>,
+    selectable: Vec<SelectableRegion<DeploySurface>>,
+    rows: Vec<(Rect, DeployRow)>,
+    scrollbars: Vec<(DeploySurface, ScrollbarLayout, ViewportMetrics)>,
+    scrollbar_drag: Option<(DeploySurface, ScrollbarDrag)>,
+}
+
+impl DeployInteraction {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            actions: actions::registry()?,
+            keybinding_state: KeybindingState::default(),
+            selection: TextSelection::default(),
+            selectable: Vec::new(),
+            rows: Vec::new(),
+            scrollbars: Vec::new(),
+            scrollbar_drag: None,
+        })
+    }
+}
+
+fn handle_event(event: Event, app: &mut App, interaction: &mut DeployInteraction) -> UiAction {
     match event {
-        Event::Key(key) => handle_key(key, app),
-        Event::Mouse(mouse) => handle_mouse(mouse, app),
+        Event::Key(key) => handle_key(key, app, interaction),
+        Event::Mouse(mouse) => handle_mouse(mouse, app, interaction),
         Event::Resize(_, _) => {
             app.cancel_layout_drag();
+            interaction.keybinding_state = KeybindingState::default();
+            interaction.scrollbar_drag = None;
             UiAction::None
         }
         Event::FocusGained | Event::FocusLost | Event::Paste(_) => UiAction::None,
     }
 }
 
-fn handle_mouse(mouse: MouseEvent, app: &mut App) -> UiAction {
+fn handle_mouse(mouse: MouseEvent, app: &mut App, interaction: &mut DeployInteraction) -> UiAction {
+    if let Some((surface, drag)) = interaction.scrollbar_drag {
+        match mouse.kind {
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some((layout, metrics)) =
+                    interaction.scrollbars.iter().find_map(|(candidate, layout, metrics)| {
+                        (*candidate == surface).then_some((*layout, *metrics))
+                    })
+                {
+                    set_surface_top(
+                        app,
+                        surface,
+                        drag.top_for_row(layout, mouse.row),
+                        metrics.max_top(),
+                    );
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => interaction.scrollbar_drag = None,
+            _ => {}
+        }
+        return UiAction::None;
+    }
+    if interaction.selection.is_dragging() && app.layout_drag.is_none() {
+        return selection_mouse(mouse, app, interaction);
+    }
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
+            let position = Position::new(mouse.column, mouse.row);
+            if let Some((surface, layout, metrics)) = interaction
+                .scrollbars
+                .iter()
+                .find(|(_, layout, _)| layout.contains(position))
+                .copied()
+            {
+                interaction.selection.clear();
+                if let Some(drag) = ScrollbarDrag::begin(layout, position) {
+                    interaction.scrollbar_drag = Some((surface, drag));
+                } else {
+                    set_surface_top(
+                        app,
+                        surface,
+                        layout.top_for_track_row(mouse.row),
+                        metrics.max_top(),
+                    );
+                }
+                return UiAction::None;
+            }
             if let Some(url) = clicked_tailscale_auth_url(mouse.column, mouse.row, app) {
                 return UiAction::OpenUrl { url };
             }
             if !app.begin_layout_drag(mouse.column, mouse.row) {
+                if let Some(row) = interaction
+                    .rows
+                    .iter()
+                    .find_map(|(area, row)| area.contains(position).then_some(*row))
+                {
+                    match row {
+                        DeployRow::Target(index) => {
+                            app.move_cursor(index as isize - app.cursor as isize)
+                        }
+                        DeployRow::Version(index) => {
+                            app.move_history_cursor(index as isize - app.history_cursor as isize)
+                        }
+                    }
+                    app.set_active_region(ActiveRegion::Primary);
+                    interaction.selection.clear();
+                    return UiAction::None;
+                }
                 if let Some(region) = navigation(app).hit_test(mouse.column, mouse.row) {
                     app.set_active_region(region);
                 }
+                return selection_mouse(mouse, app, interaction);
             }
             UiAction::None
         }
         MouseEventKind::Drag(MouseButton::Left) => {
-            app.update_layout_drag(mouse.column);
-            UiAction::None
+            if app.layout_drag.is_some() {
+                app.update_layout_drag(mouse.column);
+                UiAction::None
+            } else {
+                selection_mouse(mouse, app, interaction)
+            }
         }
         MouseEventKind::Up(MouseButton::Left) => {
             if app.finish_layout_drag() {
                 UiAction::PersistLayout
             } else {
-                UiAction::None
+                selection_mouse(mouse, app, interaction)
             }
         }
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            let delta = if mouse.kind == MouseEventKind::ScrollUp { -1 } else { 1 };
+            let position = Position::new(mouse.column, mouse.row);
+            if let Some(surface) = interaction
+                .selectable
+                .iter()
+                .find_map(|region| region.area.contains(position).then_some(region.id))
+            {
+                scroll_surface(app, surface, delta);
+                interaction.selection.clear();
+                return UiAction::None;
+            }
             if let Some(region) = navigation(app).hit_test(mouse.column, mouse.row) {
                 app.set_active_region(region);
-                let delta = if mouse.kind == MouseEventKind::ScrollUp { -1 } else { 1 };
                 scroll_or_select(app, delta);
+                interaction.selection.clear();
             }
             UiAction::None
         }
@@ -435,202 +559,273 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) -> UiAction {
     }
 }
 
-fn handle_key(key: KeyEvent, app: &mut App) -> UiAction {
-    let control_c = key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
-    if control_c {
-        app.cancel_layout_drag();
-        return if app.phase == Phase::Running { UiAction::Cancel } else { UiAction::Quit };
-    }
-
-    if app.modal.is_some() {
-        return handle_modal_key(key, app);
-    }
-
-    if app.layout_drag.is_some() {
-        if key.code == KeyCode::Esc {
-            app.cancel_layout_drag();
+fn set_surface_top(app: &mut App, surface: DeploySurface, top: usize, maximum: usize) {
+    match surface {
+        DeploySurface::Progress => {
+            app.primary_scroll = u16::try_from(top).unwrap_or(u16::MAX);
         }
-        return UiAction::None;
+        DeploySurface::LiveOutput | DeploySurface::SummaryOutput => {
+            app.secondary_scroll = u16::try_from(maximum.saturating_sub(top)).unwrap_or(u16::MAX);
+        }
     }
+}
 
-    if key.code == KeyCode::Char('=') && app.reset_active_layout().is_some() {
-        return UiAction::PersistLayout;
-    }
-
-    match key.code {
-        KeyCode::Left => move_active_region(app, Direction::Left),
-        KeyCode::Right => move_active_region(app, Direction::Right),
-        KeyCode::Tab => cycle_active_region(app, false),
-        KeyCode::BackTab => cycle_active_region(app, true),
-        _ => false,
-    };
-
-    match app.phase {
-        Phase::Browse => match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => UiAction::Quit,
-            KeyCode::Up | KeyCode::Char('k') => {
-                scroll_or_select(app, -1);
-                UiAction::None
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                scroll_or_select(app, 1);
-                UiAction::None
-            }
-            KeyCode::Char(' ') => {
-                app.toggle_focused();
-                UiAction::None
-            }
-            KeyCode::Char('a') => {
-                app.toggle_all();
-                UiAction::None
-            }
-            KeyCode::Char('v') => match app.open_versions() {
-                VersionsSource::Journal => UiAction::None,
-                VersionsSource::CloudflarePages => UiAction::LoadVersions,
-            },
-            KeyCode::Char('p') => {
-                let default_branch = app
-                    .focused_target()
-                    .map(|target| target_working_dir(&app.loaded.base_dir, target))
-                    .and_then(|dir| current_git_branch(&dir))
-                    .unwrap_or_default();
-                app.open_branch_input(default_branch);
-                UiAction::None
-            }
-            KeyCode::Enter => {
-                app.review_production_deploy();
-                UiAction::None
-            }
-            KeyCode::Char('r') if app.versions_source() == VersionsSource::CloudflarePages => {
-                app.open_versions();
-                UiAction::LoadVersions
-            }
-            _ => UiAction::None,
-        },
-        Phase::Versions => match key.code {
-            KeyCode::Char('q') => UiAction::Quit,
-            KeyCode::Esc => {
-                app.back_to_browse();
-                UiAction::None
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                scroll_or_select(app, -1);
-                UiAction::None
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                scroll_or_select(app, 1);
-                UiAction::None
-            }
-            KeyCode::Enter => {
-                app.review_rollback();
-                UiAction::None
-            }
-            KeyCode::Char('d') => {
-                app.open_confirm_delete();
-                UiAction::None
-            }
-            KeyCode::Char('e') => match app.toggle_selected_annotation_error() {
-                Some(_) => UiAction::PersistAnnotations,
-                None => UiAction::None,
-            },
-            KeyCode::Char('n') => {
-                app.open_note_input();
-                UiAction::None
-            }
-            KeyCode::Char('o') => match app.selected_cloudflare_deployment() {
-                Some(deployment) => UiAction::OpenUrl { url: deployment.url.clone() },
-                None => UiAction::None,
-            },
-            _ => UiAction::None,
-        },
-        Phase::Review => match key.code {
-            KeyCode::Esc => {
-                app.back_from_review();
-                UiAction::None
-            }
-            KeyCode::Char('q') => UiAction::Quit,
-            KeyCode::Enter => UiAction::Start,
-            _ => UiAction::None,
-        },
-        Phase::Preparing => match key.code {
-            KeyCode::Esc => UiAction::CancelPreparation,
-            KeyCode::Char('q') => UiAction::Quit,
-            _ => UiAction::None,
-        },
-        Phase::Running => {
-            if key.code == KeyCode::Char('o') {
-                return match tailscale_auth_url(app) {
-                    Some(url) => UiAction::OpenUrl { url },
-                    None => UiAction::None,
-                };
-            } else if matches!(key.code, KeyCode::Up | KeyCode::Char('k')) {
-                scroll_or_select(app, -1);
-            } else if matches!(key.code, KeyCode::Down | KeyCode::Char('j')) {
-                scroll_or_select(app, 1);
-            }
+fn selection_mouse(
+    mouse: MouseEvent,
+    app: &mut App,
+    interaction: &mut DeployInteraction,
+) -> UiAction {
+    match interaction.selection.on_mouse(mouse) {
+        SelectionOutcome::CopyReady(text) => UiAction::Copy(text),
+        SelectionOutcome::EdgeScroll { surface, lines } => {
+            scroll_surface(app, surface, lines);
             UiAction::None
         }
-        Phase::Summary => match key.code {
-            KeyCode::Char('q') => UiAction::Quit,
-            KeyCode::Enter | KeyCode::Esc => {
-                app.back_to_browse();
-                UiAction::None
-            }
-            KeyCode::Char('o') => match summary_url(app) {
-                Some(url) => UiAction::OpenUrl { url },
-                None => UiAction::None,
-            },
-            KeyCode::Up | KeyCode::Char('k') => {
-                app.scroll_summary_log(-1);
-                UiAction::None
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                app.scroll_summary_log(1);
-                UiAction::None
-            }
-            _ => UiAction::None,
+        SelectionOutcome::Captured | SelectionOutcome::Changed | SelectionOutcome::Unhandled => {
+            UiAction::None
+        }
+    }
+}
+
+fn scroll_surface(app: &mut App, surface: DeploySurface, lines: isize) {
+    match surface {
+        DeploySurface::Progress => {
+            app.set_active_region(ActiveRegion::Primary);
+            let maximum = scroll_limit(app, ActiveRegion::Primary);
+            app.scroll_active_region(lines, maximum);
+        }
+        DeploySurface::LiveOutput => {
+            app.set_active_region(ActiveRegion::Secondary);
+            let maximum = scroll_limit(app, ActiveRegion::Secondary);
+            app.scroll_active_region(lines, maximum);
+        }
+        DeploySurface::SummaryOutput => app.scroll_summary_log(lines),
+    }
+}
+
+fn handle_key(key: KeyEvent, app: &mut App, interaction: &mut DeployInteraction) -> UiAction {
+    match interaction.selection.on_key(key) {
+        SelectionOutcome::CopyReady(text) => return UiAction::Copy(text),
+        SelectionOutcome::Captured | SelectionOutcome::Changed => return UiAction::None,
+        SelectionOutcome::Unhandled | SelectionOutcome::EdgeScroll { .. } => {}
+    }
+    let Some(chord) = KeyChord::from_event(key) else {
+        return UiAction::None;
+    };
+    let context = action_context(app);
+    let invocation = match interaction.actions.resolve_keybinding(
+        &mut interaction.keybinding_state,
+        chord,
+        context,
+    ) {
+        KeybindingResolution::Invoke(invocation) => invocation,
+        KeybindingResolution::Pending | KeybindingResolution::UnmatchedSequence { .. } => {
+            return UiAction::None
+        }
+        KeybindingResolution::Unmatched => return handle_text_input(key, app),
+    };
+    match interaction.actions.command_for(&invocation) {
+        Ok(command) => execute_command(command, app),
+        Err(error) => {
+            app.notice = Some(error.to_string());
+            UiAction::None
+        }
+    }
+}
+
+fn action_context(app: &App) -> DeployActionContext {
+    let mode = match &app.modal {
+        Some(Modal::ConfirmDelete { .. }) => DeployActionMode::ModalConfirm,
+        Some(Modal::BranchInput { .. } | Modal::NoteInput { .. }) => DeployActionMode::ModalInput,
+        None if app.layout_drag.is_some() => DeployActionMode::LayoutDrag,
+        None => match app.phase {
+            Phase::Browse => DeployActionMode::Browse,
+            Phase::Versions => DeployActionMode::Versions,
+            Phase::Review => DeployActionMode::Review,
+            Phase::Preparing => DeployActionMode::Preparing,
+            Phase::Running => DeployActionMode::Running,
+            Phase::Summary => DeployActionMode::Summary,
+        },
+    };
+    DeployActionContext {
+        mode,
+        split_available: app.layout_frame.surface.is_some(),
+        cloudflare_versions: app.versions_source() == VersionsSource::CloudflarePages,
+        open_url_available: match app.phase {
+            Phase::Versions => app.selected_cloudflare_deployment().is_some(),
+            Phase::Running => tailscale_auth_url(app).is_some(),
+            Phase::Summary => summary_url(app).is_some(),
+            Phase::Browse | Phase::Review | Phase::Preparing => false,
         },
     }
 }
 
-fn handle_modal_key(key: KeyEvent, app: &mut App) -> UiAction {
-    let confirming_delete = matches!(app.modal, Some(Modal::ConfirmDelete { .. }));
-    match key.code {
-        KeyCode::Esc => {
-            app.modal_cancel();
-            UiAction::None
+fn execute_command(command: DeployCommand, app: &mut App) -> UiAction {
+    match command {
+        DeployCommand::Quit => UiAction::Quit,
+        DeployCommand::CancelOrQuit => {
+            app.cancel_layout_drag();
+            if app.phase == Phase::Running {
+                UiAction::Cancel
+            } else {
+                UiAction::Quit
+            }
         }
-        KeyCode::Char('n') | KeyCode::Char('N') if confirming_delete => {
-            app.modal_cancel();
-            UiAction::None
-        }
-        KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') if confirming_delete => {
-            match app.modal_confirm() {
-                ModalResult::DeleteDeployment { deployment_id, short_id } => {
-                    UiAction::DeleteDeployment { deployment_id, short_id }
+        DeployCommand::Escape => {
+            if app.modal.is_some() {
+                app.modal_cancel();
+                return UiAction::None;
+            }
+            if app.layout_drag.is_some() {
+                app.cancel_layout_drag();
+                return UiAction::None;
+            }
+            match app.phase {
+                Phase::Browse => UiAction::Quit,
+                Phase::Versions => {
+                    app.back_to_browse();
+                    UiAction::None
                 }
-                ModalResult::None | ModalResult::ReviewPreview | ModalResult::SaveAnnotations => {
+                Phase::Review => {
+                    app.back_from_review();
+                    UiAction::None
+                }
+                Phase::Preparing => UiAction::CancelPreparation,
+                Phase::Running => UiAction::None,
+                Phase::Summary => {
+                    app.back_to_browse();
                     UiAction::None
                 }
             }
         }
-        KeyCode::Enter => match app.modal_confirm() {
-            ModalResult::SaveAnnotations => UiAction::PersistAnnotations,
-            ModalResult::DeleteDeployment { deployment_id, short_id } => {
-                UiAction::DeleteDeployment { deployment_id, short_id }
+        DeployCommand::MoveUp => {
+            if app.phase == Phase::Summary {
+                app.scroll_summary_log(-1);
+            } else {
+                scroll_or_select(app, -1);
             }
-            ModalResult::None | ModalResult::ReviewPreview => UiAction::None,
+            UiAction::None
+        }
+        DeployCommand::MoveDown => {
+            if app.phase == Phase::Summary {
+                app.scroll_summary_log(1);
+            } else {
+                scroll_or_select(app, 1);
+            }
+            UiAction::None
+        }
+        DeployCommand::MoveLeft => {
+            move_active_region(app, Direction::Left);
+            UiAction::None
+        }
+        DeployCommand::MoveRight => {
+            move_active_region(app, Direction::Right);
+            UiAction::None
+        }
+        DeployCommand::NextRegion => {
+            cycle_active_region(app, false);
+            UiAction::None
+        }
+        DeployCommand::PreviousRegion => {
+            cycle_active_region(app, true);
+            UiAction::None
+        }
+        DeployCommand::ResetLayout => {
+            if app.reset_active_layout().is_some() {
+                UiAction::PersistLayout
+            } else {
+                UiAction::None
+            }
+        }
+        DeployCommand::ToggleSelection => {
+            app.toggle_focused();
+            UiAction::None
+        }
+        DeployCommand::ToggleAll => {
+            app.toggle_all();
+            UiAction::None
+        }
+        DeployCommand::OpenVersions => match app.open_versions() {
+            VersionsSource::Journal => UiAction::None,
+            VersionsSource::CloudflarePages => UiAction::LoadVersions,
         },
-        KeyCode::Backspace if !confirming_delete => {
-            app.modal_backspace();
+        DeployCommand::Preview => {
+            let default_branch = app
+                .focused_target()
+                .map(|target| target_working_dir(&app.loaded.base_dir, target))
+                .and_then(|dir| current_git_branch(&dir))
+                .unwrap_or_default();
+            app.open_branch_input(default_branch);
             UiAction::None
         }
-        KeyCode::Char(ch) if !confirming_delete => {
-            app.modal_push(ch);
+        DeployCommand::Activate => {
+            if app.modal.is_some() {
+                return confirm_modal(app);
+            }
+            match app.phase {
+                Phase::Browse => app.review_production_deploy(),
+                Phase::Versions => app.review_rollback(),
+                Phase::Review => return UiAction::Start,
+                Phase::Summary => app.back_to_browse(),
+                Phase::Preparing | Phase::Running => {}
+            }
             UiAction::None
         }
-        _ => UiAction::None,
+        DeployCommand::RefreshVersions => {
+            app.open_versions();
+            UiAction::LoadVersions
+        }
+        DeployCommand::DeleteVersion => {
+            app.open_confirm_delete();
+            UiAction::None
+        }
+        DeployCommand::ToggleVersionError => match app.toggle_selected_annotation_error() {
+            Some(_) => UiAction::PersistAnnotations,
+            None => UiAction::None,
+        },
+        DeployCommand::NoteOrDecline => {
+            if matches!(app.modal, Some(Modal::ConfirmDelete { .. })) {
+                app.modal_cancel();
+            } else {
+                app.open_note_input();
+            }
+            UiAction::None
+        }
+        DeployCommand::OpenUrl => {
+            let url = match app.phase {
+                Phase::Versions => {
+                    app.selected_cloudflare_deployment().map(|item| item.url.clone())
+                }
+                Phase::Running => tailscale_auth_url(app),
+                Phase::Summary => summary_url(app),
+                Phase::Browse | Phase::Review | Phase::Preparing => None,
+            };
+            url.map_or(UiAction::None, |url| UiAction::OpenUrl { url })
+        }
+        DeployCommand::Confirm => confirm_modal(app),
     }
+}
+
+fn confirm_modal(app: &mut App) -> UiAction {
+    match app.modal_confirm() {
+        ModalResult::SaveAnnotations => UiAction::PersistAnnotations,
+        ModalResult::DeleteDeployment { deployment_id, short_id } => {
+            UiAction::DeleteDeployment { deployment_id, short_id }
+        }
+        ModalResult::None | ModalResult::ReviewPreview => UiAction::None,
+    }
+}
+
+fn handle_text_input(key: KeyEvent, app: &mut App) -> UiAction {
+    if matches!(app.modal, Some(Modal::ConfirmDelete { .. })) {
+        return UiAction::None;
+    }
+    match key.code {
+        KeyCode::Backspace if app.modal.is_some() => app.modal_backspace(),
+        KeyCode::Char(ch) if app.modal.is_some() => app.modal_push(ch),
+        _ => {}
+    }
+    UiAction::None
 }
 
 fn navigation(app: &App) -> NavigationMap<ActiveRegion> {
@@ -1000,7 +1195,15 @@ fn persist_run(app: &mut App, store: &JournalStore) -> Result<()> {
     Ok(())
 }
 
-fn render(frame: &mut Frame<'_>, app: &mut App, journal_path: &Path) {
+fn render(
+    frame: &mut Frame<'_>,
+    app: &mut App,
+    journal_path: &Path,
+    interaction: &mut DeployInteraction,
+) {
+    interaction.selectable.clear();
+    interaction.rows.clear();
+    interaction.scrollbars.clear();
     let areas = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(8),
@@ -1016,16 +1219,165 @@ fn render(frame: &mut Frame<'_>, app: &mut App, journal_path: &Path) {
         Phase::Running => render_running(frame, areas[1], app),
         Phase::Summary => render_summary(frame, areas[1], app, journal_path),
     }
-    render_footer(frame, areas[2], app);
+    render_footer(frame, areas[2], app, &interaction.actions);
     if app.modal.is_some() {
-        render_modal(frame, app);
+        render_modal(frame, app, &interaction.actions);
+    } else {
+        publish_selectable_regions(areas[1], app, interaction);
+    }
+    render_deploy_scrollbars(frame, interaction);
+    interaction.selection.capture_frame(
+        frame,
+        &interaction.selectable,
+        Style::default().bg(SELECTED).add_modifier(Modifier::REVERSED),
+    );
+}
+
+fn publish_selectable_regions(body: Rect, app: &App, interaction: &mut DeployInteraction) {
+    match app.phase {
+        Phase::Browse if app.layout_frame.surface == Some(SplitSurface::Browse) => {
+            publish_rows(
+                app.layout_frame.split.first,
+                app.loaded.plan.targets.len(),
+                app.cursor,
+                DeployRow::Target,
+                &mut interaction.rows,
+            );
+        }
+        Phase::Versions if app.layout_frame.surface == Some(SplitSurface::Versions) => {
+            let count = match &app.versions {
+                VersionsState::Journal => app.history().len(),
+                VersionsState::CloudflareReady { deployments, .. } => deployments.len(),
+                VersionsState::CloudflareLoading | VersionsState::CloudflareError { .. } => 0,
+            };
+            publish_rows(
+                app.layout_frame.split.first,
+                count,
+                app.history_cursor,
+                DeployRow::Version,
+                &mut interaction.rows,
+            );
+        }
+        Phase::Running if app.layout_frame.surface == Some(SplitSurface::Running) => {
+            let progress = selectable_panel_content(app.layout_frame.split.first);
+            let progress_len = app.progress.iter().fold(2usize, |total, target| {
+                total.saturating_add(target.steps.len().saturating_add(1))
+            });
+            publish_surface(
+                interaction,
+                DeploySurface::Progress,
+                progress,
+                i64::from(app.primary_scroll),
+                progress_len,
+                usize::from(app.primary_scroll),
+                1,
+            );
+            let output = selectable_panel_content(app.layout_frame.split.second);
+            let output_end = app.output.len().saturating_sub(usize::from(app.secondary_scroll));
+            let output_start = output_end.saturating_sub(usize::from(output.height));
+            publish_surface(
+                interaction,
+                DeploySurface::LiveOutput,
+                output,
+                i64::try_from(output_start).unwrap_or(i64::MAX),
+                app.output.len(),
+                output_start,
+                1,
+            );
+        }
+        Phase::Summary if !app.output.is_empty() => {
+            let panes =
+                Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)])
+                    .split(body);
+            let output = selectable_panel_content(panes[1]);
+            let output_end = app.output.len().saturating_sub(usize::from(app.secondary_scroll));
+            let output_start = output_end.saturating_sub(usize::from(output.height));
+            publish_surface(
+                interaction,
+                DeploySurface::SummaryOutput,
+                output,
+                i64::try_from(output_start).unwrap_or(i64::MAX),
+                app.output.len(),
+                output_start,
+                1,
+            );
+        }
+        Phase::Browse | Phase::Versions | Phase::Review | Phase::Preparing | Phase::Summary => {}
+        Phase::Running => {}
     }
 }
 
-fn render_modal(frame: &mut Frame<'_>, app: &App) {
+fn publish_rows(
+    area: Rect,
+    count: usize,
+    selected: usize,
+    row: impl Fn(usize) -> DeployRow,
+    regions: &mut Vec<(Rect, DeployRow)>,
+) {
+    let capacity = usize::from(area.height.saturating_sub(2));
+    let start = selected.saturating_add(1).saturating_sub(capacity);
+    let inner = selectable_panel_content(area);
+    for (visible, index) in (start..count).take(capacity).enumerate() {
+        regions.push((
+            Rect::new(
+                inner.x,
+                inner.y.saturating_add(u16::try_from(visible).unwrap_or(u16::MAX)),
+                inner.width,
+                1,
+            ),
+            row(index),
+        ));
+    }
+}
+
+fn publish_surface(
+    interaction: &mut DeployInteraction,
+    surface: DeploySurface,
+    mut area: Rect,
+    row_origin: i64,
+    content_len: usize,
+    top: usize,
+    revision: u64,
+) {
+    let metrics = ViewportMetrics::new(content_len, usize::from(area.height));
+    if let Some(layout) = ScrollbarLayout::vertical_right(area, metrics, top) {
+        interaction.scrollbars.push((surface, layout, metrics));
+        area.width = area.width.saturating_sub(1);
+    }
+    interaction.selectable.push(SelectableRegion::new(surface, area, row_origin, 0, revision));
+}
+
+fn render_deploy_scrollbars(frame: &mut Frame<'_>, interaction: &DeployInteraction) {
+    for (surface, layout, _) in &interaction.scrollbars {
+        render_vertical_scrollbar(
+            frame,
+            *layout,
+            interaction.scrollbar_drag.is_some_and(|(dragging, _)| dragging == *surface),
+            ScrollbarStyle {
+                track_color: BORDER,
+                thumb_color: MUTED,
+                active_thumb_color: CYAN,
+                track_symbol: "│",
+                thumb_symbol: "┃",
+            },
+        );
+    }
+}
+
+fn selectable_panel_content(area: Rect) -> Rect {
+    Rect::new(
+        area.x.saturating_add(2),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(4),
+        area.height.saturating_sub(2),
+    )
+}
+
+fn render_modal(frame: &mut Frame<'_>, app: &App, actions: &DeployActionRegistry) {
     let Some(modal) = &app.modal else {
         return;
     };
+    let controls = action_help(app, actions);
     let (title, body) = match modal {
         Modal::BranchInput { buffer, .. } => (
             " Preview deploy · branch ",
@@ -1037,7 +1389,7 @@ fn render_modal(frame: &mut Frame<'_>, app: &App) {
                 Line::raw(""),
                 input_line(buffer),
                 Line::raw(""),
-                Line::styled("Enter deploy  ·  Esc cancel", Style::default().fg(MUTED)),
+                Line::styled(controls.clone(), Style::default().fg(MUTED)),
             ],
         ),
         Modal::NoteInput { buffer, .. } => (
@@ -1047,7 +1399,7 @@ fn render_modal(frame: &mut Frame<'_>, app: &App) {
                 Line::raw(""),
                 input_line(buffer),
                 Line::raw(""),
-                Line::styled("Enter save  ·  Esc cancel", Style::default().fg(MUTED)),
+                Line::styled(controls.clone(), Style::default().fg(MUTED)),
             ],
         ),
         Modal::ConfirmDelete { label, .. } => (
@@ -1062,7 +1414,7 @@ fn render_modal(frame: &mut Frame<'_>, app: &App) {
                     Span::styled(" from Cloudflare Pages?", Style::default().fg(TEXT)),
                 ]),
                 Line::raw(""),
-                Line::styled("y delete  ·  n / Esc cancel", Style::default().fg(MUTED)),
+                Line::styled(controls, Style::default().fg(MUTED)),
             ],
         ),
     };
@@ -1922,14 +2274,8 @@ fn render_summary(frame: &mut Frame<'_>, area: Rect, app: &App, journal_path: &P
     frame.render_widget(Paragraph::new(output).block(panel(" Deploy log · ↑↓ scroll ")), log_area);
 }
 
-fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let controls = match app.modal {
-        Some(Modal::ConfirmDelete { .. }) => "y delete   n / Esc cancel",
-        Some(Modal::BranchInput { .. } | Modal::NoteInput { .. }) => {
-            "type to edit   Enter confirm   Esc cancel"
-        }
-        None => modal_free_controls(app),
-    };
+fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, actions: &DeployActionRegistry) {
+    let controls = action_help(app, actions);
     if let Some(notice) = &app.notice {
         let notice = if app.phase == Phase::Preparing {
             format!("{} {notice}", SPINNER[app.spinner % SPINNER.len()])
@@ -1938,7 +2284,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         };
         let lines = vec![
             Line::styled(notice, Style::default().fg(YELLOW)),
-            Line::styled(controls, Style::default().fg(MUTED)),
+            Line::styled(controls.clone(), Style::default().fg(MUTED)),
         ];
         frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), area);
     } else {
@@ -1949,43 +2295,19 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 }
 
-fn modal_free_controls(app: &App) -> &'static str {
-    match app.phase {
-        Phase::Browse if app.active_region == ActiveRegion::Secondary => {
-            "↑↓ scroll plan   ←→/Tab region   Space select   v versions   p preview   Enter production   q quit"
-        }
-        Phase::Browse => {
-            "↑↓ targets   Space select   a all   v versions   p preview   Enter production   q quit"
-        }
-        Phase::Versions => {
-            if app.layout_frame.surface.is_none() {
-                if app.versions_source() == VersionsSource::CloudflarePages {
-                    "r refresh   Esc targets   q quit"
-                } else {
-                    "Esc targets   q quit"
-                }
-            } else if app.active_region == ActiveRegion::Secondary {
-                "↑↓ scroll details   Enter rollback   o open   e error   n note   d delete   Esc targets   q quit"
-            } else if app.versions_source() == VersionsSource::CloudflarePages {
-                "↑↓ versions   Enter rollback   o open   e error   n note   d delete   r refresh   Esc targets   q quit"
-            } else {
-                "↑↓ versions   ←→/Tab region   Enter rollback   drag resize   = reset   Esc targets   q quit"
-            }
-        }
-        Phase::Review if matches!(app.intent, Some(RunIntent::DeployProduction)) => {
-            "Enter deploy production   Esc back   q quit"
-        }
-        Phase::Review if matches!(app.intent, Some(RunIntent::DeployPreview { .. })) => {
-            "Enter deploy preview   Esc back   q quit"
-        }
-        Phase::Review => "Enter run   Esc back   q quit",
-        Phase::Preparing => "Esc cancel preparation   q quit",
-        Phase::Running if tailscale_auth_url(app).is_some() => {
-            "click link / o open Tailscale auth   ↑↓ scroll   ←→/Tab region   Ctrl-C cancel safely"
-        }
-        Phase::Running => "↑↓ scroll   ←→/Tab region   drag resize   = reset   Ctrl-C cancel safely",
-        Phase::Summary => "↑↓ scroll logs   o open   Enter continue   q quit",
+fn action_help(app: &App, actions: &DeployActionRegistry) -> String {
+    let mut help = actions
+        .resolve_command_palette(&action_context(app))
+        .items()
+        .iter()
+        .filter_map(|action| {
+            action.primary_keybinding().map(|binding| format!("{binding} {}", action.title))
+        })
+        .collect::<Vec<_>>();
+    if matches!(app.modal, Some(Modal::BranchInput { .. } | Modal::NoteInput { .. })) {
+        help.insert(0, "Type to edit".to_owned());
     }
+    help.join("  ")
 }
 
 fn panel(title: impl Into<String>) -> Block<'static> {
@@ -2179,9 +2501,11 @@ mod tests {
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend)?;
         let mut app = test_app();
+        let mut interaction = DeployInteraction::new()?;
         app.toggle_focused();
 
-        terminal.draw(|frame| render(frame, &mut app, Path::new("journal.json")))?;
+        terminal
+            .draw(|frame| render(frame, &mut app, Path::new("journal.json"), &mut interaction))?;
         let buffer = terminal.backend().buffer();
         let screen = buffer.content.iter().map(|cell| cell.symbol()).collect::<Vec<_>>().join("");
 
@@ -2198,10 +2522,12 @@ mod tests {
         let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend)?;
         let mut app = test_app();
+        let mut interaction = DeployInteraction::new()?;
         app.toggle_focused();
         app.review_production_deploy();
 
-        terminal.draw(|frame| render(frame, &mut app, Path::new("journal.json")))?;
+        terminal
+            .draw(|frame| render(frame, &mut app, Path::new("journal.json"), &mut interaction))?;
         let review = terminal
             .backend()
             .buffer()
@@ -2230,7 +2556,8 @@ mod tests {
             elapsed: Duration::from_millis(25),
         });
 
-        terminal.draw(|frame| render(frame, &mut app, Path::new("journal.json")))?;
+        terminal
+            .draw(|frame| render(frame, &mut app, Path::new("journal.json"), &mut interaction))?;
         let summary = terminal
             .backend()
             .buffer()
@@ -2250,6 +2577,7 @@ mod tests {
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend)?;
         let mut app = test_app();
+        let mut interaction = DeployInteraction::new()?;
         let step = app.loaded.plan.targets[0].steps[0].clone();
         app.loaded.plan.targets[0].steps.extend((0..30).map(|index| {
             let mut step = step.clone();
@@ -2262,23 +2590,29 @@ mod tests {
         app.loaded.plan.targets.push(second);
         app.selected.push(false);
 
-        terminal.draw(|frame| render(frame, &mut app, Path::new("journal.json")))?;
+        terminal
+            .draw(|frame| render(frame, &mut app, Path::new("journal.json"), &mut interaction))?;
         let primary = app.layout_frame.split.first;
         let secondary = app.layout_frame.split.second;
         assert_eq!(terminal.backend().buffer()[(primary.x, primary.y)].fg, CYAN);
 
-        handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &mut app);
-        handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut app);
+        handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &mut app, &mut interaction);
+        handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut app, &mut interaction);
         assert_eq!(app.active_region, ActiveRegion::Secondary);
         assert_eq!(app.secondary_scroll, 1);
         assert_eq!(app.cursor, 0);
 
-        terminal.draw(|frame| render(frame, &mut app, Path::new("journal.json")))?;
+        terminal
+            .draw(|frame| render(frame, &mut app, Path::new("journal.json"), &mut interaction))?;
         assert_eq!(terminal.backend().buffer()[(primary.x, primary.y)].fg, BORDER);
         assert_eq!(terminal.backend().buffer()[(secondary.x, secondary.y)].fg, CYAN);
 
-        handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE), &mut app);
-        handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut app);
+        handle_key(
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+            &mut app,
+            &mut interaction,
+        );
+        handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut app, &mut interaction);
         assert_eq!(app.active_region, ActiveRegion::Primary);
         assert_eq!(app.cursor, 1);
 
@@ -2290,6 +2624,7 @@ mod tests {
                 modifiers: KeyModifiers::NONE,
             },
             &mut app,
+            &mut interaction,
         );
         assert_eq!(app.active_region, ActiveRegion::Secondary);
         Ok(())
@@ -2300,6 +2635,7 @@ mod tests {
         let backend = TestBackend::new(100, 20);
         let mut terminal = Terminal::new(backend)?;
         let mut app = test_app();
+        let mut interaction = DeployInteraction::new()?;
         let step = app.loaded.plan.targets[0].steps[0].clone();
         app.loaded.plan.targets[0].steps.extend((0..30).map(|index| {
             let mut step = step.clone();
@@ -2325,13 +2661,14 @@ mod tests {
             });
         }
 
-        terminal.draw(|frame| render(frame, &mut app, Path::new("journal.json")))?;
-        handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut app);
+        terminal
+            .draw(|frame| render(frame, &mut app, Path::new("journal.json"), &mut interaction))?;
+        handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut app, &mut interaction);
         assert_eq!(app.primary_scroll, 1);
         assert_eq!(app.secondary_scroll, 0);
 
-        handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &mut app);
-        handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &mut app);
+        handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &mut app, &mut interaction);
+        handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &mut app, &mut interaction);
         assert_eq!(app.active_region, ActiveRegion::Secondary);
         assert_eq!(app.primary_scroll, 1);
         assert_eq!(app.secondary_scroll, 1);
@@ -2343,6 +2680,7 @@ mod tests {
         let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend)?;
         let mut app = test_app();
+        let mut interaction = DeployInteraction::new()?;
         app.layout.versions = crate::tools::deploy::layout::SplitRatio::new(700);
         app.phase = Phase::Versions;
         app.journal.targets.push(crate::tools::deploy::journal::TargetJournal {
@@ -2357,12 +2695,14 @@ mod tests {
             }],
         });
 
-        terminal.draw(|frame| render(frame, &mut app, Path::new("journal.json")))?;
+        terminal
+            .draw(|frame| render(frame, &mut app, Path::new("journal.json"), &mut interaction))?;
         let journal_width = app.layout_frame.split.first.width;
         let primary = app.layout_frame.split.first;
         let secondary = app.layout_frame.split.second;
-        handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &mut app);
-        terminal.draw(|frame| render(frame, &mut app, Path::new("journal.json")))?;
+        handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &mut app, &mut interaction);
+        terminal
+            .draw(|frame| render(frame, &mut app, Path::new("journal.json"), &mut interaction))?;
         assert_eq!(terminal.backend().buffer()[(primary.x, primary.y)].fg, BORDER);
         assert_eq!(terminal.backend().buffer()[(secondary.x, secondary.y)].fg, CYAN);
 
@@ -2381,7 +2721,8 @@ mod tests {
             live_id: Some("deployment-placeholder".to_owned()),
             production_branch: "main".to_owned(),
         };
-        terminal.draw(|frame| render(frame, &mut app, Path::new("journal.json")))?;
+        terminal
+            .draw(|frame| render(frame, &mut app, Path::new("journal.json"), &mut interaction))?;
 
         assert_eq!(app.layout_frame.split.first.width, journal_width);
         assert!(journal_width > app.layout_frame.split.second.width);
@@ -2406,6 +2747,7 @@ mod tests {
         let backend = TestBackend::new(100, 20);
         let mut terminal = Terminal::new(backend)?;
         let mut app = test_app();
+        let mut interaction = DeployInteraction::new()?;
         let target = app.loaded.plan.targets[0].clone();
         app.begin_run(&RunSpec {
             base_dir: PathBuf::from("."),
@@ -2422,9 +2764,14 @@ mod tests {
             stream: OutputStream::Stderr,
             line: "Authenticate at https://login.tailscale.com/a/example-auth".to_owned(),
         });
-        terminal.draw(|frame| render(frame, &mut app, Path::new("journal.json")))?;
+        terminal
+            .draw(|frame| render(frame, &mut app, Path::new("journal.json"), &mut interaction))?;
 
-        match handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE), &mut app) {
+        match handle_key(
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
+            &mut app,
+            &mut interaction,
+        ) {
             UiAction::OpenUrl { url } => {
                 assert_eq!(url, "https://login.tailscale.com/a/example-auth")
             }
@@ -2440,6 +2787,7 @@ mod tests {
                 modifiers: KeyModifiers::NONE,
             },
             &mut app,
+            &mut interaction,
         ) {
             UiAction::OpenUrl { url } => {
                 assert_eq!(url, "https://login.tailscale.com/a/example-auth")
@@ -2479,18 +2827,27 @@ mod tests {
     #[test]
     fn summary_stays_open_and_returns_to_browse() {
         let mut app = test_app();
+        let mut interaction = DeployInteraction::new().unwrap();
         app.phase = Phase::Summary;
         app.outcome = Some(RunOutcome::Succeeded);
 
         assert!(matches!(
-            handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut app),
+            handle_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &mut app,
+                &mut interaction,
+            ),
             UiAction::None
         ));
         assert_eq!(app.phase, Phase::Browse);
 
         app.phase = Phase::Summary;
         assert!(matches!(
-            handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), &mut app),
+            handle_key(
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+                &mut app,
+                &mut interaction,
+            ),
             UiAction::Quit
         ));
     }

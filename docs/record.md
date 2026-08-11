@@ -16,7 +16,7 @@ implementation, snapshots, Electron launch, replay, and artifact layout.
 - `rename NAME` moves the current recording into the saved recordings directory.
 - Tab completion covers commands, replay directories, scenarios, and a suggested
   rename value.
-- Install or refresh the binary from this repo with `cargo install --path .`.
+- Install or refresh the managed binary from this repo with `./install.sh`.
 
 ## Ownership
 
@@ -182,18 +182,18 @@ From the kit repo root:
 cargo fmt
 cargo check
 cargo test
-cargo install --path .
+./install.sh
 ```
 
 The installed binary path is usually:
 
 ```text
-~/.cargo/bin/kit
+~/.local/bin/kit
 ```
 
 After installing, check:
 
 ```bash
-kit record --help
-kit record status
+"$HOME/.local/bin/kit" record --help
+"$HOME/.local/bin/kit" record status
 ```
