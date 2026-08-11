@@ -24,7 +24,7 @@ cross-tool behavior must have one canonical owner rather than copied per-tool im
 - `cargo test`: run unit and integration tests.
 - `cargo clippy --all-targets`: lint all targets; keep it warning-free.
 - `cargo fmt`: format using the repository `rustfmt.toml`.
-- `cargo install --path .`: install the current binary as `kit`.
+- `./install.sh`: install the current binary at `~/.local/bin/kit`.
 
 ## Resource-Conservative Cargo Workflow
 
@@ -39,13 +39,13 @@ on the machine.
 - Before starting a heavy build, check for an existing Cargo or rustc build. Do not compete with a
   build already running for the user or another agent.
 - Default to at most two build jobs for non-trivial work: use `cargo check -j 2`, targeted
-  `cargo test -j 2 <test-or-module>`, `cargo clippy -j 2`, and `cargo install -j 2 --path .`.
+  `cargo test -j 2 <test-or-module>`, `cargo clippy -j 2`, and `./install.sh`.
 - Start with the cheapest relevant proof: `cargo check -j 2` or a targeted test. Run the full
   `cargo test -j 2` suite only once near handoff when the change surface warrants it.
 - Run clippy separately and only after targeted checks pass. Do not run full tests, clippy, and an
   install back-to-back unless the user explicitly asks for exhaustive verification.
 - Install only once, after the implementation is settled and the necessary checks have passed.
-  Do not repeatedly run `cargo install --path .` after each visual or code iteration.
+  Do not repeatedly run `./install.sh` after each visual or code iteration.
 - Release builds, ignored performance benchmarks, and 30-second sampling gates are opt-in heavy
   checks. Run them only when performance or release behavior is actually in scope, and announce
   them before starting.

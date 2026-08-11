@@ -25,6 +25,7 @@ Contributors can still build and install the current checkout with `./install.sh
 | `kit cdp` | Attach to running Chrome or Electron instances, inspect CDP timelines, interact with targets, assert behavior, trace code, and capture diagnostic bundles. |
 | `kit scout` | Inspect Electron memory by instance and process role, with CDP target attribution and optional heap capture. |
 | `kit stats` | Monitor CPU, memory, process trees, threads, and resources; safely terminate a selected process. |
+| `kit monitor` | Inspect production health, metrics, logs, deployments, recurring costs, and source readiness through a read-only TUI or bounded JSON. |
 | `kit diff` | Review staged, unstaged, and untracked Git changes inline or side by side; stage or unstage the selected file. |
 | `kit domain` | Check domain registration through DNS, RDAP, and WHOIS, including aftermarket listings. |
 | `kit deploy` | Run typed deployment plans, inspect version history, and execute configured rollbacks. |
@@ -33,6 +34,9 @@ Contributors can still build and install the current checkout with `./install.sh
 | `kit render` | Read Markdown in the terminal and fuzzy-search Markdown files in the current workspace. |
 | `kit secrets` | Browse, search, and manage 1Password through a local TUI backed by the official `op` CLI. |
 | `kit swarm` | Run deterministic multi-thread Codex councils and independently inspect them in a tree/detail TUI. |
+| `kit tail` | Share pasted text and dragged files across Tailscale devices; receive, copy, save, open, or expire incoming items. |
+| `kit console` | Connect to persistent terminal sessions and diagnose, install, or restart Console agents across Tailscale. |
+| `kit sync` | Keep source projects aligned across Tailscale machines without sharing Git metadata, dependencies, or credentials. |
 | `kit settings` | Edit tool-owned operator preferences in a shared TUI. |
 | `kit update` | Verify and install the newest compatible GitHub release. |
 
@@ -65,6 +69,10 @@ kit stats
 kit stats --once
 kit scout --once
 
+# Production operations and agent-readable monitoring
+kit monitor --config examples/monitor.toml
+kit --json monitor --config examples/monitor.toml sources
+
 # Git review
 kit diff
 kit diff --mode split
@@ -84,6 +92,13 @@ kit build run check
 # Start a Codex swarm, then inspect all runs independently
 kit swarm run --detach "Review this architecture"
 kit swarm
+
+# Share text or dragged files with another Tailscale device
+kit tail
+
+# Diagnose or force-restart a remote Console agent
+kit --json console status remote-mac
+kit --json console restart remote-mac --force
 ```
 
 ## Documentation
@@ -92,12 +107,17 @@ kit swarm
 - [Build provider client](./docs/build.md)
 - [CDP debugger](./docs/cdp.md)
 - [CPU and process monitor](./docs/stats.md)
+- [Production operations monitor](./docs/monitor.md)
 - [Git diff viewer](./docs/diff.md)
 - [Deployment plans and rollback](./docs/deploy.md)
 - [Modular recorder integration](./docs/record.md)
 - [Markdown viewer](./docs/render.md)
 - [1Password secrets client](./docs/secrets.md)
 - [Codex swarm orchestrator](./docs/swarm.md)
+- [Tailscale sharing](./docs/tail.md)
+- [Synced Projects](./docs/canonical/sync.md)
+- [Console lifecycle and recovery](./docs/canonical/console.md)
+- [Canonical engineering documentation](./docs/canonical/README.md)
 - [Development guide](./docs/dev-guide.md)
 - [CDP testbed](./testbed/README.md)
 - [Agent skill installation](./skills/README.md)

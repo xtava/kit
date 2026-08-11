@@ -74,7 +74,7 @@ cargo run -- domain example.io  # run a tool with args
 cargo test                  # unit tests (engine logic — no network, no /proc needed)
 cargo clippy --all-targets  # lints
 cargo fmt                   # format
-cargo install --path .      # build & drop `kit` into ~/.cargo/bin
+./install.sh                # install the managed binary at ~/.local/bin/kit
 ```
 
 `bacon` is a nicer TUI version of the check loop if you ever want it
@@ -104,6 +104,27 @@ The handful that matter for a dev tool — no enterprise ceremony.
 - **Doc-comment the public surface.** `///` on the types and `pub` items that
   carry meaning; let good names and shapes do the rest. No narration inside
   function bodies.
+
+### Testing external commands
+
+Use `framework::process::test_support::CommandFixture` when a tool shells out to
+another executable. The fixture is a real, portable process, so production code
+still crosses the canonical `ProcessSupervisor` boundary while tests control its
+arguments, stdin, output events, delays, exit status, and lifetime.
+
+- Define exact argument matches with `respond`; inspect completed calls through
+  `invocations` or await a live one with `wait_for_invocation`.
+- Model streaming and cancellation explicitly with ordered `OutputEvent`s and
+  `CommandResponse::hang`; do not generate ad hoc shell scripts in tool tests.
+- Use `record_commands` only to bootstrap a fixture from a real executable. Raw
+  captures stay untracked under `target/command-recordings`; only the sanitized
+  JSON scenario is written to the requested repository path.
+- Recording closes stdin and captures static stdout/stderr. Add secret- and
+  machine-specific values to `RecordingPolicy` before recording, then model any
+  timing, interleaving, or hanging behavior manually.
+
+This keeps mocks at the operating-system boundary, reusable across tools, and
+honest about the process behavior they exercise.
 
 ---
 

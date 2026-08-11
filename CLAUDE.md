@@ -74,7 +74,7 @@ Every change, not just the big ones:
 cargo clippy --all-targets    # zero warnings
 cargo test                    # green
 cargo fmt                     # clean
-cargo install --path .        # the binary the user runs is the code you wrote
+./install.sh                  # installs the managed binary at ~/.local/bin/kit
 ```
 
 A `kit cdp` change isn't done until it's been run against a live Instance — the
