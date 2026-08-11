@@ -7,9 +7,9 @@ work in Claude Code, Codex, and any other spec-conformant tool — only the
 *discovery* path differs per platform, and that is handled by projections:
 
 ```
-skills/kit-cdp/            ← canonical content (edit here, and only here)
-.claude/skills/kit-cdp     ← symlink: Claude Code project discovery
-.agents/skills/kit-cdp     ← symlink: Codex (and ecosystem) repo discovery
+skills/<name>/             ← canonical content (edit here, and only here)
+.claude/skills/<name>      ← symlink: Claude Code project discovery
+.agents/skills/<name>      ← symlink: Codex (and ecosystem) repo discovery
 .claude-plugin/plugin.json ← the repo doubles as a Claude Code plugin
 ```
 
@@ -35,9 +35,17 @@ claude --plugin-dir /path/to/kit
 ```bash
 mkdir -p ~/.agents/skills
 ln -s /path/to/kit/skills/kit-cdp ~/.agents/skills/kit-cdp
+ln -s /path/to/kit/skills/kit-dev-log ~/.agents/skills/kit-dev-log
+ln -s /path/to/kit/skills/kit-tsgo ~/.agents/skills/kit-tsgo
 ```
 
-**Anything else that speaks Agent Skills** — point it at `skills/kit-cdp/`.
+**Anything else that speaks Agent Skills** — point it at the desired directory under `skills/`.
+
+## Available skills
+
+- `kit-cdp` — drive and verify live Electron or Chrome applications.
+- `kit-dev-log` — create, update, and resume durable Kit engineering session ledgers.
+- `kit-tsgo` — trace semantic TypeScript callers and callees through Kit's warm native server.
 
 ## Adding a skill
 
