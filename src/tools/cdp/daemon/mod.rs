@@ -15,12 +15,12 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::mpsc;
-use tokio::time::{interval, sleep};
+use tokio::sync::{mpsc, oneshot};
+use tokio::time::{interval, sleep, timeout};
 
 use super::protocol::{
-    Command, Expectation, Frame, IgnoreOp, LaunchSettings, Locator, NetCommand, Query, Reply,
-    ScreenshotRequest, Settle, SubscriptionOverload, TargetActivity, TimelineQuery,
+    Command, Expectation, Frame, IgnoreOp, LaunchSettings, Locator, NetCommand, PerformanceRequest,
+    Query, Reply, ScreenshotRequest, Settle, SubscriptionOverload, TargetActivity, TimelineQuery,
     DEFAULT_CAPTURE_TIMEOUT_MS,
 };
 use super::readiness::{self, DocState, Readiness};
@@ -195,6 +195,10 @@ struct State {
     /// Decoded source maps by scriptId. `None` caches a failed fetch/decode so it isn't retried
     /// on every resolution.
     source_maps: HashMap<String, Option<Arc<cdp::SourceMap>>>,
+    /// Target sessions with an active Chrome sampling profiler.
+    active_performance: HashSet<String>,
+    /// One-shot layer-tree snapshots requested by an active performance capture.
+    layer_metrics_waiters: HashMap<String, oneshot::Sender<cdp::LayerMetrics>>,
     /// Live `Subscribe` clients. Each gets every emitted event; senders to dropped clients are
     /// pruned on the next `emit`.
     subscribers: Vec<SubscriberSender>,
@@ -321,6 +325,8 @@ pub async fn serve(
         debugger_enabled: HashSet::new(),
         scripts: HashMap::new(),
         source_maps: HashMap::new(),
+        active_performance: HashSet::new(),
+        layer_metrics_waiters: HashMap::new(),
         snapshots: HashMap::new(),
         subscribers: Vec::new(),
         start: Instant::now(),
@@ -440,10 +446,35 @@ async fn apply_event(state: &Shared, event: &CdpEvent, tracks: &[TrackKind]) {
                 state.snapshots.remove(session);
                 state.trace_transport.remove(session);
                 state.debugger_enabled.remove(session);
+                state.active_performance.remove(session);
+                state.layer_metrics_waiters.remove(session);
                 state.prune_scripts(|record| record.session == session);
             }
         }
         "Runtime.bindingCalled" => trace::ingest_trace_payload(state, event),
+        "LayerTree.layerTreeDidChange" => {
+            let (Some(session), Some(layers)) =
+                (event.session.as_ref(), event.params.get("layers").and_then(Value::as_array))
+            else {
+                return;
+            };
+            let metrics = cdp::LayerMetrics {
+                total: layers.len(),
+                drawing: layers
+                    .iter()
+                    .filter(|layer| {
+                        layer.get("drawsContent").and_then(Value::as_bool) == Some(true)
+                    })
+                    .count(),
+                dom_mapped: layers
+                    .iter()
+                    .filter(|layer| layer.get("backendNodeId").and_then(Value::as_u64).is_some())
+                    .count(),
+            };
+            if let Some(waiter) = state.lock().unwrap().layer_metrics_waiters.remove(session) {
+                let _ = waiter.send(metrics);
+            }
+        }
         "Debugger.paused" => trace::handle_debugger_pause(state, event).await,
         "Debugger.scriptParsed" => sourcemaps::record_script(state, event),
         "Target.targetInfoChanged" => {
@@ -755,6 +786,8 @@ async fn reconnect(state: &Shared) -> Option<CdpEventStream> {
             state.debugger_enabled.clear();
             state.scripts.clear();
             state.source_maps.clear();
+            state.active_performance.clear();
+            state.layer_metrics_waiters.clear();
         };
         return Some(events);
     }
@@ -912,6 +945,9 @@ async fn dispatch(
         Command::TargetList => target_list_reply(state),
         Command::Refs { target } => refs_reply(state, target).await,
         Command::Heap { target } => heap_reply(state, target, json).await,
+        Command::Performance { target, request } => {
+            performance_reply(state, target, request, json).await
+        }
         Command::Snap { target, interactive, diff } => {
             snap_reply(state, target, interactive, diff, json).await
         }
@@ -2118,6 +2154,212 @@ async fn heap_reply(state: &Shared, target: Option<String>, json: bool) -> Reply
     };
     let metrics = cdp::probe_metrics(&conn, Some(&session)).await;
     Reply::ok(format::heap(&target.label(), &metrics, json))
+}
+
+async fn capture_layer_metrics(
+    state: &Shared,
+    conn: &CdpConnection,
+    session: &str,
+) -> (Option<cdp::LayerMetrics>, Option<String>) {
+    let receiver = {
+        let (sender, receiver) = oneshot::channel();
+        state.lock().unwrap().layer_metrics_waiters.insert(session.to_owned(), sender);
+        receiver
+    };
+    if let Err(error) = conn.call(Some(session), "LayerTree.enable", json!({})).await {
+        state.lock().unwrap().layer_metrics_waiters.remove(session);
+        return (None, Some(error.to_string()));
+    }
+    let result = timeout(Duration::from_secs(2), receiver).await;
+    state.lock().unwrap().layer_metrics_waiters.remove(session);
+    let _ = conn.call(Some(session), "LayerTree.disable", json!({})).await;
+    match result {
+        Ok(Ok(metrics)) => (Some(metrics), None),
+        Ok(Err(error)) => (None, Some(error.to_string())),
+        Err(_) => (None, Some("LayerTree snapshot timed out after 2s".to_owned())),
+    }
+}
+
+async fn performance_reply(
+    state: &Shared,
+    target: Option<String>,
+    request: PerformanceRequest,
+    json: bool,
+) -> Reply {
+    if !(100..=60_000).contains(&request.duration_ms) {
+        return Reply::fail("performance duration must be between 100ms and 60s");
+    }
+    if !(100..=1_000_000).contains(&request.sampling_interval_us) {
+        return Reply::fail("performance sampling interval must be between 100 and 1000000µs");
+    }
+    if !(1..=100).contains(&request.top) {
+        return Reply::fail("performance top count must be between 1 and 100");
+    }
+    if !(1..=9).contains(&request.repeat) || request.repeat % 2 == 0 {
+        return Reply::fail("performance repeat count must be odd and between 1 and 9");
+    }
+    if request.duration_ms.saturating_mul(request.repeat as u64) > 60_000 {
+        return Reply::fail("total performance capture time must not exceed 60s");
+    }
+
+    let (name, resolved) = {
+        let mut state = state.lock().unwrap();
+        let resolved = state.resolve(target.as_deref()).map(|(session, target)| {
+            let already_running = !state.active_performance.insert(session.clone());
+            (state.conn.clone(), session, target, already_running)
+        });
+        (state.name.clone(), resolved)
+    };
+    let Some((conn, session, target, already_running)) = resolved else {
+        return Reply::fail(no_target());
+    };
+    if already_running {
+        return Reply::fail(format!("performance capture already active for '{}'", target.label()));
+    }
+
+    let mut captures = Vec::with_capacity(request.repeat);
+    for _ in 0..request.repeat {
+        let (layers, layer_metrics_error) = capture_layer_metrics(state, &conn, &session).await;
+        match cdp::capture_performance(
+            &conn,
+            &session,
+            Duration::from_millis(request.duration_ms),
+            request.sampling_interval_us,
+            request.top,
+        )
+        .await
+        {
+            Ok(mut capture) => {
+                capture.report.layers = layers;
+                capture.report.layer_metrics_error = layer_metrics_error;
+                captures.push(capture);
+            }
+            Err(error) => {
+                state.lock().unwrap().active_performance.remove(&session);
+                return Reply::fail(format!("profile '{}': {error:#}", target.label()));
+            }
+        }
+    }
+    state.lock().unwrap().active_performance.remove(&session);
+
+    let base_path = request.out.unwrap_or_else(|| {
+        registry::artifact_dir(&name).join(format!("perf-{}.cpuprofile", now_unix_ms()))
+    });
+    if let Some(parent) = base_path.parent() {
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            return Reply::fail(format!("create {}: {error}", parent.display()));
+        }
+    }
+    let target_label = target.label();
+    let mut saved = Vec::with_capacity(captures.len());
+    for (index, capture) in captures.into_iter().enumerate() {
+        let profile_path = performance_sample_path(&base_path, index, request.repeat);
+        let report_path = profile_path.with_extension("perf.json");
+        let profile_bytes = match serde_json::to_vec(&capture.profile) {
+            Ok(bytes) => bytes,
+            Err(error) => return Reply::fail(format!("encode CPU profile: {error}")),
+        };
+        if let Err(error) = std::fs::write(&profile_path, profile_bytes) {
+            return Reply::fail(format!("write {}: {error}", profile_path.display()));
+        }
+        let report_json =
+            format::performance(&target_label, &profile_path, &report_path, &capture.report, true);
+        if let Err(error) = std::fs::write(&report_path, report_json) {
+            return Reply::fail(format!("write {}: {error}", report_path.display()));
+        }
+        saved.push((profile_path, report_path, capture.report));
+    }
+
+    if saved.len() == 1 {
+        let (profile_path, report_path, report) = &saved[0];
+        return Reply::ok(format::performance(
+            &target_label,
+            profile_path,
+            report_path,
+            report,
+            json,
+        ));
+    }
+
+    let mut ranked = (0..saved.len()).collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        performance_score(&saved[*left].2).total_cmp(&performance_score(&saved[*right].2))
+    });
+    let median_index = ranked[ranked.len() / 2];
+    let series_path = base_path.with_extension("perf.json");
+    let samples = saved
+        .iter()
+        .enumerate()
+        .map(|(index, (profile_path, report_path, report))| {
+            json!({
+                "sample": index + 1,
+                "profile": profile_path,
+                "reportPath": report_path,
+                "report": report,
+            })
+        })
+        .collect::<Vec<_>>();
+    let series = json!({
+        "target": target_label,
+        "medianSample": median_index + 1,
+        "samples": samples,
+    });
+    let series_json = match serde_json::to_string_pretty(&series) {
+        Ok(series) => series,
+        Err(error) => return Reply::fail(format!("encode performance series: {error}")),
+    };
+    if let Err(error) = std::fs::write(&series_path, &series_json) {
+        return Reply::fail(format!("write {}: {error}", series_path.display()));
+    }
+    if json {
+        return Reply::ok(series_json);
+    }
+
+    let sample_lines = saved
+        .iter()
+        .enumerate()
+        .map(|(index, (_, _, report))| {
+            let task = report.metric_deltas.get("TaskDuration").copied();
+            let script = report.metric_deltas.get("ScriptDuration").copied();
+            format!(
+                "  #{}  task {} · script {}",
+                index + 1,
+                task.map_or_else(|| "?".to_owned(), |value| format!("{value:.3}s")),
+                script.map_or_else(|| "?".to_owned(), |value| format!("{value:.3}s")),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let (profile_path, _, report) = &saved[median_index];
+    let median = format::performance(&target_label, profile_path, &series_path, report, false);
+    Reply::ok(format!(
+        "repeat     {} · median sample #{}\nsamples\n{}\n\n{}",
+        saved.len(),
+        median_index + 1,
+        sample_lines,
+        median,
+    ))
+}
+
+fn performance_sample_path(base: &Path, index: usize, repeat: usize) -> PathBuf {
+    if repeat == 1 {
+        return base.to_owned();
+    }
+    let stem = base.file_stem().and_then(|value| value.to_str()).unwrap_or("perf");
+    let extension = base.extension().and_then(|value| value.to_str()).unwrap_or("cpuprofile");
+    base.with_file_name(format!("{stem}-{}.{extension}", index + 1))
+}
+
+fn performance_score(report: &cdp::PerformanceReport) -> f64 {
+    report.metric_deltas.get("TaskDuration").copied().unwrap_or_else(|| {
+        let idle = report
+            .cpu
+            .hotspots
+            .iter()
+            .find(|hotspot| hotspot.function_name == "(idle)")
+            .map_or(0, |hotspot| hotspot.self_time_us);
+        report.cpu.total_sampled_us.saturating_sub(idle) as f64 / 1_000_000.0
+    })
 }
 
 /// How far back `ready` looks for fatal errors, and how many it shows — recent failures that would

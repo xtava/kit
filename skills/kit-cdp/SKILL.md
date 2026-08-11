@@ -5,8 +5,8 @@ description: >-
   warm Chrome DevTools Protocol debugger CLI. Use for UI self-verification
   against a running app, CDP clicks/fills/presses, screenshots, accessibility
   snapshots, console or network error diagnosis, live logpoints, function traces,
-  source-map stack resolution, websocket inspection, value watches, or evidence
-  bundles. Resolves the app owned by the current Git worktree automatically,
+  source-map stack resolution, CPU performance profiles, websocket inspection,
+  value watches, or evidence bundles. Resolves the app owned by the current Git worktree automatically,
   supports intentional cross-instance selection with `--app <selector>`, and
   every command supports `--json`.
 license: MIT
@@ -135,6 +135,31 @@ file in the artifact dir, or `-o <path>` (format from the extension: png/jpeg/we
 `--full` captures the whole scrollable page; `--raise` brings an occluded window
 to front first (visible side effect, so never the default). It captures the
 renderer surface over CDP — page pixels, not the OS window chrome.
+
+## Profile renderer performance
+
+Use one bounded `perf` capture instead of separate CPU, metric, heap, and DOM
+commands:
+
+```bash
+kit cdp perf --duration 5s --app dev
+kit cdp perf --duration 5s --repeat 3 --app dev
+kit cdp perf --duration 5s --target workspace --out /tmp/before.cpuprofile --app dev
+```
+
+The command prints task time, script time, heap and DOM counters, and hot functions
+ranked by sampled self-time. It saves a raw `.cpuprofile` for Chrome DevTools and a
+compact `.perf.json` report beside it. Use the same duration and app state for a
+before/after test.
+Use `--repeat 3` when ranking a change. Kit keeps all raw captures and reports the
+median task-time sample. Keep the same repeat count and app state on both sides.
+
+Read the split precisely:
+
+- High script time: inspect the hot functions in the CPU profile.
+- High drawing-layer count: inspect CSS masks, filters, sticky elements, and promoted surfaces.
+- High task time with low script time: inspect layout, paint, or compositor work.
+- Rising heap, DOM nodes, or listeners across repeat captures: test for retained trees.
 
 ## Locators
 

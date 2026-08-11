@@ -53,6 +53,7 @@ Failed assertions exit non-zero, so `&&` chains behave.
 | Observe | `tail [--since 5s] [--track …]` · `brief [--tail N] [--groups N]` · `console` · `net` · `ws` | slice or compact the Timeline |
 | Triage | `errors [--explain]` | what's broken — error-shaped events deduped to `error (N×)`, with a `⚠` banner when the view is lossy |
 | Probe | `state [--visual]` · `launch-log` · `snap [-i] [--diff]` · `eval <expr>/--file` · `heap` · `targets` | live one-shot query |
+| Profile | `perf [--duration 5s] [--target …] [--out …]` | capture CPU samples, main-thread metric deltas, heap, and DOM counters; save raw and compact artifacts |
 | Interact | `click <locator>` · `fill <locator> <text>` · `press <chord>` · `select <locator> <option>` | drive a Target; every interaction settles and (re)sets the `last-action` mark |
 | Assert | `wait '<expr>'` · `expect text/eval/net/no-errors` · `verify` | self-verification: poll a condition, assert one fact, or get a composite PASS/FAIL — all exit non-zero on failure |
 | Batch | `do "<step>; <step>"` · `flow ls/run/show` | run whole sequences daemon-side in one round trip; flows are saved, parameterized step files |
@@ -265,6 +266,29 @@ eviction, undecoded error-domain events, `--limit`, or older one-off logs could
 hide useful detail, the brief says so and points back to `tail` / `errors
 --explain`.
 
+## Performance capture
+
+`kit cdp perf` uses the warm target connection. It records a Chrome CPU profile,
+composited-layer counts, and matching main-thread, heap, and DOM counter deltas:
+
+```bash
+kit cdp perf --app checkout
+kit cdp perf --duration 5s --repeat 3 --app checkout
+kit cdp perf --duration 10s --target workspace --app checkout
+kit cdp perf --duration 5s --out /tmp/checkout.cpuprofile --app checkout
+```
+
+The text result shows task and script time, layer and memory counters, and hot
+functions ranked by sampled self-time. `--json` returns the full compact report.
+The raw `.cpuprofile` opens in Chrome DevTools. A `.perf.json` report is written
+beside it. The default output directory is the Attachment artifact directory.
+Use an odd `--repeat` count to keep all raw captures and select the median task-time
+sample. The total capture window is capped at 60 seconds.
+
+Capture the same duration and app state before and after a change. CPU samples
+explain JavaScript work. A high task delta with low script time points to browser
+layout, paint, or compositor work and needs a Chrome trace for the next split.
+
 ## Controlled launcher
 
 `kit cdp launch <url> --name <session>` starts Chrome on an isolated profile,
@@ -354,6 +378,7 @@ kit cdp net rules clear --app checkout
 | `mark <name>` | Add a named Timeline mark for later `--since-mark`, `after`, and `bundle --since`. |
 | `after <mark>` | Wait for idle or timeout, then summarize events since the mark. |
 | `bundle [name]` | Export a redacted evidence folder for handoff. |
+| `perf` | Capture CPU samples and matching main-thread, heap, and DOM deltas. |
 | `profile ls/new/clone` | Manage explicit named browser profiles; never uses the normal Chrome profile. |
 | `net failed/slow/show/block/mock/rules` | Inspect and mutate session-scoped network behavior. |
 

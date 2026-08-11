@@ -30,7 +30,9 @@ use clap::{
 use crate::cdp::{ImageFormat, Source, TrackKind};
 use crate::framework::{Context, Tool, ToolMeta};
 
-use protocol::{Command, IgnoreOp, NetCommand, ScreenshotRequest, TimelineQuery};
+use protocol::{
+    Command, IgnoreOp, NetCommand, PerformanceRequest, ScreenshotRequest, TimelineQuery,
+};
 
 pub fn tool() -> CdpTool {
     CdpTool
@@ -187,6 +189,18 @@ EXAMPLES
   kit cdp verify --app checkout
   kit cdp verify --since-mark before-save --app checkout
   kit cdp verify --since 2m --app checkout
+";
+
+const PERF_AFTER_HELP: &str = "\
+CAPTURE
+  Records a Chrome CPU profile and Performance-domain deltas for one target. The raw .cpuprofile
+  opens in Chrome DevTools. A compact JSON report is written beside it.
+
+EXAMPLES
+  kit cdp perf --app checkout
+  kit cdp perf --duration 5s --repeat 3 --app checkout
+  kit cdp perf --duration 10s --target workspace --app checkout
+  kit cdp perf --duration 5s --out /tmp/checkout.cpuprofile --app checkout
 ";
 
 const WATCH_AFTER_HELP: &str = "\
@@ -674,6 +688,27 @@ enum CdpCommand {
     },
     /// JS heap + DOM counters for a Target, on demand.
     Heap {
+        #[arg(long)]
+        target: Option<String>,
+    },
+    /// Capture a CPU profile, main-thread metrics, heap, and DOM counters for one Target.
+    #[command(after_help = PERF_AFTER_HELP)]
+    Perf {
+        /// Sampling window. Accepts ms, s, or m; bounded to 100ms–60s.
+        #[arg(long, default_value = "5s")]
+        duration: String,
+        /// Chrome sampling interval in microseconds.
+        #[arg(long, default_value_t = 1_000)]
+        sampling_interval_us: u64,
+        /// Hot functions to include in the compact report.
+        #[arg(long, default_value_t = 15)]
+        top: usize,
+        /// Repeat count for a median sample. Must be odd and between 1 and 9.
+        #[arg(long, default_value_t = 1)]
+        repeat: usize,
+        /// Raw .cpuprofile path. Defaults to the Attachment artifact directory.
+        #[arg(long)]
+        out: Option<PathBuf>,
         #[arg(long)]
         target: Option<String>,
     },
@@ -1326,6 +1361,34 @@ fn session_command(command: CdpCommand) -> Result<Command> {
             timeout_ms: parse_duration(&timeout)?,
         },
         CdpCommand::Heap { target } => Command::Heap { target },
+        CdpCommand::Perf { duration, sampling_interval_us, top, repeat, out, target } => {
+            let duration_ms = parse_duration(&duration)?;
+            if !(100..=60_000).contains(&duration_ms) {
+                bail!("--duration must be between 100ms and 60s");
+            }
+            if !(1..=100).contains(&top) {
+                bail!("--top must be between 1 and 100");
+            }
+            if !(100..=1_000_000).contains(&sampling_interval_us) {
+                bail!("--sampling-interval-us must be between 100 and 1000000");
+            }
+            if !(1..=9).contains(&repeat) || repeat % 2 == 0 {
+                bail!("--repeat must be odd and between 1 and 9");
+            }
+            if duration_ms.saturating_mul(repeat as u64) > 60_000 {
+                bail!("--duration multiplied by --repeat must not exceed 60s");
+            }
+            Command::Performance {
+                target,
+                request: PerformanceRequest {
+                    duration_ms,
+                    sampling_interval_us,
+                    top,
+                    repeat,
+                    out: out.map(absolute_from_cwd).transpose()?,
+                },
+            }
+        }
         CdpCommand::Snap { interactive, diff, target } => {
             Command::Snap { target, interactive, diff }
         }

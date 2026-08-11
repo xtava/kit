@@ -9,6 +9,7 @@ pub(crate) mod base64;
 mod client;
 mod discovery;
 mod http;
+mod performance;
 mod ports;
 mod sourcemap;
 mod target;
@@ -21,6 +22,10 @@ pub use client::{
 pub use discovery::{
     browser_endpoint, discover, discover_in_worktree, discover_port, is_cdp, node_endpoint,
     targets, BrowserEndpoint, Instance, NodeEndpoint,
+};
+pub use performance::{
+    capture_performance, CpuHotspot, CpuProfileSummary, LayerMetrics, PerformanceCapture,
+    PerformanceReport,
 };
 pub use ports::{listening_ports, owner_pid};
 pub use sourcemap::{inline_map, resolve_map_url, SourceMap, SourceMatch};

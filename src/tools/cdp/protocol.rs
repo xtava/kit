@@ -133,6 +133,15 @@ pub struct Query {
     pub json: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerformanceRequest {
+    pub duration_ms: u64,
+    pub sampling_interval_us: u64,
+    pub top: usize,
+    pub repeat: usize,
+    pub out: Option<PathBuf>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Command {
     Ping,
@@ -191,6 +200,10 @@ pub enum Command {
     },
     Heap {
         target: Option<String>,
+    },
+    Performance {
+        target: Option<String>,
+        request: PerformanceRequest,
     },
     Snap {
         target: Option<String>,
@@ -580,6 +593,16 @@ mod tests {
             Command::Eval { target: target.clone(), expr: "1+1".to_owned() },
             Command::Ready { target: target.clone() },
             Command::Heap { target: target.clone() },
+            Command::Performance {
+                target: target.clone(),
+                request: PerformanceRequest {
+                    duration_ms: 5_000,
+                    sampling_interval_us: 1_000,
+                    top: 15,
+                    repeat: 3,
+                    out: Some(PathBuf::from("/tmp/checkout.cpuprofile")),
+                },
+            },
             Command::Snap { target: target.clone(), interactive: true, diff: true },
             Command::Screenshot {
                 target: target.clone(),

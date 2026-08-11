@@ -2,13 +2,14 @@
 //! carries. Compact text is the default (cheap for an agent to read); `--json` gives full structure.
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use serde::Serialize;
 use serde_json::Value;
 
 use crate::cdp::{
-    group_errors, ErrorGroup, ErrorReport, EventIngressSnapshot, NetPhase, Target, TargetKind,
-    TargetMetrics, TimelineEvent, TraceOutcome, TraceRecord, Track, WsDir,
+    group_errors, ErrorGroup, ErrorReport, EventIngressSnapshot, NetPhase, PerformanceReport,
+    Target, TargetKind, TargetMetrics, TimelineEvent, TraceOutcome, TraceRecord, Track, WsDir,
 };
 
 fn pretty<T: Serialize + ?Sized>(value: &T) -> String {
@@ -509,6 +510,95 @@ pub fn heap(target: &str, metrics: &TargetMetrics, json: bool) -> String {
     )
 }
 
+#[derive(Serialize)]
+struct PerformanceView<'a> {
+    target: &'a str,
+    profile: &'a Path,
+    report_path: &'a Path,
+    #[serde(flatten)]
+    report: &'a PerformanceReport,
+}
+
+pub fn performance(
+    target: &str,
+    profile: &Path,
+    report_path: &Path,
+    report: &PerformanceReport,
+    json: bool,
+) -> String {
+    if json {
+        return pretty(&PerformanceView { target, profile, report_path, report });
+    }
+
+    let wall_seconds = report.wall_time_ms as f64 / 1_000.0;
+    let metric = |name: &str| report.metric_deltas.get(name).copied().unwrap_or(0.0);
+    let percent = |seconds: f64| {
+        if wall_seconds == 0.0 {
+            0.0
+        } else {
+            seconds * 100.0 / wall_seconds
+        }
+    };
+    let main = report.performance_metrics_error.as_ref().map_or_else(
+        || {
+            format!(
+                "main       task {:.3}s ({:.1}%) · script {:.3}s ({:.1}%) · layout {:.3}s · style {:.3}s",
+                metric("TaskDuration"),
+                percent(metric("TaskDuration")),
+                metric("ScriptDuration"),
+                percent(metric("ScriptDuration")),
+                metric("LayoutDuration"),
+                metric("RecalcStyleDuration"),
+            )
+        },
+        |error| format!("main       unavailable · {error}"),
+    );
+    let layers = report.layers.as_ref().map_or_else(
+        || {
+            format!(
+                "layers     unavailable · {}",
+                report.layer_metrics_error.as_deref().unwrap_or("no snapshot")
+            )
+        },
+        |layers| {
+            format!(
+                "layers     {} total · {} drawing · {} DOM-mapped",
+                layers.total, layers.drawing, layers.dom_mapped
+            )
+        },
+    );
+    let mut lines = vec![
+        format!("target     {target}"),
+        format!("window     {:.3}s wall · {}µs samples", wall_seconds, report.sampling_interval_us),
+        main,
+        layers,
+        format!(
+            "memory     heap {} → {} · nodes {} → {} · listeners {} → {} · docs {} → {}",
+            heap_size(report.before.js_heap_kib),
+            heap_size(report.after.js_heap_kib),
+            opt(report.before.dom_nodes),
+            opt(report.after.dom_nodes),
+            opt(report.before.listeners),
+            opt(report.after.listeners),
+            opt(report.before.documents),
+            opt(report.after.documents),
+        ),
+        format!("profile    {}", profile.display()),
+        format!("report     {}", report_path.display()),
+        "hot self".to_owned(),
+    ];
+    lines.extend(report.cpu.hotspots.iter().map(|hotspot| {
+        format!(
+            "  {:>6.2}%  {:>8.1}ms  {}{}",
+            hotspot.self_percent,
+            hotspot.self_time_us as f64 / 1_000.0,
+            hotspot.function_name,
+            location(&hotspot.url, hotspot.line),
+        )
+    }));
+    lines.join("\n")
+}
+
 pub fn ignore(patterns: &[String], json: bool) -> String {
     if json {
         return pretty(patterns);
@@ -617,6 +707,10 @@ fn short_url(url: &str) -> String {
 
 fn opt(value: Option<u64>) -> String {
     value.map(|value| value.to_string()).unwrap_or_else(|| "?".to_owned())
+}
+
+fn heap_size(kib: Option<u64>) -> String {
+    kib.map(|kib| format!("{:.1} MiB", kib as f64 / 1024.0)).unwrap_or_else(|| "?".to_owned())
 }
 
 fn human_ms(ms: u64) -> String {
