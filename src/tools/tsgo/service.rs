@@ -1,14 +1,16 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     ffi::OsString,
     num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, bail, Context as _, Result};
+use ignore::WalkBuilder;
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
@@ -27,8 +29,9 @@ use crate::framework::process::{
 };
 
 use super::protocol::{
-    CallKind, ChildIdentity, ServiceCommand, ServiceIdentity, ServiceInfo, ServiceReply,
-    ServiceRequest,
+    ChildIdentity, ServiceCommand, ServiceIdentity, ServiceInfo, ServiceReply, ServiceRequest,
+    TraceCandidate, TraceDirection, TraceDiscovery, TraceEdge, TraceLimits, TraceLocation,
+    TraceNode, TracePath, TraceResult, TraceSelector, TraceSummary, TraceTiming,
 };
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -37,6 +40,10 @@ const PROCESS_KILL_WAIT: Duration = Duration::from_secs(3);
 const SOCKET_REQUEST_LIMIT: u64 = 1024 * 1024;
 const LSP_MESSAGE_LIMIT: usize = 16 * 1024 * 1024;
 const STREAM_BUDGET: NonZeroUsize = NonZeroUsize::new(4 * 1024 * 1024).unwrap();
+const DISCOVERY_MATCH_LIMIT: usize = 256;
+const MAX_TRACE_DEPTH: u32 = 64;
+const MAX_TRACE_NODES: usize = 4_096;
+const MAX_TRACE_PATHS: usize = 1_024;
 
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
@@ -129,8 +136,8 @@ async fn run_actor(
                     stop: false,
                 });
             }
-            ServiceCommand::Call { kind, file, line, character, item } => {
-                match lsp.call(kind, &file, line, character, item).await {
+            ServiceCommand::Trace { selector, direction, limits } => {
+                match lsp.trace(selector, direction, limits).await {
                     Ok(result) => {
                         request_count += 1;
                         let service = service_info(
@@ -393,7 +400,11 @@ impl LspSession {
                     "rootUri": root_uri,
                     "workspaceFolders": [{ "uri": root_uri, "name": workspace_name(&self.workspace) }],
                     "capabilities": {
-                        "workspace": { "configuration": true, "workspaceFolders": true },
+                        "workspace": {
+                            "configuration": true,
+                            "workspaceFolders": true,
+                            "symbol": { "dynamicRegistration": false }
+                        },
                         "textDocument": {
                             "synchronization": { "dynamicRegistration": false, "didSave": false },
                             "callHierarchy": { "dynamicRegistration": false }
@@ -408,46 +419,329 @@ impl LspSession {
         self.notify("initialized", Some(json!({}))).await
     }
 
-    async fn call(
+    async fn trace(
         &mut self,
-        kind: CallKind,
-        file: &Path,
-        line: u32,
-        character: u32,
-        item: usize,
+        selector: TraceSelector,
+        direction: TraceDirection,
+        limits: TraceLimits,
     ) -> Result<Value> {
-        let file = file
-            .canonicalize()
-            .with_context(|| format!("canonicalize TypeScript file {}", file.display()))?;
-        if !file.starts_with(&self.workspace) {
-            bail!("{} is outside workspace {}", file.display(), self.workspace.display());
-        }
-        self.synchronize_document(&file).await?;
-        let uri = file_uri(&file)?;
-        let prepared = self
-            .request(
-                "textDocument/prepareCallHierarchy",
-                Some(json!({
-                    "textDocument": { "uri": uri },
-                    "position": { "line": line, "character": character }
-                })),
-            )
-            .await?;
-        if matches!(kind, CallKind::Prepare) {
-            return Ok(prepared);
-        }
-        let items = prepared
+        validate_trace_limits(limits)?;
+        let started = Instant::now();
+        let request_start = self.next_request_id;
+        let selector_name = selector.display_name();
+        let (prepared, candidates, discovery) = self.resolve_selector(&selector).await?;
+        let prepared_items = prepared
             .as_array()
             .context("native tsgo returned a non-array call hierarchy preparation result")?;
-        let selected = items.get(item).cloned().with_context(|| {
-            format!("call hierarchy item {item} is unavailable ({} prepared)", items.len())
-        })?;
-        let method = match kind {
-            CallKind::Incoming => "callHierarchy/incomingCalls",
-            CallKind::Outgoing => "callHierarchy/outgoingCalls",
-            CallKind::Prepare => unreachable!(),
+
+        let mut result = empty_trace_result(selector_name, direction, candidates, discovery);
+        match prepared_items.len() {
+            0 => result.status = "not-found".to_owned(),
+            1 => {
+                result = self
+                    .traverse(
+                        prepared_items[0].clone(),
+                        result,
+                        direction,
+                        limits,
+                    )
+                    .await?;
+            }
+            _ => {
+                result.status = "ambiguous".to_owned();
+                if result.candidates.is_empty() {
+                    result.candidates = prepared_items
+                        .iter()
+                        .map(|item| trace_candidate(item, &self.workspace))
+                        .collect::<Result<Vec<_>>>()?;
+                }
+            }
+        }
+        if result.target.is_none() {
+            if result.discovery.truncated {
+                result.status = "truncated".to_owned();
+                result
+                    .truncation_reasons
+                    .push("symbol discovery candidate limit reached".to_owned());
+            }
+            result.summary.truncated = result.discovery.truncated;
+        }
+        result.timing = TraceTiming {
+            elapsed_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+            native_requests: self.next_request_id.saturating_sub(request_start),
         };
-        self.request(method, Some(json!({ "item": selected }))).await
+        serde_json::to_value(result).context("encode typed tsgo trace result")
+    }
+
+    async fn resolve_selector(
+        &mut self,
+        selector: &TraceSelector,
+    ) -> Result<(Value, Vec<TraceCandidate>, TraceDiscovery)> {
+        match selector {
+            TraceSelector::Position { file, line, character } => {
+                let file = file
+                    .canonicalize()
+                    .with_context(|| format!("canonicalize TypeScript file {}", file.display()))?;
+                if !file.starts_with(&self.workspace) {
+                    bail!("{} is outside workspace {}", file.display(), self.workspace.display());
+                }
+                let prepared = self.prepare_at(&file, *line, *character).await?;
+                let candidates = prepared
+                    .as_array()
+                    .context("native tsgo returned a non-array call hierarchy preparation result")?
+                    .iter()
+                    .map(|item| trace_candidate(item, &self.workspace))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok((prepared, candidates, TraceDiscovery::default()))
+            }
+            TraceSelector::Symbol { query, scope } => {
+                let mut discovery = TraceDiscovery::default();
+                let mut symbols = self.semantic_symbols(query, scope.as_deref()).await?;
+                if symbols.is_empty() {
+                    let workspace = self.workspace.clone();
+                    let scan_root = scope.clone().unwrap_or_else(|| workspace.clone());
+                    let needle = symbol_leaf(query)?.to_owned();
+                    let found = tokio::task::spawn_blocking(move || {
+                        discover_candidate_files(&workspace, &scan_root, &needle)
+                    })
+                    .await
+                    .context("join TypeScript symbol discovery")??;
+                    discovery.scanned_files = found.scanned_files;
+                    discovery.truncated = found.truncated;
+                    for file in found.files {
+                        self.synchronize_document(&file).await?;
+                        discovery.activated_files += 1;
+                    }
+                    symbols = self.semantic_symbols(query, scope.as_deref()).await?;
+                }
+
+                let semantic_candidates = symbols
+                    .iter()
+                    .map(|symbol| workspace_symbol_candidate(symbol, &self.workspace))
+                    .collect::<Result<Vec<_>>>()?;
+                if symbols.len() != 1 {
+                    return Ok((Value::Array(symbols), semantic_candidates, discovery));
+                }
+
+                let symbol = &symbols[0];
+                let file = workspace_symbol_file(symbol)?;
+                self.synchronize_document(&file).await?;
+                let (line, fallback_character) = workspace_symbol_position(symbol)?;
+                let name = symbol
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .context("workspace symbol omitted its name")?;
+                let character = self
+                    .declaration_character(&file, line, name)
+                    .unwrap_or(fallback_character);
+                let prepared = self.prepare_at(&file, line, character).await?;
+                let prepared_items = prepared.as_array().context(
+                    "native tsgo returned a non-array call hierarchy preparation result",
+                )?;
+                let candidates = if prepared_items.len() > 1 {
+                    prepared_items
+                        .iter()
+                        .map(|item| trace_candidate(item, &self.workspace))
+                        .collect::<Result<Vec<_>>>()?
+                } else {
+                    semantic_candidates
+                };
+                Ok((prepared, candidates, discovery))
+            }
+        }
+    }
+
+    async fn semantic_symbols(&mut self, query: &str, scope: Option<&Path>) -> Result<Vec<Value>> {
+        let leaf = symbol_leaf(query)?;
+        let response = self
+            .request("workspace/symbol", Some(json!({ "query": leaf })))
+            .await?;
+        let mut matches = response
+            .as_array()
+            .context("native tsgo returned a non-array workspace symbol result")?
+            .iter()
+            .filter(|symbol| workspace_symbol_matches(symbol, query, scope))
+            .cloned()
+            .collect::<Vec<_>>();
+        matches.sort_by_key(workspace_symbol_sort_key);
+        Ok(matches)
+    }
+
+    async fn prepare_at(&mut self, file: &Path, line: u32, character: u32) -> Result<Value> {
+        self.synchronize_document(file).await?;
+        self.request(
+            "textDocument/prepareCallHierarchy",
+            Some(json!({
+                "textDocument": { "uri": file_uri(file)? },
+                "position": { "line": line, "character": character }
+            })),
+        )
+        .await
+    }
+
+    fn declaration_character(&self, file: &Path, line: u32, name: &str) -> Option<u32> {
+        let text = &self.documents.get(file)?.text;
+        let source_line = text.lines().nth(usize::try_from(line).ok()?)?;
+        identifier_offsets(source_line, name).next().and_then(|offset| {
+            source_line[..offset].encode_utf16().count().try_into().ok()
+        })
+    }
+
+    async fn traverse(
+        &mut self,
+        root_item: Value,
+        mut result: TraceResult,
+        direction: TraceDirection,
+        limits: TraceLimits,
+    ) -> Result<TraceResult> {
+        let (target_id, target_node) = trace_node(&root_item, &self.workspace)?;
+        result.target = Some(target_id.clone());
+        result.nodes.insert(target_id.clone(), target_node);
+
+        let mut items = HashMap::from([(target_id.clone(), root_item)]);
+        let mut queue = VecDeque::from([(target_id.clone(), 0u32)]);
+        let mut expanded = BTreeSet::new();
+        let mut edges = BTreeMap::<(String, String), TraceEdge>::new();
+        let mut adjacency = BTreeMap::<String, BTreeSet<String>>::new();
+        let mut boundaries = BTreeSet::new();
+        let mut truncation_reasons = BTreeSet::new();
+
+        while let Some((current_id, depth)) = queue.pop_front() {
+            if !expanded.insert(current_id.clone()) {
+                continue;
+            }
+            let current = items
+                .get(&current_id)
+                .cloned()
+                .context("trace graph lost its native call hierarchy item")?;
+            let current_node = result
+                .nodes
+                .get(&current_id)
+                .context("trace graph lost its normalized node")?;
+            if current_node.external {
+                boundaries.insert(current_id);
+                continue;
+            }
+            self.synchronize_item_document(&current).await?;
+            let method = match direction {
+                TraceDirection::Callers => "callHierarchy/incomingCalls",
+                TraceDirection::Callees => "callHierarchy/outgoingCalls",
+            };
+            let response = self.request(method, Some(json!({ "item": current }))).await?;
+            let calls = match response.as_array() {
+                Some(calls) => calls,
+                None if response.is_null() => continue,
+                None => bail!("native tsgo returned a non-array {method} result"),
+            };
+            if depth >= limits.max_depth && !calls.is_empty() {
+                truncation_reasons.insert(format!(
+                    "maximum depth {} reached",
+                    limits.max_depth
+                ));
+                continue;
+            }
+
+            for call in calls {
+                let other = match direction {
+                    TraceDirection::Callers => call.get("from"),
+                    TraceDirection::Callees => call.get("to"),
+                }
+                .context("native tsgo call omitted its related item")?;
+                let (other_id, other_node) = trace_node(other, &self.workspace)?;
+                let is_new = !result.nodes.contains_key(&other_id);
+                if is_new && result.nodes.len() >= limits.max_nodes {
+                    truncation_reasons.insert(format!(
+                        "maximum node count {} reached",
+                        limits.max_nodes
+                    ));
+                    continue;
+                }
+                if is_new {
+                    if other_node.external {
+                        boundaries.insert(other_id.clone());
+                    }
+                    result.nodes.insert(other_id.clone(), other_node);
+                    items.insert(other_id.clone(), other.clone());
+                    queue.push_back((other_id.clone(), depth + 1));
+                }
+
+                let (caller, callee, caller_item) = match direction {
+                    TraceDirection::Callers => {
+                        (other_id.clone(), current_id.clone(), other)
+                    }
+                    TraceDirection::Callees => {
+                        (current_id.clone(), other_id.clone(), &current)
+                    }
+                };
+                let call_sites = trace_call_sites(call, caller_item, &self.workspace)?;
+                let cycle = caller == callee || path_exists(&adjacency, &callee, &caller);
+                let edge = edges
+                    .entry((caller.clone(), callee.clone()))
+                    .or_insert_with(|| TraceEdge {
+                        caller: caller.clone(),
+                        callee: callee.clone(),
+                        call_sites: Vec::new(),
+                        cycle,
+                    });
+                edge.cycle |= cycle;
+                for site in call_sites {
+                    if !edge.call_sites.contains(&site) {
+                        edge.call_sites.push(site);
+                    }
+                }
+                adjacency.entry(caller).or_default().insert(callee);
+            }
+        }
+
+        result.edges = edges.into_values().collect();
+        let (paths, path_truncated) = enumerate_paths(
+            direction,
+            &target_id,
+            &result.edges,
+            limits.max_paths,
+        );
+        if path_truncated {
+            truncation_reasons.insert(format!(
+                "maximum path count {} reached",
+                limits.max_paths
+            ));
+        }
+        result.paths = paths;
+        result.roots = result
+            .paths
+            .iter()
+            .filter_map(|path| path.nodes.first().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let cycle_count = result.edges.iter().filter(|edge| edge.cycle).count();
+        result.truncation_reasons = truncation_reasons.into_iter().collect();
+        let truncated = !result.truncation_reasons.is_empty() || result.discovery.truncated;
+        result.status = if truncated { "truncated" } else { "complete" }.to_owned();
+        result.summary = TraceSummary {
+            roots: result.roots.len(),
+            paths: result.paths.len(),
+            nodes: result.nodes.len(),
+            edges: result.edges.len(),
+            cycles: cycle_count,
+            boundaries: boundaries.len(),
+            truncated,
+        };
+        Ok(result)
+    }
+
+    async fn synchronize_item_document(&mut self, item: &Value) -> Result<()> {
+        let Some(file) = item_file(item) else {
+            return Ok(());
+        };
+        let canonical = match file.canonicalize() {
+            Ok(file) => file,
+            Err(_) => return Ok(()),
+        };
+        if canonical.starts_with(&self.workspace) {
+            self.synchronize_document(&canonical).await?;
+        }
+        Ok(())
     }
 
     async fn synchronize_document(&mut self, file: &Path) -> Result<()> {
@@ -469,7 +763,15 @@ impl LspSession {
                     })),
                 )
                 .await?;
-                self.documents.insert(file.to_path_buf(), DocumentState { version: 1, text });
+                self.notify(
+                    "textDocument/didChange",
+                    Some(json!({
+                        "textDocument": { "uri": uri, "version": 2 },
+                        "contentChanges": [{ "text": text }]
+                    })),
+                )
+                .await?;
+                self.documents.insert(file.to_path_buf(), DocumentState { version: 2, text });
             }
             Some(document) if document.text != text => {
                 document.version += 1;
@@ -665,6 +967,429 @@ impl LspSession {
                 report.run_id
             )),
         }
+    }
+}
+
+struct DiscoveryFiles {
+    files: Vec<PathBuf>,
+    scanned_files: usize,
+    truncated: bool,
+}
+
+fn validate_trace_limits(limits: TraceLimits) -> Result<()> {
+    if limits.max_depth > MAX_TRACE_DEPTH {
+        bail!("--max-depth may not exceed {MAX_TRACE_DEPTH}");
+    }
+    if limits.max_nodes == 0 || limits.max_nodes > MAX_TRACE_NODES {
+        bail!("--max-nodes must be between 1 and {MAX_TRACE_NODES}");
+    }
+    if limits.max_paths == 0 || limits.max_paths > MAX_TRACE_PATHS {
+        bail!("--max-paths must be between 1 and {MAX_TRACE_PATHS}");
+    }
+    Ok(())
+}
+
+fn empty_trace_result(
+    selector: String,
+    direction: TraceDirection,
+    candidates: Vec<TraceCandidate>,
+    discovery: TraceDiscovery,
+) -> TraceResult {
+    TraceResult {
+        status: String::new(),
+        selector,
+        direction,
+        target: None,
+        candidates,
+        nodes: BTreeMap::new(),
+        edges: Vec::new(),
+        roots: Vec::new(),
+        paths: Vec::new(),
+        summary: TraceSummary::default(),
+        timing: TraceTiming::default(),
+        discovery,
+        truncation_reasons: Vec::new(),
+    }
+}
+
+fn discover_candidate_files(
+    workspace: &Path,
+    scan_root: &Path,
+    needle: &str,
+) -> Result<DiscoveryFiles> {
+    if !scan_root.starts_with(workspace) {
+        bail!("symbol discovery root is outside its workspace");
+    }
+    let mut files = Vec::new();
+    let mut scanned_files = 0usize;
+    let mut truncated = false;
+    let walker = WalkBuilder::new(scan_root)
+        .standard_filters(true)
+        .follow_links(false)
+        .build();
+    for entry in walker {
+        let entry = entry.context("walk TypeScript symbol discovery scope")?;
+        if !entry.file_type().is_some_and(|kind| kind.is_file())
+            || !is_typescript_source(entry.path())
+        {
+            continue;
+        }
+        scanned_files += 1;
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        if identifier_offsets(&text, needle).next().is_none() {
+            continue;
+        }
+        files.push(
+            entry
+                .path()
+                .canonicalize()
+                .with_context(|| format!("canonicalize candidate {}", entry.path().display()))?,
+        );
+        if files.len() >= DISCOVERY_MATCH_LIMIT {
+            truncated = true;
+            break;
+        }
+    }
+    files.sort();
+    files.dedup();
+    Ok(DiscoveryFiles { files, scanned_files, truncated })
+}
+
+fn is_typescript_source(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some("ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs")
+    )
+}
+
+fn symbol_leaf(query: &str) -> Result<&str> {
+    let leaf = query.rsplit('.').next().unwrap_or(query).trim();
+    if leaf.is_empty() {
+        bail!("semantic symbol name must end in an identifier");
+    }
+    Ok(leaf)
+}
+
+fn identifier_offsets<'a>(text: &'a str, needle: &'a str) -> impl Iterator<Item = usize> + 'a {
+    text.match_indices(needle).filter_map(move |(offset, _)| {
+        let before = text[..offset].chars().next_back();
+        let after = text[offset + needle.len()..].chars().next();
+        (!before.is_some_and(is_identifier_character)
+            && !after.is_some_and(is_identifier_character))
+        .then_some(offset)
+    })
+}
+
+fn is_identifier_character(character: char) -> bool {
+    character.is_alphanumeric() || matches!(character, '_' | '$')
+}
+
+fn workspace_symbol_matches(symbol: &Value, query: &str, scope: Option<&Path>) -> bool {
+    let Some(name) = symbol.get("name").and_then(Value::as_str) else {
+        return false;
+    };
+    let semantic_name = symbol
+        .get("containerName")
+        .and_then(Value::as_str)
+        .filter(|container| !container.is_empty())
+        .map(|container| format!("{container}.{name}"));
+    if query != name && semantic_name.as_deref() != Some(query) {
+        return false;
+    }
+    match (scope, workspace_symbol_file(symbol).ok()) {
+        (Some(scope), Some(file)) => file.starts_with(scope),
+        (Some(_), None) => false,
+        (None, _) => true,
+    }
+}
+
+fn workspace_symbol_sort_key(symbol: &Value) -> String {
+    format!(
+        "{}\0{:010}\0{}",
+        symbol.pointer("/location/uri").and_then(Value::as_str).unwrap_or_default(),
+        symbol
+            .pointer("/location/range/start/line")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        symbol.get("name").and_then(Value::as_str).unwrap_or_default()
+    )
+}
+
+fn workspace_symbol_file(symbol: &Value) -> Result<PathBuf> {
+    let uri = symbol
+        .pointer("/location/uri")
+        .and_then(Value::as_str)
+        .context("workspace symbol omitted its file URI")?;
+    uri_file_path(uri)?.canonicalize().with_context(|| {
+        format!("canonicalize workspace symbol file returned by native tsgo: {uri}")
+    })
+}
+
+fn workspace_symbol_position(symbol: &Value) -> Result<(u32, u32)> {
+    let start = symbol
+        .pointer("/location/range/start")
+        .context("workspace symbol omitted its start position")?;
+    value_position(start)
+}
+
+fn workspace_symbol_candidate(symbol: &Value, workspace: &Path) -> Result<TraceCandidate> {
+    let file = workspace_symbol_file(symbol)?;
+    let (line, character) = workspace_symbol_position(symbol)?;
+    let name = symbol
+        .get("name")
+        .and_then(Value::as_str)
+        .context("workspace symbol omitted its name")?
+        .to_owned();
+    let detail = symbol
+        .get("containerName")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    Ok(TraceCandidate {
+        name,
+        detail,
+        kind: symbol.get("kind").and_then(Value::as_u64).unwrap_or_default(),
+        location: public_location(workspace, file, line, character),
+    })
+}
+
+fn trace_candidate(item: &Value, workspace: &Path) -> Result<TraceCandidate> {
+    let (file, line, character) = item_location(item)?;
+    Ok(TraceCandidate {
+        name: item
+            .get("name")
+            .and_then(Value::as_str)
+            .context("call hierarchy item omitted its name")?
+            .to_owned(),
+        detail: item.get("detail").and_then(Value::as_str).map(str::to_owned),
+        kind: item.get("kind").and_then(Value::as_u64).unwrap_or_default(),
+        location: public_location(workspace, file, line, character),
+    })
+}
+
+fn trace_node(item: &Value, workspace: &Path) -> Result<(String, TraceNode)> {
+    let uri = item
+        .get("uri")
+        .and_then(Value::as_str)
+        .context("call hierarchy item omitted its URI")?;
+    let (file, line, character) = item_location(item)?;
+    let canonical = file.canonicalize().unwrap_or(file);
+    let external = !canonical.starts_with(workspace);
+    let name = item
+        .get("name")
+        .and_then(Value::as_str)
+        .context("call hierarchy item omitted its name")?
+        .to_owned();
+    let detail = item.get("detail").and_then(Value::as_str).map(str::to_owned);
+    let kind = item.get("kind").and_then(Value::as_u64).unwrap_or_default();
+    let mut hash = Sha256::new();
+    hash.update(uri.as_bytes());
+    hash.update([0]);
+    hash.update(line.to_le_bytes());
+    hash.update(character.to_le_bytes());
+    hash.update(kind.to_le_bytes());
+    hash.update(name.as_bytes());
+    if let Some(detail) = &detail {
+        hash.update(detail.as_bytes());
+    }
+    let id = format!(
+        "sym_{}",
+        hash.finalize()[..16]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    let node = TraceNode {
+        id: id.clone(),
+        name,
+        detail,
+        kind,
+        definition: public_location(workspace, canonical, line, character),
+        external,
+    };
+    Ok((id, node))
+}
+
+fn item_location(item: &Value) -> Result<(PathBuf, u32, u32)> {
+    let uri = item
+        .get("uri")
+        .and_then(Value::as_str)
+        .context("call hierarchy item omitted its URI")?;
+    let start = item
+        .pointer("/selectionRange/start")
+        .or_else(|| item.pointer("/range/start"))
+        .context("call hierarchy item omitted its selection range")?;
+    let (line, character) = value_position(start)?;
+    let file = uri_file_path(uri).unwrap_or_else(|_| PathBuf::from(uri));
+    Ok((file, line, character))
+}
+
+fn item_file(item: &Value) -> Option<PathBuf> {
+    item.get("uri").and_then(Value::as_str).and_then(|uri| uri_file_path(uri).ok())
+}
+
+fn value_position(value: &Value) -> Result<(u32, u32)> {
+    let line = value
+        .get("line")
+        .and_then(Value::as_u64)
+        .context("LSP position omitted its line")?
+        .try_into()
+        .context("LSP line exceeds u32")?;
+    let character = value
+        .get("character")
+        .and_then(Value::as_u64)
+        .context("LSP position omitted its character")?
+        .try_into()
+        .context("LSP character exceeds u32")?;
+    Ok((line, character))
+}
+
+fn public_location(
+    workspace: &Path,
+    file: PathBuf,
+    line: u32,
+    character: u32,
+) -> TraceLocation {
+    let file = file.strip_prefix(workspace).map(Path::to_path_buf).unwrap_or(file);
+    TraceLocation { file, line: line + 1, character: character + 1 }
+}
+
+fn trace_call_sites(
+    call: &Value,
+    caller_item: &Value,
+    workspace: &Path,
+) -> Result<Vec<TraceLocation>> {
+    let unresolved_file =
+        item_file(caller_item).context("call hierarchy caller omitted a usable file URI")?;
+    let file = unresolved_file.canonicalize().unwrap_or(unresolved_file);
+    let ranges = call
+        .get("fromRanges")
+        .and_then(Value::as_array)
+        .context("native tsgo call omitted fromRanges")?;
+    ranges
+        .iter()
+        .map(|range| {
+            let start = range.get("start").context("call range omitted its start")?;
+            let (line, character) = value_position(start)?;
+            Ok(public_location(workspace, file.clone(), line, character))
+        })
+        .collect()
+}
+
+fn uri_file_path(uri: &str) -> Result<PathBuf> {
+    Url::parse(uri)
+        .with_context(|| format!("parse native tsgo URI {uri}"))?
+        .to_file_path()
+        .map_err(|()| anyhow!("native tsgo returned a non-file URI: {uri}"))
+}
+
+fn path_exists(
+    adjacency: &BTreeMap<String, BTreeSet<String>>,
+    start: &str,
+    target: &str,
+) -> bool {
+    let mut pending = vec![start.to_owned()];
+    let mut seen = BTreeSet::new();
+    while let Some(node) = pending.pop() {
+        if node == target {
+            return true;
+        }
+        if !seen.insert(node.clone()) {
+            continue;
+        }
+        if let Some(next) = adjacency.get(&node) {
+            pending.extend(next.iter().cloned());
+        }
+    }
+    false
+}
+
+fn enumerate_paths(
+    direction: TraceDirection,
+    target: &str,
+    edges: &[TraceEdge],
+    max_paths: usize,
+) -> (Vec<TracePath>, bool) {
+    let mut forward = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut reverse = BTreeMap::<String, BTreeSet<String>>::new();
+    for edge in edges {
+        forward.entry(edge.caller.clone()).or_default().insert(edge.callee.clone());
+        reverse.entry(edge.callee.clone()).or_default().insert(edge.caller.clone());
+    }
+    let adjacency = match direction {
+        TraceDirection::Callers => &reverse,
+        TraceDirection::Callees => &forward,
+    };
+    let mut paths = Vec::new();
+    let mut path = vec![target.to_owned()];
+    let mut visited = BTreeSet::from([target.to_owned()]);
+    let mut truncated = false;
+    enumerate_path_branch(
+        target,
+        direction,
+        adjacency,
+        &mut path,
+        &mut visited,
+        &mut paths,
+        max_paths,
+        &mut truncated,
+    );
+    (paths, truncated)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enumerate_path_branch(
+    current: &str,
+    direction: TraceDirection,
+    adjacency: &BTreeMap<String, BTreeSet<String>>,
+    path: &mut Vec<String>,
+    visited: &mut BTreeSet<String>,
+    output: &mut Vec<TracePath>,
+    max_paths: usize,
+    truncated: &mut bool,
+) {
+    if output.len() >= max_paths {
+        *truncated = true;
+        return;
+    }
+    let next = adjacency.get(current).cloned().unwrap_or_default();
+    if next.is_empty() {
+        let mut nodes = path.clone();
+        if matches!(direction, TraceDirection::Callers) {
+            nodes.reverse();
+        }
+        output.push(TracePath { nodes, cycle: false });
+        return;
+    }
+    for node in next {
+        if output.len() >= max_paths {
+            *truncated = true;
+            break;
+        }
+        path.push(node.clone());
+        if visited.contains(&node) {
+            let mut nodes = path.clone();
+            if matches!(direction, TraceDirection::Callers) {
+                nodes.reverse();
+            }
+            output.push(TracePath { nodes, cycle: true });
+        } else {
+            visited.insert(node.clone());
+            enumerate_path_branch(
+                &node,
+                direction,
+                adjacency,
+                path,
+                visited,
+                output,
+                max_paths,
+                truncated,
+            );
+            visited.remove(&node);
+        }
+        path.pop();
     }
 }
 

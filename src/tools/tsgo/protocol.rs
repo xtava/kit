@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -25,12 +25,46 @@ pub struct RegistryRecord {
     pub published_at_ms: u64,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum CallKind {
-    Prepare,
-    Incoming,
-    Outgoing,
+pub enum TraceDirection {
+    Callers,
+    Callees,
+}
+
+impl TraceDirection {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Callers => "Callers",
+            Self::Callees => "Callees",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "selector", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum TraceSelector {
+    Position { file: PathBuf, line: u32, character: u32 },
+    Symbol { query: String, scope: Option<PathBuf> },
+}
+
+impl TraceSelector {
+    pub fn display_name(&self) -> String {
+        match self {
+            Self::Position { file, line, character } => {
+                format!("{}:{}:{}", file.display(), line + 1, character + 1)
+            }
+            Self::Symbol { query, .. } => query.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TraceLimits {
+    pub max_depth: u32,
+    pub max_nodes: usize,
+    pub max_paths: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -38,12 +72,10 @@ pub enum CallKind {
 pub enum ServiceCommand {
     Ping,
     Inspect,
-    Call {
-        kind: CallKind,
-        file: PathBuf,
-        line: u32,
-        character: u32,
-        item: usize,
+    Trace {
+        selector: TraceSelector,
+        direction: TraceDirection,
+        limits: TraceLimits,
     },
     Stop,
 }
@@ -113,11 +145,101 @@ impl ServiceReply {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TraceLocation {
+    pub file: PathBuf,
+    pub line: u32,
+    pub character: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TraceCandidate {
+    pub name: String,
+    pub detail: Option<String>,
+    pub kind: u64,
+    pub location: TraceLocation,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TraceNode {
+    pub id: String,
+    pub name: String,
+    pub detail: Option<String>,
+    pub kind: u64,
+    pub definition: TraceLocation,
+    pub external: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TraceEdge {
+    pub caller: String,
+    pub callee: String,
+    pub call_sites: Vec<TraceLocation>,
+    pub cycle: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TracePath {
+    pub nodes: Vec<String>,
+    pub cycle: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TraceSummary {
+    pub roots: usize,
+    pub paths: usize,
+    pub nodes: usize,
+    pub edges: usize,
+    pub cycles: usize,
+    pub boundaries: usize,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TraceTiming {
+    pub elapsed_ms: u64,
+    pub native_requests: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TraceDiscovery {
+    pub scanned_files: usize,
+    pub activated_files: usize,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TraceResult {
+    pub status: String,
+    pub selector: String,
+    pub direction: TraceDirection,
+    pub target: Option<String>,
+    pub candidates: Vec<TraceCandidate>,
+    pub nodes: BTreeMap<String, TraceNode>,
+    pub edges: Vec<TraceEdge>,
+    pub roots: Vec<String>,
+    pub paths: Vec<TracePath>,
+    pub summary: TraceSummary,
+    pub timing: TraceTiming,
+    pub discovery: TraceDiscovery,
+    pub truncation_reasons: Vec<String>,
+}
+
 #[derive(Clone, Debug, Serialize)]
-pub struct QueryOutput {
+pub struct TraceOutput {
     pub action: &'static str,
     pub service: ServiceInfo,
-    pub result: Value,
+    pub result: TraceResult,
+    pub ascii: String,
 }
 
 #[derive(Clone, Debug, Serialize)]

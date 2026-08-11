@@ -1,6 +1,7 @@
 //! Warm, workspace-scoped native TypeScript language-service queries.
 
 mod protocol;
+mod render;
 mod service;
 
 use std::{
@@ -13,9 +14,8 @@ use std::{
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use async_trait::async_trait;
-use clap::{ArgMatches, Args, Command, CommandFactory, FromArgMatches, Parser, Subcommand};
+use clap::{ArgMatches, Args, Command, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use directories::ProjectDirs;
-use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -37,8 +37,9 @@ use crate::framework::process::{
 };
 
 use protocol::{
-    CallKind, InspectEntry, ManagementOutput, QueryOutput, RegistryRecord, ServiceCommand,
-    ServiceIdentity, ServiceInfo, ServiceReply, ServiceRequest, REGISTRY_SCHEMA,
+    InspectEntry, ManagementOutput, RegistryRecord, ServiceCommand, ServiceIdentity, ServiceInfo,
+    ServiceReply, ServiceRequest, TraceDirection, TraceLimits, TraceOutput, TraceResult,
+    TraceSelector, REGISTRY_SCHEMA,
 };
 
 const VERSION_CAPTURE: NonZeroUsize = NonZeroUsize::new(64 * 1024).unwrap();
@@ -46,6 +47,7 @@ const DETACHED_GRACE: Duration = Duration::from_secs(5);
 const READY_ATTEMPTS: usize = 200;
 const READY_INTERVAL: Duration = Duration::from_millis(50);
 const REGISTRY_FILE_LIMIT: u64 = 64 * 1024;
+const SOCKET_RESPONSE_LIMIT: u64 = 16 * 1024 * 1024;
 
 pub fn tool() -> TsgoTool {
     TsgoTool
@@ -57,7 +59,7 @@ pub struct TsgoTool;
 #[command(
     name = "tsgo",
     about = "Warm native TypeScript call-hierarchy service",
-    long_about = "Runs one reusable native tsgo language server per canonical workspace and exact server version. The first call starts it lazily; inspect, stop, and prune own the complete lifecycle."
+    long_about = "Runs one reusable native tsgo language server per canonical workspace and exact server version. The first trace starts it lazily; inspect, stop, and prune own the complete lifecycle."
 )]
 struct TsgoArgs {
     #[command(subcommand)]
@@ -66,17 +68,8 @@ struct TsgoArgs {
 
 #[derive(Subcommand)]
 enum TsgoCommand {
-    /// Query native TypeScript call hierarchy; starts the workspace service lazily.
-    Call {
-        #[command(subcommand)]
-        command: CallCommand,
-        /// Resolve the canonical Git worktree from this path instead of the queried file.
-        #[arg(long, global = true)]
-        workspace: Option<PathBuf>,
-        /// Exact tsgo launcher. Defaults to <workspace>/node_modules/.bin/tsgo.
-        #[arg(long, global = true)]
-        tsgo: Option<PathBuf>,
-    },
+    /// Trace callers or callees of one semantic TypeScript symbol.
+    Trace(TraceArgs),
     /// Inspect live and stale service records without starting a service.
     Inspect {
         #[arg(long)]
@@ -116,32 +109,56 @@ enum TsgoCommand {
     },
 }
 
-#[derive(Subcommand)]
-enum CallCommand {
-    /// Prepare call-hierarchy items at a UTF-16 LSP position.
-    Prepare(LocationArgs),
-    /// Return callers for one prepared item.
-    Incoming(HierarchyArgs),
-    /// Return callees for one prepared item.
-    Outgoing(HierarchyArgs),
+#[derive(Args)]
+struct TraceArgs {
+    /// Exact semantic symbol name, optionally qualified by its container.
+    #[arg(long, conflicts_with = "at")]
+    symbol: Option<String>,
+    /// Source file containing the target symbol.
+    #[arg(long, conflicts_with = "symbol")]
+    at: Option<PathBuf>,
+    /// Zero-based UTF-16 line; required with --at.
+    #[arg(long, requires = "at")]
+    line: Option<u32>,
+    /// Zero-based UTF-16 character; required with --at.
+    #[arg(long, requires = "at")]
+    character: Option<u32>,
+    /// Restrict semantic name resolution to this workspace subpath.
+    #[arg(long = "in", requires = "symbol")]
+    in_path: Option<PathBuf>,
+    /// Follow callers toward entry points, or callees away from the target.
+    #[arg(long, value_enum, default_value = "callers")]
+    direction: CliTraceDirection,
+    /// Maximum number of call edges followed from the target.
+    #[arg(long, default_value_t = 12)]
+    max_depth: u32,
+    /// Maximum number of unique semantic nodes returned.
+    #[arg(long, default_value_t = 512)]
+    max_nodes: usize,
+    /// Maximum number of rendered root-to-target or target-to-leaf paths.
+    #[arg(long, default_value_t = 128)]
+    max_paths: usize,
+    /// Resolve the canonical Git worktree from this path.
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+    /// Exact tsgo launcher. Defaults to <workspace>/node_modules/.bin/tsgo.
+    #[arg(long)]
+    tsgo: Option<PathBuf>,
 }
 
-#[derive(Args)]
-struct LocationArgs {
-    file: PathBuf,
-    #[arg(long)]
-    line: u32,
-    #[arg(long)]
-    character: u32,
+#[derive(Clone, Copy, ValueEnum)]
+enum CliTraceDirection {
+    Callers,
+    Callees,
 }
 
-#[derive(Args)]
-struct HierarchyArgs {
-    #[command(flatten)]
-    location: LocationArgs,
-    /// Prepared item index when tsgo returns more than one item.
-    #[arg(long, default_value_t = 0)]
-    item: usize,
+impl From<CliTraceDirection> for TraceDirection {
+    fn from(value: CliTraceDirection) -> Self {
+        match value {
+            CliTraceDirection::Callers => Self::Callers,
+            CliTraceDirection::Callees => Self::Callees,
+        }
+    }
 }
 
 #[async_trait]
@@ -161,39 +178,32 @@ impl Tool for TsgoTool {
     async fn run(&self, cx: &Context, matches: &ArgMatches) -> Result<()> {
         let args = TsgoArgs::from_arg_matches(matches)?;
         match args.command {
-            TsgoCommand::Call { command, workspace, tsgo } => {
-                let (kind, location, item, action) = match command {
-                    CallCommand::Prepare(location) => {
-                        (CallKind::Prepare, location, 0, "call-prepare")
-                    }
-                    CallCommand::Incoming(args) => {
-                        (CallKind::Incoming, args.location, args.item, "call-incoming")
-                    }
-                    CallCommand::Outgoing(args) => {
-                        (CallKind::Outgoing, args.location, args.item, "call-outgoing")
-                    }
-                };
-                let (identity, file) = resolve_query_identity(
+            TsgoCommand::Trace(args) => {
+                let (identity, selector) = resolve_trace_identity(
                     &cx.repositories,
                     &cx.processes,
-                    workspace.as_deref(),
-                    tsgo.as_deref(),
-                    &location.file,
+                    args.workspace.as_deref(),
+                    args.tsgo.as_deref(),
+                    args.symbol,
+                    args.at.as_deref(),
+                    args.line,
+                    args.character,
+                    args.in_path.as_deref(),
                 )
                 .await?;
-                let (service, result) = execute_call(
+                let direction = args.direction.into();
+                let limits = TraceLimits {
+                    max_depth: args.max_depth,
+                    max_nodes: args.max_nodes,
+                    max_paths: args.max_paths,
+                };
+                let (service, result) = execute_trace(
                     &cx.processes,
                     &identity,
-                    ServiceCommand::Call {
-                        kind,
-                        file,
-                        line: location.line,
-                        character: location.character,
-                        item,
-                    },
+                    ServiceCommand::Trace { selector, direction, limits },
                 )
                 .await?;
-                render_query(cx, QueryOutput { action, service, result })
+                render_trace(cx, service, result)
             }
             TsgoCommand::Inspect { workspace, all } => {
                 let workspace = management_workspace(&cx.repositories, workspace.as_deref(), all)?;
@@ -226,25 +236,78 @@ impl Tool for TsgoTool {
     }
 }
 
-async fn resolve_query_identity(
+#[allow(clippy::too_many_arguments)]
+async fn resolve_trace_identity(
     repositories: &RepositoryLocator,
     processes: &ProcessSupervisor,
     workspace: Option<&Path>,
     launcher: Option<&Path>,
-    file: &Path,
-) -> Result<(ServiceIdentity, PathBuf)> {
+    symbol: Option<String>,
+    at: Option<&Path>,
+    line: Option<u32>,
+    character: Option<u32>,
+    in_path: Option<&Path>,
+) -> Result<(ServiceIdentity, TraceSelector)> {
     let current = std::env::current_dir().context("resolve current directory")?;
-    let unresolved_file = if file.is_absolute() { file.to_path_buf() } else { current.join(file) };
+    let unresolved_file = at.map(|file| {
+        if file.is_absolute() { file.to_path_buf() } else { current.join(file) }
+    });
     let file = unresolved_file
-        .canonicalize()
-        .with_context(|| format!("canonicalize TypeScript file {}", unresolved_file.display()))?;
-    let start = workspace
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| file.parent().unwrap_or(&file).to_path_buf());
+        .as_ref()
+        .map(|file| {
+            file.canonicalize()
+                .with_context(|| format!("canonicalize TypeScript file {}", file.display()))
+        })
+        .transpose()?;
+    let start = workspace.map(Path::to_path_buf).unwrap_or_else(|| {
+        file.as_ref()
+            .and_then(|file| file.parent())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| current.clone())
+    });
     let workspace = repositories.nearest_worktree_root(&start)?.as_path().to_path_buf();
-    if !file.starts_with(&workspace) {
-        bail!("{} is outside workspace {}", file.display(), workspace.display());
-    }
+    let selector = match (symbol, file) {
+        (Some(query), None) => {
+            let query = query.trim().to_owned();
+            if query.is_empty() {
+                bail!("--symbol must not be empty");
+            }
+            if line.is_some() || character.is_some() {
+                bail!("--line and --character apply only to --at");
+            }
+            let scope = in_path
+                .map(|scope| {
+                    let unresolved = if scope.is_absolute() {
+                        scope.to_path_buf()
+                    } else {
+                        workspace.join(scope)
+                    };
+                    unresolved
+                        .canonicalize()
+                        .with_context(|| format!("canonicalize trace scope {}", unresolved.display()))
+                })
+                .transpose()?;
+            if let Some(scope) = &scope {
+                if !scope.starts_with(&workspace) {
+                    bail!("trace scope {} is outside workspace {}", scope.display(), workspace.display());
+                }
+            }
+            TraceSelector::Symbol { query, scope }
+        }
+        (None, Some(file)) => {
+            if !file.starts_with(&workspace) {
+                bail!("{} is outside workspace {}", file.display(), workspace.display());
+            }
+            let line = line.context("--line is required with --at")?;
+            let character = character.context("--character is required with --at")?;
+            if in_path.is_some() {
+                bail!("--in applies only to --symbol");
+            }
+            TraceSelector::Position { file, line, character }
+        }
+        (Some(_), Some(_)) => bail!("use exactly one of --symbol or --at"),
+        (None, None) => bail!("use exactly one of --symbol or --at"),
+    };
     let unresolved_launcher = match launcher {
         Some(path) if path.is_absolute() => path.to_path_buf(),
         Some(path) => current.join(path),
@@ -265,7 +328,7 @@ async fn resolve_query_identity(
     }
     let server_version = resolve_server_version(processes, &workspace, &launcher).await?;
     let key = identity_key(&workspace, &launcher, &server_version);
-    Ok((ServiceIdentity { key, workspace, launcher, server_version }, file))
+    Ok((ServiceIdentity { key, workspace, launcher, server_version }, selector))
 }
 
 async fn resolve_server_version(
@@ -369,17 +432,21 @@ fn management_workspace(
     Ok(Some(repositories.nearest_worktree_root(&start)?.as_path().to_path_buf()))
 }
 
-async fn execute_call(
+async fn execute_trace(
     processes: &ProcessSupervisor,
     identity: &ServiceIdentity,
     command: ServiceCommand,
-) -> Result<(ServiceInfo, Value)> {
+) -> Result<(ServiceInfo, TraceResult)> {
     let mut record = ensure_service(processes, identity).await?;
     for attempt in 0..2 {
         match send_service(&record, command.clone()).await {
             Ok(reply) if reply.ok => {
                 let service = reply.service.context("tsgo service reply omitted identity")?;
-                return Ok((service, reply.result.unwrap_or(Value::Null)));
+                let result = serde_json::from_value(
+                    reply.result.context("tsgo trace reply omitted its result")?,
+                )
+                .context("decode typed tsgo trace result")?;
+                return Ok((service, result));
             }
             Ok(reply) if !reply.fatal => {
                 bail!("{}", reply.error.unwrap_or_else(|| "tsgo query failed".to_owned()));
@@ -549,8 +616,8 @@ async fn send_service(record: &RegistryRecord, command: ServiceCommand) -> Resul
     timeout(Duration::from_secs(60), reader.read_line(&mut response))
         .await
         .context("time out waiting for tsgo service reply")??;
-    if response.len() as u64 > REGISTRY_FILE_LIMIT {
-        bail!("tsgo service reply exceeded 64 KiB");
+    if response.len() as u64 > SOCKET_RESPONSE_LIMIT {
+        bail!("tsgo service reply exceeded 16 MiB");
     }
     let reply: ServiceReply = serde_json::from_str(response.trim())?;
     if reply.request_id != request_id {
@@ -871,9 +938,9 @@ fn socket_path(key: &str) -> Result<PathBuf> {
 
 pub(super) fn runtime_dir() -> Result<PathBuf> {
     let project = ProjectDirs::from("", "", "kit").context("resolve Kit runtime directory")?;
-    let base = project.runtime_dir().or_else(|| project.state_dir()).with_context(|| {
-        "Kit has neither a runtime directory nor a state directory for tsgo service ownership"
-    })?;
+    let base = project
+        .state_dir()
+        .context("Kit has no stable state directory for tsgo service ownership")?;
     Ok(base.join("tsgo"))
 }
 
@@ -907,18 +974,13 @@ pub(super) fn now_unix_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-fn render_query(cx: &Context, output: QueryOutput) -> Result<()> {
+fn render_trace(cx: &Context, service: ServiceInfo, result: TraceResult) -> Result<()> {
+    let ascii = render::trace_text(&service, &result);
+    let output = TraceOutput { action: "trace", service, result, ascii };
     if cx.out.is_json() {
         return cx.out.json(&output);
     }
-    println!(
-        "{} · instance {} · child {} · request {}",
-        output.action,
-        output.service.instance_id,
-        output.service.child.run_id,
-        output.service.request_count
-    );
-    println!("{}", serde_json::to_string_pretty(&output.result)?);
+    println!("{}", output.ascii);
     Ok(())
 }
 
