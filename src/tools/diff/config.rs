@@ -5,9 +5,12 @@ use crate::framework::{
     ConfigStore, ConfigValue, EditableSettings, SettingEdit, SettingField, SettingId,
     SettingsSection, SettingsSectionMeta,
 };
+use crate::tui::SplitRatio;
 
 const TOOL: &str = "diff";
 const LINE_NUMBERS: SettingId = SettingId("line_numbers");
+const TREE_SPLIT_RATIO: &str = "tree_split_ratio";
+pub(super) const DEFAULT_TREE_SPLIT_RATIO: SplitRatio = SplitRatio::new(286);
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -64,22 +67,45 @@ impl LineNumbers {
 pub(crate) struct Config {
     store: ConfigStore,
     line_numbers: LineNumbers,
+    tree_split_ratio: SplitRatio,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct Stored {
     #[serde(default)]
     line_numbers: LineNumbers,
+    #[serde(default = "default_tree_split_ratio")]
+    tree_split_ratio: SplitRatio,
+}
+
+impl Default for Stored {
+    fn default() -> Self {
+        Self { line_numbers: LineNumbers::default(), tree_split_ratio: DEFAULT_TREE_SPLIT_RATIO }
+    }
 }
 
 impl Config {
     pub(crate) fn load(store: ConfigStore) -> Result<Self> {
         let stored: Stored = store.load(TOOL)?;
-        Ok(Self { store, line_numbers: stored.line_numbers })
+        Ok(Self {
+            store,
+            line_numbers: stored.line_numbers,
+            tree_split_ratio: stored.tree_split_ratio,
+        })
     }
 
     pub(crate) const fn line_numbers(&self) -> LineNumbers {
         self.line_numbers
+    }
+
+    pub(crate) const fn tree_split_ratio(&self) -> SplitRatio {
+        self.tree_split_ratio
+    }
+
+    pub(crate) fn set_tree_split_ratio(&mut self, ratio: SplitRatio) -> Result<()> {
+        self.store.set(TOOL, TREE_SPLIT_RATIO, ConfigValue::Integer(i64::from(ratio.value())))?;
+        self.tree_split_ratio = ratio;
+        Ok(())
     }
 
     fn set_line_numbers(&mut self, line_numbers: LineNumbers) -> Result<()> {
@@ -91,6 +117,10 @@ impl Config {
         self.line_numbers = line_numbers;
         Ok(())
     }
+}
+
+const fn default_tree_split_ratio() -> SplitRatio {
+    DEFAULT_TREE_SPLIT_RATIO
 }
 
 impl EditableSettings for Config {
@@ -184,6 +214,22 @@ mod tests {
         let raw = std::fs::read_to_string(store.path(TOOL))?;
         assert!(raw.contains("future_option = true"));
         assert_eq!(Config::load(store)?.line_numbers(), LineNumbers::Always);
+        let _ = std::fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn tree_panel_ratio_defaults_and_round_trips_without_becoming_a_settings_field() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("kit-diff-tree-ratio-{}", std::process::id()));
+        let store = ConfigStore::rooted(dir.clone());
+        let mut config = Config::load(store.clone())?;
+
+        assert_eq!(config.tree_split_ratio(), DEFAULT_TREE_SPLIT_RATIO);
+        config.set_tree_split_ratio(SplitRatio::new(417))?;
+
+        let reloaded = Config::load(store.clone())?;
+        assert_eq!(reloaded.tree_split_ratio(), SplitRatio::new(417));
+        assert_eq!(reloaded.fields().len(), 1);
         let _ = std::fs::remove_dir_all(dir);
         Ok(())
     }

@@ -3,7 +3,6 @@ use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{anyhow, Context as _, Result};
-#[cfg(test)]
 use crossterm::event::KeyCode;
 use crossterm::event::{Event, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Constraint, Direction as LayoutDirection, Layout, Position, Rect};
@@ -14,24 +13,31 @@ use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::actions::{self, DiffActionContext, DiffActionRegistry, DiffCommand};
-use super::config::LineNumbers;
+use super::config::{Config, LineNumbers, DEFAULT_TREE_SPLIT_RATIO};
 use super::git::{load_repository, stage_document, unstage_document};
 use super::model::{
     ChangeGroup, ChangeKind, DiffBody, DiffContext, DiffDocument, LineCell, RowKind, SpecialState,
     TextDiffDocument, TextSnapshot,
 };
+use crate::framework::{
+    external_file_capabilities, process::ProcessSupervisor, start_external, ExternalFileAction,
+    ExternalTarget,
+};
 use crate::tui::theme::TuiTheme;
 use crate::tui::{
-    render_vertical_scrollbar, ActionInvocation, Direction, EventReader, KeyChord,
-    KeybindingResolution, KeybindingState, NavigationMap, NavigationRegion, ScrollbarDrag,
-    ScrollbarLayout, ScrollbarStyle, SelectableRegion, SelectionOutcome, Session, SessionOptions,
+    render_split_divider, render_vertical_scrollbar, ActionInvocation, Direction, EventReader,
+    KeyChord, KeybindingResolution, KeybindingState, NavigationMap, NavigationRegion,
+    ScrollbarDrag, ScrollbarLayout, ScrollbarStyle, SelectableRegion, SelectionOutcome, Session,
+    SessionOptions, SplitDividerStyle, SplitDrag, SplitFrame, SplitMinimums, SplitRatio,
     TextSelection, Viewport, ViewportMetrics,
 };
 
 const WIDE_MIN_WIDTH: u16 = 84;
 const MIN_WIDTH: u16 = 30;
 const MIN_HEIGHT: u16 = 8;
-const TREE_WIDTH: u16 = 34;
+const TREE_MIN_WIDTH: u16 = 24;
+const REVIEW_MIN_WIDTH: u16 = 40;
+const TREE_RESIZE_STEP: i16 = 50;
 const TREE_ACTION_WIDTH: u16 = 3;
 const CHANGE_INDICATOR_WIDTH: usize = 2;
 const SPLIT_GUTTER_WIDTH: usize = 8;
@@ -82,12 +88,20 @@ pub async fn run(
     mouse_capture: bool,
     mode: ViewMode,
     context: DiffContext,
-    line_numbers: LineNumbers,
+    mut config: Config,
+    processes: ProcessSupervisor,
 ) -> Result<()> {
-    let mut app = DiffApp::with_line_numbers(documents, theme, mode, line_numbers);
+    let mut app = DiffApp::with_preferences(
+        documents,
+        theme,
+        mode,
+        config.line_numbers(),
+        config.tree_split_ratio(),
+    );
     let mut session = Session::open(SessionOptions { mouse_capture, bracketed_paste: false })?;
     let mut events = EventReader::start();
     let mut repository_task = None;
+    let mut external_file_task = None;
 
     loop {
         session.draw(|frame| render(frame, &mut app))?;
@@ -95,6 +109,11 @@ pub async fn run(
             tokio::select! {
                 event = events.recv() => RuntimeEvent::Terminal(event),
                 result = task => RuntimeEvent::RepositoryUpdated(result),
+            }
+        } else if let Some(task) = external_file_task.as_mut() {
+            tokio::select! {
+                event = events.recv() => RuntimeEvent::Terminal(event),
+                result = task => RuntimeEvent::ExternalFileFinished(result),
             }
         } else {
             RuntimeEvent::Terminal(events.recv().await)
@@ -111,24 +130,49 @@ pub async fn run(
                 });
                 Flow::Continue
             }
+            RuntimeEvent::ExternalFileFinished(result) => {
+                external_file_task = None;
+                app.finish_external_file_operation(match result {
+                    Ok(result) => result,
+                    Err(error) => Err(anyhow!("external file task failed: {error}")),
+                });
+                Flow::Continue
+            }
         };
         match flow {
             Flow::Copy(text) => session.copy(&text)?,
             Flow::Quit => break,
-            Flow::Refresh if repository_task.is_none() => {
+            Flow::Refresh if repository_task.is_none() && external_file_task.is_none() => {
                 let operation = RepositoryOperation::Refresh;
-                app.repository_status = Some(RepositoryStatus::Running(operation.running_label()));
+                app.begin_operation(operation.running_label());
                 repository_task = Some(spawn_repository_operation(cwd.clone(), operation, context));
             }
-            Flow::ToggleStage if repository_task.is_none() => {
+            Flow::ToggleStage if repository_task.is_none() && external_file_task.is_none() => {
                 if let Some(operation) = app.selected_repository_operation() {
-                    app.repository_status =
-                        Some(RepositoryStatus::Running(operation.running_label()));
+                    app.begin_operation(operation.running_label());
                     repository_task =
                         Some(spawn_repository_operation(cwd.clone(), operation, context));
                 }
             }
-            Flow::Continue | Flow::Refresh | Flow::ToggleStage => {}
+            Flow::ExternalFile(operation)
+                if repository_task.is_none() && external_file_task.is_none() =>
+            {
+                app.begin_operation(operation.running_label());
+                external_file_task = Some(spawn_external_file_operation(
+                    processes.clone(),
+                    operation.with_root(&cwd),
+                ));
+            }
+            Flow::PersistTreeSplit { ratio, original } => {
+                if let Err(error) = config.set_tree_split_ratio(ratio) {
+                    app.tree_split_ratio = original;
+                    app.repository_status =
+                        Some(RepositoryStatus::Error(format!("save tree panel width: {error:#}")));
+                } else {
+                    app.repository_status = Some(RepositoryStatus::Success("tree width saved"));
+                }
+            }
+            Flow::Continue | Flow::Refresh | Flow::ToggleStage | Flow::ExternalFile(_) => {}
         }
     }
     Ok(())
@@ -168,6 +212,8 @@ enum Flow {
     Copy(String),
     Refresh,
     ToggleStage,
+    ExternalFile(ExternalFileOperation),
+    PersistTreeSplit { ratio: SplitRatio, original: SplitRatio },
     Quit,
 }
 
@@ -176,6 +222,7 @@ enum RuntimeEvent {
     RepositoryUpdated(
         std::result::Result<Result<(Vec<DiffDocument>, &'static str)>, tokio::task::JoinError>,
     ),
+    ExternalFileFinished(std::result::Result<Result<&'static str>, tokio::task::JoinError>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -190,6 +237,37 @@ enum RepositoryOperation {
     Refresh,
     Stage(DiffDocument),
     Unstage(DiffDocument),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExternalFileOperation {
+    action: ExternalFileAction,
+    path: PathBuf,
+}
+
+impl ExternalFileOperation {
+    fn with_root(mut self, root: &Path) -> Self {
+        if !self.path.is_absolute() {
+            self.path = root.join(self.path);
+        }
+        self
+    }
+
+    fn running_label(&self) -> &'static str {
+        match self.action {
+            ExternalFileAction::Open => "opening file…",
+            ExternalFileAction::Reveal => "revealing file…",
+            ExternalFileAction::Preview => "opening preview…",
+        }
+    }
+
+    fn success_label(&self) -> &'static str {
+        match self.action {
+            ExternalFileAction::Open => "file opened",
+            ExternalFileAction::Reveal => "file revealed",
+            ExternalFileAction::Preview => "preview opened",
+        }
+    }
 }
 
 impl RepositoryOperation {
@@ -233,6 +311,24 @@ fn spawn_repository_operation(
     })
 }
 
+fn spawn_external_file_operation(
+    processes: ProcessSupervisor,
+    operation: ExternalFileOperation,
+) -> tokio::task::JoinHandle<Result<&'static str>> {
+    tokio::spawn(async move {
+        let target = operation.path.clone();
+        let receipt = start_external(
+            &processes,
+            ExternalTarget::File { action: operation.action, path: target.clone() },
+        )
+        .with_context(|| format!("{} {}", operation.action, target.display()))?;
+        receipt.completion().await.with_context(|| {
+            format!("complete {} handoff for {}", operation.action, target.display())
+        })?;
+        Ok(operation.success_label())
+    })
+}
+
 #[derive(Clone, Debug)]
 enum TreeTarget {
     Group(ChangeGroup),
@@ -263,7 +359,9 @@ struct UiRegions {
     tree_area: Rect,
     content_area: Rect,
     content_inner: Rect,
-    divider: Option<Rect>,
+    tree_split: Option<SplitFrame>,
+    tree_toggle: Option<Rect>,
+    document_divider: Option<Rect>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -310,10 +408,14 @@ struct DiffApp {
     mode: ViewMode,
     last_effective_mode: Option<EffectiveMode>,
     active_region: ActiveRegion,
+    tree_collapsed: bool,
+    tree_split_ratio: SplitRatio,
+    tree_split_drag: Option<SplitDrag<()>>,
     divider_percent: u16,
-    dragging_divider: bool,
+    dragging_document_divider: bool,
     hovered_file: Option<usize>,
     repository_status: Option<RepositoryStatus>,
+    operation_running: bool,
     theme: TuiTheme,
     line_numbers: LineNumbers,
     regions: UiRegions,
@@ -325,11 +427,22 @@ impl DiffApp {
         Self::with_line_numbers(documents, theme, mode, LineNumbers::Auto)
     }
 
+    #[cfg(test)]
     fn with_line_numbers(
         documents: Vec<DiffDocument>,
         theme: TuiTheme,
         mode: ViewMode,
         line_numbers: LineNumbers,
+    ) -> Self {
+        Self::with_preferences(documents, theme, mode, line_numbers, DEFAULT_TREE_SPLIT_RATIO)
+    }
+
+    fn with_preferences(
+        documents: Vec<DiffDocument>,
+        theme: TuiTheme,
+        mode: ViewMode,
+        line_numbers: LineNumbers,
+        tree_split_ratio: SplitRatio,
     ) -> Self {
         let expanded = directory_keys(&documents).into_iter().collect();
         let tree_order = tree_file_order(&documents);
@@ -362,10 +475,14 @@ impl DiffApp {
             mode,
             last_effective_mode: None,
             active_region: ActiveRegion::Changes,
+            tree_collapsed: false,
+            tree_split_ratio,
+            tree_split_drag: None,
             divider_percent: 50,
-            dragging_divider: false,
+            dragging_document_divider: false,
             hovered_file: None,
             repository_status: None,
+            operation_running: false,
             theme,
             line_numbers,
             regions: UiRegions::default(),
@@ -373,6 +490,12 @@ impl DiffApp {
     }
 
     fn on_key(&mut self, key: KeyEvent) -> Flow {
+        if self.tree_split_drag.is_some() {
+            if key.code == KeyCode::Esc {
+                self.cancel_tree_split_drag();
+            }
+            return Flow::Continue;
+        }
         match self.selection.on_key(key) {
             SelectionOutcome::CopyReady(text) => return Flow::Copy(text),
             SelectionOutcome::Captured | SelectionOutcome::Changed => return Flow::Continue,
@@ -381,11 +504,7 @@ impl DiffApp {
         let Some(chord) = KeyChord::from_event(key) else {
             return Flow::Continue;
         };
-        let context = DiffActionContext {
-            has_document: self.selected.is_some(),
-            repository_idle: !matches!(self.repository_status, Some(RepositoryStatus::Running(_))),
-            filename: None,
-        };
+        let context = self.action_context(None);
         let invocation =
             match self.actions.resolve_keybinding(&mut self.keybinding_state, chord, context) {
                 KeybindingResolution::Invoke(invocation) => invocation,
@@ -412,6 +531,42 @@ impl DiffApp {
             DiffCommand::CopyFilename => {
                 return invocation.context.filename.map(Flow::Copy).unwrap_or(Flow::Continue)
             }
+            DiffCommand::OpenFile => {
+                return invocation
+                    .context
+                    .file
+                    .map(|path| {
+                        Flow::ExternalFile(ExternalFileOperation {
+                            action: ExternalFileAction::Open,
+                            path,
+                        })
+                    })
+                    .unwrap_or(Flow::Continue)
+            }
+            DiffCommand::RevealFile => {
+                return invocation
+                    .context
+                    .file
+                    .map(|path| {
+                        Flow::ExternalFile(ExternalFileOperation {
+                            action: ExternalFileAction::Reveal,
+                            path,
+                        })
+                    })
+                    .unwrap_or(Flow::Continue)
+            }
+            DiffCommand::PreviewFile => {
+                return invocation
+                    .context
+                    .file
+                    .map(|path| {
+                        Flow::ExternalFile(ExternalFileOperation {
+                            action: ExternalFileAction::Preview,
+                            path,
+                        })
+                    })
+                    .unwrap_or(Flow::Continue)
+            }
             DiffCommand::MoveDown => match self.active_region {
                 ActiveRegion::Changes => self.move_tree_selection(TreeStep::Next),
                 ActiveRegion::Old | ActiveRegion::New => self.scroll_content(1),
@@ -435,6 +590,15 @@ impl DiffApp {
             DiffCommand::RegionLeft => self.move_region(Direction::Left),
             DiffCommand::PanRight => self.pan(4),
             DiffCommand::PanLeft => self.pan(-4),
+            DiffCommand::NarrowTree => {
+                return self.set_tree_split_ratio(self.tree_split_ratio.adjusted(-TREE_RESIZE_STEP))
+            }
+            DiffCommand::WidenTree => {
+                return self.set_tree_split_ratio(self.tree_split_ratio.adjusted(TREE_RESIZE_STEP))
+            }
+            DiffCommand::FitTree => return self.fit_tree_split(),
+            DiffCommand::ToggleTree => self.toggle_tree(),
+            DiffCommand::ResetLayout => return self.set_tree_split_ratio(DEFAULT_TREE_SPLIT_RATIO),
             DiffCommand::Home => {
                 self.content_viewport.home();
                 self.old_horizontal_scroll = 0;
@@ -449,7 +613,13 @@ impl DiffApp {
         Flow::Continue
     }
 
+    fn begin_operation(&mut self, label: &'static str) {
+        self.operation_running = true;
+        self.repository_status = Some(RepositoryStatus::Running(label));
+    }
+
     fn finish_repository_operation(&mut self, result: Result<(Vec<DiffDocument>, &'static str)>) {
+        self.operation_running = false;
         match result {
             Ok((documents, label)) => {
                 self.replace_documents(documents);
@@ -457,6 +627,14 @@ impl DiffApp {
             }
             Err(error) => self.repository_status = Some(RepositoryStatus::Error(error.to_string())),
         }
+    }
+
+    fn finish_external_file_operation(&mut self, result: Result<&'static str>) {
+        self.operation_running = false;
+        self.repository_status = Some(match result {
+            Ok(label) => RepositoryStatus::Success(label),
+            Err(error) => RepositoryStatus::Error(error.to_string()),
+        });
     }
 
     fn selected_repository_operation(&self) -> Option<RepositoryOperation> {
@@ -525,20 +703,47 @@ impl DiffApp {
         self.document_projection = None;
         self.restore_anchor = false;
         self.last_effective_mode = None;
-        self.dragging_divider = false;
+        self.dragging_document_divider = false;
     }
 
     fn cancel_pointer_drags(&mut self) {
-        self.dragging_divider = false;
+        self.cancel_tree_split_drag();
+        self.dragging_document_divider = false;
         self.tree_scroll_drag = None;
         self.content_scroll_drag = None;
     }
 
     fn on_mouse(&mut self, mouse: MouseEvent) -> Flow {
-        if self.dragging_divider {
+        if let Some(drag) = self.tree_split_drag {
             match mouse.kind {
-                MouseEventKind::Drag(MouseButton::Left) => self.drag_divider(mouse.column),
-                MouseEventKind::Up(MouseButton::Left) => self.dragging_divider = false,
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    let Some(ratio) = self
+                        .regions
+                        .tree_split
+                        .and_then(|split| drag.ratio_for_column((), split, mouse.column))
+                    else {
+                        self.cancel_tree_split_drag();
+                        return Flow::Continue;
+                    };
+                    self.tree_split_ratio = ratio;
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    self.tree_split_drag = None;
+                    if drag.changed(self.tree_split_ratio) {
+                        return Flow::PersistTreeSplit {
+                            ratio: self.tree_split_ratio,
+                            original: drag.cancel().1,
+                        };
+                    }
+                }
+                _ => {}
+            }
+            return Flow::Continue;
+        }
+        if self.dragging_document_divider {
+            match mouse.kind {
+                MouseEventKind::Drag(MouseButton::Left) => self.drag_document_divider(mouse.column),
+                MouseEventKind::Up(MouseButton::Left) => self.dragging_document_divider = false,
                 _ => {}
             }
             return Flow::Continue;
@@ -596,6 +801,20 @@ impl DiffApp {
                 });
             }
             MouseEventKind::Down(MouseButton::Left) => {
+                if self.regions.tree_toggle.is_some_and(|area| area.intersects(point)) {
+                    return self.invoke_action(ActionInvocation::new(
+                        actions::TOGGLE_TREE,
+                        self.action_context(None),
+                    ));
+                }
+                self.tree_split_drag = self.regions.tree_split.and_then(|split| {
+                    SplitDrag::begin((), split, self.tree_split_ratio, mouse.column, mouse.row)
+                });
+                if self.tree_split_drag.is_some() {
+                    self.selection.clear();
+                    self.hovered_file = None;
+                    return Flow::Continue;
+                }
                 if let Some(index) = self
                     .regions
                     .tree_actions
@@ -604,14 +823,7 @@ impl DiffApp {
                     .map(|(_, index)| *index)
                 {
                     self.select(index);
-                    let context = DiffActionContext {
-                        has_document: self.selected.is_some(),
-                        repository_idle: !matches!(
-                            self.repository_status,
-                            Some(RepositoryStatus::Running(_))
-                        ),
-                        filename: None,
-                    };
+                    let context = self.action_context(None);
                     return self
                         .invoke_action(ActionInvocation::new(actions::TOGGLE_STAGE, context));
                 }
@@ -627,8 +839,8 @@ impl DiffApp {
                     }
                     return Flow::Continue;
                 }
-                if self.regions.divider.is_some_and(|area| area.intersects(point)) {
-                    self.dragging_divider = true;
+                if self.regions.document_divider.is_some_and(|area| area.intersects(point)) {
+                    self.dragging_document_divider = true;
                     return Flow::Continue;
                 }
                 if let Some(layout) =
@@ -654,12 +866,15 @@ impl DiffApp {
                     self.active_region = ActiveRegion::Changes;
                     self.activate_tree_target(target);
                 } else if self.regions.content_inner.intersects(point) {
-                    self.active_region =
-                        if self.regions.divider.is_some_and(|divider| mouse.column < divider.x) {
-                            ActiveRegion::Old
-                        } else {
-                            ActiveRegion::New
-                        };
+                    self.active_region = if self
+                        .regions
+                        .document_divider
+                        .is_some_and(|divider| mouse.column < divider.x)
+                    {
+                        ActiveRegion::Old
+                    } else {
+                        ActiveRegion::New
+                    };
                     let _ = self.selection.on_mouse(mouse);
                 }
             }
@@ -680,14 +895,7 @@ impl DiffApp {
                         TreeTarget::Group(_) | TreeTarget::Directory(_, _) => None,
                     });
                 if let Some(filename) = filename {
-                    let context = DiffActionContext {
-                        has_document: self.selected.is_some(),
-                        repository_idle: !matches!(
-                            self.repository_status,
-                            Some(RepositoryStatus::Running(_))
-                        ),
-                        filename: Some(filename),
-                    };
+                    let context = self.action_context(Some(filename));
                     return self
                         .invoke_action(ActionInvocation::new(actions::COPY_FILENAME, context));
                 }
@@ -870,20 +1078,77 @@ impl DiffApp {
         }
     }
 
-    fn drag_divider(&mut self, column: u16) {
+    fn set_tree_split_ratio(&mut self, ratio: SplitRatio) -> Flow {
+        let original = self.tree_split_ratio;
+        if ratio == original || self.regions.tree_split.is_none() {
+            return Flow::Continue;
+        }
+        self.tree_split_ratio = ratio;
+        Flow::PersistTreeSplit { ratio, original }
+    }
+
+    fn fit_tree_split(&mut self) -> Flow {
+        let Some(split) = self.regions.tree_split else {
+            return Flow::Continue;
+        };
+        let rows = tree_rows(&self.documents, &self.expanded);
+        let scrollbar_width = usize::from(self.tree_scrollbar.is_some());
+        let content_width = rows
+            .iter()
+            .map(tree_row_intrinsic_width)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(scrollbar_width);
+        let panel_width = u16::try_from(content_width.saturating_add(2)).unwrap_or(u16::MAX);
+        let column = split.content.x.saturating_add(panel_width);
+        let Some(ratio) = split.ratio_for_column(column) else {
+            return Flow::Continue;
+        };
+        self.set_tree_split_ratio(ratio)
+    }
+
+    fn toggle_tree(&mut self) {
+        self.cancel_pointer_drags();
+        self.selection.clear();
+        self.hovered_file = None;
+        self.tree_collapsed = !self.tree_collapsed;
+        if self.tree_collapsed && self.active_region == ActiveRegion::Changes {
+            self.active_region = ActiveRegion::New;
+        }
+        self.repository_status = Some(RepositoryStatus::Success(if self.tree_collapsed {
+            "changes panel hidden"
+        } else {
+            "changes panel restored"
+        }));
+    }
+
+    fn cancel_tree_split_drag(&mut self) -> bool {
+        let Some(drag) = self.tree_split_drag.take() else {
+            return false;
+        };
+        let (_, original) = drag.cancel();
+        let changed = self.tree_split_ratio != original;
+        self.tree_split_ratio = original;
+        changed
+    }
+
+    fn drag_document_divider(&mut self, column: u16) {
         let area = self.regions.content_inner;
         if area.width <= 1 {
             return;
         }
         let relative = column.saturating_sub(area.x).min(area.width - 1);
-        self.divider_percent =
-            ((u32::from(relative) * 100) / u32::from(area.width)).clamp(25, 75) as u16;
+        self.divider_percent = ((u32::from(relative) * 100 + u32::from(area.width / 2))
+            / u32::from(area.width))
+        .clamp(25, 75) as u16;
     }
 
     fn navigation(&self) -> NavigationMap<ActiveRegion> {
-        let mut regions =
-            vec![NavigationRegion::new(ActiveRegion::Changes, self.regions.tree_area)];
-        if let Some(divider) = self.regions.divider {
+        let mut regions = Vec::new();
+        if self.regions.tree_area.width > 0 && self.regions.tree_area.height > 0 {
+            regions.push(NavigationRegion::new(ActiveRegion::Changes, self.regions.tree_area));
+        }
+        if let Some(divider) = self.regions.document_divider {
             regions.push(NavigationRegion::new(
                 ActiveRegion::Old,
                 Rect::new(
@@ -910,7 +1175,7 @@ impl DiffApp {
     }
 
     fn normalize_active_region(&mut self) {
-        if self.active_region == ActiveRegion::Old && self.regions.divider.is_none() {
+        if self.active_region == ActiveRegion::Old && self.regions.document_divider.is_none() {
             self.active_region = ActiveRegion::New;
         }
         if let Some(region) = self.navigation().normalize(self.active_region) {
@@ -937,11 +1202,7 @@ impl DiffApp {
     }
 
     fn action_help(&self) -> String {
-        let context = DiffActionContext {
-            has_document: self.selected.is_some(),
-            repository_idle: !matches!(self.repository_status, Some(RepositoryStatus::Running(_))),
-            filename: None,
-        };
+        let context = self.action_context(None);
         let bindings = self
             .actions
             .resolve_command_palette(&context)
@@ -954,6 +1215,21 @@ impl DiffApp {
             .collect::<Vec<_>>()
             .join(" · ");
         format!(" {bindings} · mouse click/drag/wheel · right-click filename copies ")
+    }
+
+    fn action_context(&self, filename: Option<String>) -> DiffActionContext {
+        DiffActionContext {
+            has_document: self.selected.is_some(),
+            repository_idle: !self.operation_running,
+            filename,
+            file: self
+                .selected
+                .and_then(|index| self.documents.get(index))
+                .and_then(DiffDocument::display_path)
+                .map(Path::to_path_buf),
+            file_capabilities: external_file_capabilities(),
+            resizable_tree: self.regions.tree_split.is_some(),
+        }
     }
 }
 
@@ -976,12 +1252,16 @@ fn render(frame: &mut Frame<'_>, app: &mut DiffApp) {
         return;
     }
 
-    let (tree_area, content_area) = if area.width >= WIDE_MIN_WIDTH {
-        let chunks = Layout::default()
-            .direction(LayoutDirection::Horizontal)
-            .constraints([Constraint::Length(TREE_WIDTH), Constraint::Min(40)])
-            .split(area);
-        (chunks[0], chunks[1])
+    let (tree_area, content_area) = if app.tree_collapsed {
+        (Rect::default(), area)
+    } else if area.width >= WIDE_MIN_WIDTH {
+        let split = SplitFrame::horizontal(
+            area,
+            app.tree_split_ratio,
+            SplitMinimums::new(TREE_MIN_WIDTH, REVIEW_MIN_WIDTH),
+        );
+        app.regions.tree_split = Some(split);
+        (split.first, split.second)
     } else {
         let tree_height = (area.height / 3).clamp(5, 10);
         let chunks = Layout::default()
@@ -992,8 +1272,24 @@ fn render(frame: &mut Frame<'_>, app: &mut DiffApp) {
     };
     app.regions.tree_area = tree_area;
     app.regions.content_area = content_area;
-    render_tree(frame, tree_area, app);
+    if tree_area.width > 0 && tree_area.height > 0 {
+        render_tree(frame, tree_area, app);
+    }
     render_document(frame, content_area, app);
+    if let Some(split) = app.regions.tree_split {
+        render_split_divider(
+            frame,
+            split,
+            app.tree_split_drag.is_some(),
+            SplitDividerStyle {
+                idle_color: app.theme.border,
+                active_color: app.theme.accent,
+                idle_line: "│",
+                idle_grip: "┋",
+                active_line: "┃",
+            },
+        );
+    }
     let selectable = app.content_selectable.into_iter().collect::<Vec<_>>();
     app.selection.capture_frame(
         frame,
@@ -1004,6 +1300,10 @@ fn render(frame: &mut Frame<'_>, app: &mut DiffApp) {
 }
 
 fn render_tree(frame: &mut Frame<'_>, area: Rect, app: &mut DiffApp) {
+    let title = " changes [-] ";
+    let title_width = (UnicodeWidthStr::width(title) as u16).min(area.width.saturating_sub(2));
+    app.regions.tree_toggle =
+        Some(Rect::new(area.x.saturating_add(1), area.y, title_width, u16::from(title_width > 0)));
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -1012,8 +1312,10 @@ fn render_tree(frame: &mut Frame<'_>, area: Rect, app: &mut DiffApp) {
         } else {
             app.theme.border
         }))
-        .title(" changes ")
-        .title_style(Style::default().fg(app.theme.text_strong).add_modifier(Modifier::BOLD));
+        .title(Line::styled(
+            title,
+            Style::default().fg(app.theme.accent).add_modifier(Modifier::BOLD),
+        ));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let rows = tree_rows(&app.documents, &app.expanded);
@@ -1157,6 +1459,25 @@ fn tree_count_spans(row: &TreeRow, style: Style, theme: TuiTheme) -> Vec<Span<'s
     spans
 }
 
+fn tree_row_intrinsic_width(row: &TreeRow) -> usize {
+    let counts = usize::from(row.additions > 0)
+        .saturating_mul(UnicodeWidthStr::width(format!(" +{}", row.additions).as_str()))
+        .saturating_add(
+            usize::from(row.deletions > 0)
+                .saturating_mul(UnicodeWidthStr::width(format!(" -{}", row.deletions).as_str())),
+        );
+    let trailing = if matches!(row.target, TreeTarget::File(_)) {
+        counts.max(TREE_ACTION_WIDTH as usize)
+    } else {
+        counts
+    };
+    row.depth
+        .saturating_mul(2)
+        .saturating_add(2)
+        .saturating_add(UnicodeWidthStr::width(row.label.as_str()))
+        .saturating_add(trailing)
+}
+
 fn change_color(kind: ChangeKind, theme: TuiTheme) -> Color {
     match kind {
         ChangeKind::Added | ChangeKind::Untracked => theme.success,
@@ -1188,7 +1509,7 @@ fn change_glyph(kind: Option<ChangeKind>) -> &'static str {
 fn render_document(frame: &mut Frame<'_>, area: Rect, app: &mut DiffApp) {
     let controls = app.action_help();
     let footer = repository_footer(app, &controls);
-    let block = Block::default()
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(if app.active_region == ActiveRegion::Changes {
@@ -1198,6 +1519,20 @@ fn render_document(frame: &mut Frame<'_>, area: Rect, app: &mut DiffApp) {
         }))
         .title(document_title(app))
         .title_bottom(footer);
+    if app.tree_collapsed {
+        let title = " changes [+] ";
+        let title_width = (UnicodeWidthStr::width(title) as u16).min(area.width.saturating_sub(2));
+        app.regions.tree_toggle = Some(Rect::new(
+            area.right().saturating_sub(1).saturating_sub(title_width),
+            area.y,
+            title_width,
+            u16::from(title_width > 0),
+        ));
+        block = block.title(
+            Line::styled(title, Style::default().fg(app.theme.accent).add_modifier(Modifier::BOLD))
+                .right_aligned(),
+        );
+    }
     let inner = block.inner(area);
     app.regions.content_inner = inner;
     frame.render_widget(block, area);
@@ -1258,7 +1593,7 @@ fn render_document(frame: &mut Frame<'_>, area: Rect, app: &mut DiffApp) {
     if effective == EffectiveMode::Split {
         let left_width =
             split_widths(inner.width as usize, app.divider_percent, app.line_numbers.show(true)).0;
-        app.regions.divider =
+        app.regions.document_divider =
             Some(Rect::new(inner.x + left_width as u16, inner.y, 1, inner.height));
     }
     let visible = projection
@@ -2534,7 +2869,7 @@ mod tests {
         app.pan(4);
         assert_eq!((app.old_horizontal_scroll, app.new_horizontal_scroll), (4, 4));
 
-        let original = app.regions.divider.expect("split divider");
+        let original = app.regions.document_divider.expect("split divider");
         app.on_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: original.x,
@@ -2555,7 +2890,7 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         });
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        assert!(app.regions.divider.unwrap().x > original.x);
+        assert!(app.regions.document_divider.unwrap().x > original.x);
         assert_eq!(app.divider_percent, 75);
     }
 
@@ -2596,7 +2931,7 @@ mod tests {
             terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
             assert_eq!(app.last_effective_mode, Some(EffectiveMode::Single));
-            assert!(app.regions.divider.is_none());
+            assert!(app.regions.document_divider.is_none());
             assert!(!screen(&terminal).contains("Split mode needs"));
         }
     }

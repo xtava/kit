@@ -70,13 +70,16 @@ fn benchmark_diff_lifecycle() {
             ViewMode::Split => EffectiveMode::Split,
             ViewMode::Auto | ViewMode::Inline => EffectiveMode::Inline,
         };
+        let review_width = SplitFrame::horizontal(
+            Rect::new(0, 0, case.width, case.height),
+            app.tree_split_ratio,
+            SplitMinimums::new(TREE_MIN_WIDTH, REVIEW_MIN_WIDTH),
+        )
+        .second
+        .width
+        .saturating_sub(2) as usize;
         measure(case, "projection_build", || {
-            black_box(document_lines(
-                &app.documents[0],
-                &app,
-                effective,
-                case.width as usize - TREE_WIDTH as usize - 2,
-            ));
+            black_box(document_lines(&app.documents[0], &app, effective, review_width));
         });
         measure(case, "tree_build", || {
             black_box(tree_rows(&app.documents, &app.expanded));

@@ -34,7 +34,14 @@ start and end of the file.
 | `←` / `→` | Move between the Changes, old-file, and new-file regions |
 | `h` / `l` | Pan the active code region horizontally |
 | `v` | Toggle inline and side-by-side split views |
+| `<` / `>` | Narrow or widen the Changes tree in a wide terminal |
+| `F` | Fit the Changes tree to the visible paths and counts |
+| `Ctrl-T` | Hide or restore the Changes tree for focused review |
+| `=` | Reset the Changes tree to its default width |
 | `s` | Stage the selected Changes file or unstage the selected Staged file |
+| `o` | Open the selected file with the system default handler |
+| `O` | Reveal the selected file in the system file manager |
+| `p` | Preview the selected file when the platform provides a native preview |
 | `r` | Refresh staged, unstaged, and untracked changes from Git |
 | `Tab` / `Shift-Tab` | Cycle the visible interactive regions |
 | `Home` / `End` | Return to the start and reset panning, or jump to the end |
@@ -44,9 +51,24 @@ The cyan border identifies the active region. Click a file to select it, or clic
 to expand or collapse it. Hover a file row to replace its change counts with a `+` button for
 unstaged files or a `-` button for staged files; click that exact adornment to stage or unstage the
 file. Each wheel event scrolls the surface under the pointer by one row;
-Shift-wheel pans the active code region. In split mode, click a region to activate it and drag the
-center divider to resize it. The divider is clamped so neither side disappears. Use `--no-mouse` to
-keep terminal mouse reporting disabled.
+Shift-wheel pans the active code region. In a wide terminal, drag the divider between the Changes
+tree and review panel to resize the tree; the proportional width is saved for the next run. Press
+Escape during a drag to restore the starting width. In split mode, the divider between the old and
+new files can be dragged independently. Both dividers are clamped so their neighboring panes remain
+usable. Use `--no-mouse` to keep terminal mouse reporting disabled; the keyboard resize controls
+remain available.
+
+Click `[-]` in the Changes title or press `Ctrl-T` to give the review panel the whole terminal;
+click `changes [+]` or press `Ctrl-T` again to restore the tree at its saved width. `F` measures the
+currently expanded tree—including indentation, paths, counts, hover actions, borders, and any
+scrollbar—and chooses the smallest width that shows it without crowding the review pane.
+
+File actions resolve the selected Git path from the canonical worktree root, so they keep working
+when `kit diff` is launched from a nested directory. They use Kit's shared external-handoff and
+process-supervision framework: `o` opens the file, while `O` selects it in Finder or Explorer and
+opens its containing directory on Linux. `p` uses the native preview capability when one is
+available (Quick Look on macOS); unsupported actions are reported in the footer instead of running
+an ad hoc fallback command.
 
 ## Review presentation
 
@@ -80,7 +102,8 @@ CRLF and missing-final-newline information. Paths that are not valid UTF-8 are b
 
 ## Scope and limitations
 
-`kit diff` writes only the Git index when `s` is pressed. It never discards or edits worktree content,
+`kit diff` writes only the Git index when `s` is pressed. The open, reveal, and preview controls hand
+paths to the operating system but do not edit them in Kit. Diff never discards worktree content,
 creates commits, or changes branches. Press `r` to refresh manually; the current snapshot remains
 visible if reloading fails. It has no automatic watch mode. It does not show ignored files, recurse
 into submodules, compare arbitrary commits/ranges, read patch files or stdin, or perform semantic/AST

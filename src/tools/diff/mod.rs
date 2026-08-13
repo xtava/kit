@@ -79,8 +79,14 @@ impl Tool for DiffTool {
             bail!("kit diff requires an interactive terminal");
         }
         let cwd = env::current_dir().context("resolve current directory")?;
+        let repository_root = cx
+            .repositories
+            .nearest_worktree_root(&cwd)
+            .context("locate Git worktree for Diff")?
+            .as_path()
+            .to_path_buf();
         let config = Config::load(cx.config.clone())?;
-        let documents = load_repository(&cwd, args.context)?;
+        let documents = load_repository(&repository_root, args.context)?;
         let (_, theme) = crate::tui::theme::resolve(&args.theme)
             .with_context(|| format!("load diff theme {:?}", args.theme))?;
         let mode = match args.mode {
@@ -88,8 +94,17 @@ impl Tool for DiffTool {
             ModeArg::Inline => tui::ViewMode::Inline,
             ModeArg::Split => tui::ViewMode::Split,
         };
-        tui::run(cwd, documents, theme, !args.no_mouse, mode, args.context, config.line_numbers())
-            .await
+        tui::run(
+            repository_root,
+            documents,
+            theme,
+            !args.no_mouse,
+            mode,
+            args.context,
+            config,
+            cx.processes.clone(),
+        )
+        .await
     }
 }
 
