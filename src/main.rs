@@ -12,7 +12,7 @@ use kit::tools::{stream, tsgo};
 use kit::tools::{console, tail};
 
 #[cfg(unix)]
-use kit::tools::{cdp, scout};
+use kit::tools::{cdp, scout, skills};
 
 fn main() -> Result<()> {
     // Behave like a normal Unix filter under a closed pipe (`… | head`): exit on SIGPIPE instead of
@@ -63,6 +63,6 @@ async fn run() -> Result<()> {
     #[cfg(target_os = "linux")]
     let registry = registry.register(stream::tool()).register(tsgo::tool());
     #[cfg(unix)]
-    let registry = registry.register(scout::tool()).register(cdp::tool());
+    let registry = registry.register(scout::tool()).register(cdp::tool()).register(skills::tool());
     registry.register_settings(settings::tool).dispatch().await
 }

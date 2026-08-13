@@ -18,6 +18,8 @@ pub mod render;
 pub mod scout;
 pub mod secrets;
 pub mod settings;
+#[cfg(unix)]
+pub mod skills;
 pub mod stats;
 #[cfg(target_os = "linux")]
 pub mod stream;
