@@ -31,7 +31,7 @@ Contributors can still build and install the current checkout with `./install.sh
 | `kit deploy` | Run typed deployment plans, inspect version history, and execute configured rollbacks. |
 | `kit ops` | Run named refs-only operations with validated public JSON input and 1Password-masked secrets. |
 | `kit record` | Start, stop, inspect, save, and replay Modular Playwright recorder runs. |
-| `kit render` | Read Markdown in the terminal and fuzzy-search Markdown files in the current workspace. |
+| `kit render` | Read syntax-highlighted source or rich Markdown in the terminal and fuzzy-search supported workspace files. |
 | `kit secrets` | Browse, search, and manage 1Password through a local TUI backed by the official `op` CLI. |
 | `kit swarm` | Run deterministic multi-thread Codex councils and independently inspect them in a tree/detail TUI. |
 | `kit tail` | Share pasted text and dragged files across Tailscale devices; receive, copy, save, open, or expire incoming items. |
@@ -71,6 +71,7 @@ kit scout --once
 
 # Production operations and agent-readable monitoring
 kit monitor --config examples/monitor.toml
+kit monitor --config examples/monitor.toml logs --level error --since 30m --limit 100
 kit --json monitor --config examples/monitor.toml sources
 
 # Git review
@@ -101,17 +102,46 @@ kit --json console status remote-mac
 kit --json console restart remote-mac --force
 ```
 
+### Scout live controls
+
+Press `Ctrl-P` in `kit scout` to open its searchable command palette. Type to filter Scout's
+actions, use the arrow keys to select, and press `Enter` to invoke. `Esc` or a click outside closes
+the palette; it reflows automatically when the terminal is resized. Direct controls remain
+available: `Up` / `Down` or `j` / `k` navigate, `Enter` / `Space` expands or collapses, `r`
+refreshes, and `q` quits. Both routes invoke the same typed Scout action registry.
+
+### Monitor searchable commands
+
+Press `Ctrl-P` anywhere in `kit monitor`—including while editing a `/` filter—to search its full
+contextual action catalog. Type part of a title, group, or action ID; use `Up` / `Down`,
+`Ctrl-P` / `Ctrl-N`, or the mouse wheel to select; then press `Enter` or click a row to invoke it.
+`Esc` and clicks outside the overlay close it.
+
+The palette includes **Inspect**, **Refresh**, **Open provider**, **Open in kit deploy**, **Toggle log
+follow**, and trace, metrics, and deployment correlation commands. It projects Monitor's existing
+typed registry, so the same enablement and exact captured target apply to palette, keyboard, inline,
+and context-menu actions. Commands unavailable for the current selection remain discoverable and
+explain the missing capability instead of silently retargeting another item.
+
+Examples:
+
+- From Overview, search `refresh` to update the active scope.
+- Select a service and search `inspect` to focus its inspector.
+- In Logs with a ready Loki source, search `follow` to start or pause three-second refreshes.
+- Search `provider`, `deploy`, or `trace` to discover whether the selected source publishes that
+  handoff.
+
 ## Documentation
 
 - [Contribution guide](./CONTRIBUTING.md)
 - [Build provider client](./docs/build.md)
 - [CDP debugger](./docs/cdp.md)
 - [CPU and process monitor](./docs/stats.md)
-- [Production operations monitor](./docs/monitor.md)
+- Production operations monitor controls are documented above and in the built-in `?` help.
 - [Git diff viewer](./docs/diff.md)
 - [Deployment plans and rollback](./docs/deploy.md)
 - [Modular recorder integration](./docs/record.md)
-- [Markdown viewer](./docs/render.md)
+- [Source and Markdown viewer](./docs/render.md)
 - [1Password secrets client](./docs/secrets.md)
 - [Codex swarm orchestrator](./docs/swarm.md)
 - [Tailscale sharing](./docs/tail.md)
