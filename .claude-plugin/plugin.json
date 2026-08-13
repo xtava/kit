@@ -2,9 +2,9 @@
   "name": "kit",
   "displayName": "kit",
   "version": "0.1.0",
-  "description": "Agent skills for the kit toolbelt — drive and verify live Electron/Chrome apps over a warm CDP attachment.",
+  "description": "Agent skills for the kit toolbelt — inspect live apps and trace semantic TypeScript call graphs through warm Kit services.",
   "author": { "name": "Kit maintainers" },
   "repository": "https://github.com/xtava/kit",
   "license": "MIT",
-  "keywords": ["cdp", "electron", "chrome", "devtools", "verification", "debugging"]
+  "keywords": ["cdp", "electron", "chrome", "typescript", "tsgo", "call-graph", "verification", "debugging"]
 }

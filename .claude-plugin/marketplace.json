@@ -1,12 +1,12 @@
 {
   "name": "kit",
-  "description": "Skills from the kit toolbelt: warm-CDP driving and self-verification of live Electron/Chrome apps.",
+  "description": "Skills from the kit toolbelt: warm live-app inspection and semantic TypeScript call tracing.",
   "owner": { "name": "Kit maintainers" },
   "plugins": [
     {
       "name": "kit",
       "source": ".",
-      "description": "Agent skills for the kit toolbelt — drive and verify live Electron/Chrome apps over a warm CDP attachment."
+      "description": "Agent skills for the kit toolbelt — inspect live apps and trace semantic TypeScript call graphs through warm Kit services."
     }
   ]
 }

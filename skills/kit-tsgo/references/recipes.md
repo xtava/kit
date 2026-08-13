@@ -1,5 +1,27 @@
 # `kit tsgo` recipes
 
+## Run the agent edit loop
+
+After editing a bounded set of TypeScript files, get warm local feedback:
+
+```bash
+kit tsgo diagnose src/a.ts src/b.ts --json
+```
+
+Use the returned diagnostics immediately, but do not describe
+`no-local-diagnostics` as project success. At handoff, run the configured
+project gate:
+
+```bash
+kit tsgo check --project tsconfig.json --json
+```
+
+If either command exits 2, resolve its explicit freshness, coverage, output,
+capability, or operational reason instead of treating an empty diagnostics
+array as success. Exit 0 from `check` means the compiler reported no diagnostics
+for one nonempty root project at invocation time; it does not prove project-
+reference closure or a replayable input snapshot.
+
 ## Trace a feature upward
 
 Use callers when the question is “How can this function be reached?”
@@ -82,6 +104,29 @@ service.child.started_at_ms
 
 Require the second `service.request_count` to be larger. PIDs are neither
 necessary nor sufficient.
+
+## Find a shared semantic seam
+
+When two feature paths should converge, create a locus case with one seed and
+one bounded call acquisition per path. Use `call-witness-intersection` with both
+seed IDs, then run:
+
+```bash
+kit tsgo locus --case shared-seam.case.json --workspace . --json
+```
+
+Inspect only anchors that carry a witness from every declared path. If any
+participating acquisition is cut and `require_complete` is true, the discovery
+receipt stays incomplete and returns no intersection. Do not replace the
+missing witness with a textual match.
+
+## Preserve a non-TypeScript gap
+
+If static TypeScript operations cannot prove an event-to-reducer transition,
+DI registration, generated-code edge, resource flow, or runtime observation,
+declare that gap in the case and attach it to an obligation. The result remains
+`investigation-required` until the gap is resolved outside this tool. Do not
+pretend a nearby definition or reference closes it.
 
 ## Verify a live edit
 

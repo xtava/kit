@@ -4,6 +4,9 @@
 
 ```text
 kit tsgo trace
+kit tsgo locus
+kit tsgo diagnose
+kit tsgo check
 kit tsgo inspect
 kit tsgo stop
 kit tsgo prune
@@ -11,6 +14,58 @@ kit tsgo prune
 
 `__serve` is an internal detached-process entry and must never be called by an
 agent or user workflow.
+
+## Diagnose explicit documents
+
+```bash
+kit tsgo diagnose <FILE>... \
+  [--workspace /canonical/worktree] \
+  [--tsgo /exact/path/to/tsgo] \
+  [--json]
+```
+
+`diagnose` synchronizes the complete explicit file set before pulling a report
+for each document. It reuses the warm service, reports the selected configured
+or inferred project, hashes and rechecks requested source bytes, and returns
+bounded normalized diagnostics. Query overlays are closed before and after the
+request so a prior edit cannot remain as stale warm text. It never claims all
+project contexts, dependency freshness, project completeness, or workspace
+completeness because the exact native server exposes inter-file document
+diagnostics but not workspace diagnostics.
+
+Exit 0 means no diagnostics in the complete declared document scope; exit 1
+means diagnostics; exit 2 means stale, incomplete, or operationally failed evidence. The
+verdict names the narrower truth: `no-local-diagnostics`, `local-diagnostics`,
+or `incomplete`.
+
+## Check one configured project
+
+```bash
+kit tsgo check \
+  [-p|--project tsconfig.json] \
+  [--workspace /canonical/worktree] \
+  [--tsgo /exact/path/to/tsgo] \
+  [--json]
+```
+
+Without `--project`, Kit walks from the current directory to the canonical
+worktree and selects the nearest `tsconfig.json`. A read-only `--showConfig`
+preflight records root-file and project-reference coverage and rejects effective
+`generateTrace` or `generateCpuProfile` writes. Kit then invokes the exact native
+compiler with `--noEmit --noCheck false --incremental true --pretty false`, a
+stable locale, and private `--tsBuildInfoFile` storage. It captures bounded
+output and combines native completion, exit, coverage, and classification
+evidence. It does not start or reuse the language-service daemon.
+
+Exit 0 is `compiler-reported-no-diagnostics` for a nonempty root project with no
+references. Exit 1 is completely classified source diagnostics. Exit 2 is
+`incomplete` or an `operational-failure`; this includes project-level
+diagnostics, unclassified/truncated output, uncovered project references, zero
+root files, unsafe write-producing options, and unexpected process exits.
+Overall input freshness is explicitly `unchecked`, so the receipt does not
+pretend to be a replayable source snapshot. `--changed`, solution/build closure,
+baselines, watch, emit, fixes, and arbitrary compiler passthrough are
+deliberately absent.
 
 ## Trace by semantic name
 
@@ -73,6 +128,31 @@ The canonical graph always stores `caller → callee` edges.
 The visual orientation is always target-centered. Do not reverse the printed
 tree to imitate a runtime stack.
 
+## Run a placement-evidence case
+
+`locus` is experimental and read-only. Its public contract records evidence for
+inspection; it does not choose an edit location.
+
+```bash
+kit tsgo locus \
+  --case placement.case.json \
+  [--workspace /canonical/worktree] \
+  [--tsgo /exact/path/to/tsgo] \
+  [--json]
+```
+
+- `--case`: one bounded schema-versioned JSON object; `-` reads stdin.
+- Relative source paths resolve inside the canonical worktree.
+- Positions are zero-based UTF-16 coordinates.
+- Native operations are definitions, references, implementations, incoming
+  calls, and outgoing calls.
+- Candidate discovery is restricted to supplied anchors, returned definitions,
+  returned implementations, or an intersection witnessed by at least two call
+  acquisitions.
+
+The command never performs textual candidate fallback and never selects a
+change location. See [locus.md](locus.md) for the complete contract.
+
 ## Text output
 
 Text contains:
@@ -105,7 +185,7 @@ references.
 
 ## Structured output
 
-`--json` returns:
+Trace `--json` returns:
 
 ```text
 action
@@ -154,6 +234,29 @@ truncation_reasons
 and deduplicated. `ascii` is a deterministic projection of that graph, not a
 second semantic owner.
 
+Locus `--json` returns:
+
+```text
+action
+service
+result
+text
+```
+
+`result` retains seed query provenance, prepared semantic roots for successful
+call acquisitions, acquisition completeness, evidence provenance, inspect
+anchors, obligation matrices, discovery receipts, declared gaps, freshness
+hashes, a replay fingerprint, and timing. `text` is the same bounded evidence
+view shown in text mode.
+
+Diagnose and check `--json` use an `outcome` discriminant. A `result` outcome
+contains `action`, typed `result`, and a stable `text` projection; diagnose also
+contains `service` reuse evidence. An `operational-failure` outcome contains a
+typed failure and exits 2 rather than colliding with the diagnostics exit code.
+Their shared diagnostic records use one-based positions, workspace-relative
+paths, closed severity/code/source variants, stable receipt-local IDs, explicit
+detail/collection cuts, and deterministic ordering.
+
 ## Inspect
 
 ```bash
@@ -191,6 +294,15 @@ receipts and removes owned registry/socket files without guessing from a PID.
 | `truncated` | Discovery, depth, or node guard cut the result | Inspect typed cuts; raise only the relevant guard |
 | `ambiguous` | Multiple semantic targets matched | Qualify, narrow `--in`, or use `--at` |
 | `not-found` | No semantic target prepared | Check name, scope, project activation, or exact position |
+
+Locus statuses are deliberately separate:
+
+| Status | Meaning | Next action |
+| --- | --- | --- |
+| `blocked` | Seed ambiguity/failure or observed-input change invalidates the case | Resolve the block and replay |
+| `investigation-required` | A required acquisition, discovery receipt, or declared gap remains open | Gather the named missing evidence |
+| `no-candidate` | Complete declared discovery returned no inspect anchor | Widen only the declared evidence model |
+| `evidence-ready` | The declared bounded evidence is closed and anchors exist | Inspect anchors; make the edit decision outside the tool |
 
 ## Trust boundary
 

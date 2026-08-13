@@ -1,28 +1,56 @@
 ---
 name: kit-tsgo
 description: >-
-  Trace and inspect semantic TypeScript call graphs with `kit tsgo`, a warm
-  workspace-scoped native TypeScript 7 language-service daemon. Use when an
-  agent needs to identify a function's callers or callees, trace upward toward
-  entry points, understand downstream implementation calls, inspect callsites,
-  assess change impact, follow converging or recursive call chains, verify that
-  edits changed the semantic graph, or manage the reusable tsgo service. Accepts
-  semantic symbols or exact UTF-16 source positions and supports structured JSON.
+  Diagnose explicit TypeScript documents, run authoritative project type
+  checks, trace semantic call graphs, and capture replayable placement evidence
+  with `kit tsgo`. Use for fast post-edit feedback, project handoff gates,
+  callers, callees, definitions, references, implementations, converging call
+  witnesses, explicit evidence gaps, change-impact evidence, or bounded source
+  anchors before choosing where to edit. Supports structured JSON.
 license: MIT
 metadata:
   source: https://github.com/xtava/kit
 ---
 
-# kit tsgo — trace a function through the semantic call graph
+# kit tsgo — diagnostics, project checks, and semantic evidence
 
 `kit tsgo` keeps one native `tsgo --lsp --stdio` child warm per canonical Git
-worktree and exact server version. The first trace starts the service lazily;
-later traces reuse the same daemon and native child. Use Kit for the entire
-lifecycle—never launch, signal, or clean the language server by hand.
+worktree and exact server version. The first trace, locus, or diagnose request
+starts the service lazily; later queries reuse the same daemon and native child.
+Authoritative `check` is deliberately separate: it runs one supervised compiler
+process and never pretends that document diagnostics prove project correctness.
+Use Kit for the entire lifecycle—never launch, signal, or clean the language
+server by hand.
 
 Requires `kit` on `PATH` and a native `tsgo` launcher. By default Kit resolves
 `<worktree>/node_modules/.bin/tsgo`; use `--tsgo` only to select an intentional
 exact launcher.
+
+## Use the two-stage edit gate
+
+During an edit loop, request warm diagnostics for exactly the files changed:
+
+```bash
+kit tsgo diagnose src/cart.ts src/checkout.ts --json
+```
+
+This returns `no-local-diagnostics`, `local-diagnostics`, or `incomplete`. Even
+zero diagnostics means only the explicit documents were checked; the result
+always declares that workspace diagnostics are unavailable.
+
+Before handoff, run the authoritative project compiler:
+
+```bash
+kit tsgo check --project tsconfig.json --json
+```
+
+Omit `--project` to use the nearest `tsconfig.json`. `check` first reads the
+effective config, then runs the exact native launcher with checking forced on,
+emission disabled, and incremental state redirected into Kit's private process
+workspace. Exit 0 means only `compiler-reported-no-diagnostics` for that root
+project at invocation time. Input freshness is explicitly unchecked, and any
+project references make the result incomplete because solution closure is not
+part of v1.
 
 ## Start with the function
 
@@ -110,9 +138,39 @@ child.run_id · child.generation · child.started_at_ms · child.server_version
 Reuse means the instance/start and child identity remain unchanged while
 `request_count` increases. PID equality alone is not proof.
 
+## Compare inspect anchors without ranking them
+
+Use `locus` when a feature request spans several plausible seams and the next
+question is “what should I inspect before deciding where to edit?”:
+
+```bash
+kit tsgo locus --case placement.case.json --workspace . --json
+```
+
+`locus` is an experimental evidence surface. Do not present it as a placement
+recommender or treat `evidence-ready` as a promotion decision.
+
+A locus case declares:
+
+- semantic seeds;
+- required obligations;
+- bounded native acquisitions;
+- allowed candidate-discovery rules;
+- explicit non-TypeScript evidence gaps.
+
+The result may be `blocked`, `investigation-required`, `no-candidate`, or
+`evidence-ready`. `evidence-ready` means only that the declared capture is
+complete enough to inspect its returned anchors. It is not a recommendation,
+score, or proof of runtime behavior. A cut, unsupported operation, ambiguous
+seed/call item, changed input, or declared gap stays explicit rather than being
+converted into negative evidence.
+
+Use [references/locus.md](references/locus.md) for the case contract and a
+minimal replayable example.
+
 ## Keep the service warm
 
-There is no warm-up command. Trace directly. Inspecting never starts a service:
+There is no warm-up command. Query directly. Inspecting never starts a service:
 
 ```bash
 kit tsgo inspect
@@ -130,13 +188,18 @@ delete a socket manually, or run `tsgo --lsp --stdio` beside Kit's owner.
 
 ## Agent operating rules
 
-1. Trace the requested function directly; do not perform a separate warm-up.
-2. Prefer semantic names, then exact positions when names remain ambiguous.
-3. Begin with default limits; raise only the guard shown in structured cuts.
-4. Use `--json` when comparing runs or claiming graph/reuse evidence.
-5. Do not modify the target repository merely to make a query easier.
-6. Do not claim dynamic runtime execution from static call-hierarchy evidence.
-7. Stop only when teardown or a clean replacement is part of the task.
+1. Use `diagnose` for fast explicit-file feedback and `check` for the native root-project gate.
+2. Trace the requested function directly; do not perform a separate warm-up.
+3. Prefer semantic names, then exact positions when names remain ambiguous.
+4. Begin with default limits; raise only the guard shown in structured cuts.
+5. Use `--json` when comparing runs or claiming diagnostic, graph, or reuse evidence.
+6. Do not modify the target repository merely to make a query easier.
+7. Do not claim dynamic runtime execution from static call-hierarchy evidence.
+8. Stop only when teardown or a clean replacement is part of the task.
+9. For `locus`, inspect only returned anchors and keep every open obligation or
+   declared gap visible in the handoff.
+10. Treat exit 2 and every `operational-failure` outcome as unresolved evidence,
+    never as an empty successful check.
 
 ## Going deeper
 
@@ -145,3 +208,5 @@ delete a socket manually, or run `tsgo --lsp --stdio` beside Kit's owner.
 - [references/recipes.md](references/recipes.md) — focused workflows for feature
   tracing, implementation exploration, ambiguity, reuse, live edits, large
   graphs, recovery, and Modular's Read tool.
+- [references/locus.md](references/locus.md) — typed placement-evidence cases,
+  status semantics, discovery rules, completeness, and replay receipts.
