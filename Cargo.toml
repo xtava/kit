@@ -77,6 +77,9 @@ wezterm-blob-leases = { path = "vendor/wezterm/wezterm-blob-leases", features = 
 wezterm-term = { path = "vendor/wezterm/term", features = ["use_serde"] }
 termwiz = { path = "vendor/wezterm/termwiz", features = ["use_serde"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+
 [profile.dev]
 debug = "line-tables-only"
 split-debuginfo = "unpacked"

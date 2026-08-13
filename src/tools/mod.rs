@@ -23,6 +23,9 @@ pub mod skills;
 pub mod stats;
 #[cfg(target_os = "linux")]
 pub mod stream;
+#[cfg(target_os = "macos")]
+#[path = "stream_macos/mod.rs"]
+pub mod stream;
 pub mod swarm;
 pub mod sync;
 #[cfg(any(target_os = "linux", target_os = "macos"))]

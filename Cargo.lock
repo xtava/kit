@@ -2569,6 +2569,7 @@ dependencies = [
  "clap",
  "codec",
  "config",
+ "core-foundation 0.10.1",
  "crossterm",
  "directories",
  "futures-util",
