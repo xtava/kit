@@ -194,8 +194,8 @@ impl EditableSettings for Config {
         vec![
             SettingField::Toggle {
                 id: SHOW_GIT_IGNORED,
-                label: "Git-ignored Markdown",
-                description: "Include ignored Markdown files in workspace discovery results.",
+                label: "Git-ignored files",
+                description: "Include ignored source and Markdown files in discovery results.",
                 value: self.show_git_ignored,
             },
             SettingField::Choice {
@@ -250,7 +250,11 @@ fn open(store: ConfigStore) -> Result<Box<dyn EditableSettings>> {
 
 pub(super) fn settings() -> SettingsSection {
     SettingsSection::new(
-        SettingsSectionMeta { id: TOOL, title: "Render", description: "Markdown viewer" },
+        SettingsSectionMeta {
+            id: TOOL,
+            title: "Render",
+            description: "Source and Markdown viewer",
+        },
         open,
     )
 }

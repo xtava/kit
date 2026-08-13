@@ -28,7 +28,7 @@ pub fn truncate_terminal_text(value: &str, width: usize, overflow: CellOverflow)
         CellOverflow::Clip => width,
         CellOverflow::Ellipsis => width.saturating_sub(1),
     };
-    let mut used = 0;
+    let mut used: usize = 0;
     let mut end = 0;
     for (index, character) in value.char_indices() {
         let character_width = character.width().unwrap_or_default();

@@ -1,6 +1,6 @@
 //! Shared whole-source syntax highlighting for terminal surfaces.
 
-use std::sync::LazyLock;
+use std::{path::Path, sync::LazyLock};
 
 use ratatui::{
     style::{Modifier, Style},
@@ -9,12 +9,12 @@ use ratatui::{
 use syntect::{
     easy::HighlightLines,
     highlighting::{FontStyle, Theme, ThemeSet},
-    parsing::SyntaxSet,
+    parsing::{SyntaxReference, SyntaxSet},
 };
 
 use super::theme::TuiTheme;
 
-static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(two_face::syntax::extra_newlines);
+static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(two_face::syntax::extra_no_newlines);
 static CODE_THEME: LazyLock<Theme> = LazyLock::new(|| {
     ThemeSet::load_defaults()
         .themes
@@ -30,10 +30,54 @@ pub fn highlight_lines<'a>(
     fallback: Style,
     palette: TuiTheme,
 ) -> Vec<Vec<Span<'static>>> {
-    let lines: Vec<_> = lines.into_iter().collect();
+    let lines = lines.into_iter().map(without_line_ending).collect::<Vec<_>>();
     let syntax = SYNTAXES
         .find_syntax_by_token(syntax_hint)
         .or_else(|| SYNTAXES.find_syntax_by_extension(syntax_hint));
+    highlight_with_syntax(lines, syntax, fallback, palette)
+}
+
+/// Highlight a source file using its full filename, extension, or first-line mode marker.
+pub fn highlight_file_lines<'a>(
+    lines: impl IntoIterator<Item = &'a str>,
+    path: &Path,
+    fallback: Style,
+    palette: TuiTheme,
+) -> Vec<Vec<Span<'static>>> {
+    let lines = lines.into_iter().map(without_line_ending).collect::<Vec<_>>();
+    let first_line = lines.first().copied().unwrap_or_default();
+    let syntax = syntax_for_file(path, first_line);
+    highlight_with_syntax(lines, syntax, fallback, palette)
+}
+
+/// Return the display name of the syntax selected for a source file.
+pub fn file_syntax_name(path: &Path, first_line: &str) -> Option<String> {
+    syntax_for_file(path, first_line).map(|syntax| syntax.name.clone())
+}
+
+/// Whether a filename or extension has a bundled syntax definition.
+pub fn supports_file(path: &Path) -> bool {
+    syntax_for_path(path).is_some_and(|syntax| syntax.name != "Plain Text")
+}
+
+fn syntax_for_file(path: &Path, first_line: &str) -> Option<&'static SyntaxReference> {
+    syntax_for_path(path).or_else(|| SYNTAXES.find_syntax_by_first_line(first_line))
+}
+
+fn syntax_for_path(path: &Path) -> Option<&'static SyntaxReference> {
+    let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+    let extension = path.extension().and_then(|extension| extension.to_str()).unwrap_or_default();
+    SYNTAXES
+        .find_syntax_by_extension(file_name)
+        .or_else(|| SYNTAXES.find_syntax_by_extension(extension))
+}
+
+fn highlight_with_syntax(
+    lines: Vec<&str>,
+    syntax: Option<&SyntaxReference>,
+    fallback: Style,
+    palette: TuiTheme,
+) -> Vec<Vec<Span<'static>>> {
     let Some(syntax) = syntax else {
         return fallback_lines(lines, fallback);
     };
@@ -59,6 +103,11 @@ pub fn highlight_lines<'a>(
 
 fn fallback_lines(lines: Vec<&str>, fallback: Style) -> Vec<Vec<Span<'static>>> {
     lines.into_iter().map(|line| vec![Span::styled(line.to_owned(), fallback)]).collect()
+}
+
+fn without_line_ending(line: &str) -> &str {
+    let line = line.strip_suffix('\n').unwrap_or(line);
+    line.strip_suffix('\r').unwrap_or(line)
 }
 
 fn to_ratatui(style: syntect::highlighting::Style, palette: TuiTheme) -> Style {

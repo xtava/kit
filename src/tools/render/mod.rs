@@ -1,4 +1,4 @@
-//! `render` — an interactive Markdown file viewer and fuzzy workspace file switcher.
+//! `render` — an interactive source and Markdown viewer with a fuzzy workspace file switcher.
 
 mod actions;
 mod config;
@@ -23,11 +23,11 @@ pub struct RenderTool;
 #[derive(Parser)]
 #[command(
     name = "render",
-    about = "Read Markdown files in an interactive terminal viewer",
-    long_about = "Renders a Markdown file in a scrollable terminal viewer. The bottom prompt fuzzy-searches Markdown files under the current directory, visibly labels Git-ignored results, and supports /configure discovery settings."
+    about = "Read source and Markdown files in an interactive terminal viewer",
+    long_about = "Renders source files with syntax highlighting and Markdown files with rich formatting in a scrollable terminal viewer. The bottom prompt fuzzy-searches supported files under the current directory, visibly labels Git-ignored results, and supports /configure discovery settings."
 )]
 struct RenderArgs {
-    /// Markdown file to open. Omit it to start with the fuzzy workspace picker.
+    /// Source or Markdown file to open. Omit it to start with the fuzzy workspace picker.
     #[arg(value_name = "FILE")]
     file: Option<PathBuf>,
 
@@ -41,7 +41,7 @@ impl Tool for RenderTool {
     fn meta(&self) -> ToolMeta {
         ToolMeta {
             name: "render",
-            about: "Read Markdown files in an interactive terminal viewer",
+            about: "Read source and Markdown files in an interactive terminal viewer",
             version: env!("CARGO_PKG_VERSION"),
         }
     }

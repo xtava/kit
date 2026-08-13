@@ -28,12 +28,12 @@ use url::Url;
 use super::{
     actions::{self, RenderActionContext, RenderActionRegistry, RenderCommand, RenderTarget},
     config::{self, Config},
-    search::SearchIndex,
+    search::{is_markdown, SearchIndex},
 };
 use crate::tui::{
     fuzzy,
-    markdown::{has_heading, MarkdownHeading, MarkdownLink, MarkdownRenderer, MarkdownSearchLine},
-    render_split_divider, render_vertical_scrollbar,
+    markdown::{has_heading, MarkdownHeading, MarkdownLink, MarkdownRenderer},
+    render_split_divider, render_vertical_scrollbar, syntax,
     theme::{self, TuiTheme},
     ActionInvocation, CommandSet, CommandSpec, EventReader, Frecency, FrecencyStore, KeyChord,
     KeybindingResolution, KeybindingState, LineEditor, NavigationHistory, ParsedInput,
@@ -55,7 +55,7 @@ const COMMANDS: CommandSet = CommandSet::new(&[
         name: "configure",
         aliases: &["config"],
         usage: "/configure",
-        description: "configure the Markdown viewer",
+        description: "configure the source and Markdown viewer",
     },
     CommandSpec {
         name: "theme",
@@ -85,7 +85,7 @@ pub async fn run(
     theme_spec: String,
     theme: TuiTheme,
 ) -> Result<()> {
-    let root = root.canonicalize().context("resolve Markdown search root")?;
+    let root = root.canonicalize().context("resolve Render search root")?;
     let search_wake = Arc::new(Notify::new());
     let index = SearchIndex::discover(&root, Arc::clone(&search_wake));
     let frecency_store =
@@ -840,7 +840,7 @@ impl App {
 
     fn open_document_search(&mut self) {
         if self.document.is_none() {
-            self.notice = Notice::error("open a Markdown file before searching".to_owned());
+            self.notice = Notice::error("open a file before searching".to_owned());
             return;
         }
         self.input.set("/find ".to_owned());
@@ -850,7 +850,7 @@ impl App {
 
     fn start_document_search(&mut self, query: &str) {
         if self.document.is_none() {
-            self.notice = Notice::error("open a Markdown file before searching".to_owned());
+            self.notice = Notice::error("open a file before searching".to_owned());
             return;
         }
         self.search =
@@ -989,10 +989,7 @@ impl App {
         };
         match Document::load(&self.root, path) {
             Ok(document)
-                if self
-                    .document
-                    .as_ref()
-                    .is_some_and(|open| open.markdown == document.markdown) =>
+                if self.document.as_ref().is_some_and(|open| open.source == document.source) =>
             {
                 if announce_unchanged {
                     self.notice = Notice::info(format!("refreshed {}", document.display));
@@ -1026,8 +1023,8 @@ impl App {
         }
         let noun = if indexed == 1 { "file" } else { "files" };
         self.notice = Notice::info(match display {
-            Some(display) => format!("refreshed {display} · indexed {indexed} Markdown {noun}"),
-            None => format!("indexed {indexed} Markdown {noun}"),
+            Some(display) => format!("refreshed {display} · indexed {indexed} supported {noun}"),
+            None => format!("indexed {indexed} supported {noun}"),
         });
     }
 
@@ -1222,21 +1219,40 @@ impl App {
 struct Document {
     path: PathBuf,
     display: String,
-    markdown: String,
+    source: String,
+    kind: DocumentKind,
+}
+
+enum DocumentKind {
+    Markdown,
+    Source { syntax_name: Option<String> },
 }
 
 impl Document {
     fn load(root: &Path, path: PathBuf) -> Result<Self> {
-        let path = path
-            .canonicalize()
-            .with_context(|| format!("resolve Markdown file {}", path.display()))?;
+        let path =
+            path.canonicalize().with_context(|| format!("resolve file {}", path.display()))?;
         if !path.is_file() {
             return Err(anyhow!("{} is not a file", path.display()));
         }
-        let markdown = fs::read_to_string(&path)
-            .with_context(|| format!("read Markdown file {} as UTF-8", path.display()))?;
+        let source = fs::read_to_string(&path)
+            .with_context(|| format!("read file {} as UTF-8 text", path.display()))?;
+        let kind = if is_markdown(&path) {
+            DocumentKind::Markdown
+        } else {
+            let first_line = source.lines().next().unwrap_or_default();
+            DocumentKind::Source { syntax_name: syntax::file_syntax_name(&path, first_line) }
+        };
         let display = display_path(root, &path);
-        Ok(Self { path, display, markdown })
+        Ok(Self { path, display, source, kind })
+    }
+
+    fn panel_label(&self) -> &str {
+        match &self.kind {
+            DocumentKind::Markdown => "markdown",
+            DocumentKind::Source { syntax_name: Some(name) } => name,
+            DocumentKind::Source { syntax_name: None } => "text",
+        }
     }
 }
 
@@ -1299,7 +1315,7 @@ fn render_document(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         let body = vec![
             Line::from(""),
             Line::from(Span::styled(
-                "Type a Markdown filename below.",
+                "Type a source or Markdown filename below.",
                 Style::default().fg(app.theme.text_strong).add_modifier(Modifier::BOLD),
             )),
             Line::from("Use fuzzy fragments from any part of the path, then Tab or ↑/↓ to select."),
@@ -1311,7 +1327,7 @@ fn render_document(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             )),
         ];
         app.set_geometry(body.len(), area.height.saturating_sub(2) as usize);
-        frame.render_widget(Paragraph::new(body).block(panel(" markdown ", app.theme)), area);
+        frame.render_widget(Paragraph::new(body).block(panel(" render ", app.theme)), area);
         let content_area = Rect::new(
             area.x.saturating_add(2),
             area.y.saturating_add(1),
@@ -1328,10 +1344,10 @@ fn render_document(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         return;
     };
 
-    let renderer = MarkdownRenderer::new(app.theme);
     let toc_heading_depth = app.config.toc_heading_depth();
-    let toc_available =
-        area.width >= TOC_MIN_LAYOUT_WIDTH && has_heading(&document.markdown, toc_heading_depth);
+    let toc_available = matches!(&document.kind, DocumentKind::Markdown)
+        && area.width >= TOC_MIN_LAYOUT_WIDTH
+        && has_heading(&document.source, toc_heading_depth);
     let mut document_area = area;
     let mut toc_area = None;
     let rendered = if toc_available && !app.toc_collapsed {
@@ -1343,10 +1359,11 @@ fn render_document(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         app.toc_split_frame = split;
         document_area = split.first;
         toc_area = Some(split.second);
-        renderer.render_with_outline(&document.markdown, split.first.width.saturating_sub(4).max(1))
+        render_content(document, split.first.width.saturating_sub(4).max(1), app.theme)
     } else {
-        renderer.render_with_outline(&document.markdown, area.width.saturating_sub(4).max(1))
+        render_content(document, area.width.saturating_sub(4).max(1), app.theme)
     };
+    let panel_label = document.panel_label().to_owned();
     if !toc_available || app.toc_collapsed {
         app.cancel_toc_drag();
     }
@@ -1368,9 +1385,9 @@ fn render_document(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let scroll_top = app.viewport.top(app.viewport_metrics);
     app.link_hits = rendered_link_hits(document_area, scroll_top, viewport_height, &links);
     let title = if max_scroll == 0 {
-        " markdown ".to_owned()
+        format!(" {panel_label} ")
     } else {
-        format!(" markdown ─ {}/{} ", scroll_top + 1, max_scroll + 1)
+        format!(" {panel_label} ─ {}/{} ", scroll_top + 1, max_scroll + 1)
     };
     let scroll = scroll_top.min(u16::MAX as usize) as u16;
     let mut document_panel = panel(title, app.theme);
@@ -1485,6 +1502,71 @@ fn render_document(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     }
 }
 
+struct RenderedDocument {
+    text: Text<'static>,
+    headings: Vec<MarkdownHeading>,
+    links: Vec<MarkdownLink>,
+    search_lines: Vec<DocumentSearchLine>,
+}
+
+struct DocumentSearchLine {
+    text: String,
+    start_line: usize,
+    end_line: usize,
+}
+
+fn render_content(document: &Document, width: u16, theme: TuiTheme) -> RenderedDocument {
+    match &document.kind {
+        DocumentKind::Markdown => {
+            let rendered =
+                MarkdownRenderer::new(theme).render_with_outline(&document.source, width);
+            RenderedDocument {
+                text: rendered.text,
+                headings: rendered.headings,
+                links: rendered.links,
+                search_lines: rendered
+                    .search_lines
+                    .into_iter()
+                    .map(|line| DocumentSearchLine {
+                        text: line.text,
+                        start_line: line.start_line,
+                        end_line: line.end_line,
+                    })
+                    .collect(),
+            }
+        }
+        DocumentKind::Source { .. } => render_source(document, theme),
+    }
+}
+
+fn render_source(document: &Document, theme: TuiTheme) -> RenderedDocument {
+    let source = document.source.strip_suffix('\n').unwrap_or(&document.source);
+    let lines = if source.is_empty() {
+        vec![""]
+    } else {
+        source.split('\n').map(|line| line.strip_suffix('\r').unwrap_or(line)).collect::<Vec<_>>()
+    };
+    let highlighted = syntax::highlight_file_lines(
+        lines.iter().copied(),
+        &document.path,
+        Style::default().fg(theme.text),
+        theme,
+    );
+    let text = Text::from(
+        highlighted.into_iter().map(|spans| Line::from(spans)).collect::<Vec<Line<'static>>>(),
+    );
+    let search_lines = lines
+        .into_iter()
+        .enumerate()
+        .map(|(line, text)| DocumentSearchLine {
+            text: text.to_owned(),
+            start_line: line,
+            end_line: line + 1,
+        })
+        .collect();
+    RenderedDocument { text, headings: Vec::new(), links: Vec::new(), search_lines }
+}
+
 fn rendered_link_hits(
     area: Rect,
     scroll_top: usize,
@@ -1575,7 +1657,7 @@ fn render_toc(
 
 fn matching_document_lines(
     text: &Text<'_>,
-    search_lines: &[MarkdownSearchLine],
+    search_lines: &[DocumentSearchLine],
     query: &str,
 ) -> Vec<usize> {
     let query = query.to_lowercase();
@@ -1837,14 +1919,11 @@ mod tests {
             Flow::Continue
         );
 
-        assert_eq!(
-            app.document.as_ref().map(|document| document.markdown.as_str()),
-            Some("# After")
-        );
+        assert_eq!(app.document.as_ref().map(|document| document.source.as_str()), Some("# After"));
         assert_eq!(app.viewport.top(app.viewport_metrics), 12);
         assert_eq!(app.index.len(), 2);
         assert!(app.input.value().is_empty());
-        assert_eq!(app.notice.text, "refreshed README.md · indexed 2 Markdown files");
+        assert_eq!(app.notice.text, "refreshed README.md · indexed 2 supported files");
 
         app.input.set("new".to_owned());
         app.refresh_suggestions();

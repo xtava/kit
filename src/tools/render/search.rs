@@ -1,5 +1,7 @@
 use std::{
     collections::HashSet,
+    fs::File,
+    io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
@@ -8,7 +10,7 @@ use std::{
 use ignore::WalkBuilder;
 use tokio::sync::Notify;
 
-use crate::tui::{Frecency, FuzzyIndex, SearchMode, Suggestion};
+use crate::tui::{syntax, Frecency, FuzzyIndex, SearchMode, Suggestion};
 
 pub(crate) struct SearchIndex {
     index: FuzzyIndex<FileEntry>,
@@ -125,19 +127,19 @@ fn discover_entries(root: &Path) -> Vec<FileEntry> {
         .build()
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
-        .filter(|entry| is_markdown(entry.path()))
+        .filter(|entry| is_renderable(entry.path()))
         .map(|entry| FileEntry::new(root, entry.into_path(), false))
         .collect::<Vec<_>>();
 
     let mut known = entries.iter().map(|entry| entry.path.clone()).collect::<HashSet<_>>();
-    for relative in git_ignored_markdown(root) {
+    for relative in git_ignored_files(root) {
         let path = root.join(relative);
         let Ok(path) = path.canonicalize() else {
             continue;
         };
         if !path.starts_with(root)
             || !path.is_file()
-            || !is_markdown(&path)
+            || !is_renderable(&path)
             || !known.insert(path.clone())
         {
             continue;
@@ -168,22 +170,9 @@ fn suggestion(
     Suggestion::new(entry.display.clone(), hint.join(" · "))
 }
 
-fn git_ignored_markdown(root: &Path) -> Vec<PathBuf> {
+fn git_ignored_files(root: &Path) -> Vec<PathBuf> {
     let output = Command::new("git")
-        .args([
-            "ls-files",
-            "-z",
-            "--cached",
-            "--others",
-            "--ignored",
-            "--exclude-standard",
-            "--",
-            ":(icase)*.md",
-            ":(icase)*.markdown",
-            ":(icase)*.mdown",
-            ":(icase)*.mkd",
-            ":(icase)*.mdx",
-        ])
+        .args(["ls-files", "-z", "--cached", "--others", "--ignored", "--exclude-standard"])
         .current_dir(root)
         .output();
     let Ok(output) = output else {
@@ -202,12 +191,27 @@ fn git_ignored_markdown(root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-fn is_markdown(path: &Path) -> bool {
+pub(super) fn is_markdown(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|extension| extension.to_str()).map(str::to_ascii_lowercase),
         Some(extension)
             if matches!(extension.as_str(), "md" | "markdown" | "mdown" | "mkd" | "mdx")
     )
+}
+
+fn is_renderable(path: &Path) -> bool {
+    if is_markdown(path) || syntax::supports_file(path) {
+        return true;
+    }
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    let mut first_line = String::new();
+    if BufReader::new(file).read_line(&mut first_line).is_err() {
+        return false;
+    }
+    syntax::file_syntax_name(path, &first_line)
+        .is_some_and(|syntax_name| syntax_name != "Plain Text")
 }
 
 fn display_path(root: &Path, path: &Path) -> String {
