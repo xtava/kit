@@ -15,6 +15,7 @@ pub(super) const TOGGLE_FOLLOW: ActionId = ActionId::new("monitor.logs.toggleFol
 pub(super) const OPEN_TRACE: ActionId = ActionId::new("monitor.correlation.openTrace");
 pub(super) const OPEN_METRICS: ActionId = ActionId::new("monitor.correlation.openMetrics");
 pub(super) const OPEN_DEPLOYMENT: ActionId = ActionId::new("monitor.correlation.openDeployment");
+pub(super) const OPEN_COMMAND_PALETTE: ActionId = ActionId::new("monitor.commandPalette.open");
 
 pub(super) const ITEM_CONTEXT: MenuId = ActionIdMenu::ITEM_CONTEXT;
 pub(super) const ITEM_INLINE: MenuId = ActionIdMenu::ITEM_INLINE;
@@ -72,6 +73,7 @@ pub(super) enum MonitorCommand {
     OpenTraceCorrelation,
     OpenMetricsCorrelation,
     OpenDeploymentCorrelation,
+    OpenCommandPalette,
 }
 
 pub(super) type MonitorActionRegistry = ActionRegistry<MonitorActionContext, MonitorCommand>;
@@ -84,6 +86,13 @@ pub(super) fn registry() -> Result<MonitorActionRegistry, ActionRegistryError> {
 
 fn contribute_actions(builder: &mut ActionRegistryBuilder<MonitorActionContext, MonitorCommand>) {
     builder
+        .register_action(ActionSpec {
+            id: OPEN_COMMAND_PALETTE,
+            title: "Show command palette",
+            command: MonitorCommand::OpenCommandPalette,
+            enablement: always_enabled,
+            command_palette: CommandPalettePlacement::Hidden,
+        })
         .register_action(ActionSpec {
             id: INSPECT,
             title: "Inspect",
@@ -246,10 +255,19 @@ fn contribute_actions(builder: &mut ActionRegistryBuilder<MonitorActionContext, 
             when: visible,
         });
     }
+    builder.bind_key(KeybindingPlacement {
+        binding: KeyChord::new(KeyCode::Char('p'), KeyModifiers::CONTROL).into(),
+        action: OPEN_COMMAND_PALETTE,
+        when: always,
+    });
 }
 
 fn always(_: &MonitorActionContext) -> bool {
     true
+}
+
+fn always_enabled(_: &MonitorActionContext) -> ActionState {
+    ActionState::Enabled
 }
 
 fn logs_view(context: &MonitorActionContext) -> bool {

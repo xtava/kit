@@ -18,7 +18,8 @@ use ratatui::{
 use tokio::sync::mpsc;
 
 use crate::tui::{
-    theme::NORD, ActionId, ActionInvocation, ActionUnavailable, ContextMenu, ContextMenuLayout,
+    theme::NORD, ActionId, ActionInvocation, ActionUnavailable, CommandPalette,
+    CommandPaletteLayout, CommandPaletteOutcome, ContextMenu, ContextMenuLayout,
     ContextMenuOutcome, ContextMenuStyle, EventReader, KeyChord, KeybindingResolution,
     KeybindingState, NavigationMap, NavigationRegion, ResolvedAction, SelectableRegion,
     SelectionOutcome, Session, SessionOptions, SplitFrame, SplitMinimums, SplitRatio,
@@ -63,6 +64,7 @@ enum MonitorSurface {
 }
 
 enum MonitorOverlay {
+    CommandPalette(CommandPalette<MonitorActionContext>),
     ContextMenu(ContextMenu<MonitorActionContext>),
     Help,
 }
@@ -74,6 +76,7 @@ struct UiRegions {
     secondary: Option<Rect>,
     rows: Vec<(Rect, usize)>,
     inline_actions: Vec<(Rect, ActionId)>,
+    command_palette: Option<CommandPaletteLayout>,
     context_menu: Option<ContextMenuLayout>,
     selectable: Vec<SelectableRegion<MonitorSurface>>,
 }
@@ -294,7 +297,31 @@ impl App {
     }
 
     fn on_overlay_event(&mut self, event: Event, regions: &UiRegions) -> Flow {
+        if matches!(self.overlay, Some(MonitorOverlay::CommandPalette(_))) {
+            let Some(layout) = regions.command_palette.as_ref() else {
+                self.overlay = None;
+                return Flow::Continue;
+            };
+            let outcome = match self.overlay.as_mut() {
+                Some(MonitorOverlay::CommandPalette(palette)) => palette.on_event(event, layout),
+                _ => unreachable!("command palette overlay checked above"),
+            };
+            return match outcome {
+                CommandPaletteOutcome::Captured => Flow::Continue,
+                CommandPaletteOutcome::Dismissed => {
+                    self.overlay = None;
+                    Flow::Continue
+                }
+                CommandPaletteOutcome::Invoke(invocation) => {
+                    self.overlay = None;
+                    self.invoke_action(invocation)
+                }
+            };
+        }
         let outcome = match self.overlay.as_mut() {
+            Some(MonitorOverlay::CommandPalette(_)) => {
+                unreachable!("command palette events return above")
+            }
             Some(MonitorOverlay::ContextMenu(menu)) => {
                 let layout = regions.context_menu.clone().unwrap_or_default();
                 Some(menu.on_event(event, &layout))
@@ -333,6 +360,22 @@ impl App {
 
     fn on_key(&mut self, key: KeyEvent, regions: &UiRegions) -> Flow {
         if self.filtering {
+            let command_palette = KeyChord::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
+            if KeyChord::from_event(key) == Some(command_palette) {
+                let context = self.action_context();
+                match self.registry.resolve_keybinding(
+                    &mut self.keybinding_state,
+                    command_palette,
+                    context,
+                ) {
+                    KeybindingResolution::Invoke(invocation) => {
+                        return self.invoke_action(invocation)
+                    }
+                    KeybindingResolution::Pending => return Flow::Continue,
+                    KeybindingResolution::Unmatched
+                    | KeybindingResolution::UnmatchedSequence { .. } => {}
+                }
+            }
             match key.code {
                 KeyCode::Enter => self.filtering = false,
                 KeyCode::Esc => {
@@ -522,6 +565,14 @@ impl App {
             }
         };
         match command {
+            MonitorCommand::OpenCommandPalette => {
+                self.selection.clear();
+                self.overlay = Some(MonitorOverlay::CommandPalette(CommandPalette::open(
+                    invocation.context,
+                    &self.registry,
+                )));
+                Flow::Continue
+            }
             MonitorCommand::Inspect => {
                 self.active_region = ActiveRegion::Secondary;
                 Flow::Continue
@@ -778,6 +829,11 @@ fn render(frame: &mut Frame<'_>, app: &mut App) -> UiRegions {
     }
     render_footer(frame, rows[3], app, &mut regions);
     match app.overlay.as_ref() {
+        Some(MonitorOverlay::CommandPalette(palette)) => {
+            let layout = palette.layout(frame.area());
+            palette.render(frame, &layout, NORD);
+            regions.command_palette = Some(layout);
+        }
         Some(MonitorOverlay::ContextMenu(menu)) => {
             let layout = menu.layout(frame.area());
             menu.render(frame, &layout, ContextMenuStyle::from_theme(NORD));
@@ -1296,6 +1352,8 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, regions: &mut UiR
         Span::styled("regions  ", Style::default().fg(NORD.text_muted)),
         Span::styled("/ ", Style::default().fg(NORD.accent)),
         Span::styled("filter  ", Style::default().fg(NORD.text_muted)),
+        Span::styled("Ctrl-P ", Style::default().fg(NORD.accent)),
+        Span::styled("commands  ", Style::default().fg(NORD.text_muted)),
         Span::styled("? ", Style::default().fg(NORD.accent)),
         Span::styled("help  ", Style::default().fg(NORD.text_muted)),
         Span::styled("q ", Style::default().fg(NORD.accent)),
@@ -1333,7 +1391,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, regions: &mut UiR
 }
 
 fn render_help(frame: &mut Frame<'_>, app: &App) {
-    let area = centered_rect(frame.area(), 72, 18);
+    let area = centered_rect(frame.area(), 72, 19);
     frame.render_widget(Clear, area);
     let context = app.action_context();
     let mut lines = vec![
@@ -1346,6 +1404,7 @@ fn render_help(frame: &mut Frame<'_>, app: &App) {
         Line::raw("Up/Down · j/k        move within the active list"),
         Line::raw("Tab · Shift-Tab      move between list and inspector"),
         Line::raw("/                    filter the current view"),
+        Line::raw("Ctrl-P               search every contextual command"),
         Line::raw("right-click          exact-target action menu"),
         Line::raw("Esc                  dismiss, clear, back, then quit"),
         Line::raw("q · Ctrl-C           quit"),
