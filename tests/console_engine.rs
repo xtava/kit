@@ -199,7 +199,6 @@ impl HeadlessClient {
                 &lifecycle,
                 None,
                 &domain,
-                Some(expected_build_identity()),
                 sanitized_client_id(),
                 true,
                 true,
@@ -344,26 +343,6 @@ async fn embedded_wezterm_protocol_bootstrap() {
     let domain = isolated_domain(&agent);
     let expected = expected_build_identity();
 
-    let mismatch_admission = RuntimeAdmission::new(RuntimeRole::Client).unwrap();
-    let mismatch_lifecycle =
-        wezterm_client::client::HeadlessConnectionLifecycle::new(Arc::clone(&mismatch_admission));
-    let mut mismatch = expected.clone();
-    mismatch.source_dirty = Some(!expected.source_dirty.unwrap_or(false));
-    let mismatch_error = wezterm_client::client::Client::new_unix_domain_headless(
-        mismatch_admission,
-        &mismatch_lifecycle,
-        None,
-        &domain,
-        Some(mismatch),
-        sanitized_client_id(),
-        true,
-        true,
-    )
-    .await
-    .err()
-    .expect("mismatched build identity must fail");
-    assert!(mismatch_error.root_cause().is::<wezterm_client::client::BuildIdentityMismatch>());
-
     let admission = RuntimeAdmission::new(RuntimeRole::Client).unwrap();
     let lifecycle =
         wezterm_client::client::HeadlessConnectionLifecycle::new(Arc::clone(&admission));
@@ -372,14 +351,14 @@ async fn embedded_wezterm_protocol_bootstrap() {
         &lifecycle,
         None,
         &domain,
-        Some(expected),
         sanitized_client_id(),
         true,
         true,
     )
     .await
-    .expect("matching build identity must activate the client");
+    .expect("compatible codec must activate the client");
     assert_eq!(client.initial_server_version().codec_vers, wezterm_codec::CODEC_VERSION);
+    assert_eq!(client.server_build_identity(), expected);
     let _ = client.shutdown_and_join();
     drop(client);
     agent.shutdown();

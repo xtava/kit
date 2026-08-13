@@ -29,7 +29,9 @@ use crate::{
 use super::{
     config::Config,
     service::{ConsoleStage, ConsoleStatus, RemoteFailureKind},
-    transport::{PreparedRelayEpoch, RelayEpochFailure, RelayEpochProvider, SshRelay},
+    transport::{
+        PreparedRelayEpoch, RelayEpochFailure, RelayEpochProvider, SshRelay, SshRelayError,
+    },
 };
 
 const STATUS_CAPTURE_BYTES: NonZeroUsize = NonZeroUsize::new(1024 * 1024).unwrap();
@@ -250,18 +252,6 @@ async fn status_with_authentication(
         authenticate,
     )
     .await?;
-    if let ConsoleStatus::Ready { platform, sessions, build } = status {
-        let expected = super::build_identity()?;
-        if build != expected {
-            return Ok(ConsoleStatus::BuildIncompatible {
-                platform,
-                sessions: Some(sessions),
-                expected,
-                actual: build,
-            });
-        }
-        return Ok(ConsoleStatus::Ready { platform, sessions, build });
-    }
     Ok(status)
 }
 
@@ -341,8 +331,21 @@ pub(crate) async fn start_relay(
         authenticate_next: AtomicBool::new(true),
         status,
     });
-    let relay = SshRelay::start(processes, provider).await?;
+    let relay = match SshRelay::start(processes, provider).await {
+        Ok(relay) => relay,
+        Err(error) => return Err(initial_relay_error(&receiver, error)),
+    };
     Ok(RemoteRelay { relay, status: receiver })
+}
+
+fn initial_relay_error(
+    status: &watch::Receiver<Option<ConsoleStatus>>,
+    error: SshRelayError,
+) -> anyhow::Error {
+    match status.borrow().clone() {
+        Some(status) => anyhow::anyhow!(status.text()),
+        None => error.into(),
+    }
 }
 
 #[async_trait]
@@ -851,8 +854,8 @@ fn split_selector(selector: &str) -> Result<(Option<&str>, &str)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        split_selector, ssh_authentication_status, ssh_exit_failure_kind, ConsoleStatus,
-        RemoteFailureKind,
+        initial_relay_error, split_selector, ssh_authentication_status, ssh_exit_failure_kind,
+        ConsoleStatus, RemoteFailureKind, SshRelayError,
     };
 
     #[test]
@@ -900,5 +903,17 @@ mod tests {
             ssh_exit_failure_kind("Error: Decode limit exceeded for containers: 65536"),
             RemoteFailureKind::RemoteCommand
         );
+    }
+
+    #[test]
+    fn initial_relay_failure_preserves_the_typed_preflight_status() {
+        let (_sender, receiver) = tokio::sync::watch::channel(Some(ConsoleStatus::PeerOffline {
+            machine: "ari-mac-1".to_owned(),
+        }));
+        let error = initial_relay_error(&receiver, SshRelayError::InitialPreflight);
+        let message = error.to_string();
+
+        assert!(message.contains("offline — ari-mac-1"));
+        assert!(!message.contains("initial Console relay preflight failed"));
     }
 }

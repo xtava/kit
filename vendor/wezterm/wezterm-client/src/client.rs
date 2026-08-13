@@ -593,6 +593,7 @@ pub struct Client {
     local_domain_id: Option<DomainId>,
     pub client_id: ClientId,
     initial_server_version: Arc<OnceLock<GetCodecVersionResponse>>,
+    server_build_identity: Arc<Mutex<Option<BuildIdentity>>>,
     client_domain_config: ClientDomainConfig,
     pub is_reconnectable: bool,
     pub is_local: bool,
@@ -612,13 +613,6 @@ pub struct Client {
 pub struct IncompatibleVersionError {
     pub version: String,
     pub codec_vers: usize,
-}
-
-#[derive(Error, Debug, Clone, PartialEq, Eq)]
-#[error("server build identity mismatch: expected {expected:?}, received {actual:?}")]
-pub struct BuildIdentityMismatch {
-    pub expected: BuildIdentity,
-    pub actual: BuildIdentity,
 }
 
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
@@ -855,6 +849,7 @@ fn prepare_client_request(
 
 struct ClientBootstrap {
     server_version: GetCodecVersionResponse,
+    server_build_identity: BuildIdentity,
     next_serial: u64,
     resume_token: AttachmentResumeToken,
     control_snapshot: ControlSnapshot,
@@ -930,7 +925,6 @@ async fn bootstrap_client_stream_async<R>(
     ui: &dyn ConnectionUi,
     admission: &RuntimeAdmission,
     permit: &CountPermit,
-    expected_build_identity: Option<&BuildIdentity>,
 ) -> anyhow::Result<ClientBootstrap>
 where
     R: Unpin + AsyncRead + AsyncWrite + std::fmt::Debug,
@@ -1011,17 +1005,9 @@ where
     .try_map(|pdu| match pdu {
         Pdu::GetBuildIdentityResponse(build) => Ok(build),
         unexpected => bail!("unexpected response {unexpected:?}"),
-    })?;
-    log::trace!("Server build identity is {:?}", build.value().identity);
-    if let Some(expected) = expected_build_identity {
-        if &build.value().identity != expected {
-            return Err(BuildIdentityMismatch {
-                expected: expected.clone(),
-                actual: build.value().identity.clone(),
-            }
-            .into());
-        }
-    }
+    })?
+    .into_inner();
+    log::trace!("Server build identity is {:?}", build.identity);
 
     let registration = bootstrap_request(
         stream,
@@ -1054,6 +1040,7 @@ where
     ui.output_str("Version check OK!\n");
     Ok(ClientBootstrap {
         server_version: info.into_inner(),
+        server_build_identity: build.identity,
         next_serial: 4,
         resume_token: confirmed_resume_token,
         control_snapshot,
@@ -1332,7 +1319,6 @@ struct Reconnectable {
     stream: Option<Box<dyn AsyncReadAndWrite>>,
     tls_creds: Option<GetTlsCredsResponse>,
     admission: Arc<RuntimeAdmission>,
-    expected_build_identity: Option<BuildIdentity>,
 }
 
 struct SshStream {
@@ -1402,13 +1388,7 @@ impl Reconnectable {
             stream,
             tls_creds: None,
             admission,
-            expected_build_identity: None,
         }
-    }
-
-    fn expect_build_identity(mut self, identity: Option<BuildIdentity>) -> Self {
-        self.expected_build_identity = identity;
-        self
     }
 
     fn tls_creds_path(&self) -> anyhow::Result<PathBuf> {
@@ -1927,7 +1907,6 @@ impl ClientRuntimeConnection for Reconnectable {
                 presentation,
                 &admission,
                 permit,
-                self.expected_build_identity.as_ref(),
             ),
             async {
                 let _ = cancellation.receiver.recv().await;
@@ -2142,6 +2121,7 @@ struct ClientRuntimeRun<'a> {
     client_id: ClientId,
     attachment_resume_token: AttachmentResumeToken,
     initial_server_version: Arc<OnceLock<GetCodecVersionResponse>>,
+    server_build_identity: Arc<Mutex<Option<BuildIdentity>>>,
     bootstrap_request_permit: CountPermit,
     host: &'a dyn ClientRuntimeHost,
     reconnect_backoff: ReconnectBackoff,
@@ -2162,6 +2142,7 @@ fn run_client_runtime<C: ClientRuntimeConnection>(
         client_id,
         attachment_resume_token,
         initial_server_version,
+        server_build_identity,
         bootstrap_request_permit,
         host,
         reconnect_backoff,
@@ -2226,8 +2207,7 @@ fn run_client_runtime<C: ClientRuntimeConnection>(
                 Ok(bootstrap) => break bootstrap,
                 Err(error)
                     if should_reconnect(&connection, &presentation, local_domain_id, &error)
-                        && !error.root_cause().is::<IncompatibleVersionError>()
-                        && !error.root_cause().is::<BuildIdentityMismatch>() =>
+                        && !error.root_cause().is::<IncompatibleVersionError>() =>
                 {
                     attempt = attempt.saturating_add(1);
                     if presentation
@@ -2322,6 +2302,7 @@ fn run_client_runtime<C: ClientRuntimeConnection>(
     };
     let ClientBootstrap {
         server_version,
+        server_build_identity: initial_server_build_identity,
         mut next_serial,
         mut resume_token,
         control_snapshot,
@@ -2340,6 +2321,7 @@ fn run_client_runtime<C: ClientRuntimeConnection>(
             None => publish_terminal_failure(&presentation, HeadlessConnectionFailure::Runtime),
         };
     }
+    *server_build_identity.lock().unwrap() = Some(initial_server_build_identity);
     control.begin_connection();
     if let Err(error) = control.reduce_snapshot(control_snapshot) {
         let _ = initial_ready.try_send(Err(error.into()));
@@ -2492,6 +2474,8 @@ fn run_client_runtime<C: ClientRuntimeConnection>(
                             continue;
                         }
                     };
+                    *server_build_identity.lock().unwrap() =
+                        Some(bootstrap.server_build_identity.clone());
                     next_serial = bootstrap.next_serial;
                     resume_token = bootstrap.resume_token;
                     control.begin_connection();
@@ -2574,6 +2558,8 @@ impl Client {
         let worker_control = Arc::clone(&control);
         let initial_server_version = Arc::new(OnceLock::new());
         let worker_initial_server_version = Arc::clone(&initial_server_version);
+        let server_build_identity = Arc::new(Mutex::new(None));
+        let worker_server_build_identity = Arc::clone(&server_build_identity);
         let bootstrap_request_permit = reserve_client_request(&admission)?;
         let (initial_ready, initial_ready_receiver) = bounded(1);
         let worker_presentation = presentation.clone();
@@ -2592,6 +2578,7 @@ impl Client {
                     client_id: worker_client_id,
                     attachment_resume_token: worker_attachment_resume_token,
                     initial_server_version: worker_initial_server_version,
+                    server_build_identity: worker_server_build_identity,
                     bootstrap_request_permit,
                     host: &host,
                     reconnect_backoff: ReconnectBackoff::STANDARD,
@@ -2611,6 +2598,7 @@ impl Client {
                 is_local,
                 client_id,
                 initial_server_version,
+                server_build_identity,
                 client_domain_config,
             },
             initial_ready_receiver,
@@ -2653,6 +2641,14 @@ impl Client {
     pub fn initial_server_version(&self) -> &GetCodecVersionResponse {
         self.initial_server_version
             .get()
+            .expect("Client constructors complete bootstrap before returning")
+    }
+
+    pub fn server_build_identity(&self) -> BuildIdentity {
+        self.server_build_identity
+            .lock()
+            .unwrap()
+            .clone()
             .expect("Client constructors complete bootstrap before returning")
     }
 
@@ -2790,7 +2786,6 @@ impl Client {
         config: ClientDomainConfig,
         admission: Arc<RuntimeAdmission>,
         lifecycle: &HeadlessConnectionLifecycle,
-        expected_build_identity: Option<BuildIdentity>,
         client_id: ClientId,
         initial: bool,
         no_auto_start: bool,
@@ -2798,8 +2793,7 @@ impl Client {
         if !lifecycle.uses_admission(&admission) {
             bail!("headless lifecycle and client must share one runtime admission owner");
         }
-        let reconnectable = Reconnectable::new(config, None, Arc::clone(&admission))
-            .expect_build_identity(expected_build_identity);
+        let reconnectable = Reconnectable::new(config, None, Arc::clone(&admission));
         let (client, initial_ready) = match Self::new(
             local_domain_id,
             reconnectable,
@@ -2834,7 +2828,6 @@ impl Client {
             lifecycle,
             None,
             &unix,
-            None,
             ClientId::new(),
             initial,
             no_auto_start,
@@ -2847,7 +2840,6 @@ impl Client {
         lifecycle: &HeadlessConnectionLifecycle,
         local_domain_id: Option<DomainId>,
         unix: &UnixDomain,
-        expected_build_identity: Option<BuildIdentity>,
         client_id: ClientId,
         initial: bool,
         no_auto_start: bool,
@@ -2857,7 +2849,6 @@ impl Client {
             ClientDomainConfig::Unix(unix.clone()),
             admission,
             lifecycle,
-            expected_build_identity,
             client_id,
             initial,
             no_auto_start,
@@ -3327,6 +3318,13 @@ mod admission_tests {
                     executable_path: PathBuf::new(),
                     config_file_path: None,
                 },
+                server_build_identity: BuildIdentity {
+                    product: "wezterm".to_string(),
+                    version: config::wezterm_version().to_string(),
+                    source_revision: None,
+                    source_dirty: None,
+                    embedded_wezterm_revision: None,
+                },
                 next_serial: 4,
                 resume_token: resume_token.clone(),
                 control_snapshot: ControlSnapshot {
@@ -3451,11 +3449,11 @@ mod admission_tests {
             &reporter,
             &admission,
             &permit,
-            Some(&expected_build_identity),
         ))
         .unwrap();
 
         assert_eq!(bootstrap.server_version.codec_vers, CODEC_VERSION);
+        assert_eq!(bootstrap.server_build_identity, expected_build_identity);
         assert_eq!(bootstrap.next_serial, 4);
         assert_eq!(bootstrap.resume_token, issued_resume_token);
         assert_eq!(
@@ -3543,7 +3541,6 @@ mod admission_tests {
             &reporter,
             &admission,
             &permit,
-            None,
         ))
         .err()
         .expect("attachment rejection must fail bootstrap");
@@ -3552,7 +3549,7 @@ mod admission_tests {
     }
 
     #[test]
-    fn stream_bootstrap_rejects_build_mismatch_before_registration() {
+    fn stream_bootstrap_accepts_build_drift_and_reports_server_identity() {
         let admission = RuntimeAdmission::new(RuntimeRole::Client).unwrap();
         let actual = BuildIdentity {
             product: "kit-console".to_string(),
@@ -3561,8 +3558,7 @@ mod admission_tests {
             source_dirty: Some(false),
             embedded_wezterm_revision: Some("b".repeat(40)),
         };
-        let mut expected = actual.clone();
-        expected.source_dirty = Some(true);
+        let issued_resume_token = resume_token(13);
 
         let mut readable = Vec::new();
         Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
@@ -3578,6 +3574,15 @@ mod admission_tests {
         })
         .encode(&mut readable, 2, &admission)
         .unwrap();
+        Pdu::SetClientIdResponse(SetClientIdResponse {
+            resume_token: Some(issued_resume_token.clone()),
+            control_snapshot: Some(ControlSnapshot {
+                attachment_identity: attachment_identity(1),
+                state: control_state(0, std::iter::empty()),
+            }),
+        })
+        .encode(&mut readable, 3, &admission)
+        .unwrap();
 
         let mut stream = ScriptedBootstrapStream {
             readable: Cursor::new(readable),
@@ -3586,24 +3591,23 @@ mod admission_tests {
         let lifecycle = HeadlessConnectionLifecycle::new(Arc::clone(&admission));
         let reporter = lifecycle.reporter();
         let permit = reserve_client_request(&admission).unwrap();
-        let error = block_on(bootstrap_client_stream_async(
+        let bootstrap = block_on(bootstrap_client_stream_async(
             &mut stream,
             &ClientId::new(),
-            &resume_token(13),
+            &issued_resume_token,
             &reporter,
             &admission,
             &permit,
-            Some(&expected),
         ))
-        .err()
-        .expect("mismatched build identity must fail bootstrap");
-        let mismatch = error.downcast_ref::<BuildIdentityMismatch>().unwrap();
-        assert_eq!(mismatch.expected, expected);
-        assert_eq!(mismatch.actual, actual);
+        .expect("build drift must not block a codec-compatible bootstrap");
+        assert_eq!(bootstrap.server_build_identity, actual);
 
         let mut written = stream.written.as_slice();
-        for (serial, expected_tag) in [(1, PduTag::GetCodecVersion), (2, PduTag::GetBuildIdentity)]
-        {
+        for (serial, expected_tag) in [
+            (1, PduTag::GetCodecVersion),
+            (2, PduTag::GetBuildIdentity),
+            (3, PduTag::SetClientId),
+        ] {
             let decoded = Pdu::decode(
                 &mut written,
                 DecodeContext::client_to_server_request(ClientRequestPhase::Bootstrap),
@@ -3750,6 +3754,7 @@ mod admission_tests {
                     client_id: ClientId::new(),
                     attachment_resume_token: attachment_resume_token.clone(),
                     initial_server_version: Arc::new(OnceLock::new()),
+                    server_build_identity: Arc::new(Mutex::new(None)),
                     bootstrap_request_permit,
                     host: &host,
                     reconnect_backoff: ZERO_BACKOFF,
@@ -3809,6 +3814,7 @@ mod admission_tests {
                     client_id: client_id.clone(),
                     attachment_resume_token: attachment_resume_token.clone(),
                     initial_server_version: Arc::clone(&initial_server_version),
+                    server_build_identity: Arc::new(Mutex::new(None)),
                     bootstrap_request_permit,
                     host: &host,
                     reconnect_backoff: ZERO_BACKOFF,
@@ -3890,6 +3896,7 @@ mod admission_tests {
                     client_id: ClientId::new(),
                     attachment_resume_token: resume_token(22),
                     initial_server_version: Arc::new(OnceLock::new()),
+                    server_build_identity: Arc::new(Mutex::new(None)),
                     bootstrap_request_permit,
                     host: &host,
                     reconnect_backoff: ZERO_BACKOFF,
@@ -3949,6 +3956,7 @@ mod admission_tests {
                     client_id,
                     attachment_resume_token: resume_token(23),
                     initial_server_version,
+                    server_build_identity: Arc::new(Mutex::new(None)),
                     bootstrap_request_permit,
                     host: &host,
                     reconnect_backoff: ZERO_BACKOFF,

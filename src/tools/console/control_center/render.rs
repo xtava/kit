@@ -7,9 +7,9 @@ use ratatui::{
 };
 
 use crate::tui::{
-    render_vertical_scrollbar, theme::NORD, CommandPaletteLayout, ContextMenuLayout,
-    ContextMenuStyle, LineEditor, ScrollbarLayout, ScrollbarStyle, SelectableRegion,
-    ViewportMetrics,
+    fit_terminal_text, render_vertical_scrollbar, terminal_text_width, theme::NORD, CellAlignment,
+    CellOverflow, CommandPaletteLayout, ContextMenuLayout, ContextMenuStyle, LineEditor,
+    ScrollbarLayout, ScrollbarStyle, SelectableRegion, ViewportMetrics,
 };
 
 use super::{
@@ -248,7 +248,10 @@ fn render_machine_details(
         .into_iter()
         .map(|(label, value)| {
             Line::from(vec![
-                Span::styled(format!("{label:<18}"), Style::default().fg(NORD.text_muted)),
+                Span::styled(
+                    fit_terminal_text(label, 18, CellAlignment::Left, CellOverflow::Clip),
+                    Style::default().fg(NORD.text_muted),
+                ),
                 Span::styled(value, Style::default().fg(NORD.text_strong)),
             ])
         })
@@ -319,8 +322,14 @@ fn render_unix_user(frame: &mut Frame<'_>, area: Rect, input: &LineEditor, notic
 
 fn machine_row_line(row: MachineRowProjection) -> Line<'static> {
     let mut spans = vec![
-        Span::styled(format!("{:<20}", row.name), Style::default().fg(NORD.text)),
-        Span::styled(format!("{:<18}", row.status), Style::default().fg(NORD.text_strong)),
+        Span::styled(
+            fit_terminal_text(&row.name, 20, CellAlignment::Left, CellOverflow::Clip),
+            Style::default().fg(NORD.text),
+        ),
+        Span::styled(
+            fit_terminal_text(&row.status, 18, CellAlignment::Left, CellOverflow::Clip),
+            Style::default().fg(NORD.text_strong),
+        ),
     ];
     for value in
         [row.role.map(str::to_owned), row.operating_system, row.sessions, row.unix_user, row.build]
@@ -364,8 +373,10 @@ fn render_selected_machine(
             inner,
         );
         if app.notice.is_none() {
-            regions.primary_action =
-                label.map(|label| Rect::new(inner.x, inner.y, label.chars().count() as u16, 1));
+            regions.primary_action = label.map(|label| {
+                let width = u16::try_from(terminal_text_width(&label)).unwrap_or(u16::MAX);
+                Rect::new(inner.x, inner.y, width, 1)
+            });
         }
         return;
     };
@@ -413,19 +424,18 @@ fn render_selected_machine(
 
     if app.notice.is_none() && inner.height >= 2 {
         let actions_y = inner.y + 1;
-        regions.primary_action =
-            Some(Rect::new(inner.x, actions_y, action_label.chars().count() as u16, 1));
-        let new_session_x = inner.x + action_label.chars().count() as u16 + 2;
-        regions.new_session_action = can_create_session.then_some(Rect::new(
-            new_session_x,
-            actions_y,
-            new_session_label.chars().count() as u16,
-            1,
-        ));
+        let action_width = u16::try_from(terminal_text_width(&action_label)).unwrap_or(u16::MAX);
+        let new_session_width =
+            u16::try_from(terminal_text_width(new_session_label)).unwrap_or(u16::MAX);
+        let refresh_width = u16::try_from(terminal_text_width(refresh_label)).unwrap_or(u16::MAX);
+        regions.primary_action = Some(Rect::new(inner.x, actions_y, action_width, 1));
+        let new_session_x = inner.x.saturating_add(action_width).saturating_add(2);
+        regions.new_session_action =
+            can_create_session.then_some(Rect::new(new_session_x, actions_y, new_session_width, 1));
         regions.refresh_action = Some(Rect::new(
-            new_session_x + new_session_label.chars().count() as u16 + 2,
+            new_session_x.saturating_add(new_session_width).saturating_add(2),
             actions_y,
-            refresh_label.chars().count() as u16,
+            refresh_width,
             1,
         ));
     }

@@ -581,7 +581,6 @@ impl HeadlessConsoleClient {
                 lifecycle.as_ref(),
                 None,
                 &harness.domain(),
-                Some(expected_build_identity()),
                 sanitized_client_id(),
                 true,
                 true,
@@ -794,16 +793,6 @@ fn pane_node_tab_id(root: &PaneNode) -> Option<usize> {
 impl Drop for HeadlessConsoleClient {
     fn drop(&mut self) {
         let _ = self.client.shutdown_and_join();
-    }
-}
-
-fn expected_build_identity() -> wezterm_codec::BuildIdentity {
-    wezterm_codec::BuildIdentity {
-        product: "kit-console".to_owned(),
-        version: env!("CARGO_PKG_VERSION").to_owned(),
-        source_revision: Some(env!("KIT_SOURCE_REVISION").to_owned()),
-        source_dirty: Some(env!("KIT_SOURCE_DIRTY") == "true"),
-        embedded_wezterm_revision: Some(env!("KIT_WEZTERM_REVISION").to_owned()),
     }
 }
 

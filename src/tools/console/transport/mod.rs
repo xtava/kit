@@ -6,4 +6,6 @@
 
 mod relay;
 
-pub(crate) use relay::{PreparedRelayEpoch, RelayEpochFailure, RelayEpochProvider, SshRelay};
+pub(crate) use relay::{
+    PreparedRelayEpoch, RelayEpochFailure, RelayEpochProvider, SshRelay, SshRelayError,
+};

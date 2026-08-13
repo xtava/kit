@@ -13,7 +13,6 @@ use wezterm_client::{
     },
     domain::{ClientDomain, ClientDomainConfig},
 };
-use wezterm_codec::BuildIdentity;
 use wezterm_mux::{client::ClientId, domain::Domain, Mux, RuntimeAdmission, RuntimeRole};
 use wezterm_promise::spawn::{SimpleExecutor, SimpleExecutorHandle};
 
@@ -36,7 +35,6 @@ pub struct ConnectionHealth {
 #[derive(Clone)]
 pub(crate) struct AttachmentPolicy {
     domain: ClientDomainConfig,
-    expected_build_identity: Option<BuildIdentity>,
     timeout: Duration,
     reconnect_attempt_limit: Option<NonZeroU32>,
 }
@@ -44,11 +42,10 @@ pub(crate) struct AttachmentPolicy {
 impl AttachmentPolicy {
     pub(crate) fn new(
         domain: ClientDomainConfig,
-        expected_build_identity: Option<BuildIdentity>,
         timeout: Duration,
         reconnect_attempt_limit: Option<NonZeroU32>,
     ) -> Self {
-        Self { domain, expected_build_identity, timeout, reconnect_attempt_limit }
+        Self { domain, timeout, reconnect_attempt_limit }
     }
 }
 
@@ -201,12 +198,7 @@ impl OwnerState {
             Some(LifecycleGeneration { number, lifecycle: Arc::clone(&lifecycle) });
 
         let client_id = ClientId { ssh_auth_sock: None, ..ClientId::new() };
-        let attach = domain.attach_with_lifecycle(
-            None,
-            &lifecycle,
-            policy.expected_build_identity,
-            client_id,
-        );
+        let attach = domain.attach_with_lifecycle(None, &lifecycle, client_id);
         tokio::time::timeout(policy.timeout, attach)
             .await
             .context("timed out connecting to the Console agent")??;

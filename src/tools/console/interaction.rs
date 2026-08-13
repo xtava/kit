@@ -8,9 +8,6 @@ use crate::tui::SplitRatio;
 
 use super::client::SessionControl;
 
-/// Minimum width required by the canonical 18-column sidebar, divider, and 20-column terminal.
-pub(super) const MINIMUM_SPLIT_WIDTH: u16 = 39;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SessionAccess {
     Synchronizing,
@@ -146,37 +143,11 @@ impl LayoutPreference {
             Self::TerminalOnly { .. } => Self::TerminalOnly { restore_ratio: sidebar_ratio },
         }
     }
-
-    pub(super) const fn effective(self, width: u16) -> EffectiveLayout {
-        match self {
-            Self::TerminalOnly { .. } => {
-                EffectiveLayout::TerminalOnly { reason: TerminalOnlyReason::User }
-            }
-            Self::Split { .. } if width < MINIMUM_SPLIT_WIDTH => {
-                EffectiveLayout::TerminalOnly { reason: TerminalOnlyReason::Compact }
-            }
-            Self::Split { .. } => EffectiveLayout::Split,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum EffectiveLayout {
-    Split,
-    TerminalOnly { reason: TerminalOnlyReason },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum TerminalOnlyReason {
-    User,
-    Compact,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const RATIO: SplitRatio = SplitRatio::new(260);
 
     #[test]
     fn current_access_has_one_primary_control_operation() {
@@ -232,19 +203,5 @@ mod tests {
             resolve_control(ControlIntent::Primary, SessionAccess::ControlledByOther),
             InteractionDecision::Control(ControlOperation::Take)
         );
-    }
-
-    #[test]
-    fn collapse_preserves_ratio_and_compact_projection_does_not_change_preference() {
-        let split = LayoutPreference::split(RATIO);
-        let collapsed = split.terminal_only();
-
-        assert_eq!(collapsed.restore_ratio(), RATIO);
-        assert_eq!(collapsed.split_view(), split);
-        assert_eq!(
-            split.effective(MINIMUM_SPLIT_WIDTH - 1),
-            EffectiveLayout::TerminalOnly { reason: TerminalOnlyReason::Compact }
-        );
-        assert_eq!(split, LayoutPreference::split(RATIO));
     }
 }

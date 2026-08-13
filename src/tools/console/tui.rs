@@ -18,8 +18,9 @@ use wezterm_term::{
 };
 
 use crate::tui::{
-    render_split_divider, theme::NORD, ActionId, ActionInvocation, ActionRegistry,
-    ActionRegistryBuilder, ActionSpec, ActionState, ActionUnavailable, CommandPalette,
+    fit_terminal_text, render_split_divider, terminal_text_width, theme::NORD,
+    truncate_terminal_text, ActionId, ActionInvocation, ActionRegistry, ActionRegistryBuilder,
+    ActionSpec, ActionState, ActionUnavailable, CellAlignment, CellOverflow, CommandPalette,
     CommandPaletteLayout, CommandPaletteOutcome, CommandPalettePlacement, ContextMenu,
     ContextMenuLayout, ContextMenuOutcome, ContextMenuStyle, Direction, EventReader, KeyChord,
     Keybinding, KeybindingPlacement, KeybindingResolution, KeybindingState, LineEditor, MenuId,
@@ -36,22 +37,27 @@ use super::client::{
 use super::config::{Config, Keybindings, ReadyNotification};
 use super::control_center::ConnectedSessionOutcome;
 use super::interaction::{
-    resolve_control, ControlIntent, ControlOperation, EffectiveLayout, InteractionDecision,
-    LayoutPreference, SessionAccess, TerminalOnlyReason,
+    resolve_control, ControlIntent, ControlOperation, InteractionDecision, LayoutPreference,
+    SessionAccess,
 };
 use super::invalidation::ConsoleInvalidations;
 use super::panels::{
-    close_panel_change, next_split_session, select_change, visible_panel_slots, ClosePanelChange,
-    PanelSlot, SelectionChange,
+    visible_panel_slots, FocusSurface, PanelSlot, PanelWorkspace, SelectionChange,
+    TERMINAL_PANEL_MIN_WIDTH, TERMINAL_SPLIT_MINIMUMS,
 };
 use super::perf_trace::{self, InputKind};
 use super::scroll::{ScrollMetrics, ScrollState};
 
 const ACTIVITY_INTERVAL: Duration = Duration::from_millis(300);
+const ANIMATION_INTERVAL: Duration = Duration::from_millis(120);
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(4);
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(350);
 const WHEEL_SCROLL_ROWS: usize = 3;
 const SIDEBAR_STEP: i16 = 40;
+const SESSION_TABS_HEIGHT: u16 = 1;
+const SESSION_TAB_MAX_WIDTH: u16 = 24;
+const SESSIONS_DRAWER_MIN_WIDTH: u16 = 18;
+const WORKING_FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 const SESSION_MENU: MenuId = MenuId::new("console.session.context");
 
 const SELECT_SESSION: ActionId = ActionId::new("console.session.select");
@@ -78,6 +84,7 @@ const NEXT_SESSION: ActionId = ActionId::new("console.session.next");
 const HISTORY_BACK: ActionId = ActionId::new("console.session.historyBack");
 const HISTORY_FORWARD: ActionId = ActionId::new("console.session.historyForward");
 const FOCUS_SESSIONS: ActionId = ActionId::new("console.focus.sessions");
+const FOCUS_TERMINAL: ActionId = ActionId::new("console.focus.terminal");
 const FOCUS_LEFT: ActionId = ActionId::new("console.focus.left");
 const FOCUS_RIGHT: ActionId = ActionId::new("console.focus.right");
 const FOCUS_NEXT: ActionId = ActionId::new("console.focus.next");
@@ -85,9 +92,11 @@ const FOCUS_PREVIOUS: ActionId = ActionId::new("console.focus.previous");
 const NARROW_SIDEBAR: ActionId = ActionId::new("console.sidebar.narrow");
 const WIDEN_SIDEBAR: ActionId = ActionId::new("console.sidebar.widen");
 const RESIZE_SIDEBAR: ActionId = ActionId::new("console.sidebar.resize");
+const RESIZE_TERMINALS: ActionId = ActionId::new("console.panels.resize");
 const TOGGLE_SIDEBAR: ActionId = ActionId::new("console.sidebar.toggle");
 const OPEN_COMMAND_PALETTE: ActionId = ActionId::new("console.commandPalette.open");
 const OPEN_SETTINGS: ActionId = ActionId::new("console.settings.open");
+const PREVIEW_NOTIFICATION: ActionId = ActionId::new("console.notification.preview");
 const RETRY_CONNECTION: ActionId = ActionId::new("console.connection.retry");
 const QUIT: ActionId = ActionId::new("console.quit");
 
@@ -96,6 +105,30 @@ enum ActiveRegion {
     Sessions,
     PrimaryTerminal,
     SecondaryTerminal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SplitSurface {
+    SessionsDrawer,
+    TerminalPanels,
+}
+
+impl SplitSurface {
+    const ALL: [Self; 2] = [Self::SessionsDrawer, Self::TerminalPanels];
+
+    const fn resize_action(self) -> ActionId {
+        match self {
+            Self::SessionsDrawer => RESIZE_SIDEBAR,
+            Self::TerminalPanels => RESIZE_TERMINALS,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BodyLayout {
+    SessionsDrawer,
+    Terminals,
+    DrawerAndTerminals,
 }
 
 impl PanelSlot {
@@ -162,6 +195,7 @@ enum ConsoleAction {
     HistoryBack,
     HistoryForward,
     FocusSessions,
+    FocusTerminal,
     FocusLeft,
     FocusRight,
     FocusNext,
@@ -169,15 +203,17 @@ enum ConsoleAction {
     NarrowSidebar,
     WidenSidebar,
     ResizeSidebar,
+    ResizeTerminalPanels,
     ToggleSidebar,
     OpenCommandPalette,
     OpenSettings,
+    PreviewReadyNotification,
     RetryConnection,
     Quit,
 }
 
 impl ConsoleAction {
-    const ALL: [Self; 36] = [
+    const ALL: [Self; 39] = [
         Self::SelectSession,
         Self::CreateSession,
         Self::Activate,
@@ -202,6 +238,7 @@ impl ConsoleAction {
         Self::HistoryBack,
         Self::HistoryForward,
         Self::FocusSessions,
+        Self::FocusTerminal,
         Self::FocusLeft,
         Self::FocusRight,
         Self::FocusNext,
@@ -209,9 +246,11 @@ impl ConsoleAction {
         Self::NarrowSidebar,
         Self::WidenSidebar,
         Self::ResizeSidebar,
+        Self::ResizeTerminalPanels,
         Self::ToggleSidebar,
         Self::OpenCommandPalette,
         Self::OpenSettings,
+        Self::PreviewReadyNotification,
         Self::RetryConnection,
         Self::Quit,
     ];
@@ -242,6 +281,7 @@ impl ConsoleAction {
             Self::HistoryBack => HISTORY_BACK,
             Self::HistoryForward => HISTORY_FORWARD,
             Self::FocusSessions => FOCUS_SESSIONS,
+            Self::FocusTerminal => FOCUS_TERMINAL,
             Self::FocusLeft => FOCUS_LEFT,
             Self::FocusRight => FOCUS_RIGHT,
             Self::FocusNext => FOCUS_NEXT,
@@ -249,9 +289,11 @@ impl ConsoleAction {
             Self::NarrowSidebar => NARROW_SIDEBAR,
             Self::WidenSidebar => WIDEN_SIDEBAR,
             Self::ResizeSidebar => RESIZE_SIDEBAR,
+            Self::ResizeTerminalPanels => RESIZE_TERMINALS,
             Self::ToggleSidebar => TOGGLE_SIDEBAR,
             Self::OpenCommandPalette => OPEN_COMMAND_PALETTE,
             Self::OpenSettings => OPEN_SETTINGS,
+            Self::PreviewReadyNotification => PREVIEW_NOTIFICATION,
             Self::RetryConnection => RETRY_CONNECTION,
             Self::Quit => QUIT,
         }
@@ -283,6 +325,7 @@ impl ConsoleAction {
             Self::HistoryBack => "Session history back",
             Self::HistoryForward => "Session history forward",
             Self::FocusSessions => "Focus sessions",
+            Self::FocusTerminal => "Focus selected terminal",
             Self::FocusLeft => "Focus left",
             Self::FocusRight => "Focus right",
             Self::FocusNext => "Focus next region",
@@ -290,9 +333,11 @@ impl ConsoleAction {
             Self::NarrowSidebar => "Narrow sidebar",
             Self::WidenSidebar => "Widen sidebar",
             Self::ResizeSidebar => "Resize sidebar",
+            Self::ResizeTerminalPanels => "Resize terminal panels",
             Self::ToggleSidebar => "Toggle sessions sidebar",
             Self::OpenCommandPalette => "Show command palette",
             Self::OpenSettings => "Open Console settings",
+            Self::PreviewReadyNotification => "Preview ready notification",
             Self::RetryConnection => "Retry connection",
             Self::Quit => "Quit Console",
         }
@@ -327,15 +372,18 @@ impl ConsoleAction {
             Self::ToggleSidebar => ("View", 40, 80),
             Self::RetryConnection => ("Console", 50, 10),
             Self::OpenSettings => ("Console", 50, 20),
-            Self::OpenCommandPalette => ("Console", 50, 30),
-            Self::Quit => ("Console", 50, 40),
+            Self::PreviewReadyNotification => ("Console", 50, 30),
+            Self::OpenCommandPalette => ("Console", 50, 40),
+            Self::Quit => ("Console", 50, 50),
             Self::SelectSession
             | Self::Activate
             | Self::Dismiss
             | Self::PrimaryControl
+            | Self::FocusTerminal
             | Self::ScrollLineUp
             | Self::ScrollLineDown
-            | Self::ResizeSidebar => return CommandPalettePlacement::Hidden,
+            | Self::ResizeSidebar
+            | Self::ResizeTerminalPanels => return CommandPalettePlacement::Hidden,
         };
         CommandPalettePlacement::Visible { group, group_order, order }
     }
@@ -381,6 +429,7 @@ enum Effect {
     ReleaseControl(SessionId),
     TakeControl(SessionId),
     Copy(String),
+    PreviewNotification,
     SendKey(KeyEvent),
     SendMouse { pane_id: usize, event: MouseEvent, geometry: TerminalContentGeometry },
     Paste(String),
@@ -403,7 +452,8 @@ struct TerminalRegion {
 
 #[derive(Default)]
 struct UiRegions {
-    split: Option<SplitFrame>,
+    drawer_split: Option<SplitFrame>,
+    terminal_split: Option<SplitFrame>,
     sessions: Option<Rect>,
     terminals: Vec<TerminalRegion>,
     session_rows: Vec<(Rect, SessionId)>,
@@ -415,14 +465,23 @@ struct UiRegions {
 
 impl UiRegions {
     fn navigation(&self) -> NavigationMap<ActiveRegion> {
-        let mut regions =
-            vec![NavigationRegion::new(ActiveRegion::Sessions, self.sessions.unwrap_or_default())];
+        let mut regions = Vec::new();
+        if let Some(area) = self.sessions {
+            regions.push(NavigationRegion::new(ActiveRegion::Sessions, area));
+        }
         regions.extend(
             self.terminals
                 .iter()
                 .map(|terminal| NavigationRegion::new(terminal.slot.region(), terminal.area)),
         );
         NavigationMap::new(regions)
+    }
+
+    const fn split(&self, surface: SplitSurface) -> Option<SplitFrame> {
+        match surface {
+            SplitSurface::SessionsDrawer => self.drawer_split,
+            SplitSurface::TerminalPanels => self.terminal_split,
+        }
     }
 
     fn create_size(&self) -> (u16, u16) {
@@ -441,13 +500,6 @@ impl UiRegions {
     }
 }
 
-struct SecondaryPanel {
-    session_id: SessionId,
-    terminal: Option<TerminalView>,
-    scroll: ScrollState,
-    last_terminal_size: Option<(usize, u16, u16)>,
-}
-
 #[derive(Clone, Copy)]
 struct CloseTransition {
     pane_id: usize,
@@ -458,31 +510,28 @@ struct App {
     client: ConsoleClient,
     config: Config,
     snapshot: ConsoleSnapshot,
-    selected: Option<SessionId>,
-    active_region: ActiveRegion,
-    focused_panel: PanelSlot,
+    workspace: PanelWorkspace,
     surface: Surface,
     keybinding_state: KeybindingState,
     layout: LayoutPreference,
-    split_drag: Option<SplitDrag<()>>,
+    split_drag: Option<SplitDrag<SplitSurface>>,
     history: NavigationHistory<SessionId>,
     menu: Option<ContextMenu<ConsoleActionContext>>,
     registry: ActionRegistry<ConsoleActionContext, ConsoleAction>,
-    last_terminal_size: Option<(usize, u16, u16)>,
     last_session_click: Option<(SessionId, Instant)>,
-    scroll: ScrollState,
     selection: TextSelection<PanelSlot>,
-    secondary: Option<SecondaryPanel>,
     notice: Option<String>,
     connection_generation: u64,
+    projected_generation: u64,
     connection: ConnectionState,
     connection_detail: Option<String>,
     close_transitions: Vec<CloseTransition>,
+    animation_phase: usize,
 }
 
 impl App {
     async fn new(client: ConsoleClient, config: Config) -> Result<Self> {
-        let mut snapshot = client.snapshot(None).await?;
+        let snapshot = client.snapshot().await?;
         let health = client.drain_connection_health()?;
         let connection_generation = health.map_or(0, |health| health.generation);
         let connection = health.map_or(ConnectionState::Ready, |health| health.state);
@@ -491,40 +540,34 @@ impl App {
         let mut history = NavigationHistory::default();
         if let Some(id) = selected {
             history.visit(id);
-            let pane_id = snapshot
-                .sessions
-                .iter()
-                .find(|session| session.id == id)
-                .map(|session| session.pane_id);
-            snapshot.terminal =
-                pane_id.map(|pane_id| client.project_terminal(pane_id)).transpose()?.flatten();
         }
         let registry = console_actions(config.keybindings())?;
-        Ok(Self {
+        let workspace = PanelWorkspace::new(selected, config.terminal_split_ratio());
+        let mut app = Self {
             layout: LayoutPreference::split(config.sidebar_split_ratio()),
             client,
             config,
             snapshot,
-            selected,
-            active_region: ActiveRegion::Sessions,
-            focused_panel: PanelSlot::Primary,
+            workspace,
             surface: Surface::Normal,
             keybinding_state: KeybindingState::default(),
             split_drag: None,
             history,
             menu: None,
             registry,
-            last_terminal_size: None,
             last_session_click: None,
-            scroll: ScrollState::default(),
             selection: TextSelection::default(),
-            secondary: None,
             notice: None,
             connection_generation,
+            projected_generation: connection_generation,
             connection,
             connection_detail,
             close_transitions: Vec::new(),
-        })
+            animation_phase: 0,
+        };
+        let _ = app.project_terminal()?;
+        let _ = app.refresh_activity()?;
+        Ok(app)
     }
 
     async fn reconcile_topology(&mut self) -> Result<bool> {
@@ -545,7 +588,7 @@ impl App {
         ) {
             return Ok(changed);
         }
-        let mut snapshot = match self.client.snapshot(self.selected).await {
+        let mut snapshot = match self.client.snapshot().await {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 if let Some(health) = self.client.drain_connection_health()? {
@@ -566,10 +609,24 @@ impl App {
             !self.close_transitions.iter().any(|transition| transition.pane_id == session.pane_id)
         });
         self.close_transitions.retain(|transition| remote_panes.contains(&transition.pane_id));
-        let selected = self.selected;
+        let assigned = (
+            self.workspace.session_id(PanelSlot::Primary),
+            self.workspace.session_id(PanelSlot::Secondary),
+        );
         changed |= self.reconcile(snapshot);
-        if self.selected != selected {
+        let generation_changed = self.projected_generation != self.connection_generation;
+        if generation_changed
+            || assigned
+                != (
+                    self.workspace.session_id(PanelSlot::Primary),
+                    self.workspace.session_id(PanelSlot::Secondary),
+                )
+        {
             changed |= self.project_terminal()?;
+        }
+        if generation_changed {
+            changed |= self.refresh_activity()?.changed;
+            self.projected_generation = self.connection_generation;
         }
         Ok(changed)
     }
@@ -596,37 +653,19 @@ impl App {
             .client
             .local_pane_id(pane_id)?
             .context("session has no local terminal projection")?;
-        let closing_secondary = self.secondary.as_ref().is_some_and(|panel| panel.session_id == id);
         let restore_terminal_focus = self.focused_session_id() == Some(id)
-            && matches!(
-                self.active_region,
-                ActiveRegion::PrimaryTerminal | ActiveRegion::SecondaryTerminal
-            );
+            && self.workspace.focus_surface() == FocusSurface::Terminal;
         self.client.close_pane(pane_id).await?;
         self.close_transitions.push(CloseTransition { pane_id, local_pane_id });
         self.snapshot.sessions.retain(|session| session.pane_id != pane_id);
-        if closing_secondary {
-            self.secondary = None;
-            self.focused_panel = PanelSlot::Primary;
-            self.active_region = ActiveRegion::PrimaryTerminal;
-        }
-        if self.selected == Some(id) {
-            if let Some(secondary) = self.secondary.take() {
-                self.selected = Some(secondary.session_id);
-                self.snapshot.terminal = secondary.terminal;
-                self.scroll = secondary.scroll;
-                self.selection.clear();
-                self.last_terminal_size = secondary.last_terminal_size;
-                self.focused_panel = PanelSlot::Primary;
-            } else {
-                self.selected = self.snapshot.sessions.first().map(|session| session.id);
-                self.scroll.reset();
-                self.selection.clear();
-            }
-            if let Some(selected) = self.selected {
+        let live_sessions =
+            self.snapshot.sessions.iter().map(|session| session.id).collect::<Vec<_>>();
+        if self.workspace.reconcile(&live_sessions) {
+            self.selection.clear();
+            if let Some(selected) = self.focused_session_id() {
                 self.history.replace_current(selected);
             }
-            self.project_terminal()?;
+            let _ = self.project_terminal()?;
         }
         if !restore_terminal_focus {
             return Ok(());
@@ -634,13 +673,13 @@ impl App {
         let Some((replacement_id, replacement_access)) =
             self.focused_session().map(|session| (session.id, session_access(session)))
         else {
-            self.active_region = ActiveRegion::Sessions;
+            let _ = self.workspace.focus_sessions();
             return Ok(());
         };
         match replacement_access {
             SessionAccess::Available | SessionAccess::Synchronizing => {
                 self.client.acquire_control(replacement_id).await?;
-                self.active_region = self.focused_panel.region();
+                let _ = self.workspace.focus_selected_terminal();
                 if let Some(session) =
                     self.snapshot.sessions.iter_mut().find(|session| session.id == replacement_id)
                 {
@@ -648,10 +687,10 @@ impl App {
                 }
             }
             SessionAccess::ControlledBySelf => {
-                self.active_region = self.focused_panel.region();
+                let _ = self.workspace.focus_selected_terminal();
             }
             SessionAccess::ControlledByOther => {
-                self.active_region = ActiveRegion::Sessions;
+                let _ = self.workspace.focus_sessions();
                 self.notice =
                     Some("Focused session closed; the replacement is controlled elsewhere".into());
             }
@@ -671,67 +710,68 @@ impl App {
     }
 
     fn project_terminal(&mut self) -> Result<bool> {
-        let pane_id = self.primary_session().map(|session| session.pane_id);
-        let terminal =
-            pane_id.map(|pane_id| self.client.project_terminal(pane_id)).transpose()?.flatten();
-        let changed = self.snapshot.terminal != terminal;
-        self.snapshot.terminal = terminal;
-        let secondary_terminal = self
-            .secondary
-            .as_ref()
-            .and_then(|panel| self.session(panel.session_id))
-            .map(|session| self.client.project_terminal(session.pane_id))
-            .transpose()?
-            .flatten();
-        let secondary_changed =
-            self.secondary.as_ref().is_some_and(|panel| panel.terminal != secondary_terminal);
-        if let Some(panel) = self.secondary.as_mut() {
-            panel.terminal = secondary_terminal;
+        let mut changed = false;
+        for slot in PanelSlot::ALL {
+            let pane_id = self
+                .workspace
+                .session_id(slot)
+                .and_then(|session_id| self.session(session_id))
+                .map(|session| session.pane_id);
+            let terminal =
+                pane_id.map(|pane_id| self.client.project_terminal(pane_id)).transpose()?.flatten();
+            changed |= self.workspace.set_terminal(slot, terminal);
         }
-        if changed || secondary_changed {
-            self.normalize_terminal_state();
-        }
-        Ok(changed || secondary_changed)
+        Ok(changed)
     }
 
     fn refresh_activity(&mut self) -> Result<super::client::ActivityRefresh> {
-        let selected = match self.focused_panel {
-            PanelSlot::Primary => self.selected,
-            PanelSlot::Secondary => self.secondary.as_ref().map(|panel| panel.session_id),
-        };
-        let terminal = match self.focused_panel {
-            PanelSlot::Primary => self.snapshot.terminal.as_ref(),
-            PanelSlot::Secondary => {
-                self.secondary.as_ref().and_then(|panel| panel.terminal.as_ref())
-            }
-        };
-        self.client.refresh_activity(&mut self.snapshot.sessions, selected, terminal)
+        let selected = self.focused_session_id();
+        let terminals = PanelSlot::ALL
+            .into_iter()
+            .filter_map(|slot| self.workspace.terminal(slot))
+            .collect::<Vec<_>>();
+        self.client.refresh_activity(&mut self.snapshot.sessions, selected, &terminals)
     }
 
-    fn reconcile(&mut self, snapshot: ConsoleSnapshot) -> bool {
+    fn has_working_session(&self) -> bool {
+        self.snapshot.sessions.iter().any(|session| {
+            session.agent.is_some_and(|agent| agent.activity == AgentActivity::Working)
+        })
+    }
+
+    fn advance_animation(&mut self) {
+        self.animation_phase = (self.animation_phase + 1) % WORKING_FRAMES.len();
+    }
+
+    fn activity_icon(&self, agent: AgentPresentation) -> &'static str {
+        if agent.activity == AgentActivity::Working {
+            WORKING_FRAMES[self.animation_phase]
+        } else {
+            stable_agent_icon(agent)
+        }
+    }
+
+    fn reconcile(&mut self, mut snapshot: ConsoleSnapshot) -> bool {
+        for session in &mut snapshot.sessions {
+            session.agent = self
+                .snapshot
+                .sessions
+                .iter()
+                .find(|current| current.id == session.id)
+                .and_then(|current| current.agent);
+        }
         let mut changed = self.snapshot != snapshot;
         self.snapshot = snapshot;
-        let previous_selection = self.selected;
-        let selection_exists = self
-            .selected
-            .is_some_and(|id| self.snapshot.sessions.iter().any(|session| session.id == id));
-        if !selection_exists {
-            self.selected = self.snapshot.sessions.first().map(|session| session.id);
-            self.scroll.reset();
-            if let Some(id) = self.selected {
+        let live_sessions =
+            self.snapshot.sessions.iter().map(|session| session.id).collect::<Vec<_>>();
+        let workspace_changed = self.workspace.reconcile(&live_sessions);
+        changed |= workspace_changed;
+        if workspace_changed {
+            if let Some(id) = self.focused_session_id() {
                 self.history.replace_current(id);
             }
+            self.selection.clear();
         }
-        if self.secondary.as_ref().is_some_and(|panel| {
-            Some(panel.session_id) == self.selected || !self.has_session(Some(panel.session_id))
-        }) {
-            self.secondary = None;
-            self.focused_panel = PanelSlot::Primary;
-            if self.active_region == ActiveRegion::SecondaryTerminal {
-                self.active_region = ActiveRegion::PrimaryTerminal;
-            }
-        }
-        changed |= self.selected != previous_selection;
         if self.menu.as_ref().is_some_and(|menu| !self.has_session(menu.context().target)) {
             self.menu = None;
         }
@@ -740,31 +780,18 @@ impl App {
                 self.surface = Surface::Normal;
             }
         }
-        self.normalize_terminal_state();
+        self.workspace.normalize_terminals();
         changed
-    }
-
-    fn normalize_terminal_state(&mut self) {
-        if let Some(terminal) = self.snapshot.terminal.as_ref() {
-            let metrics =
-                ScrollMetrics::new(terminal.first_row, terminal.lines.len(), terminal.rows);
-            self.scroll.normalize(metrics);
-        } else {
-            self.scroll.reset();
-        }
-        if let Some(panel) = self.secondary.as_mut() {
-            if let Some(terminal) = panel.terminal.as_ref() {
-                let metrics =
-                    ScrollMetrics::new(terminal.first_row, terminal.lines.len(), terminal.rows);
-                panel.scroll.normalize(metrics);
-            } else {
-                panel.scroll.reset();
-            }
-        }
     }
 
     fn apply_connection_health(&mut self, health: ConnectionHealth) {
         if health.generation >= self.connection_generation {
+            if health.generation > self.connection_generation {
+                self.client.reset_activity();
+                for session in &mut self.snapshot.sessions {
+                    session.agent = None;
+                }
+            }
             self.connection_generation = health.generation;
             self.connection = health.state;
         }
@@ -774,22 +801,47 @@ impl App {
         id.is_some_and(|id| self.snapshot.sessions.iter().any(|session| session.id == id))
     }
 
-    fn primary_session(&self) -> Option<&SessionView> {
-        let selected = self.selected?;
-        self.snapshot.sessions.iter().find(|session| session.id == selected)
+    fn focused_session_id(&self) -> Option<SessionId> {
+        self.workspace.focused_session_id()
     }
 
-    fn focused_session_id(&self) -> Option<SessionId> {
-        match self.focused_panel {
-            PanelSlot::Primary => self.selected,
-            PanelSlot::Secondary => self.secondary.as_ref().map(|panel| panel.session_id),
+    fn active_region(&self) -> ActiveRegion {
+        match self.workspace.focus_surface() {
+            FocusSurface::Sessions => ActiveRegion::Sessions,
+            FocusSurface::Terminal => self.workspace.focused_slot().region(),
+        }
+    }
+
+    fn focus_region(&mut self, region: ActiveRegion) {
+        match region {
+            ActiveRegion::Sessions => {
+                let _ = self.workspace.focus_sessions();
+            }
+            ActiveRegion::PrimaryTerminal => {
+                let _ = self.workspace.focus_terminal(PanelSlot::Primary);
+            }
+            ActiveRegion::SecondaryTerminal => {
+                let _ = self.workspace.focus_terminal(PanelSlot::Secondary);
+            }
         }
     }
 
     fn panel_session_id(&self, slot: PanelSlot) -> Option<SessionId> {
-        match slot {
-            PanelSlot::Primary => self.selected,
-            PanelSlot::Secondary => self.secondary.as_ref().map(|panel| panel.session_id),
+        self.workspace.session_id(slot)
+    }
+
+    fn panel_marker(&self, id: SessionId) -> Option<&'static str> {
+        if !self.workspace.is_split() {
+            return None;
+        }
+        match (
+            self.workspace.session_id(PanelSlot::Primary) == Some(id),
+            self.workspace.session_id(PanelSlot::Secondary) == Some(id),
+        ) {
+            (true, false) => Some("1"),
+            (false, true) => Some("2"),
+            (false, false) => None,
+            (true, true) => unreachable!("a session cannot occupy both terminal panels"),
         }
     }
 
@@ -798,27 +850,25 @@ impl App {
     }
 
     fn panel_terminal(&self, slot: PanelSlot) -> Option<&TerminalView> {
-        match slot {
-            PanelSlot::Primary => self.snapshot.terminal.as_ref(),
-            PanelSlot::Secondary => self.secondary.as_ref()?.terminal.as_ref(),
-        }
+        self.workspace.terminal(slot)
     }
 
     fn panel_scroll(&self, slot: PanelSlot) -> ScrollState {
-        match slot {
-            PanelSlot::Primary => self.scroll,
-            PanelSlot::Secondary => {
-                self.secondary.as_ref().map_or(ScrollState::default(), |panel| panel.scroll)
-            }
-        }
+        self.workspace.scroll(slot)
     }
 
     fn focus_panel(&mut self, slot: PanelSlot) {
-        if slot == PanelSlot::Secondary && self.secondary.is_none() {
+        if self.workspace.session_id(slot).is_none() {
             return;
         }
-        self.focused_panel = slot;
-        self.active_region = slot.region();
+        let _ = self.workspace.focus_terminal(slot);
+    }
+
+    fn focus_sessions(&mut self) {
+        if matches!(self.layout, LayoutPreference::TerminalOnly { .. }) {
+            self.layout = self.layout.split_view();
+        }
+        let _ = self.workspace.focus_sessions();
     }
 
     fn session(&self, id: SessionId) -> Option<&SessionView> {
@@ -842,28 +892,12 @@ impl App {
         if !self.has_session(Some(id)) {
             return false;
         }
-        let secondary = self.secondary.as_ref().map(|panel| panel.session_id);
-        match select_change(self.selected, secondary, self.focused_panel, id) {
+        match self.workspace.select(id) {
             SelectionChange::Unchanged => return false,
-            SelectionChange::Focus(slot) => self.focused_panel = slot,
-            SelectionChange::Replace(slot) => match slot {
-                PanelSlot::Primary => {
-                    self.selected = Some(id);
-                    self.scroll.reset();
-                    self.selection.clear();
-                }
-                PanelSlot::Secondary => {
-                    if let Some(panel) = self.secondary.as_mut() {
-                        panel.session_id = id;
-                        panel.scroll.reset();
-                        panel.last_terminal_size = None;
-                    }
-                    self.selection.clear();
-                }
-            },
-        }
-        if self.active_region != ActiveRegion::Sessions {
-            self.active_region = self.focused_panel.region();
+            SelectionChange::Focus(_) => {}
+            SelectionChange::Replace(_) => {
+                self.selection.clear();
+            }
         }
         true
     }
@@ -879,44 +913,26 @@ impl App {
     }
 
     fn split_panel(&mut self) -> bool {
-        if self.secondary.is_some() {
+        if self.workspace.is_split() {
             self.focus_panel(PanelSlot::Secondary);
             return false;
         }
-        let Some(session_id) = next_split_session(
-            self.selected,
-            self.secondary.as_ref().map(|panel| panel.session_id),
-            self.snapshot.sessions.iter().map(|session| session.id),
-        ) else {
+        let Some(session_id) = self
+            .workspace
+            .next_split_session(self.snapshot.sessions.iter().map(|session| session.id))
+        else {
             return false;
         };
-        self.secondary = Some(SecondaryPanel {
-            session_id,
-            terminal: None,
-            scroll: ScrollState::default(),
-            last_terminal_size: None,
-        });
-        self.focus_panel(PanelSlot::Secondary);
+        let _ = self.workspace.split(session_id);
         self.history.visit(session_id);
         true
     }
 
     fn close_focused_panel(&mut self) -> bool {
-        let Some(change) = close_panel_change(self.secondary.is_some(), self.focused_panel) else {
+        if !self.workspace.close_focused() {
             return false;
-        };
-        let Some(secondary) = self.secondary.take() else {
-            return false;
-        };
-        if change == ClosePanelChange::PromoteSecondary {
-            self.selected = Some(secondary.session_id);
-            self.snapshot.terminal = secondary.terminal;
-            self.scroll = secondary.scroll;
-            self.last_terminal_size = secondary.last_terminal_size;
         }
         self.selection.clear();
-        self.focused_panel = PanelSlot::Primary;
-        self.active_region = ActiveRegion::PrimaryTerminal;
         true
     }
 
@@ -948,23 +964,15 @@ impl App {
     fn resize_requests(&mut self, regions: &UiRegions) -> Vec<(usize, usize, u16, u16)> {
         let mut requests = Vec::new();
         for region in &regions.terminals {
-            let session_id = match region.slot {
-                PanelSlot::Primary => self.selected,
-                PanelSlot::Secondary => self.secondary.as_ref().map(|panel| panel.session_id),
-            };
+            let session_id = self.workspace.session_id(region.slot);
             let values = session_id
                 .and_then(|id| self.session(id))
                 .zip(self.panel_terminal(region.slot))
                 .map(|(session, terminal)| (session.control, session.tab_id, terminal.pane_id));
-            let last_terminal_size = match region.slot {
-                PanelSlot::Primary => &mut self.last_terminal_size,
-                PanelSlot::Secondary => {
-                    let Some(panel) = self.secondary.as_mut() else {
-                        continue;
-                    };
-                    &mut panel.last_terminal_size
-                }
+            let Some(panel) = self.workspace.panel_mut(region.slot) else {
+                continue;
             };
+            let last_terminal_size = panel.last_terminal_size_mut();
             let Some((control, tab_id, pane_id)) = values else {
                 *last_terminal_size = None;
                 continue;
@@ -992,15 +1000,17 @@ impl App {
         let target = target.or(self.focused_session_id());
         let target_access = target.and_then(|id| self.session(id)).map(session_access);
         let (create_cols, create_rows) = regions.create_size();
-        let visible_rows = regions
-            .terminal(self.focused_panel)
-            .map_or(0, |region| usize::from(region.content.height));
-        let terminal = self.panel_terminal(self.focused_panel);
-        let scroll = self.panel_scroll(self.focused_panel);
+        let focused_panel = self.workspace.focused_slot();
+        let visible_rows =
+            regions.terminal(focused_panel).map_or(0, |region| usize::from(region.content.height));
+        let terminal =
+            regions.terminal(focused_panel).and_then(|_| self.panel_terminal(focused_panel));
+        let scroll = self.panel_scroll(focused_panel);
         let scroll_metrics = terminal.map(|terminal| {
             ScrollMetrics::new(terminal.first_row, terminal.lines.len(), visible_rows)
         });
         let navigation = regions.navigation();
+        let active_region = self.active_region();
         ConsoleActionContext {
             target,
             target_access,
@@ -1008,15 +1018,15 @@ impl App {
             selected_index: self.selected_index(),
             session_count: self.snapshot.sessions.len(),
             sidebar_visible: regions.sessions.is_some(),
-            region: self.active_region,
-            focus_left: navigation.neighbor(self.active_region, Direction::Left),
-            focus_right: navigation.neighbor(self.active_region, Direction::Right),
-            focus_next: navigation.next(self.active_region),
-            focus_previous: navigation.previous(self.active_region),
+            region: active_region,
+            focus_left: navigation.neighbor(active_region, Direction::Left),
+            focus_right: navigation.neighbor(active_region, Direction::Right),
+            focus_next: navigation.next(active_region),
+            focus_previous: navigation.previous(active_region),
             surface: self.surface.kind(),
             has_terminal: terminal.is_some(),
-            has_secondary_panel: self.secondary.is_some(),
-            can_split_panel: self.secondary.is_none() && self.snapshot.sessions.len() > 1,
+            has_secondary_panel: self.workspace.is_split(),
+            can_split_panel: !self.workspace.is_split() && self.snapshot.sessions.len() > 1,
             visible_rows,
             can_scroll_up: scroll_metrics.is_some_and(|metrics| scroll.can_scroll_up(metrics)),
             can_scroll_down: scroll.can_scroll_down(),
@@ -1106,6 +1116,7 @@ impl App {
             }
             ConsoleAction::TakeControl => self.control_intent(context.target, ControlIntent::Take),
             ConsoleAction::PrimaryControl => {
+                let _ = context.target.is_some_and(|id| self.select(id));
                 self.control_intent(context.target, ControlIntent::Primary)
             }
             ConsoleAction::CopyVisibleTerminal => self
@@ -1126,7 +1137,7 @@ impl App {
                 Effect::None
             }
             ConsoleAction::FocusOtherPanel => {
-                let slot = match self.focused_panel {
+                let slot = match self.workspace.focused_slot() {
                     PanelSlot::Primary => PanelSlot::Secondary,
                     PanelSlot::Secondary => PanelSlot::Primary,
                 };
@@ -1176,48 +1187,61 @@ impl App {
                 Effect::ProjectTerminal
             }
             ConsoleAction::FocusSessions => {
-                self.active_region = ActiveRegion::Sessions;
+                self.focus_sessions();
                 Effect::None
+            }
+            ConsoleAction::FocusTerminal => {
+                let _ = context.target.is_some_and(|id| self.select(id));
+                self.focus_panel(self.workspace.focused_slot());
+                Effect::ProjectTerminal
             }
             ConsoleAction::FocusLeft => {
                 if let Some(region) = context.focus_left {
-                    self.active_region = region;
-                    self.sync_focused_panel_from_region();
+                    self.focus_region(region);
                 }
                 Effect::None
             }
             ConsoleAction::FocusRight => {
                 if let Some(region) = context.focus_right {
-                    self.active_region = region;
-                    self.sync_focused_panel_from_region();
+                    self.focus_region(region);
                 }
                 Effect::None
             }
             ConsoleAction::FocusNext => {
                 if let Some(region) = context.focus_next {
-                    self.active_region = region;
-                    self.sync_focused_panel_from_region();
+                    self.focus_region(region);
                 }
                 Effect::None
             }
             ConsoleAction::FocusPrevious => {
                 if let Some(region) = context.focus_previous {
-                    self.active_region = region;
-                    self.sync_focused_panel_from_region();
+                    self.focus_region(region);
                 }
                 Effect::None
             }
             ConsoleAction::NarrowSidebar => {
-                self.persist_split_ratio(self.layout.restore_ratio().adjusted(-SIDEBAR_STEP));
+                self.persist_split_ratio(
+                    SplitSurface::SessionsDrawer,
+                    self.layout.restore_ratio().adjusted(-SIDEBAR_STEP),
+                );
                 Effect::None
             }
             ConsoleAction::WidenSidebar => {
-                self.persist_split_ratio(self.layout.restore_ratio().adjusted(SIDEBAR_STEP));
+                self.persist_split_ratio(
+                    SplitSurface::SessionsDrawer,
+                    self.layout.restore_ratio().adjusted(SIDEBAR_STEP),
+                );
                 Effect::None
             }
             ConsoleAction::ResizeSidebar => {
                 if let Some(ratio) = context.requested_ratio {
-                    self.layout = self.layout.with_ratio(ratio);
+                    self.set_split_ratio(SplitSurface::SessionsDrawer, ratio);
+                }
+                Effect::None
+            }
+            ConsoleAction::ResizeTerminalPanels => {
+                if let Some(ratio) = context.requested_ratio {
+                    self.set_split_ratio(SplitSurface::TerminalPanels, ratio);
                 }
                 Effect::None
             }
@@ -1238,6 +1262,7 @@ impl App {
                 ));
                 Effect::None
             }
+            ConsoleAction::PreviewReadyNotification => Effect::PreviewNotification,
             ConsoleAction::RetryConnection => Effect::RetryConnection,
             ConsoleAction::Quit => Effect::Quit,
         }
@@ -1271,6 +1296,7 @@ impl App {
         }) {
             Ok((config, registry)) => {
                 self.layout = self.layout.with_ratio(config.sidebar_split_ratio());
+                self.workspace.set_split_ratio(config.terminal_split_ratio());
                 self.config = config;
                 self.registry = registry;
             }
@@ -1289,7 +1315,7 @@ impl App {
         };
         match resolve_control(intent, access) {
             InteractionDecision::FocusTerminal => {
-                self.active_region = self.focused_panel.region();
+                let _ = self.workspace.focus_selected_terminal();
                 Effect::None
             }
             InteractionDecision::Control(ControlOperation::Acquire) => Effect::AcquireControl(id),
@@ -1318,7 +1344,7 @@ impl App {
             }
             return;
         }
-        let slot = self.focused_panel;
+        let slot = self.workspace.focused_slot();
         let Some(terminal) = self.panel_terminal(slot) else {
             return;
         };
@@ -1348,13 +1374,8 @@ impl App {
         if let Surface::Search { current_match, .. } = &mut self.surface {
             *current_match = Some(next);
         }
-        match slot {
-            PanelSlot::Primary => self.scroll.scroll_to_row(next, metrics),
-            PanelSlot::Secondary => {
-                if let Some(panel) = self.secondary.as_mut() {
-                    panel.scroll.scroll_to_row(next, metrics);
-                }
-            }
+        if let Some(scroll) = self.workspace.scroll_mut(slot) {
+            scroll.scroll_to_row(next, metrics);
         }
         self.notice = Some(format!(
             "Match {} of {}",
@@ -1364,8 +1385,9 @@ impl App {
     }
 
     fn visible_terminal_text(&self, visible_rows: usize) -> Option<String> {
-        let terminal = self.panel_terminal(self.focused_panel)?;
-        let range = self.panel_scroll(self.focused_panel).visible_range(ScrollMetrics::new(
+        let slot = self.workspace.focused_slot();
+        let terminal = self.panel_terminal(slot)?;
+        let range = self.panel_scroll(slot).visible_range(ScrollMetrics::new(
             terminal.first_row,
             terminal.lines.len(),
             visible_rows,
@@ -1389,29 +1411,19 @@ impl App {
     }
 
     fn scroll_up(&mut self, rows: usize, visible_rows: usize) {
-        let slot = self.focused_panel;
+        let slot = self.workspace.focused_slot();
         if let Some(metrics) = self.scroll_metrics(slot, visible_rows) {
-            match slot {
-                PanelSlot::Primary => self.scroll.scroll_up(rows, metrics),
-                PanelSlot::Secondary => {
-                    if let Some(panel) = self.secondary.as_mut() {
-                        panel.scroll.scroll_up(rows, metrics);
-                    }
-                }
+            if let Some(scroll) = self.workspace.scroll_mut(slot) {
+                scroll.scroll_up(rows, metrics);
             }
         }
     }
 
     fn scroll_down(&mut self, rows: usize, visible_rows: usize) {
-        let slot = self.focused_panel;
+        let slot = self.workspace.focused_slot();
         if let Some(metrics) = self.scroll_metrics(slot, visible_rows) {
-            match slot {
-                PanelSlot::Primary => self.scroll.scroll_down(rows, metrics),
-                PanelSlot::Secondary => {
-                    if let Some(panel) = self.secondary.as_mut() {
-                        panel.scroll.scroll_down(rows, metrics);
-                    }
-                }
+            if let Some(scroll) = self.workspace.scroll_mut(slot) {
+                scroll.scroll_down(rows, metrics);
             }
         }
     }
@@ -1421,27 +1433,11 @@ impl App {
     }
 
     fn reset_focused_terminal_state(&mut self) {
-        match self.focused_panel {
-            PanelSlot::Primary => {
-                self.scroll.reset();
-            }
-            PanelSlot::Secondary => {
-                if let Some(panel) = self.secondary.as_mut() {
-                    panel.scroll.reset();
-                }
-            }
+        let slot = self.workspace.focused_slot();
+        if let Some(scroll) = self.workspace.scroll_mut(slot) {
+            scroll.reset();
         }
         self.selection.clear();
-    }
-
-    fn sync_focused_panel_from_region(&mut self) {
-        match self.active_region {
-            ActiveRegion::PrimaryTerminal => self.focused_panel = PanelSlot::Primary,
-            ActiveRegion::SecondaryTerminal if self.secondary.is_some() => {
-                self.focused_panel = PanelSlot::Secondary;
-            }
-            ActiveRegion::Sessions | ActiveRegion::SecondaryTerminal => {}
-        }
     }
 
     fn terminal_input_enabled(&self) -> bool {
@@ -1464,46 +1460,102 @@ impl App {
         }
     }
 
-    fn persist_split_ratio(&mut self, ratio: SplitRatio) {
-        match self.config.set_sidebar_split_ratio(ratio) {
-            Ok(()) => self.layout = self.layout.with_ratio(ratio),
+    fn body_layout(&self, width: u16) -> BodyLayout {
+        let drawer_requested = matches!(self.layout, LayoutPreference::Split { .. });
+
+        if drawer_requested && self.body_split_minimums().fits(width) {
+            BodyLayout::DrawerAndTerminals
+        } else if drawer_requested && self.active_region() == ActiveRegion::Sessions {
+            BodyLayout::SessionsDrawer
+        } else {
+            BodyLayout::Terminals
+        }
+    }
+
+    fn body_split_minimums(&self) -> SplitMinimums {
+        let terminal = if self.workspace.is_split() {
+            TERMINAL_SPLIT_MINIMUMS.required_width()
+        } else {
+            TERMINAL_PANEL_MIN_WIDTH
+        };
+        SplitMinimums::new(SESSIONS_DRAWER_MIN_WIDTH, terminal)
+    }
+
+    const fn split_ratio(&self, surface: SplitSurface) -> SplitRatio {
+        match surface {
+            SplitSurface::SessionsDrawer => self.layout.restore_ratio(),
+            SplitSurface::TerminalPanels => self.workspace.split_ratio(),
+        }
+    }
+
+    fn set_split_ratio(&mut self, surface: SplitSurface, ratio: SplitRatio) {
+        match surface {
+            SplitSurface::SessionsDrawer => self.layout = self.layout.with_ratio(ratio),
+            SplitSurface::TerminalPanels => self.workspace.set_split_ratio(ratio),
+        }
+    }
+
+    fn persist_split_ratio(&mut self, surface: SplitSurface, ratio: SplitRatio) {
+        let result = match surface {
+            SplitSurface::SessionsDrawer => self.config.set_sidebar_split_ratio(ratio),
+            SplitSurface::TerminalPanels => self.config.set_terminal_split_ratio(ratio),
+        };
+        match result {
+            Ok(()) => self.set_split_ratio(surface, ratio),
             Err(error) => {
-                self.layout = self.layout.with_ratio(self.config.sidebar_split_ratio());
-                self.notice = Some(format!("Could not save sidebar width: {error:#}"));
+                let restore = match surface {
+                    SplitSurface::SessionsDrawer => self.config.sidebar_split_ratio(),
+                    SplitSurface::TerminalPanels => self.config.terminal_split_ratio(),
+                };
+                self.set_split_ratio(surface, restore);
+                self.notice = Some(format!("Could not save split width: {error:#}"));
             }
         }
     }
 
+    fn cancel_split_drag(&mut self) {
+        if let Some(drag) = self.split_drag.take() {
+            let (surface, ratio) = drag.cancel();
+            self.set_split_ratio(surface, ratio);
+        }
+    }
+
     fn toggle_sidebar(&mut self) {
-        match (self.layout, self.active_region) {
+        match (self.layout, self.active_region()) {
             (LayoutPreference::TerminalOnly { .. }, _) => {
                 self.layout = self.layout.split_view();
-                self.active_region = ActiveRegion::Sessions;
+                let _ = self.workspace.focus_sessions();
             }
             (LayoutPreference::Split { .. }, ActiveRegion::Sessions) => {
                 self.layout = self.layout.terminal_only();
-                self.active_region = self.focused_panel.region();
+                let _ = self.workspace.focus_selected_terminal();
                 self.menu = None;
-                self.split_drag = None;
+                self.cancel_split_drag();
             }
             (
                 LayoutPreference::Split { .. },
                 ActiveRegion::PrimaryTerminal | ActiveRegion::SecondaryTerminal,
             ) => {
-                self.active_region = ActiveRegion::Sessions;
+                let _ = self.workspace.focus_sessions();
             }
         }
     }
 
     fn normalize_focus(&mut self, regions: &UiRegions) {
-        self.active_region = regions
+        let region = regions
             .navigation()
-            .normalize(self.active_region)
+            .normalize(self.active_region())
             .unwrap_or(ActiveRegion::PrimaryTerminal);
-        self.sync_focused_panel_from_region();
+        self.focus_region(region);
         if regions.sessions.is_none() {
             self.menu = None;
-            self.split_drag = None;
+        }
+        if self.split_drag.is_some_and(|drag| {
+            SplitSurface::ALL
+                .into_iter()
+                .any(|surface| drag.applies_to(surface) && regions.split(surface).is_none())
+        }) {
+            self.cancel_split_drag();
         }
     }
 }
@@ -1532,6 +1584,9 @@ async fn run_loop(client: ConsoleClient, config: Config) -> Result<ConnectedSess
     reconcile.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut activity = tokio::time::interval_at(now + ACTIVITY_INTERVAL, ACTIVITY_INTERVAL);
     activity.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut animation = tokio::time::interval_at(now + ANIMATION_INTERVAL, ANIMATION_INTERVAL);
+    animation.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut notifications = super::notification::CompletionDelivery::default();
     let mut activity_dirty = false;
     let mut needs_draw = true;
     let mut regions = UiRegions::default();
@@ -1554,7 +1609,15 @@ async fn run_loop(client: ConsoleClient, config: Config) -> Result<ConnectedSess
             }
         }
 
+        let notification_active = notifications.is_active();
         let effect = tokio::select! {
+            result = notifications.wait(), if notification_active => {
+                if let Err(error) = result {
+                    app.notice = Some(format!("Ready notification failed: {error:#}"));
+                    needs_draw = true;
+                }
+                continue;
+            }
             invalidation = invalidations.recv() => {
                 let Some(invalidation) = invalidation else {
                     return Ok(ConnectedSessionOutcome::ReturnToControlCenter);
@@ -1593,10 +1656,21 @@ async fn run_loop(client: ConsoleClient, config: Config) -> Result<ConnectedSess
                     Ok(refresh) => {
                         needs_draw |= refresh.changed;
                         activity_dirty = refresh.revisit;
-                        if refresh.ready
-                            && app.config.ready_notification() == ReadyNotification::TerminalBell
-                        {
-                            session.ring_bell()?;
+                        if let Some((first, additional)) = refresh.completions.split_first() {
+                            let batch = super::notification::CompletionBatch::new(
+                                *first,
+                                additional,
+                                |id| app.session(id).map(|session| session.title.clone()),
+                            );
+                            if let Err(error) = dispatch_ready_notification(
+                                &mut app,
+                                &mut session,
+                                &mut notifications,
+                                super::notification::NotificationRequest::Completions(batch),
+                            ) {
+                                app.notice = Some(format!("Ready notification failed: {error:#}"));
+                                needs_draw = true;
+                            }
                         }
                     }
                     Err(error) => {
@@ -1605,6 +1679,11 @@ async fn run_loop(client: ConsoleClient, config: Config) -> Result<ConnectedSess
                         needs_draw = true;
                     }
                 }
+                continue;
+            }
+            _ = animation.tick(), if app.has_working_session() => {
+                app.advance_animation();
+                needs_draw = true;
                 continue;
             }
             event = events.recv() => {
@@ -1619,7 +1698,7 @@ async fn run_loop(client: ConsoleClient, config: Config) -> Result<ConnectedSess
         // need an immediate draw. Mouse reporting has no local prediction; pane output is the
         // authoritative redraw signal, and drawing here would render the same terminal twice.
         let redraw_after_effect = !matches!(&effect, Effect::SendMouse { .. });
-        match apply_effect(effect, &mut app, &mut session).await {
+        match apply_effect(effect, &mut app, &mut session, &mut notifications).await {
             Ok(EffectFlow::Continue) => needs_draw |= redraw_after_effect,
             Ok(EffectFlow::Quit) => {
                 return Ok(ConnectedSessionOutcome::ReturnToControlCenter);
@@ -1637,7 +1716,34 @@ enum EffectFlow {
     Quit,
 }
 
-async fn apply_effect(effect: Effect, app: &mut App, session: &mut Session) -> Result<EffectFlow> {
+fn dispatch_ready_notification(
+    app: &mut App,
+    session: &mut Session,
+    delivery: &mut super::notification::CompletionDelivery,
+    request: super::notification::NotificationRequest,
+) -> Result<()> {
+    match app.config.ready_notification() {
+        ReadyNotification::TerminalBell => session.ring_bell(),
+        ReadyNotification::SystemSound => {
+            delivery.enqueue(request);
+            Ok(())
+        }
+        ReadyNotification::Off => {
+            if matches!(request, super::notification::NotificationRequest::Preview { .. }) {
+                app.notice =
+                    Some("Ready notifications are disabled in Console settings".to_owned());
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn apply_effect(
+    effect: Effect,
+    app: &mut App,
+    session: &mut Session,
+    notifications: &mut super::notification::CompletionDelivery,
+) -> Result<EffectFlow> {
     match effect {
         Effect::None => {}
         Effect::ProjectTerminal => {
@@ -1654,13 +1760,12 @@ async fn apply_effect(effect: Effect, app: &mut App, session: &mut Session) -> R
         }
         Effect::Create { cols, rows } => {
             let id = app.client.create_session(cols, rows).await?;
-            app.selected = Some(id);
-            app.focused_panel = PanelSlot::Primary;
+            let _ = app.workspace.select(id);
             app.history.visit(id);
-            app.active_region = ActiveRegion::PrimaryTerminal;
-            app.scroll.reset();
+            let _ = app.workspace.focus_selected_terminal();
             app.selection.clear();
             app.reconcile_topology().await?;
+            let _ = app.project_terminal()?;
         }
         Effect::Rename { id, title } => {
             app.client.rename_session(id, title).await?;
@@ -1671,22 +1776,30 @@ async fn apply_effect(effect: Effect, app: &mut App, session: &mut Session) -> R
         }
         Effect::AcquireControl(id) => {
             app.client.acquire_control(id).await?;
-            app.active_region = app.focused_panel.region();
+            let _ = app.workspace.focus_selected_terminal();
             app.reconcile_topology().await?;
         }
         Effect::ReleaseControl(id) => {
             app.client.release_control(id).await?;
-            app.active_region = ActiveRegion::Sessions;
+            let _ = app.workspace.focus_sessions();
             app.reconcile_topology().await?;
         }
         Effect::TakeControl(id) => {
             app.client.take_control(id).await?;
-            app.active_region = app.focused_panel.region();
+            let _ = app.workspace.focus_selected_terminal();
             app.reconcile_topology().await?;
         }
         Effect::Copy(text) => {
             session.copy(&text)?;
             app.notice = Some(format!("Copied {} visible lines", text.lines().count()));
+        }
+        Effect::PreviewNotification => {
+            let request = super::notification::NotificationRequest::preview(
+                app.focused_session().map(|session| session.title.as_str()),
+            );
+            if let Err(error) = dispatch_ready_notification(app, session, notifications, request) {
+                app.notice = Some(format!("Ready notification failed: {error:#}"));
+            }
         }
         Effect::SendKey(key) => {
             if let Some(pane_id) = app.focused_session().map(|session| session.pane_id) {
@@ -1780,10 +1893,8 @@ fn handle_event(event: Event, app: &mut App, regions: &UiRegions) -> Result<Effe
             handle_mouse(mouse, app, regions)
         }
         Event::Paste(text)
-            if matches!(
-                app.active_region,
-                ActiveRegion::PrimaryTerminal | ActiveRegion::SecondaryTerminal
-            ) && app.surface.kind() == SurfaceKind::Normal
+            if app.workspace.focus_surface() == FocusSurface::Terminal
+                && app.surface.kind() == SurfaceKind::Normal
                 && app.terminal_input_enabled() =>
         {
             app.keybinding_state.cancel();
@@ -1791,12 +1902,7 @@ fn handle_event(event: Event, app: &mut App, regions: &UiRegions) -> Result<Effe
         }
         Event::Resize(_, _) => {
             app.keybinding_state.cancel();
-            if let Some(drag) = app.split_drag.take() {
-                let ratio = app.layout.restore_ratio();
-                if drag.changed(ratio) {
-                    app.persist_split_ratio(ratio);
-                }
-            }
+            app.cancel_split_drag();
             Ok(Effect::None)
         }
         _ => Ok(Effect::None),
@@ -1820,10 +1926,7 @@ fn handle_key(key: KeyEvent, app: &mut App, regions: &UiRegions) -> Result<Effec
         KeybindingResolution::Pending => return Ok(Effect::None),
         KeybindingResolution::UnmatchedSequence { prefix, chord }
             if prefix == chord
-                && matches!(
-                    app.active_region,
-                    ActiveRegion::PrimaryTerminal | ActiveRegion::SecondaryTerminal
-                )
+                && app.workspace.focus_surface() == FocusSurface::Terminal
                 && app.surface.kind() == SurfaceKind::Normal
                 && app.terminal_input_enabled() =>
         {
@@ -1844,12 +1947,7 @@ fn handle_key(key: KeyEvent, app: &mut App, regions: &UiRegions) -> Result<Effec
             app.reset_focused_terminal_state();
             Ok(Effect::None)
         }
-        Surface::Normal
-            if matches!(
-                app.active_region,
-                ActiveRegion::PrimaryTerminal | ActiveRegion::SecondaryTerminal
-            ) =>
-        {
+        Surface::Normal if app.workspace.focus_surface() == FocusSurface::Terminal => {
             if app.terminal_input_enabled() {
                 Ok(Effect::SendKey(key))
             } else {
@@ -1908,16 +2006,14 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App, regions: &UiRegions) -> Result
 
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            app.split_drag = regions.split.and_then(|split| {
-                SplitDrag::begin((), split, app.layout.restore_ratio(), mouse.column, mouse.row)
+            app.split_drag = SplitSurface::ALL.into_iter().find_map(|surface| {
+                let split = regions.split(surface)?;
+                SplitDrag::begin(surface, split, app.split_ratio(surface), mouse.column, mouse.row)
             });
             if app.split_drag.is_some() {
                 return Ok(Effect::None);
             }
             if let Some(hit) = action_at(regions, position) {
-                if let Some(id) = hit.target {
-                    let _ = app.invoke_action(ConsoleAction::SelectSession, Some(id), regions)?;
-                }
                 return app.invoke_action(hit.action, hit.target, regions);
             }
             if let Some(id) = session_at(regions, position) {
@@ -1926,6 +2022,8 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App, regions: &UiRegions) -> Result
                 let select = app.invoke_action(ConsoleAction::SelectSession, Some(id), regions)?;
                 if double {
                     let _ = app.invoke_action(ConsoleAction::RenameSession, Some(id), regions)?;
+                } else if regions.terminals.is_empty() {
+                    let _ = app.workspace.focus_selected_terminal();
                 }
                 return Ok(select);
             }
@@ -1940,15 +2038,14 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App, regions: &UiRegions) -> Result
                         app.invoke_action(ConsoleAction::FocusSessions, None, regions)
                     }
                     ActiveRegion::PrimaryTerminal | ActiveRegion::SecondaryTerminal => {
-                        app.active_region = region;
-                        app.sync_focused_panel_from_region();
+                        app.focus_region(region);
                         app.invoke_action(ConsoleAction::Activate, None, regions)
                     }
                 };
             }
         }
         MouseEventKind::Down(MouseButton::Right) => {
-            app.split_drag = None;
+            app.cancel_split_drag();
             if let Some(id) = session_at(regions, position) {
                 let _ = app.invoke_action(ConsoleAction::FocusSessions, None, regions)?;
                 let _ = app.invoke_action(ConsoleAction::SelectSession, Some(id), regions)?;
@@ -1966,18 +2063,27 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App, regions: &UiRegions) -> Result
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
-            if let Some(ratio) = app.split_drag.and_then(|drag| {
-                regions.split.and_then(|split| drag.ratio_for_column((), split, mouse.column))
+            if let Some((surface, ratio)) = app.split_drag.and_then(|drag| {
+                SplitSurface::ALL.into_iter().find_map(|surface| {
+                    let split = regions.split(surface)?;
+                    drag.ratio_for_column(surface, split, mouse.column)
+                        .map(|ratio| (surface, ratio))
+                })
             }) {
                 let context = app.action_context(None, regions, Some(ratio));
-                return app.invoke(ActionInvocation::new(RESIZE_SIDEBAR, context), regions);
+                return app
+                    .invoke(ActionInvocation::new(surface.resize_action(), context), regions);
             }
         }
         MouseEventKind::Up(MouseButton::Left) => {
             if let Some(drag) = app.split_drag.take() {
-                let ratio = app.layout.restore_ratio();
+                let surface = SplitSurface::ALL
+                    .into_iter()
+                    .find(|surface| drag.applies_to(*surface))
+                    .expect("split drag has a known surface");
+                let ratio = app.split_ratio(surface);
                 if drag.changed(ratio) {
-                    app.persist_split_ratio(ratio);
+                    app.persist_split_ratio(surface, ratio);
                 }
             }
         }
@@ -2018,15 +2124,17 @@ fn console_actions(
     let mut builder = ActionRegistryBuilder::new();
     for action in ConsoleAction::ALL {
         let enablement = match action {
-            ConsoleAction::SelectSession => has_target,
+            ConsoleAction::SelectSession | ConsoleAction::FocusTerminal => has_target,
             ConsoleAction::CreateSession
             | ConsoleAction::FocusSessions
             | ConsoleAction::NarrowSidebar
             | ConsoleAction::WidenSidebar
             | ConsoleAction::ResizeSidebar
+            | ConsoleAction::ResizeTerminalPanels
             | ConsoleAction::ToggleSidebar
             | ConsoleAction::OpenCommandPalette
             | ConsoleAction::OpenSettings
+            | ConsoleAction::PreviewReadyNotification
             | ConsoleAction::Quit => enabled,
             ConsoleAction::RetryConnection => can_retry_connection,
             ConsoleAction::Activate => can_activate,
@@ -2451,41 +2559,10 @@ fn render(frame: &mut Frame<'_>, app: &mut App) -> UiRegions {
         editor.render(frame, area);
         return regions;
     }
-
-    match app.layout.effective(area.width) {
-        EffectiveLayout::Split => {
-            let split = SplitFrame::horizontal(
-                area,
-                app.layout.restore_ratio(),
-                SplitMinimums::new(18, 20),
-            );
-            regions.split = Some(split);
-            regions.sessions = Some(split.first);
-            render_sessions(frame, split.first, app, &mut regions);
-            render_terminals(frame, split.second, app, &mut regions);
-            render_split_divider(
-                frame,
-                split,
-                app.split_drag.is_some(),
-                SplitDividerStyle {
-                    idle_color: NORD.border,
-                    active_color: NORD.focus,
-                    idle_line: "│",
-                    idle_grip: "┃",
-                    active_line: "┃",
-                },
-            );
-        }
-        EffectiveLayout::TerminalOnly { reason: TerminalOnlyReason::Compact }
-            if app.active_region == ActiveRegion::Sessions =>
-        {
-            regions.sessions = Some(area);
-            render_sessions(frame, area, app, &mut regions);
-        }
-        EffectiveLayout::TerminalOnly { .. } => {
-            render_terminals(frame, area, app, &mut regions);
-        }
-    }
+    let rows =
+        Layout::vertical([Constraint::Length(SESSION_TABS_HEIGHT), Constraint::Min(0)]).split(area);
+    render_session_tabs(frame, rows[0], app, &mut regions);
+    render_body(frame, rows[1], app, &mut regions);
     app.selection.capture_frame(
         frame,
         &regions.selectable,
@@ -2504,8 +2581,129 @@ fn render(frame: &mut Frame<'_>, app: &mut App) -> UiRegions {
     regions
 }
 
+fn render_body(frame: &mut Frame<'_>, area: Rect, app: &App, regions: &mut UiRegions) {
+    match app.body_layout(area.width) {
+        BodyLayout::SessionsDrawer => {
+            regions.sessions = Some(area);
+            render_sessions(frame, area, app, regions);
+        }
+        BodyLayout::Terminals => {
+            render_terminals(frame, area, app, regions);
+        }
+        BodyLayout::DrawerAndTerminals => {
+            let split =
+                SplitFrame::horizontal(area, app.layout.restore_ratio(), app.body_split_minimums());
+            regions.drawer_split = Some(split);
+            regions.sessions = Some(split.first);
+            render_sessions(frame, split.first, app, regions);
+            render_terminals(frame, split.second, app, regions);
+            render_workspace_divider(frame, app, split, SplitSurface::SessionsDrawer);
+        }
+    }
+}
+
+fn render_workspace_divider(
+    frame: &mut Frame<'_>,
+    app: &App,
+    split: SplitFrame,
+    surface: SplitSurface,
+) {
+    render_split_divider(
+        frame,
+        split,
+        app.split_drag.is_some_and(|drag| drag.applies_to(surface)),
+        SplitDividerStyle {
+            idle_color: NORD.border,
+            active_color: NORD.focus,
+            idle_line: "│",
+            idle_grip: "┃",
+            active_line: "┃",
+        },
+    );
+}
+
+fn render_session_tabs(frame: &mut Frame<'_>, area: Rect, app: &App, regions: &mut UiRegions) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    if app.snapshot.sessions.is_empty() {
+        frame.render_widget(
+            Paragraph::new(" Console · no sessions ").style(Style::default().fg(NORD.text_muted)),
+            area,
+        );
+        return;
+    }
+
+    let tabs = app
+        .snapshot
+        .sessions
+        .iter()
+        .map(|session| {
+            let label = session_tab_label(app, session);
+            let width = u16::try_from(terminal_text_width(&label))
+                .unwrap_or(u16::MAX)
+                .min(SESSION_TAB_MAX_WIDTH);
+            (session.id, label, width)
+        })
+        .collect::<Vec<_>>();
+    let focused = app
+        .focused_session_id()
+        .and_then(|id| tabs.iter().position(|(session_id, _, _)| *session_id == id))
+        .unwrap_or_default();
+    let mut start = 0;
+    while start < focused
+        && tabs[start..=focused].iter().map(|(_, _, width)| *width).fold(0_u16, u16::saturating_add)
+            > area.width
+    {
+        start += 1;
+    }
+
+    let right = area.x.saturating_add(area.width);
+    let mut x = area.x;
+    for (session_id, label, requested_width) in tabs.iter().skip(start) {
+        let width = (*requested_width).min(right.saturating_sub(x));
+        if width == 0 {
+            break;
+        }
+        let tab_area = Rect::new(x, area.y, width, area.height);
+        let label = truncate_terminal_text(label, usize::from(width), CellOverflow::Clip);
+        let focused = app.focused_session_id() == Some(*session_id);
+        let assigned = app.panel_marker(*session_id).is_some();
+        let style = if focused {
+            Style::default().fg(NORD.text_strong).bg(NORD.selection).add_modifier(Modifier::BOLD)
+        } else if assigned {
+            Style::default().fg(NORD.accent)
+        } else {
+            Style::default().fg(NORD.text_muted)
+        };
+        frame.render_widget(Paragraph::new(label).style(style), tab_area);
+        regions.action_hits.push(ActionHitTarget {
+            area: tab_area,
+            action: ConsoleAction::FocusTerminal,
+            target: Some(*session_id),
+        });
+        x = x.saturating_add(width);
+        if x >= right {
+            break;
+        }
+    }
+}
+
+fn session_tab_label(app: &App, session: &SessionView) -> String {
+    let activity = session.agent.map_or("·", |agent| app.activity_icon(agent));
+    let panel = app.panel_marker(session.id).map_or("", |panel| panel);
+    let prefix =
+        if panel.is_empty() { format!(" {activity} ") } else { format!(" {panel} {activity} ") };
+    let suffix = " │";
+    let title_width = usize::from(SESSION_TAB_MAX_WIDTH)
+        .saturating_sub(terminal_text_width(&prefix))
+        .saturating_sub(terminal_text_width(suffix));
+    let title = truncate_terminal_text(&session.title, title_width, CellOverflow::Clip);
+    format!("{prefix}{title}{suffix}")
+}
+
 fn render_sessions(frame: &mut Frame<'_>, area: Rect, app: &App, regions: &mut UiRegions) {
-    let focused = app.active_region == ActiveRegion::Sessions;
+    let focused = app.active_region() == ActiveRegion::Sessions;
     let mut block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(if focused { NORD.focus } else { NORD.border }))
@@ -2529,14 +2727,8 @@ fn render_sessions(frame: &mut Frame<'_>, area: Rect, app: &App, regions: &mut U
 
     let item_width = usize::from(chunks[0].width.saturating_sub(2));
     let items = app.snapshot.sessions.iter().map(|session| {
-        let panel = if app.selected == Some(session.id) {
-            Some("1")
-        } else if app.secondary.as_ref().is_some_and(|panel| panel.session_id == session.id) {
-            Some("2")
-        } else {
-            None
-        };
-        session_item(session, &app.surface, item_width, panel)
+        let panel = app.panel_marker(session.id);
+        session_item(app, session, &app.surface, item_width, panel)
     });
     let mut state = ListState::default();
     state.select(app.selected_index());
@@ -2548,7 +2740,6 @@ fn render_sessions(frame: &mut Frame<'_>, area: Rect, app: &App, regions: &mut U
         &mut state,
     );
     let offset = state.offset();
-    regions.session_rows.clear();
     let mut row = chunks[0].y;
     let bottom = chunks[0].y.saturating_add(chunks[0].height);
     for session in app.snapshot.sessions.iter().skip(offset) {
@@ -2568,7 +2759,8 @@ fn render_sessions(frame: &mut Frame<'_>, area: Rect, app: &App, regions: &mut U
         let Some(badge) = control_badge(session.control) else {
             continue;
         };
-        let control_width = row.width.min(badge.len() as u16);
+        let control_width =
+            row.width.min(u16::try_from(terminal_text_width(badge)).unwrap_or(u16::MAX));
         let control_area = Rect::new(
             row.x.saturating_add(row.width.saturating_sub(control_width)),
             row.y,
@@ -2603,23 +2795,28 @@ fn render_sessions(frame: &mut Frame<'_>, area: Rect, app: &App, regions: &mut U
 }
 
 fn session_item(
+    app: &App,
     session: &SessionView,
     surface: &Surface,
     width: usize,
     panel: Option<&str>,
 ) -> ListItem<'static> {
-    let mut title = match surface {
+    let title = match surface {
         Surface::Rename { id, input } if *id == session.id => format!("✎ {}▏", input.value()),
         _ => session.title.clone(),
     };
+    let mut status = Vec::new();
     if let Some(panel) = panel {
-        title = format!("[{panel}] {title}");
+        status.push(format!("P{panel}"));
     }
-    let badge = control_badge(session.control);
-    let status_width = badge.map_or(0, |badge| badge.len().min(width));
+    if let Some(badge) = control_badge(session.control) {
+        status.push(badge.to_owned());
+    }
+    let status = status.join(" · ");
+    let status_width = terminal_text_width(&status).min(width);
     let gap_width = usize::from(status_width > 0);
-    let title_width = width.saturating_sub(status_width.saturating_add(gap_width));
-    title.truncate(title.char_indices().nth(title_width).map_or(title.len(), |(index, _)| index));
+    let title_width = width.saturating_sub(2 + status_width + gap_width);
+    let title = fit_terminal_text(&title, title_width, CellAlignment::Left, CellOverflow::Clip);
     let title_style = session
         .agent
         .filter(|agent| {
@@ -2630,44 +2827,32 @@ fn session_item(
             || Style::default().fg(NORD.text),
             |agent| Style::default().fg(agent_color(agent)).add_modifier(Modifier::BOLD),
         );
-    let mut primary = vec![Span::styled(format!("{title:<title_width$}"), title_style)];
-    if let Some(badge) = badge {
-        primary.push(Span::raw(" "));
-        primary.push(Span::styled(
-            format!("{badge:>status_width$}"),
-            Style::default().fg(control_color(session.control)),
-        ));
+    let (icon, icon_color) = session
+        .agent
+        .map(|agent| (app.activity_icon(agent), agent_color(agent)))
+        .unwrap_or(("·", NORD.text_muted));
+    let mut line = vec![
+        Span::styled(icon, Style::default().fg(icon_color)),
+        Span::raw(" "),
+        Span::styled(title, title_style),
+    ];
+    if !status.is_empty() {
+        line.push(Span::raw(" "));
+        let status =
+            fit_terminal_text(&status, status_width, CellAlignment::Right, CellOverflow::Clip);
+        line.push(Span::styled(status, Style::default().fg(control_color(session.control))));
     }
-    let primary = Line::from(primary);
-    match session.agent {
-        Some(agent) => {
-            let color = agent_color(agent);
-            ListItem::new(vec![
-                primary,
-                Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled(agent_icon(agent), Style::default().fg(color)),
-                    Span::raw(" "),
-                    Span::styled(agent.kind.label(), Style::default().fg(NORD.text_muted)),
-                ]),
-            ])
-        }
-        None => ListItem::new(primary),
-    }
+    ListItem::new(Line::from(line))
 }
 
-fn session_item_height(session: &SessionView) -> u16 {
-    if session.agent.is_some() {
-        2
-    } else {
-        1
-    }
+fn session_item_height(_session: &SessionView) -> u16 {
+    1
 }
 
-fn agent_icon(agent: AgentPresentation) -> &'static str {
+fn stable_agent_icon(agent: AgentPresentation) -> &'static str {
     match (agent.activity, agent.seen) {
         (AgentActivity::NeedsAttention, _) => "◉",
-        (AgentActivity::Working, _) => "●",
+        (AgentActivity::Working, _) => "⠋",
         (AgentActivity::Idle, false) => "●",
         (AgentActivity::Idle, true) => "✓",
         (AgentActivity::Unknown, _) => "○",
@@ -2703,14 +2888,17 @@ fn control_color(control: SessionControl) -> Color {
 }
 
 fn render_terminals(frame: &mut Frame<'_>, area: Rect, app: &App, regions: &mut UiRegions) {
-    let slots = visible_panel_slots(app.secondary.is_some(), area.width, app.focused_panel);
+    let slots =
+        visible_panel_slots(app.workspace.is_split(), area.width, app.workspace.focused_slot());
     if slots.len() == 2 {
-        let panels = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(area);
-        render_terminal(frame, panels[0], app, regions, slots[0], false);
-        render_terminal(frame, panels[1], app, regions, slots[1], false);
+        let split =
+            SplitFrame::horizontal(area, app.workspace.split_ratio(), TERMINAL_SPLIT_MINIMUMS);
+        regions.terminal_split = Some(split);
+        render_terminal(frame, split.first, app, regions, slots[0], false);
+        render_terminal(frame, split.second, app, regions, slots[1], false);
+        render_workspace_divider(frame, app, split, SplitSurface::TerminalPanels);
     } else {
-        render_terminal(frame, area, app, regions, slots[0], app.secondary.is_some());
+        render_terminal(frame, area, app, regions, slots[0], app.workspace.is_split());
     }
 }
 
@@ -2722,7 +2910,7 @@ fn render_terminal(
     slot: PanelSlot,
     narrow_fallback: bool,
 ) {
-    let focused = app.active_region == slot.region();
+    let focused = app.active_region() == slot.region();
     let session_title = app
         .panel_session_id(slot)
         .and_then(|id| app.session(id))
@@ -2771,13 +2959,19 @@ fn render_terminal(
         let row_origin = terminal
             .first_row
             .saturating_add(StableRowIndex::try_from(range.start).unwrap_or_default());
-        regions.selectable.push(SelectableRegion::new(
-            slot,
-            content,
-            i64::try_from(row_origin).unwrap_or(if row_origin < 0 { i64::MIN } else { i64::MAX }),
-            0,
-            u64::try_from(terminal.pane_id).unwrap_or(u64::MAX),
-        ));
+        regions.selectable.push(
+            SelectableRegion::new(
+                slot,
+                content,
+                i64::try_from(row_origin)
+                    .unwrap_or(if row_origin < 0 { i64::MIN } else { i64::MAX }),
+                0,
+                u64::try_from(terminal.pane_id).unwrap_or(u64::MAX),
+            )
+            .with_content_revision(
+                u64::try_from(terminal.content_sequence).unwrap_or(u64::MAX),
+            ),
+        );
         if focused
             && scroll.is_live()
             && terminal.cursor_x < usize::from(content.width)
@@ -3332,7 +3526,7 @@ mod tests {
             seen: false,
         };
 
-        assert_eq!((agent_icon(blocked), agent_color(blocked)), ("◉", NORD.danger));
-        assert_eq!((agent_icon(done), agent_color(done)), ("●", NORD.accent_alt));
+        assert_eq!((stable_agent_icon(blocked), agent_color(blocked)), ("◉", NORD.danger));
+        assert_eq!((stable_agent_icon(done), agent_color(done)), ("●", NORD.accent_alt));
     }
 }

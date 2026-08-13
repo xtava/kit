@@ -113,8 +113,9 @@ async fn mux_status(
         }
         ConsoleSocketProbe::Ready => match ConsoleClient::connect(owner).await {
             Ok(client) => {
-                let sessions = client.snapshot(None).await?.sessions.len();
-                Ok(ConsoleStatus::Ready { platform, sessions, build: super::build_identity()? })
+                let sessions = client.snapshot().await?.sessions.len();
+                let build = client.server_build_identity()?;
+                Ok(ConsoleStatus::Ready { platform, sessions, build })
             }
             Err(error) => {
                 if let Some(incompatible) =
@@ -124,16 +125,6 @@ async fn mux_status(
                         platform,
                         server_version: incompatible.version.clone(),
                         server_codec: incompatible.codec_vers,
-                    });
-                }
-                if let Some(incompatible) =
-                    error.downcast_ref::<wezterm_client::client::BuildIdentityMismatch>()
-                {
-                    return Ok(ConsoleStatus::BuildIncompatible {
-                        platform,
-                        sessions: None,
-                        expected: incompatible.expected.clone(),
-                        actual: incompatible.actual.clone(),
                     });
                 }
                 if error.downcast_ref::<wezterm_client::client::AttachmentRejectedError>().is_some()
@@ -184,7 +175,7 @@ pub(crate) async fn setup_with_owner(
             .await
             .context("attach to the live Console agent before repairing its service")?;
         client.begin_service_drain().await?;
-        let sessions = client.snapshot(None).await?.sessions;
+        let sessions = client.snapshot().await?.sessions;
         if !sessions.is_empty() {
             client.cancel_service_drain().await?;
             return Ok(ConsoleStatus::ActivationDeferred {
@@ -263,7 +254,7 @@ pub(crate) async fn stop_with_owner(
         .await
         .context("attach to the Console agent before stopping it")?;
     client.begin_service_drain().await?;
-    let sessions = client.snapshot(None).await?.sessions;
+    let sessions = client.snapshot().await?.sessions;
     if !sessions.is_empty() && !force {
         let names = sessions
             .iter()
@@ -307,7 +298,7 @@ async fn close_all_sessions(
 
     let started = tokio::time::Instant::now();
     loop {
-        let remaining = client.snapshot(None).await?.sessions;
+        let remaining = client.snapshot().await?.sessions;
         if remaining.is_empty() {
             return Ok(());
         }

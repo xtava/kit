@@ -432,11 +432,7 @@ impl MachineState {
     }
 
     pub(super) fn update_allowed(&self) -> bool {
-        matches!(
-            self.complete_status(),
-            Some(ConsoleStatus::Ready { sessions: 0, .. })
-                | Some(ConsoleStatus::BuildIncompatible { sessions: Some(0), .. })
-        )
+        matches!(self.complete_status(), Some(ConsoleStatus::Ready { sessions: 0, .. }))
     }
 
     pub(super) fn complete_status(&self) -> Option<&ConsoleStatus> {
@@ -609,7 +605,6 @@ fn primary_action_for_status(status: &ConsoleStatus) -> MachineAction {
             | ConsoleRecovery::Retry,
         ) => MachineAction::Refresh,
         Some(ConsoleRecovery::InstallKit) => MachineAction::InstallKit,
-        Some(ConsoleRecovery::UpdateRemoteKit) => MachineAction::UpdateKit,
         Some(
             ConsoleRecovery::RunSetup
             | ConsoleRecovery::RestoreServiceManager
@@ -652,7 +647,6 @@ fn status_label(status: &ConsoleStatus) -> &'static str {
         ConsoleStatus::SocketStale { .. } => "stale",
         ConsoleStatus::SocketRejected { .. } => "socket rejected",
         ConsoleStatus::CodecIncompatible { .. } => "update required",
-        ConsoleStatus::BuildIncompatible { .. } => "different build",
         ConsoleStatus::ActivationDeferred { .. } => "activation deferred",
         ConsoleStatus::RepairBusy { .. } => "repair busy",
         ConsoleStatus::MuxUnavailable { .. } => "terminal unavailable",
@@ -676,9 +670,6 @@ pub(super) fn compatibility_for_status(
 ) -> MachineCompatibility {
     let compatibility = match status {
         ConsoleStatus::CodecIncompatible { .. } => MachineCompatibility::CodecIncompatible,
-        ConsoleStatus::BuildIncompatible { actual, .. } => {
-            compatibility_for_build(expected, actual)
-        }
         ConsoleStatus::Ready { build, .. } => compatibility_for_build(expected, build),
         _ => MachineCompatibility::Unknown,
     };

@@ -14,7 +14,6 @@ pub(crate) enum ConsoleRecovery {
     RetryWithUnixUser { machine: String },
     AuthenticateSsh,
     InspectAndRetry,
-    UpdateRemoteKit,
     InstallKit,
     RunSetup,
     RestoreServiceManager,
@@ -41,7 +40,6 @@ impl std::fmt::Display for ConsoleRecovery {
             Self::InspectAndRetry => {
                 "inspect the details, correct the failing layer, and retry".to_owned()
             }
-            Self::UpdateRemoteKit => "update Kit on the machine and run setup again".to_owned(),
             Self::InstallKit => "install Kit and configure Console".to_owned(),
             Self::RunSetup => "kit console setup".to_owned(),
             Self::RestoreServiceManager => {
@@ -190,12 +188,6 @@ pub enum ConsoleStatus {
         server_version: String,
         server_codec: usize,
     },
-    BuildIncompatible {
-        platform: ConsoleServicePlatform,
-        sessions: Option<usize>,
-        expected: BuildIdentity,
-        actual: BuildIdentity,
-    },
     ActivationDeferred {
         platform: ConsoleServicePlatform,
         sessions: usize,
@@ -277,15 +269,6 @@ impl ConsoleStatus {
                 "incompatible — {}\nserver {server_version} uses codec {server_codec}",
                 platform.label()
             ),
-            Self::BuildIncompatible { platform, sessions, expected, actual } => {
-                let sessions = sessions
-                    .map(|sessions| format!("\nactive sessions: {sessions}"))
-                    .unwrap_or_default();
-                format!(
-                    "update required — {}{sessions}\nexpected {expected:?}\nactual   {actual:?}",
-                    platform.label()
-                )
-            }
             Self::ActivationDeferred { platform, sessions } => {
                 format!("activation deferred — {}\nactive sessions: {sessions}", platform.label())
             }
@@ -341,12 +324,7 @@ impl ConsoleStatus {
             Self::WrongOwner { .. } => Some(ConsoleRecovery::RemoveForeignServiceDefinition),
             Self::SocketRejected { .. } => Some(ConsoleRecovery::RemoveRejectedSocket),
             Self::CodecIncompatible { .. } => Some(ConsoleRecovery::InspectServiceLog),
-            Self::BuildIncompatible { sessions: Some(0), .. } => {
-                Some(ConsoleRecovery::UpdateRemoteKit)
-            }
-            Self::BuildIncompatible { .. } | Self::ActivationDeferred { .. } => {
-                Some(ConsoleRecovery::CloseSessions)
-            }
+            Self::ActivationDeferred { .. } => Some(ConsoleRecovery::CloseSessions),
             Self::RepairBusy { .. } => Some(ConsoleRecovery::Retry),
             Self::MuxUnavailable { .. } => Some(ConsoleRecovery::RunSetup),
             Self::Ready { .. } => None,

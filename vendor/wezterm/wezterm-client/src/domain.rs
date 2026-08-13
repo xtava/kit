@@ -5,8 +5,8 @@ use crate::pane::ClientPane;
 use anyhow::{anyhow, bail};
 use async_trait::async_trait;
 use codec::{
-    AdmittedRpcResponse, BuildIdentity, EnvironmentFreeCommand, ListPanesResponse, SpawnV2,
-    SplitPane, SplitSpawnDomain, SplitSpawnSource, TabSpawnDomain, TabSpawnPlacement,
+    AdmittedRpcResponse, EnvironmentFreeCommand, ListPanesResponse, SpawnV2, SplitPane,
+    SplitSpawnDomain, SplitSpawnSource, TabSpawnDomain, TabSpawnPlacement,
 };
 use config::{SshDomain, TlsDomainClient, UnixDomain};
 use lru::LruCache;
@@ -523,7 +523,6 @@ impl ClientDomain {
         &self,
         window_id: Option<WindowId>,
         lifecycle: &HeadlessConnectionLifecycle,
-        expected_build_identity: Option<BuildIdentity>,
         client_id: ClientId,
     ) -> anyhow::Result<()> {
         let mux = Mux::get();
@@ -559,7 +558,6 @@ impl ClientDomain {
             self.config.clone(),
             admission,
             lifecycle,
-            expected_build_identity,
             client_id,
             true,
             false,

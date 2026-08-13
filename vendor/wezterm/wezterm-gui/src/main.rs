@@ -558,7 +558,6 @@ impl Publish {
                 ClientDomainConfig::Unix(dom),
                 admission,
                 &lifecycle,
-                None,
                 mux::client::ClientId::new(),
                 false,
                 true,

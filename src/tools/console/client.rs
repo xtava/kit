@@ -2,6 +2,7 @@ use std::fs::Metadata;
 use std::future::Future;
 use std::io::ErrorKind;
 use std::num::NonZeroU32;
+use std::ops::Range;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -24,6 +25,7 @@ use wezterm_codec::{
     ServiceDrainRequest, SpawnV2, TabSpawnDomain, TabSpawnPlacement, TabTitleChanged,
 };
 use wezterm_config::UnixDomain;
+use wezterm_mux::pane::Pane;
 use wezterm_mux::tab::PaneNode;
 use wezterm_mux::{Mux, DEFAULT_WORKSPACE};
 use wezterm_term::{
@@ -31,7 +33,7 @@ use wezterm_term::{
     MouseEventKind as WeztermMouseEventKind, StableRowIndex, TerminalSize,
 };
 
-use super::activity::{self, ActivityTracker, AgentEvidence, AgentPresentation};
+use super::activity::{self, ActivityTracker, AgentEvidence, AgentKind, AgentPresentation};
 use super::perf_trace;
 
 pub type SessionId = usize;
@@ -112,13 +114,39 @@ pub struct TerminalView {
 #[derive(PartialEq)]
 pub struct ConsoleSnapshot {
     pub sessions: Vec<SessionView>,
-    pub terminal: Option<TerminalView>,
 }
 
 pub(super) struct ActivityRefresh {
     pub changed: bool,
     pub revisit: bool,
-    pub ready: bool,
+    pub completions: Vec<CompletedSession>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct CompletedSession {
+    pub session_id: SessionId,
+    pub kind: AgentKind,
+}
+
+struct PreparedActivity<'a> {
+    session_id: SessionId,
+    selected: bool,
+    foreground_process_name: Option<String>,
+    source: ActivitySource<'a>,
+}
+
+enum ActivitySource<'a> {
+    Projected(&'a TerminalView),
+    TitleOnly {
+        title: String,
+    },
+    Pane {
+        pane: Arc<dyn Pane>,
+        content_sequence: usize,
+        title: String,
+        rows: Range<StableRowIndex>,
+    },
+    Unavailable,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -295,7 +323,6 @@ impl ConsoleClient {
                 Self::connect_once(
                     owner,
                     ClientDomainConfig::Unix(unix_domain()?),
-                    Some(super::build_identity()?),
                     CONNECT_TIMEOUT,
                     None,
                 )
@@ -318,7 +345,6 @@ impl ConsoleClient {
                 Self::connect_once(
                     owner,
                     ClientDomainConfig::Unix(unix_domain()?),
-                    None,
                     CONNECT_TIMEOUT,
                     None,
                 )
@@ -338,19 +364,12 @@ impl ConsoleClient {
     async fn connect_once(
         owner: &ConnectionOwner,
         domain: ClientDomainConfig,
-        expected_build_identity: Option<wezterm_codec::BuildIdentity>,
         timeout: Duration,
         remote_status: Option<watch::Receiver<Option<super::service::ConsoleStatus>>>,
     ) -> Result<Self> {
         let reconnect_attempt_limit = remote_status.as_ref().map(|_| REMOTE_RECONNECT_ATTEMPTS);
-        let connection = owner
-            .attach(AttachmentPolicy::new(
-                domain,
-                expected_build_identity,
-                timeout,
-                reconnect_attempt_limit,
-            ))
-            .await?;
+        let connection =
+            owner.attach(AttachmentPolicy::new(domain, timeout, reconnect_attempt_limit)).await?;
         Ok(Self {
             connection,
             remote_status: remote_status.map(|receiver| Arc::new(Mutex::new(receiver))),
@@ -364,6 +383,10 @@ impl ConsoleClient {
 
     pub async fn retry(&self) -> Result<()> {
         self.connection.retry().await
+    }
+
+    pub fn server_build_identity(&self) -> Result<wezterm_codec::BuildIdentity> {
+        Ok(self.connection.client()?.server_build_identity())
     }
 
     pub fn drain_remote_status(&self) -> Option<Option<super::service::ConsoleStatus>> {
@@ -383,55 +406,64 @@ impl ConsoleClient {
         Self::connect_once(
             owner,
             remote_domain(socket_path),
-            Some(super::build_identity()?),
             REMOTE_CONNECT_TIMEOUT,
             Some(remote_status),
         )
         .await
     }
 
-    pub async fn snapshot(&self, selected: Option<SessionId>) -> Result<ConsoleSnapshot> {
+    pub async fn snapshot(&self) -> Result<ConsoleSnapshot> {
         perf_trace::record_snapshot();
-        let mut sessions = self.list_sessions().await?;
-        let selected_pane = selected
-            .and_then(|id| sessions.iter().find(|session| session.id == id))
-            .map(|session| session.pane_id);
-        let terminal =
-            selected_pane.map(|pane_id| self.project_terminal(pane_id)).transpose()?.flatten();
-        let _ = self.refresh_activity(&mut sessions, selected, terminal.as_ref())?;
-        Ok(ConsoleSnapshot { sessions, terminal })
+        Ok(ConsoleSnapshot { sessions: self.list_sessions().await? })
     }
 
     pub fn refresh_activity(
         &self,
         sessions: &mut [SessionView],
         selected: Option<SessionId>,
-        selected_terminal: Option<&TerminalView>,
+        projected_terminals: &[&TerminalView],
     ) -> Result<ActivityRefresh> {
+        let prepared = sessions
+            .iter()
+            .map(|session| {
+                let terminal = projected_terminals
+                    .iter()
+                    .copied()
+                    .find(|terminal| terminal.pane_id == session.pane_id);
+                self.prepare_agent_activity(session, selected == Some(session.id), terminal)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
         let mut tracker = self.activity.lock().unwrap();
-        let mut changed = false;
         let mut revisit = false;
-        let mut ready = false;
+        let mut completions = Vec::new();
         let now = Instant::now();
-        for session in sessions.iter_mut() {
-            let terminal = selected_terminal.filter(|terminal| terminal.pane_id == session.pane_id);
-            let observation = self.observe_agent_activity(
-                &mut tracker,
-                session,
-                selected == Some(session.id),
-                terminal,
-                now,
-            )?;
-            let agent = observation.presentation;
-            revisit |= observation.revisit;
-            ready |= matches!(observation.transition, Some(activity::AgentTransition::Ready(_)));
-            changed |= session.agent != agent;
-            session.agent = agent;
-        }
+        let presentations = prepared
+            .iter()
+            .map(|prepared| {
+                let observation = observe_prepared_activity(&mut tracker, prepared, now);
+                revisit |= observation.revisit;
+                if let Some(activity::AgentTransition::Ready(kind)) = observation.transition {
+                    completions.push(CompletedSession { session_id: prepared.session_id, kind });
+                }
+                observation.presentation
+            })
+            .collect::<Vec<_>>();
         tracker.retain(|session_id| {
             sessions.binary_search_by_key(&session_id, |session| session.id).is_ok()
         });
-        Ok(ActivityRefresh { changed, revisit, ready })
+        drop(tracker);
+
+        let mut changed = false;
+        for (session, agent) in sessions.iter_mut().zip(presentations) {
+            changed |= session.agent != agent;
+            session.agent = agent;
+        }
+        Ok(ActivityRefresh { changed, revisit, completions })
+    }
+
+    pub fn reset_activity(&self) {
+        self.activity.lock().unwrap().clear();
     }
 
     pub fn project_terminal(&self, remote_pane_id: usize) -> Result<Option<TerminalView>> {
@@ -720,59 +752,35 @@ impl ConsoleClient {
         }))
     }
 
-    fn observe_agent_activity(
+    fn prepare_agent_activity<'a>(
         &self,
-        tracker: &mut ActivityTracker,
         session: &SessionView,
         selected: bool,
-        terminal: Option<&TerminalView>,
-        now: Instant,
-    ) -> Result<activity::ActivityObservation> {
+        terminal: Option<&'a TerminalView>,
+    ) -> Result<PreparedActivity<'a>> {
+        let foreground_process_name = session.foreground_process_name.clone();
         if let Some(terminal) = terminal {
-            return Ok(tracker.observe_with(
-                session.id,
-                activity::AgentFingerprint {
-                    content_sequence: Some(terminal.content_sequence),
-                    foreground_process_name: session.foreground_process_name.as_deref(),
-                    title: &terminal.title,
-                },
+            return Ok(PreparedActivity {
+                session_id: session.id,
                 selected,
-                now,
-                || {
-                    let screen =
-                        terminal.lines.iter().map(Line::as_str).collect::<Vec<_>>().join("\n");
-                    activity::detect(AgentEvidence {
-                        foreground_process_name: session.foreground_process_name.as_deref(),
-                        title: &terminal.title,
-                        screen: &screen,
-                    })
-                },
-            ));
+                foreground_process_name,
+                source: ActivitySource::Projected(terminal),
+            });
         }
         let Some(local_pane_id) = self.local_pane_id(session.pane_id)? else {
-            return Ok(tracker.observe_with(
-                session.id,
-                activity::AgentFingerprint {
-                    content_sequence: None,
-                    foreground_process_name: session.foreground_process_name.as_deref(),
-                    title: &session.pane_title,
-                },
+            return Ok(PreparedActivity {
+                session_id: session.id,
                 selected,
-                now,
-                || {
-                    activity::detect(AgentEvidence {
-                        foreground_process_name: session.foreground_process_name.as_deref(),
-                        title: &session.pane_title,
-                        screen: "",
-                    })
-                },
-            ));
+                foreground_process_name,
+                source: ActivitySource::TitleOnly { title: session.pane_title.clone() },
+            });
         };
         let Some(pane) = self.connection.mux()?.get_pane(local_pane_id) else {
-            return Ok(activity::ActivityObservation {
-                presentation: None,
-                revisit: false,
-                transition: None,
+            return Ok(PreparedActivity {
+                session_id: session.id,
+                selected,
+                foreground_process_name,
+                source: ActivitySource::Unavailable,
             });
         };
         let content_sequence = pane.get_current_seqno();
@@ -784,27 +792,67 @@ impl ConsoleClient {
             .context("computing Console agent-detection range")?;
         let start =
             dimensions.physical_top.max(end.saturating_sub(MAX_AGENT_DETECTION_ROWS)).min(end);
-        Ok(tracker.observe_with(
-            session.id,
-            activity::AgentFingerprint {
-                content_sequence: Some(content_sequence),
-                foreground_process_name: session.foreground_process_name.as_deref(),
-                title: &title,
-            },
+        Ok(PreparedActivity {
+            session_id: session.id,
             selected,
+            foreground_process_name,
+            source: ActivitySource::Pane { pane, content_sequence, title, rows: start..end },
+        })
+    }
+}
+
+fn observe_prepared_activity(
+    tracker: &mut ActivityTracker,
+    prepared: &PreparedActivity<'_>,
+    now: Instant,
+) -> activity::ActivityObservation {
+    let foreground_process_name = prepared.foreground_process_name.as_deref();
+    match &prepared.source {
+        ActivitySource::Projected(terminal) => tracker.observe_with(
+            prepared.session_id,
+            activity::AgentFingerprint {
+                content_sequence: Some(terminal.content_sequence),
+                foreground_process_name,
+                title: &terminal.title,
+            },
+            prepared.selected,
             now,
             || {
-                let _ = pane.get_changed_since(start..end, content_sequence);
-                let (_, lines) = pane.get_lines(start..end);
-                perf_trace::record_activity_screen_read();
-                let screen = lines.iter().map(Line::as_str).collect::<Vec<_>>().join("\n");
+                let screen = terminal.lines.iter().map(Line::as_str).collect::<Vec<_>>().join("\n");
                 activity::detect(AgentEvidence {
-                    foreground_process_name: session.foreground_process_name.as_deref(),
-                    title: &title,
+                    foreground_process_name,
+                    title: &terminal.title,
                     screen: &screen,
                 })
             },
-        ))
+        ),
+        ActivitySource::TitleOnly { title } => tracker.observe_with(
+            prepared.session_id,
+            activity::AgentFingerprint { content_sequence: None, foreground_process_name, title },
+            prepared.selected,
+            now,
+            || activity::detect(AgentEvidence { foreground_process_name, title, screen: "" }),
+        ),
+        ActivitySource::Pane { pane, content_sequence, title, rows } => tracker.observe_with(
+            prepared.session_id,
+            activity::AgentFingerprint {
+                content_sequence: Some(*content_sequence),
+                foreground_process_name,
+                title,
+            },
+            prepared.selected,
+            now,
+            || {
+                let _ = pane.get_changed_since(rows.clone(), *content_sequence);
+                let (_, lines) = pane.get_lines(rows.clone());
+                perf_trace::record_activity_screen_read();
+                let screen = lines.iter().map(Line::as_str).collect::<Vec<_>>().join("\n");
+                activity::detect(AgentEvidence { foreground_process_name, title, screen: &screen })
+            },
+        ),
+        ActivitySource::Unavailable => {
+            activity::ActivityObservation { presentation: None, revisit: false, transition: None }
+        }
     }
 }
 

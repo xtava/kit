@@ -10,6 +10,7 @@ mod connection;
 mod control_center;
 mod interaction;
 mod invalidation;
+mod notification;
 mod panels;
 mod perf_trace;
 mod remote;

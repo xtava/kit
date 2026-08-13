@@ -277,6 +277,10 @@ pub struct ActivityTracker {
 }
 
 impl ActivityTracker {
+    pub fn clear(&mut self) {
+        self.sessions.clear();
+    }
+
     pub fn observe_with(
         &mut self,
         session_id: SessionId,

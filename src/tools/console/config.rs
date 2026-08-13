@@ -15,6 +15,7 @@ use crate::{
 const TOOL: &str = "console";
 const SIDEBAR_WIDTH: SettingId = SettingId("sidebar_width");
 const SIDEBAR_SPLIT_RATIO: &str = "sidebar_split_ratio";
+const TERMINAL_SPLIT_RATIO: &str = "terminal_split_ratio";
 const READY_NOTIFICATION: SettingId = SettingId("ready_notification");
 const SELECTED_MACHINE: &str = "selected_machine";
 const PREFIX: SettingId = SettingId("prefix");
@@ -27,11 +28,13 @@ const QUIT: SettingId = SettingId("quit");
 const COMPACT_SIDEBAR: SplitRatio = SplitRatio::new(200);
 const BALANCED_SIDEBAR: SplitRatio = SplitRatio::new(260);
 const WIDE_SIDEBAR: SplitRatio = SplitRatio::new(360);
+const BALANCED_TERMINALS: SplitRatio = SplitRatio::new(500);
 
 #[derive(Clone, Debug)]
 pub(super) struct Config {
     store: ConfigStore,
     sidebar_split_ratio: SplitRatio,
+    terminal_split_ratio: SplitRatio,
     ready_notification: ReadyNotification,
     keybindings: Keybindings,
     users: BTreeMap<String, String>,
@@ -42,6 +45,8 @@ pub(super) struct Config {
 struct Stored {
     #[serde(default = "default_sidebar_split_ratio")]
     sidebar_split_ratio: SplitRatio,
+    #[serde(default = "default_terminal_split_ratio")]
+    terminal_split_ratio: SplitRatio,
     #[serde(default = "default_ready_notification")]
     ready_notification: ReadyNotification,
     #[serde(default)]
@@ -56,6 +61,7 @@ impl Default for Stored {
     fn default() -> Self {
         Self {
             sidebar_split_ratio: default_sidebar_split_ratio(),
+            terminal_split_ratio: default_terminal_split_ratio(),
             ready_notification: default_ready_notification(),
             keybindings: Keybindings::default(),
             users: BTreeMap::new(),
@@ -155,6 +161,7 @@ impl Config {
         Ok(Self {
             store,
             sidebar_split_ratio: stored.sidebar_split_ratio,
+            terminal_split_ratio: stored.terminal_split_ratio,
             ready_notification: stored.ready_notification,
             keybindings: stored.keybindings,
             users: stored.users,
@@ -164,6 +171,10 @@ impl Config {
 
     pub(super) const fn sidebar_split_ratio(&self) -> SplitRatio {
         self.sidebar_split_ratio
+    }
+
+    pub(super) const fn terminal_split_ratio(&self) -> SplitRatio {
+        self.terminal_split_ratio
     }
 
     pub(super) const fn keybindings(&self) -> &Keybindings {
@@ -210,6 +221,16 @@ impl Config {
         Ok(())
     }
 
+    pub(super) fn set_terminal_split_ratio(&mut self, ratio: SplitRatio) -> Result<()> {
+        self.store.set(
+            TOOL,
+            TERMINAL_SPLIT_RATIO,
+            ConfigValue::Integer(i64::from(ratio.value())),
+        )?;
+        self.terminal_split_ratio = ratio;
+        Ok(())
+    }
+
     pub(super) fn unix_user(&self, stable_node_id: &str) -> Option<&str> {
         self.users.get(stable_node_id).map(String::as_str)
     }
@@ -253,6 +274,7 @@ impl Config {
 #[serde(rename_all = "kebab-case")]
 pub(super) enum ReadyNotification {
     Off,
+    SystemSound,
     TerminalBell,
 }
 
@@ -260,6 +282,7 @@ impl ReadyNotification {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Off => "off",
+            Self::SystemSound => "system-sound",
             Self::TerminalBell => "terminal-bell",
         }
     }
@@ -267,14 +290,24 @@ impl ReadyNotification {
     const fn label(self) -> &'static str {
         match self {
             Self::Off => "Off",
+            Self::SystemSound => "System sound",
             Self::TerminalBell => "Terminal bell",
         }
     }
 
-    const fn toggled(self) -> Self {
+    const fn next(self) -> Self {
         match self {
-            Self::Off => Self::TerminalBell,
             Self::TerminalBell => Self::Off,
+            Self::Off => Self::SystemSound,
+            Self::SystemSound => Self::TerminalBell,
+        }
+    }
+
+    const fn previous(self) -> Self {
+        match self {
+            Self::TerminalBell => Self::SystemSound,
+            Self::SystemSound => Self::Off,
+            Self::Off => Self::TerminalBell,
         }
     }
 }
@@ -341,7 +374,7 @@ impl EditableSettings for Config {
             SettingField::Choice {
                 id: READY_NOTIFICATION,
                 label: "Ready notification",
-                description: "Ring the viewing terminal once when an agent finishes working.",
+                description: "Choose the local sound played when an agent finishes working.",
                 selected: self.ready_notification.label(),
             },
             keybinding_field(
@@ -394,10 +427,12 @@ impl EditableSettings for Config {
             (SIDEBAR_WIDTH, SettingEdit::Reset) => {
                 self.set_sidebar_split_ratio(default_sidebar_split_ratio())
             }
-            (
-                READY_NOTIFICATION,
-                SettingEdit::Activate | SettingEdit::Next | SettingEdit::Previous,
-            ) => self.set_ready_notification(self.ready_notification.toggled()),
+            (READY_NOTIFICATION, SettingEdit::Activate | SettingEdit::Next) => {
+                self.set_ready_notification(self.ready_notification.next())
+            }
+            (READY_NOTIFICATION, SettingEdit::Previous) => {
+                self.set_ready_notification(self.ready_notification.previous())
+            }
             (READY_NOTIFICATION, SettingEdit::Reset) => {
                 self.set_ready_notification(default_ready_notification())
             }
@@ -440,6 +475,10 @@ pub(super) fn settings() -> SettingsSection {
 
 const fn default_sidebar_split_ratio() -> SplitRatio {
     BALANCED_SIDEBAR
+}
+
+const fn default_terminal_split_ratio() -> SplitRatio {
+    BALANCED_TERMINALS
 }
 
 const fn default_ready_notification() -> ReadyNotification {

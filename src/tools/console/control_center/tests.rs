@@ -85,8 +85,6 @@ fn start_screen_story_is_exhaustive_for_discovery_and_empty_states() {
 fn primary_action_covers_every_service_state() {
     let platform = ConsoleServicePlatform::MacosLaunchAgent;
     let path = PathBuf::from("/tmp/console.sock");
-    let expected = build("0.2.0", &"a".repeat(40), false);
-    let actual = build("0.1.0", &"c".repeat(40), false);
     let cases = [
         (ConsoleStatus::NeedsTailscaleLogin, MachineAction::AuthenticateTailscale),
         (ConsoleStatus::TailscaleCliUnavailable { detail: String::new() }, MachineAction::Refresh),
@@ -170,10 +168,6 @@ fn primary_action_covers_every_service_state() {
                 server_codec: 1,
             },
             MachineAction::ShowDetails,
-        ),
-        (
-            ConsoleStatus::BuildIncompatible { platform, sessions: Some(0), expected, actual },
-            MachineAction::UpdateKit,
         ),
         (
             ConsoleStatus::MuxUnavailable { platform, detail: String::new() },
