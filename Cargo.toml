@@ -19,6 +19,7 @@ schemars = "1"
 sha2 = "0.10"
 toml = "1.1"
 toml_edit = "0.25"
+yaml_serde = "0.10"
 directories = "6"
 unicode-width = "0.2"
 url = { version = "2.5", features = ["serde"] }
@@ -28,6 +29,7 @@ shell-words = "1"
 ignore = "0.4"
 notify = "8.2"
 nucleo = "0.5"
+petgraph = { version = "=0.8.3", default-features = false, features = ["std"] }
 processkit = "2.2.5"
 uuid = { version = "1", features = ["v4", "serde"] }
 systemd-zbus = { version = "5.3.2", default-features = false }
