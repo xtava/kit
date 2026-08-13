@@ -1,12 +1,73 @@
-use std::{ffi::OsString, path::PathBuf, process::Stdio};
+use std::{
+    ffi::OsString,
+    fmt,
+    path::{Path, PathBuf},
+    process::Stdio,
+};
 
 use anyhow::{bail, Context, Result};
+use thiserror::Error;
 use tokio::task::JoinHandle;
 
 use super::process::{
     leader_exit, tokio_command, CommandSpec, EnvironmentBase, LeaderExit, ProcessEnvironment,
     ProcessLabel, ProcessRunId, ProcessStartError, ProcessSupervisor,
 };
+
+/// An operating-system file action Kit can hand off without owning the launched application.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExternalFileAction {
+    Open,
+    Reveal,
+    Preview,
+}
+
+impl fmt::Display for ExternalFileAction {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Open => "open",
+            Self::Reveal => "reveal",
+            Self::Preview => "preview",
+        })
+    }
+}
+
+/// File handoffs supported by the current operating system integration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExternalFileCapabilities {
+    open: bool,
+    reveal: bool,
+    preview: bool,
+}
+
+impl ExternalFileCapabilities {
+    pub const fn supports(self, action: ExternalFileAction) -> bool {
+        match action {
+            ExternalFileAction::Open => self.open,
+            ExternalFileAction::Reveal => self.reveal,
+            ExternalFileAction::Preview => self.preview,
+        }
+    }
+
+    fn for_platform(platform: &str) -> Self {
+        match platform {
+            "linux" | "windows" => Self { open: true, reveal: true, preview: false },
+            "macos" => Self { open: true, reveal: true, preview: true },
+            _ => Self { open: false, reveal: false, preview: false },
+        }
+    }
+}
+
+/// Returns the file handoffs that can be planned on this host.
+pub fn external_file_capabilities() -> ExternalFileCapabilities {
+    ExternalFileCapabilities::for_platform(std::env::consts::OS)
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum ExternalFileActionError {
+    #[error("{action} file handoff is unsupported on {platform}")]
+    Unsupported { action: ExternalFileAction, platform: String },
+}
 
 impl ProcessSupervisor {
     /// Starts the platform launcher without exposing an uncontained process API to tools.
@@ -42,6 +103,7 @@ pub struct ExternalCommand {
 pub enum ExternalTarget {
     Url(String),
     Path(PathBuf),
+    File { action: ExternalFileAction, path: PathBuf },
     Command(ExternalCommand),
 }
 
@@ -91,6 +153,10 @@ pub fn start_external(
             command_for(std::env::consts::OS, path.into_os_string())?,
             std::env::current_dir().context("resolve working directory")?,
         ),
+        ExternalTarget::File { action, path } => (
+            file_command_for(std::env::consts::OS, action, &path)?,
+            std::env::current_dir().context("resolve working directory")?,
+        ),
         ExternalTarget::Command(command) => (
             OpenCommand { program: command.program, args: command.arguments },
             command.working_directory,
@@ -134,6 +200,57 @@ fn command_for(platform: &str, target: OsString) -> Result<OpenCommand> {
         }),
         other => anyhow::bail!("opening external targets is unsupported on {other}"),
     }
+}
+
+/// Purely maps a typed file intent to the platform launcher command. Process creation remains in
+/// [`start_open_command`], so callers cannot accidentally bypass Kit's process ownership.
+fn file_command_for(
+    platform: &str,
+    action: ExternalFileAction,
+    target: &Path,
+) -> std::result::Result<OpenCommand, ExternalFileActionError> {
+    let reveal_directory = target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .as_os_str()
+        .to_owned();
+    let target = target.as_os_str().to_owned();
+    let command = match (platform, action) {
+        ("linux", ExternalFileAction::Open) => {
+            OpenCommand { program: OsString::from("xdg-open"), args: vec![target] }
+        }
+        ("linux", ExternalFileAction::Reveal) => {
+            OpenCommand { program: OsString::from("xdg-open"), args: vec![reveal_directory] }
+        }
+        ("macos", ExternalFileAction::Open) => {
+            OpenCommand { program: OsString::from("open"), args: vec![target] }
+        }
+        ("macos", ExternalFileAction::Reveal) => OpenCommand {
+            program: OsString::from("open"),
+            args: vec![OsString::from("-R"), target],
+        },
+        ("macos", ExternalFileAction::Preview) => OpenCommand {
+            program: OsString::from("qlmanage"),
+            args: vec![OsString::from("-p"), target],
+        },
+        ("windows", ExternalFileAction::Open) => OpenCommand {
+            program: OsString::from("rundll32.exe"),
+            args: vec![OsString::from("url.dll,FileProtocolHandler"), target],
+        },
+        ("windows", ExternalFileAction::Reveal) => {
+            let mut selection = OsString::from("/select,");
+            selection.push(target);
+            OpenCommand { program: OsString::from("explorer.exe"), args: vec![selection] }
+        }
+        _ => {
+            return Err(ExternalFileActionError::Unsupported {
+                action,
+                platform: platform.to_owned(),
+            })
+        }
+    };
+    Ok(command)
 }
 
 #[cfg(test)]

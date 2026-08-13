@@ -19,7 +19,10 @@ mod tool;
 pub(crate) use atomic_file::{AtomicFileError, AtomicFileTryLock, AtomicFileWriter};
 pub use config::{ConfigStore, ConfigValue};
 pub use context::Context;
-pub use external::{start_external, ExternalCommand, ExternalOpenReceipt, ExternalTarget};
+pub use external::{
+    external_file_capabilities, start_external, ExternalCommand, ExternalFileAction,
+    ExternalFileActionError, ExternalFileCapabilities, ExternalOpenReceipt, ExternalTarget,
+};
 pub use output::{Output, OutputFormat};
 pub use registry::Registry;
 pub use repository::{RepositoryLocator, RepositoryRootError, WorktreeRoot};
