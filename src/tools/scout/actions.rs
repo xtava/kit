@@ -12,6 +12,7 @@ pub(super) enum ScoutCommand {
     Previous,
     Next,
     Toggle,
+    OpenCommandPalette,
 }
 
 pub(super) type ScoutActionRegistry = ActionRegistry<(), ScoutCommand>;
@@ -24,6 +25,7 @@ pub(super) fn registry() -> Result<ScoutActionRegistry, ActionRegistryError> {
         ("scout.previous", "Move up", ScoutCommand::Previous),
         ("scout.next", "Move down", ScoutCommand::Next),
         ("scout.toggle", "Expand or collapse", ScoutCommand::Toggle),
+        ("scout.commandPalette.open", "Show command palette", ScoutCommand::OpenCommandPalette),
     ]
     .into_iter()
     .enumerate()
@@ -33,10 +35,13 @@ pub(super) fn registry() -> Result<ScoutActionRegistry, ActionRegistryError> {
             title,
             command,
             enablement: enabled,
-            command_palette: CommandPalettePlacement::Visible {
-                group: "Scout",
-                group_order: 10,
-                order: order as i16,
+            command_palette: match command {
+                ScoutCommand::OpenCommandPalette => CommandPalettePlacement::Hidden,
+                _ => CommandPalettePlacement::Visible {
+                    group: "Scout",
+                    group_order: 10,
+                    order: order as i16,
+                },
             },
         });
     }
@@ -51,6 +56,7 @@ pub(super) fn registry() -> Result<ScoutActionRegistry, ActionRegistryError> {
         (KeyCode::Char('j'), KeyModifiers::NONE, "scout.next"),
         (KeyCode::Enter, KeyModifiers::NONE, "scout.toggle"),
         (KeyCode::Char(' '), KeyModifiers::NONE, "scout.toggle"),
+        (KeyCode::Char('p'), KeyModifiers::CONTROL, "scout.commandPalette.open"),
     ] {
         builder.bind_key(KeybindingPlacement {
             binding: KeyChord::new(code, modifiers).into(),

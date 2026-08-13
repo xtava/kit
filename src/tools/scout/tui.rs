@@ -20,7 +20,8 @@ use super::model::{Survey, TargetKind};
 use super::proc::total_pss;
 use super::survey;
 use crate::tui::{
-    render_vertical_scrollbar, EventReader, KeyChord, KeybindingResolution, KeybindingState,
+    render_vertical_scrollbar, theme::NORD, CommandPalette, CommandPaletteLayout,
+    CommandPaletteOutcome, EventReader, KeyChord, KeybindingResolution, KeybindingState,
     ScrollbarDrag, ScrollbarLayout, ScrollbarStyle, SelectableRegion, SelectionOutcome, Session,
     SessionOptions, TextSelection, Viewport, ViewportMetrics,
 };
@@ -54,28 +55,17 @@ pub async fn run(marker: String) -> Result<()> {
             }
             Some(survey) = rx.recv() => app.ingest(survey),
             event = events.recv() => match event {
-                Some(Event::Key(key)) => match app.on_key(key) {
-                    ScoutCommand::Quit => break,
-                    ScoutCommand::Refresh => {
+                Some(event) => match app.on_event(event, &regions) {
+                    Flow::Quit => break,
+                    Flow::Refresh => {
                         if !app.loading {
                             app.loading = true;
                             spawn_survey(app.marker.clone(), tx.clone());
                         }
                     }
-                    ScoutCommand::Previous | ScoutCommand::Next | ScoutCommand::Toggle => {}
-                },
-                Some(Event::Mouse(mouse)) => match app.on_mouse(mouse, &regions) {
-                    Some(ScoutCommand::Quit) => break,
-                    Some(ScoutCommand::Refresh) => {
-                        if !app.loading {
-                            app.loading = true;
-                            spawn_survey(app.marker.clone(), tx.clone());
-                        }
-                    }
-                    _ => {}
+                    Flow::Continue => {}
                 },
                 None => break,
-                _ => {}
             },
         }
         if let Some(text) = app.pending_copy.take() {
@@ -101,7 +91,20 @@ struct UiRegions {
     tree: Option<Rect>,
     rows: Vec<(Rect, usize)>,
     scrollbar: Option<ScrollbarLayout>,
+    command_palette: Option<CommandPaletteLayout>,
     selectable: Vec<SelectableRegion<SelectionSurface>>,
+}
+
+enum Surface {
+    Normal,
+    CommandPalette(CommandPalette<()>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Flow {
+    Continue,
+    Quit,
+    Refresh,
 }
 
 struct App {
@@ -121,6 +124,7 @@ struct App {
     selection: TextSelection<SelectionSurface>,
     revision: u64,
     pending_copy: Option<String>,
+    surface: Surface,
 }
 
 struct Row {
@@ -150,6 +154,7 @@ impl App {
             selection: TextSelection::default(),
             revision: 0,
             pending_copy: None,
+            surface: Surface::Normal,
         }
     }
 
@@ -170,32 +175,79 @@ impl App {
         }
     }
 
-    fn on_key(&mut self, key: crossterm::event::KeyEvent) -> ScoutCommand {
+    fn on_event(&mut self, event: Event, regions: &UiRegions) -> Flow {
+        if matches!(self.surface, Surface::CommandPalette(_)) {
+            return self.on_palette_event(event, regions);
+        }
+        match event {
+            Event::Key(key) => self.on_key(key),
+            Event::Mouse(mouse) => {
+                self.on_mouse(mouse, regions);
+                Flow::Continue
+            }
+            Event::Resize(_, _) | Event::FocusGained | Event::FocusLost | Event::Paste(_) => {
+                Flow::Continue
+            }
+        }
+    }
+
+    fn on_palette_event(&mut self, event: Event, regions: &UiRegions) -> Flow {
+        let Some(layout) = regions.command_palette.as_ref() else {
+            self.surface = Surface::Normal;
+            return Flow::Continue;
+        };
+        let outcome = match &mut self.surface {
+            Surface::CommandPalette(palette) => palette.on_event(event, layout),
+            Surface::Normal => unreachable!("palette surface checked above"),
+        };
+        match outcome {
+            CommandPaletteOutcome::Captured => Flow::Continue,
+            CommandPaletteOutcome::Dismissed => {
+                self.surface = Surface::Normal;
+                Flow::Continue
+            }
+            CommandPaletteOutcome::Invoke(invocation) => {
+                self.surface = Surface::Normal;
+                self.invoke(invocation)
+            }
+        }
+    }
+
+    fn on_key(&mut self, key: crossterm::event::KeyEvent) -> Flow {
         match self.selection.on_key(key) {
             SelectionOutcome::CopyReady(text) => {
                 self.pending_copy = Some(text);
-                return ScoutCommand::Toggle;
+                return Flow::Continue;
             }
-            SelectionOutcome::Captured | SelectionOutcome::Changed => return ScoutCommand::Toggle,
+            SelectionOutcome::Captured | SelectionOutcome::Changed => return Flow::Continue,
             SelectionOutcome::Unhandled | SelectionOutcome::EdgeScroll { .. } => {}
         }
         let Some(chord) = KeyChord::from_event(key) else {
-            return ScoutCommand::Toggle;
+            return Flow::Continue;
         };
         let invocation = match self.registry.resolve_keybinding(&mut self.keybindings, chord, ()) {
             KeybindingResolution::Invoke(invocation) => invocation,
-            _ => return ScoutCommand::Toggle,
+            _ => return Flow::Continue,
         };
-        let Ok(command) = self.registry.command_for(&invocation) else {
-            return ScoutCommand::Toggle;
-        };
+        self.invoke(invocation)
+    }
+
+    fn invoke(&mut self, invocation: crate::tui::ActionInvocation<()>) -> Flow {
+        let Ok(command) = self.registry.command_for(&invocation) else { return Flow::Continue };
         match command {
             ScoutCommand::Previous => self.move_selection(-1),
             ScoutCommand::Next => self.move_selection(1),
             ScoutCommand::Toggle => self.toggle(),
-            ScoutCommand::Quit | ScoutCommand::Refresh => {}
+            ScoutCommand::OpenCommandPalette => {
+                self.surface = Surface::CommandPalette(CommandPalette::open(
+                    invocation.context,
+                    &self.registry,
+                ));
+            }
+            ScoutCommand::Quit => return Flow::Quit,
+            ScoutCommand::Refresh => return Flow::Refresh,
         }
-        command
+        Flow::Continue
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -206,7 +258,7 @@ impl App {
         self.selected = (self.selected as isize + delta).clamp(0, bound) as usize;
     }
 
-    fn on_mouse(&mut self, mouse: MouseEvent, regions: &UiRegions) -> Option<ScoutCommand> {
+    fn on_mouse(&mut self, mouse: MouseEvent, regions: &UiRegions) {
         let position = Position::new(mouse.column, mouse.row);
         if let Some(drag) = self.scrollbar_drag {
             match mouse.kind {
@@ -220,7 +272,7 @@ impl App {
                 MouseEventKind::Up(MouseButton::Left) => self.scrollbar_drag = None,
                 _ => {}
             }
-            return None;
+            return;
         }
         if let Some(scrollbar) = regions.scrollbar.filter(|scrollbar| scrollbar.contains(position))
         {
@@ -233,13 +285,13 @@ impl App {
                     self.selected = top;
                 }
             }
-            return None;
+            return;
         }
         if matches!(mouse.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown)
             && regions.tree.is_some_and(|area| area.contains(position))
         {
             self.move_selection(if mouse.kind == MouseEventKind::ScrollUp { -3 } else { 3 });
-            return None;
+            return;
         }
         if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
             if let Some((_, index)) = regions.rows.iter().find(|(area, _)| area.contains(position))
@@ -247,7 +299,7 @@ impl App {
                 self.selected = *index;
                 if self.rows[*index].instance.is_some() {
                     self.toggle();
-                    return None;
+                    return;
                 }
             }
         }
@@ -256,7 +308,6 @@ impl App {
             SelectionOutcome::EdgeScroll { lines, .. } => self.move_selection(lines),
             _ => {}
         }
-        None
     }
 
     fn toggle(&mut self) {
@@ -343,6 +394,11 @@ fn render(frame: &mut Frame, app: &mut App) -> UiRegions {
         &selectable,
         Style::default().bg(Color::Rgb(40, 44, 52)).add_modifier(Modifier::REVERSED),
     );
+    if let Surface::CommandPalette(palette) = &app.surface {
+        let layout = palette.layout(frame.area());
+        palette.render(frame, &layout, NORD);
+        regions.command_palette = Some(layout);
+    }
     regions
 }
 
@@ -441,6 +497,8 @@ fn render_footer(frame: &mut Frame, area: Rect, registry: &ScoutActionRegistry) 
         Span::raw(format!(" {}  ", title(ScoutCommand::Toggle))),
         key("r"),
         Span::raw(format!(" {}  ", title(ScoutCommand::Refresh))),
+        key("Ctrl-P"),
+        Span::raw(" commands  "),
         key("q"),
         Span::raw(format!(" {}", title(ScoutCommand::Quit))),
     ]))
