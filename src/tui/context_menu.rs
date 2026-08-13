@@ -12,11 +12,11 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 use ratatui::Frame;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::actions::{
     ActionId, ActionInvocation, ActionState, KeyChord, ResolvedAction, ResolvedActions,
 };
+use super::text::{fit_terminal_text, terminal_text_width, CellAlignment, CellOverflow};
 use super::theme::{TuiTheme, NORD};
 
 #[derive(Clone, Copy, Debug)]
@@ -370,11 +370,12 @@ fn clamp_axis(anchor: u16, start: u16, end: u16, length: u16) -> u16 {
 fn item_width(item: &ResolvedAction) -> u16 {
     let reason = match &item.state {
         ActionState::Enabled => 0,
-        ActionState::Disabled { reason } => 3 + reason.width(),
+        ActionState::Disabled { reason } => 3 + terminal_text_width(reason),
     };
-    let shortcut =
-        menu_keybinding(item).map(|chord| chord.to_string().width() + 2).unwrap_or_default();
-    u16::try_from(2 + item.title.width() + reason + shortcut).unwrap_or(u16::MAX)
+    let shortcut = menu_keybinding(item)
+        .map(|chord| terminal_text_width(&chord.to_string()) + 2)
+        .unwrap_or_default();
+    u16::try_from(2 + terminal_text_width(item.title) + reason + shortcut).unwrap_or(u16::MAX)
 }
 
 fn item_line(
@@ -396,34 +397,15 @@ fn item_line(
     let left = format!(" {}{reason}", item.title);
     let shortcut = menu_keybinding(item).map(|chord| format!("{} ", chord));
     let total_width = usize::from(width);
-    let shortcut = shortcut.filter(|shortcut| shortcut.width() + 3 <= total_width);
-    let shortcut_width = shortcut.as_deref().map(UnicodeWidthStr::width).unwrap_or_default();
+    let shortcut = shortcut.filter(|shortcut| terminal_text_width(shortcut) + 3 <= total_width);
+    let shortcut_width = shortcut.as_deref().map(terminal_text_width).unwrap_or_default();
     let left_width = total_width.saturating_sub(shortcut_width);
-    let left = fit(&left, left_width);
+    let left = fit_terminal_text(&left, left_width, CellAlignment::Left, CellOverflow::Clip);
     let shortcut_style = if selected { row_style } else { style.shortcut };
     Line::from(vec![
         Span::styled(left, row_style),
         Span::styled(shortcut.unwrap_or_default(), shortcut_style),
     ])
-}
-
-fn fit(value: &str, width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-
-    let mut output = String::new();
-    let mut used = 0;
-    for character in value.chars() {
-        let character_width = character.width().unwrap_or(0);
-        if used + character_width > width {
-            break;
-        }
-        output.push(character);
-        used += character_width;
-    }
-    output.push_str(&" ".repeat(width.saturating_sub(used)));
-    output
 }
 
 #[cfg(test)]
@@ -872,12 +854,24 @@ mod tests {
 
         assert_eq!(item_width(&item), 22);
         let line = item_line(&item, 16, false, ContextMenuStyle::default());
-        assert_eq!(line.spans.iter().map(|span| span.content.width()).sum::<usize>(), 16);
+        assert_eq!(
+            line.spans.iter().map(|span| terminal_text_width(span.content.as_ref())).sum::<usize>(),
+            16
+        );
 
-        assert_eq!(fit("界e\u{301}", 3), "界e\u{301}");
-        assert_eq!(fit("界e\u{301}", 2), "界");
-        assert_eq!(fit("e\u{301}", 1), "e\u{301}");
-        assert_eq!(fit("界", 1), " ");
+        assert_eq!(
+            fit_terminal_text("界e\u{301}", 3, CellAlignment::Left, CellOverflow::Clip),
+            "界e\u{301}"
+        );
+        assert_eq!(
+            fit_terminal_text("界e\u{301}", 2, CellAlignment::Left, CellOverflow::Clip),
+            "界"
+        );
+        assert_eq!(
+            fit_terminal_text("e\u{301}", 1, CellAlignment::Left, CellOverflow::Clip),
+            "e\u{301}"
+        );
+        assert_eq!(fit_terminal_text("界", 1, CellAlignment::Left, CellOverflow::Clip), " ");
     }
 
     #[test]

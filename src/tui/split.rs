@@ -145,6 +145,14 @@ impl SplitMinimums {
     pub const fn new(first: u16, second: u16) -> Self {
         Self { first, second }
     }
+
+    pub const fn required_width(self) -> u16 {
+        self.first.saturating_add(DIVIDER_WIDTH).saturating_add(self.second)
+    }
+
+    pub const fn fits(self, width: u16) -> bool {
+        width >= self.required_width()
+    }
 }
 
 /// The exact rendered rectangles and hit target for a two-pane horizontal split.

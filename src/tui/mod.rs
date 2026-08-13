@@ -23,6 +23,7 @@ pub mod settings;
 mod split;
 mod suggestions;
 pub mod syntax;
+mod text;
 pub mod theme;
 mod viewport;
 
@@ -49,6 +50,9 @@ pub use split::{
     render_split_divider, SplitDividerStyle, SplitDrag, SplitFrame, SplitMinimums, SplitRatio,
 };
 pub use suggestions::{Suggestion, SuggestionMenu};
+pub use text::{
+    fit_terminal_text, terminal_text_width, truncate_terminal_text, CellAlignment, CellOverflow,
+};
 pub use viewport::{
     render_vertical_scrollbar, FollowViewport, ScrollbarDrag, ScrollbarLayout, ScrollbarStyle,
     Viewport, ViewportMetrics,

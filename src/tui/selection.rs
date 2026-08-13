@@ -5,6 +5,7 @@
 //! caller retains event precedence and performs clipboard effects through [`super::Session`].
 
 use std::{
+    cmp::Ordering,
     collections::BTreeMap,
     time::{Duration, Instant},
 };
@@ -29,7 +30,10 @@ pub struct SelectableRegion<Id> {
     pub area: Rect,
     pub row_origin: i64,
     pub column_origin: usize,
+    /// Stable identity used to decide whether an active selection can continue.
     pub revision: u64,
+    /// Optional exact rendered-text version used to reuse passive-selection snapshots.
+    content_revision: Option<u64>,
 }
 
 impl<Id> SelectableRegion<Id> {
@@ -40,7 +44,13 @@ impl<Id> SelectableRegion<Id> {
         column_origin: usize,
         revision: u64,
     ) -> Self {
-        Self { id, area, row_origin, column_origin, revision }
+        Self { id, area, row_origin, column_origin, revision, content_revision: None }
+    }
+
+    /// Sets the exact rendered-text version. It must change whenever rendered symbols change.
+    pub const fn with_content_revision(mut self, content_revision: u64) -> Self {
+        self.content_revision = Some(content_revision);
+        self
     }
 }
 
@@ -120,60 +130,146 @@ struct ClickState<Id> {
     at: Instant,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CapturedCell {
+    column: usize,
+    byte_start: usize,
+    byte_end: usize,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct CapturedRow {
-    cells: BTreeMap<usize, String>,
+    text: String,
+    cells: Vec<CapturedCell>,
 }
 
 impl CapturedRow {
+    fn with_capacity(cell_capacity: usize, byte_capacity: usize) -> Self {
+        Self {
+            text: String::with_capacity(byte_capacity),
+            cells: Vec::with_capacity(cell_capacity),
+        }
+    }
+
+    fn push(&mut self, column: usize, symbol: &str) {
+        let byte_start = self.text.len();
+        self.text.push_str(symbol);
+        self.cells.push(CapturedCell {
+            column,
+            byte_start,
+            byte_end: self.text.len(),
+        });
+    }
+
+    fn symbol_at(&self, index: usize) -> &str {
+        let cell = self.cells[index];
+        &self.text[cell.byte_start..cell.byte_end]
+    }
+
+    fn get(&self, column: usize) -> Option<&str> {
+        self.cells
+            .binary_search_by_key(&column, |cell| cell.column)
+            .ok()
+            .map(|index| self.symbol_at(index))
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (usize, &str)> + '_ {
+        self.cells
+            .iter()
+            .enumerate()
+            .map(|(index, cell)| (cell.column, self.symbol_at(index)))
+    }
+
     fn merge(&mut self, other: &Self) {
-        self.cells.extend(other.cells.iter().map(|(column, text)| (*column, text.clone())));
+        if other.iter().all(|(column, symbol)| self.get(column) == Some(symbol)) {
+            return;
+        }
+        let mut merged = Self::with_capacity(
+            self.cells.len().saturating_add(other.cells.len()),
+            self.text.len().saturating_add(other.text.len()),
+        );
+        let mut left = 0;
+        let mut right = 0;
+        while left < self.cells.len() || right < other.cells.len() {
+            match (self.cells.get(left).copied(), other.cells.get(right).copied()) {
+                (Some(left_cell), Some(right_cell)) => {
+                    match left_cell.column.cmp(&right_cell.column) {
+                        Ordering::Less => {
+                            merged.push(left_cell.column, self.symbol_at(left));
+                            left += 1;
+                        }
+                        Ordering::Equal => {
+                            merged.push(right_cell.column, other.symbol_at(right));
+                            left += 1;
+                            right += 1;
+                        }
+                        Ordering::Greater => {
+                            merged.push(right_cell.column, other.symbol_at(right));
+                            right += 1;
+                        }
+                    }
+                }
+                (Some(cell), None) => {
+                    merged.push(cell.column, self.symbol_at(left));
+                    left += 1;
+                }
+                (None, Some(cell)) => {
+                    merged.push(cell.column, other.symbol_at(right));
+                    right += 1;
+                }
+                (None, None) => break,
+            }
+        }
+        *self = merged;
     }
 
     fn normalize_column(&self, column: usize) -> usize {
-        if self.cells.contains_key(&column) {
-            return column;
+        match self.cells.binary_search_by_key(&column, |cell| cell.column) {
+            Ok(_) | Err(0) => column,
+            Err(index) => {
+                let previous = self.cells[index - 1];
+                let width = UnicodeWidthStr::width(self.symbol_at(index - 1)).max(1);
+                if previous.column.saturating_add(width) > column {
+                    previous.column
+                } else {
+                    column
+                }
+            }
         }
-        self.cells
-            .range(..column)
-            .next_back()
-            .and_then(|(start, text)| {
-                let width = UnicodeWidthStr::width(text.as_str()).max(1);
-                ((*start).saturating_add(width) > column).then_some(*start)
-            })
-            .unwrap_or(column)
     }
 
     fn bounds(&self) -> Option<(usize, usize)> {
-        Some((*self.cells.first_key_value()?.0, *self.cells.last_key_value()?.0))
+        Some((self.cells.first()?.column, self.cells.last()?.column))
     }
 
     fn word_range(&self, column: usize) -> Option<(usize, usize)> {
         let column = self.normalize_column(column);
-        let class = word_class(self.cells.get(&column)?);
-        let mut start = column;
-        let mut end = column;
-        for (candidate, text) in self.cells.range(..column).rev() {
-            if word_class(text) != class {
-                break;
-            }
-            start = *candidate;
+        let index = self.cells.binary_search_by_key(&column, |cell| cell.column).ok()?;
+        let class = word_class(self.symbol_at(index));
+        let mut start = index;
+        while start > 0 && word_class(self.symbol_at(start - 1)) == class {
+            start -= 1;
         }
-        for (candidate, text) in self.cells.range(column.saturating_add(1)..) {
-            if word_class(text) != class {
-                break;
-            }
-            end = *candidate;
+        let mut end = index;
+        while end + 1 < self.cells.len() && word_class(self.symbol_at(end + 1)) == class {
+            end += 1;
         }
-        Some((start, end))
+        Some((self.cells[start].column, self.cells[end].column))
     }
 
     fn text(&self, first_column: usize, last_column: usize) -> String {
-        let mut text = String::new();
-        for (_, symbol) in self.cells.range(first_column..=last_column) {
-            text.push_str(symbol);
+        let Some(first) = self.cells.iter().position(|cell| cell.column >= first_column) else {
+            return String::new();
+        };
+        let Some(last) = self.cells.iter().rposition(|cell| cell.column <= last_column) else {
+            return String::new();
+        };
+        if first > last {
+            return String::new();
         }
-        text.trim_end_matches(' ').to_owned()
+        self.text[self.cells[first].byte_start..self.cells[last].byte_end]
+            .trim_end_matches(' ')
+            .to_owned()
     }
 }
 
@@ -271,9 +367,26 @@ impl<Id: Copy + Eq> TextSelection<Id> {
         regions: &[SelectableRegion<Id>],
         selection_style: Style,
     ) {
+        let mut previous = std::mem::take(&mut self.frame);
         let snapshots = {
             let buffer = frame.buffer_mut();
-            regions.iter().filter_map(|region| capture_region(buffer, *region)).collect::<Vec<_>>()
+            regions
+                .iter()
+                .filter_map(|region| {
+                    let region = clip_region(*buffer.area(), *region)?;
+                    Some(
+                        previous
+                            .iter()
+                            .position(|snapshot| {
+                                region.content_revision.is_some() && snapshot.region == region
+                            })
+                            .map_or_else(
+                                || capture_region(buffer, region),
+                                |index| previous.swap_remove(index),
+                            ),
+                    )
+                })
+                .collect::<Vec<_>>()
         };
 
         if let Some(active) = self.active {
@@ -562,26 +675,40 @@ fn selection_changed<Id: Copy + Eq>(
         let Some(current) = snapshot.rows.get(row) else {
             return false;
         };
-        previous.cells.iter().any(|(column, text)| {
-            active.range.contains(TextPoint::new(*row, *column), rectangular)
-                && current.cells.get(column) != Some(text)
+        previous.iter().any(|(column, text)| {
+            active.range.contains(TextPoint::new(*row, column), rectangular)
+                && current.get(column) != Some(text)
         })
     })
 }
 
-fn capture_region<Id: Copy>(
-    buffer: &Buffer,
+fn clip_region<Id: Copy>(
+    buffer_area: Rect,
     region: SelectableRegion<Id>,
-) -> Option<RegionSnapshot<Id>> {
-    let area = region.area.intersection(*buffer.area());
+) -> Option<SelectableRegion<Id>> {
+    let area = region.area.intersection(buffer_area);
     if area.width == 0 || area.height == 0 {
         return None;
     }
+    let row_origin = region
+        .row_origin
+        .saturating_add(i64::from(area.y.saturating_sub(region.area.y)));
+    let column_origin = region
+        .column_origin
+        .saturating_add(usize::from(area.x.saturating_sub(region.area.x)));
+    Some(SelectableRegion { area, row_origin, column_origin, ..region })
+}
+
+fn capture_region<Id: Copy>(buffer: &Buffer, region: SelectableRegion<Id>) -> RegionSnapshot<Id> {
+    let area = region.area;
     let mut rows = BTreeMap::new();
+    let row_capacity = usize::from(area.width);
     for screen_row in area.y..area.bottom() {
         let logical_row =
             region.row_origin.saturating_add(i64::from(screen_row.saturating_sub(region.area.y)));
-        let row = rows.entry(logical_row).or_insert_with(CapturedRow::default);
+        let row = rows
+            .entry(logical_row)
+            .or_insert_with(|| CapturedRow::with_capacity(row_capacity, row_capacity));
         let mut screen_column = area.x;
         while screen_column < area.right() {
             let cell = &buffer[(screen_column, screen_row)];
@@ -592,12 +719,12 @@ fn capture_region<Id: Copy>(
             let logical_column = region
                 .column_origin
                 .saturating_add(usize::from(screen_column.saturating_sub(region.area.x)));
-            row.cells.insert(logical_column, cell.symbol().to_owned());
+            row.push(logical_column, cell.symbol());
             let width = UnicodeWidthStr::width(cell.symbol()).max(1);
             screen_column = screen_column.saturating_add(u16::try_from(width).unwrap_or(u16::MAX));
         }
     }
-    Some(RegionSnapshot { region: SelectableRegion { area, ..region }, rows })
+    RegionSnapshot { region, rows }
 }
 
 fn highlight_snapshot<Id: Copy + Eq>(

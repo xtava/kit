@@ -18,7 +18,8 @@ use ratatui::{
 use super::fuzzy::Matcher;
 use super::theme::TuiTheme;
 use super::{
-    ActionInvocation, ActionRegistry, ActionState, LineEditor, ResolvedAction, ResolvedActions,
+    fit_terminal_text, terminal_text_width, ActionInvocation, ActionRegistry, ActionState,
+    CellAlignment, CellOverflow, LineEditor, ResolvedAction, ResolvedActions,
 };
 
 const MIN_WIDTH: u16 = 38;
@@ -198,7 +199,12 @@ impl<C: Clone> CommandPalette<C> {
                     Layout::horizontal([Constraint::Fill(1), Constraint::Length(24)]).split(*area);
                 let label = Line::from(vec![
                     Span::styled(
-                        format!("{:<12}", command.group),
+                        fit_terminal_text(
+                            command.group,
+                            12,
+                            CellAlignment::Left,
+                            CellOverflow::Clip,
+                        ),
                         style.fg(if selected { theme.accent_alt } else { theme.text_muted }),
                     ),
                     Span::styled(command.title, style),
@@ -232,7 +238,9 @@ impl<C: Clone> CommandPalette<C> {
             );
         }
 
-        let cursor_cells = self.query.value()[..self.query.cursor()].chars().count() as u16;
+        let cursor_cells =
+            u16::try_from(terminal_text_width(&self.query.value()[..self.query.cursor()]))
+                .unwrap_or(u16::MAX);
         let cursor_x = layout
             .input
             .x

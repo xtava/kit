@@ -10,7 +10,10 @@ use ratatui::{
     Frame,
 };
 
-use super::{theme::TuiTheme, Direction, KeyChord, NavigationMap, NavigationRegion};
+use super::{
+    fit_terminal_text, theme::TuiTheme, CellAlignment, CellOverflow, Direction, KeyChord,
+    NavigationMap, NavigationRegion,
+};
 use crate::framework::{ConfigStore, EditableSettings, SettingEdit, SettingField, SettingsSection};
 
 const MIN_WIDTH: u16 = 58;
@@ -433,7 +436,7 @@ fn render_fields(frame: &mut Frame<'_>, area: Rect, app: &mut SettingsEditor) {
         lines.push(Line::from(vec![
             Span::styled(if selected { "▌ " } else { "  " }, Style::default().fg(app.theme.accent)),
             Span::styled(
-                format!("{:<25}", field.label()),
+                fit_terminal_text(field.label(), 25, CellAlignment::Left, CellOverflow::Clip),
                 Style::default()
                     .fg(if selected { app.theme.text_strong } else { app.theme.text })
                     .add_modifier(if selected { Modifier::BOLD } else { Modifier::empty() }),

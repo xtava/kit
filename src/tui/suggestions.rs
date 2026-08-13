@@ -5,8 +5,10 @@ use ratatui::{
     widgets::Paragraph,
     Frame,
 };
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use super::text::{
+    fit_terminal_text, terminal_text_width, truncate_terminal_text, CellAlignment, CellOverflow,
+};
 use super::theme::TuiTheme;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -119,11 +121,22 @@ impl SuggestionMenu {
             let hint = if candidate.hint.is_empty() {
                 String::new()
             } else {
-                format!("  {}", truncate(&candidate.hint, hint_width))
+                format!(
+                    "  {}",
+                    truncate_terminal_text(&candidate.hint, hint_width, CellOverflow::Ellipsis)
+                )
             };
             lines.push(Line::from(vec![
                 Span::styled(marker, Style::default().fg(theme.accent)),
-                Span::styled(fit(&candidate.insert, insert_width), insert_style),
+                Span::styled(
+                    fit_terminal_text(
+                        &candidate.insert,
+                        insert_width,
+                        CellAlignment::Left,
+                        CellOverflow::Ellipsis,
+                    ),
+                    insert_style,
+                ),
                 Span::styled(hint, Style::default().fg(theme.text_muted)),
             ]));
         }
@@ -145,42 +158,12 @@ impl SuggestionMenu {
         }
         let keys =
             if self.is_engaged() { " ⏎ accept · esc back ─" } else { " ⇥ select ─" };
-        let fill = width.saturating_sub(label.width() + keys.width());
+        let fill = width.saturating_sub(terminal_text_width(&label) + terminal_text_width(keys));
         Line::from(Span::styled(
             format!("{label}{}{keys}", "─".repeat(fill)),
             Style::default().fg(theme.border),
         ))
     }
-}
-
-fn fit(text: &str, width: usize) -> String {
-    let mut fitted = truncate(text, width);
-    let padding = width.saturating_sub(fitted.width());
-    fitted.push_str(&" ".repeat(padding));
-    fitted
-}
-
-fn truncate(text: &str, width: usize) -> String {
-    if text.width() <= width {
-        return text.to_owned();
-    }
-    if width == 0 {
-        return String::new();
-    }
-
-    let content_width = width.saturating_sub(1);
-    let mut out = String::new();
-    let mut used = 0;
-    for character in text.chars() {
-        let character_width = character.width().unwrap_or(0);
-        if used + character_width > content_width {
-            break;
-        }
-        out.push(character);
-        used += character_width;
-    }
-    out.push('…');
-    out
 }
 
 #[cfg(test)]
@@ -244,7 +227,13 @@ mod tests {
 
     #[test]
     fn fit_uses_terminal_column_width() {
-        assert_eq!(fit("abc", 5), "abc  ");
-        assert_eq!(fit("文档-name", 6), "文档-…");
+        assert_eq!(
+            fit_terminal_text("abc", 5, CellAlignment::Left, CellOverflow::Ellipsis),
+            "abc  "
+        );
+        assert_eq!(
+            fit_terminal_text("文档-name", 6, CellAlignment::Left, CellOverflow::Ellipsis),
+            "文档-…"
+        );
     }
 }
