@@ -40,6 +40,7 @@ const DARK_ADDED_BACKGROUND: Color = Color::Rgb(33, 58, 43);
 const DARK_DELETED_BACKGROUND: Color = Color::Rgb(74, 34, 29);
 const LIGHT_ADDED_BACKGROUND: Color = Color::Rgb(218, 251, 225);
 const LIGHT_DELETED_BACKGROUND: Color = Color::Rgb(255, 235, 233);
+const TREE_GROUPS: [ChangeGroup; 2] = [ChangeGroup::Staged, ChangeGroup::Changes];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ViewMode {
@@ -239,6 +240,12 @@ enum TreeTarget {
     File(usize),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TreeStep {
+    Previous,
+    Next,
+}
+
 #[derive(Clone, Debug)]
 struct TreeRow {
     target: TreeTarget,
@@ -280,6 +287,7 @@ struct DiffApp {
     keybinding_state: KeybindingState,
     documents: Vec<DiffDocument>,
     selected: Option<usize>,
+    tree_order: Vec<usize>,
     expanded: HashSet<(ChangeGroup, PathBuf)>,
     tree_viewport: Viewport,
     tree_metrics: ViewportMetrics,
@@ -324,18 +332,20 @@ impl DiffApp {
         line_numbers: LineNumbers,
     ) -> Self {
         let expanded = directory_keys(&documents).into_iter().collect();
-        let has_documents = !documents.is_empty();
+        let tree_order = tree_file_order(&documents);
+        let selected = tree_order.first().copied();
         Self {
             actions: actions::registry().expect("Diff action contributions are valid"),
             keybinding_state: KeybindingState::default(),
-            selected: has_documents.then_some(0),
+            selected,
             documents,
+            tree_order,
             expanded,
             tree_viewport: Viewport::default(),
             tree_metrics: ViewportMetrics::default(),
             tree_scrollbar: None,
             tree_scroll_drag: None,
-            tree_reveal_selected: has_documents,
+            tree_reveal_selected: selected.is_some(),
             content_viewport: Viewport::default(),
             content_metrics: ViewportMetrics::default(),
             content_scrollbar: None,
@@ -403,11 +413,11 @@ impl DiffApp {
                 return invocation.context.filename.map(Flow::Copy).unwrap_or(Flow::Continue)
             }
             DiffCommand::MoveDown => match self.active_region {
-                ActiveRegion::Changes => self.select_relative(1),
+                ActiveRegion::Changes => self.move_tree_selection(TreeStep::Next),
                 ActiveRegion::Old | ActiveRegion::New => self.scroll_content(1),
             },
             DiffCommand::MoveUp => match self.active_region {
-                ActiveRegion::Changes => self.select_relative(-1),
+                ActiveRegion::Changes => self.move_tree_selection(TreeStep::Previous),
                 ActiveRegion::Old | ActiveRegion::New => self.scroll_content(-1),
             },
             DiffCommand::PageDown => {
@@ -459,7 +469,10 @@ impl DiffApp {
 
     fn replace_documents(&mut self, documents: Vec<DiffDocument>) {
         self.hovered_file = None;
-        let previous_index = self.selected.unwrap_or(0);
+        let previous_position = self
+            .selected
+            .and_then(|selected| self.tree_order.iter().position(|index| *index == selected))
+            .unwrap_or(0);
         let previous_identity = self
             .selected
             .and_then(|index| self.documents.get(index))
@@ -471,6 +484,7 @@ impl DiffApp {
             .filter(|key| !previous_keys.contains(key) || self.expanded.contains(key))
             .collect();
         self.documents = documents;
+        self.tree_order = tree_file_order(&self.documents);
         self.selected = previous_identity
             .as_ref()
             .and_then(|(group, path)| {
@@ -486,7 +500,9 @@ impl DiffApp {
                 })
             })
             .or_else(|| {
-                (!self.documents.is_empty()).then_some(previous_index.min(self.documents.len() - 1))
+                self.tree_order
+                    .get(previous_position.min(self.tree_order.len().saturating_sub(1)))
+                    .copied()
             });
         self.reset_document_position();
         if self.selected.is_none() {
@@ -729,13 +745,28 @@ impl DiffApp {
         }
     }
 
-    fn select_relative(&mut self, delta: isize) {
-        if self.documents.is_empty() {
-            return;
+    fn move_tree_selection(&mut self, step: TreeStep) {
+        let current_position = self
+            .selected
+            .and_then(|selected| self.tree_order.iter().position(|index| *index == selected));
+        let visible_at = |position| {
+            let index = self.tree_order[position];
+            self.documents
+                .get(index)
+                .filter(|document| tree_file_is_visible(document, &self.expanded))
+                .map(|_| index)
+        };
+        let next = match (step, current_position) {
+            (TreeStep::Next, Some(position)) => {
+                (position + 1..self.tree_order.len()).find_map(visible_at)
+            }
+            (TreeStep::Previous, Some(position)) => (0..position).rev().find_map(visible_at),
+            (TreeStep::Next, None) => (0..self.tree_order.len()).find_map(visible_at),
+            (TreeStep::Previous, None) => (0..self.tree_order.len()).rev().find_map(visible_at),
+        };
+        if let Some(next) = next {
+            self.select(next);
         }
-        let current = self.selected.unwrap_or(0) as isize;
-        let next = (current + delta).clamp(0, self.documents.len() as isize - 1) as usize;
-        self.select(next);
     }
 
     fn select(&mut self, index: usize) {
@@ -1798,12 +1829,8 @@ fn tree_rows(
     expanded: &HashSet<(ChangeGroup, PathBuf)>,
 ) -> Vec<TreeRow> {
     let mut rows = Vec::new();
-    for group in [ChangeGroup::Staged, ChangeGroup::Changes] {
-        let indices: Vec<_> = documents
-            .iter()
-            .enumerate()
-            .filter_map(|(index, document)| (document.group == group).then_some(index))
-            .collect();
+    for group in TREE_GROUPS {
+        let indices = group_document_indices(documents, group);
         let (additions, deletions) = totals(documents, &indices);
         rows.push(TreeRow {
             target: TreeTarget::Group(group),
@@ -1845,6 +1872,60 @@ fn build_tree(documents: &[DiffDocument], indices: &[usize]) -> TreeNode {
         node.files.push(index);
     }
     root
+}
+
+fn group_document_indices(documents: &[DiffDocument], group: ChangeGroup) -> Vec<usize> {
+    documents
+        .iter()
+        .enumerate()
+        .filter_map(|(index, document)| (document.group == group).then_some(index))
+        .collect()
+}
+
+fn tree_file_order(documents: &[DiffDocument]) -> Vec<usize> {
+    let mut order = Vec::with_capacity(documents.len());
+    for group in TREE_GROUPS {
+        let indices = group_document_indices(documents, group);
+        append_tree_file_order(&mut order, &build_tree(documents, &indices));
+    }
+    order
+}
+
+fn append_tree_file_order(order: &mut Vec<usize>, node: &TreeNode) {
+    for child in node.directories.values() {
+        append_tree_file_order(order, child);
+    }
+    order.extend(node.files.iter().copied());
+}
+
+fn tree_file_is_visible(
+    document: &DiffDocument,
+    expanded: &HashSet<(ChangeGroup, PathBuf)>,
+) -> bool {
+    if !expanded.contains(&(document.group, PathBuf::new())) {
+        return false;
+    }
+    let Some(path) = document.display_path() else {
+        return false;
+    };
+    let mut parent = PathBuf::new();
+    let mut components = path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => Some(value),
+            _ => None,
+        })
+        .peekable();
+    while let Some(component) = components.next() {
+        if components.peek().is_none() {
+            break;
+        }
+        parent.push(component);
+        if !expanded.contains(&(document.group, parent.clone())) {
+            return false;
+        }
+    }
+    true
 }
 
 fn append_tree_rows(
