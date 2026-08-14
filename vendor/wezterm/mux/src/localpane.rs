@@ -6,7 +6,6 @@ use crate::pane::{
 use crate::renderable::*;
 use crate::tmux::{TmuxDomain, TmuxDomainState};
 #[cfg(unix)]
-use crate::PaneTaskKind;
 use crate::{CountClass, Domain, Mux, MuxNotification, RuntimeAdmission};
 use anyhow::{Context, Error};
 use async_trait::async_trait;
@@ -1123,17 +1122,13 @@ impl LocalPane {
                 let mux = Mux::get();
                 if mux.is_headless_runtime() {
                     let leader_ref = Arc::clone(&self.leader);
-                    if let Err(error) = mux.try_spawn_pane_task_local(
-                        self.pane_id,
-                        PaneTaskKind::Refresh,
-                        async move {
-                            let mut leader = leader_ref.lock();
-                            if let Some(leader) = leader.as_mut() {
-                                leader.update();
-                            }
-                            Ok(())
-                        },
-                    ) {
+                    if let Err(error) = mux.try_spawn_pane_refresh_local(self.pane_id, async move {
+                        let mut leader = leader_ref.lock();
+                        if let Some(leader) = leader.as_mut() {
+                            leader.update();
+                        }
+                        Ok(())
+                    }) {
                         info.updating = false;
                         log::warn!("failed to schedule pane leader refresh: {error:#}");
                     }

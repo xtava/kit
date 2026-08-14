@@ -5,7 +5,7 @@ use wezterm_mux_server_impl::authorization::{RequestAuthorizer, ServerIssuedIden
 
 /// Kit Console's closed host policy for its private per-user mux socket.
 ///
-/// Generic WezTerm code classifies requests and enforces pane-control leases.
+/// Generic WezTerm code classifies requests and validates attachment identity.
 /// This policy decides which classified operations the Console product exposes.
 pub struct ConsoleAuthorizer;
 
@@ -43,7 +43,6 @@ fn authorize_bootstrap_operation(operation: RequestOperation) -> anyhow::Result<
         | RequestOperation::EraseScrollback
         | RequestOperation::GetPaneDirection
         | RequestOperation::AdjustPaneSize
-        | RequestOperation::ControlLease
         | RequestOperation::ServiceDrain => {
             bail!("ordinary request {operation:?} is invalid during bootstrap")
         }
@@ -71,7 +70,6 @@ fn authorize_established_operation(operation: RequestOperation) -> anyhow::Resul
         | RequestOperation::SetPalette
         | RequestOperation::SetTabTitle
         | RequestOperation::SetWindowTitle
-        | RequestOperation::ControlLease
         | RequestOperation::ServiceDrain => Ok(()),
         RequestOperation::GetCodecVersion
         | RequestOperation::GetBuildIdentity
@@ -140,8 +138,7 @@ mod tests {
     }
 
     #[test]
-    fn embedded_wezterm_control_authorization() {
-        assert!(authorize_established_operation(RequestOperation::ControlLease).is_ok());
+    fn embedded_wezterm_terminal_authorization() {
         assert!(authorize_established_operation(RequestOperation::SendKey).is_ok());
         assert!(authorize_established_operation(RequestOperation::SendMouse).is_ok());
         assert!(authorize_established_operation(RequestOperation::GetLines).is_ok());

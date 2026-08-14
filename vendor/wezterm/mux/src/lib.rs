@@ -139,23 +139,28 @@ impl ClientPaneTaskKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PaneTaskKind {
+pub enum PaneMutationKind {
     Input { bytes: usize },
     Write { bytes: usize },
-    Refresh,
+    Resize,
+    EraseScrollback,
+    SetPalette,
+    Kill,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OwnedPaneTaskKind {
     Client(ClientPaneTaskKind),
-    Pane(PaneTaskKind),
+    Mutation(PaneMutationKind),
+    Refresh,
 }
 
 impl OwnedPaneTaskKind {
     fn cancel_on_removal(self, removal: PaneRemoval) -> bool {
         match self {
             Self::Client(ClientPaneTaskKind::Close) => removal == PaneRemoval::Unregister,
-            Self::Client(_) | Self::Pane(_) => true,
+            Self::Mutation(PaneMutationKind::Kill) => false,
+            Self::Client(_) | Self::Mutation(_) | Self::Refresh => true,
         }
     }
 
@@ -249,10 +254,10 @@ impl PaneTaskPermits {
     fn admit(
         admission: &RuntimeAdmission,
         pane_input: &Arc<PaneInputAdmission>,
-        kind: PaneTaskKind,
+        kind: PaneMutationKind,
     ) -> anyhow::Result<Self> {
         match kind {
-            PaneTaskKind::Input { bytes } => Ok(Self {
+            PaneMutationKind::Input { bytes } => Ok(Self {
                 _pane_input: Some(pane_input.try_input(bytes)?),
                 _input_item: Some(
                     admission
@@ -266,7 +271,7 @@ impl PaneTaskPermits {
                 ),
                 _job: None,
             }),
-            PaneTaskKind::Write { bytes } => Ok(Self {
+            PaneMutationKind::Write { bytes } => Ok(Self {
                 _pane_input: Some(pane_input.try_input(bytes)?),
                 _input_item: Some(
                     admission
@@ -284,14 +289,10 @@ impl PaneTaskPermits {
                         .context("admit pane write bytes")?,
                 ),
             }),
-            PaneTaskKind::Refresh => Ok(Self {
-                _job: Some(
-                    admission
-                        .try_count(CountClass::PaneRefreshJob, 1)
-                        .context("admit pane refresh job")?,
-                ),
-                ..Self::default()
-            }),
+            PaneMutationKind::Resize
+            | PaneMutationKind::EraseScrollback
+            | PaneMutationKind::SetPalette
+            | PaneMutationKind::Kill => Ok(Self::default()),
         }
     }
 }
@@ -405,6 +406,8 @@ struct PaneWorkerSet {
     has_reader: bool,
     input_admission: Arc<PaneInputAdmission>,
     tasks: Vec<OwnedPaneTask>,
+    next_mutation_sequence: u64,
+    closing: bool,
     stopped: bool,
 }
 
@@ -433,6 +436,8 @@ impl PaneWorkerSet {
                 has_reader: false,
                 input_admission: Arc::new(PaneInputAdmission::default()),
                 tasks: Vec::new(),
+                next_mutation_sequence: 1,
+                closing: false,
                 stopped: false,
             });
         };
@@ -492,6 +497,8 @@ impl PaneWorkerSet {
             has_reader: true,
             input_admission: Arc::new(PaneInputAdmission::default()),
             tasks: Vec::new(),
+            next_mutation_sequence: 1,
+            closing: false,
             stopped: false,
         })
     }
@@ -1099,16 +1106,7 @@ impl Mux {
         Ok(())
     }
 
-    /// Schedule one admitted pane mutation or refresh on the headless owner executor.
-    ///
-    /// The pane worker set retains the task and its permits through completion, pane removal, or
-    /// runtime shutdown. Interactive runtimes deliberately use their synchronous pane path instead.
-    pub fn try_spawn_pane_task_local<F>(
-        &self,
-        pane_id: PaneId,
-        kind: PaneTaskKind,
-        future: F,
-    ) -> anyhow::Result<()>
+    pub fn try_spawn_pane_refresh_local<F>(&self, pane_id: PaneId, future: F) -> anyhow::Result<()>
     where
         F: Future<Output = anyhow::Result<()>> + 'static,
     {
@@ -1130,24 +1128,83 @@ impl Mux {
         let workers = pane_workers
             .get_mut(&pane_id)
             .ok_or_else(|| anyhow!("pane {pane_id} has no registered task owner"))?;
-        if kind == PaneTaskKind::Refresh
-            && workers
-                .tasks
-                .iter()
-                .any(|owned| owned.kind == OwnedPaneTaskKind::Pane(PaneTaskKind::Refresh))
+        if workers
+            .tasks
+            .iter()
+            .any(|owned| owned.kind == OwnedPaneTaskKind::Refresh)
         {
             return Ok(());
         }
-
-        let permits = PaneTaskPermits::admit(&self.admission, &workers.input_admission, kind)?;
+        let permit = self
+            .admission
+            .try_count(CountClass::PaneRefreshJob, 1)
+            .context("admit pane refresh job")?;
         let task = executor.handle().local().try_spawn_local(async move {
-            let _permits = permits;
+            let _permit = permit;
             future.await
         })?;
         workers.tasks.push(OwnedPaneTask {
-            kind: OwnedPaneTaskKind::Pane(kind),
+            kind: OwnedPaneTaskKind::Refresh,
             task,
         });
+        Ok(())
+    }
+
+    /// Enqueue one non-yielding mutation on the authoritative lane for a pane.
+    ///
+    /// Taking the pane-worker lock is the acceptance and linearization point. The owner executor's
+    /// FIFO queue preserves the assigned sequence, and accepting a closure rather than a future
+    /// prevents one mutation from yielding midway through its application. A queued kill is
+    /// terminal: later mutations reject while earlier accepted work drains first.
+    pub fn try_enqueue_pane_mutation_local<F>(
+        &self,
+        pane_id: PaneId,
+        kind: PaneMutationKind,
+        apply: F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnOnce() -> anyhow::Result<()> + 'static,
+    {
+        if self.admission.is_shutting_down() {
+            anyhow::bail!("mux is shutting down");
+        }
+        if !self.is_main_thread() {
+            anyhow::bail!("pane mutations must be enqueued on the mux owner thread");
+        }
+        let executor = self
+            .headless_executor
+            .as_ref()
+            .ok_or_else(|| anyhow!("pane mutation scheduling requires a headless mux runtime"))?;
+
+        if let Err(err) = self.reap_headless_tasks() {
+            self.record_headless_task_error(err);
+        }
+        let mut pane_workers = self.pane_workers.lock();
+        let workers = pane_workers
+            .get_mut(&pane_id)
+            .ok_or_else(|| anyhow!("pane {pane_id} has no registered mutation lane"))?;
+        if workers.closing {
+            anyhow::bail!("pane {pane_id} is closing");
+        }
+        let sequence = workers.next_mutation_sequence;
+        let next_sequence = sequence
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("pane {pane_id} mutation sequence exhausted"))?;
+        let permits = PaneTaskPermits::admit(&self.admission, &workers.input_admission, kind)?;
+        let task = executor.handle().local().try_spawn_local(async move {
+            let _permits = permits;
+            log::trace!("applying pane {pane_id} mutation {sequence}: {kind:?}");
+            apply()
+        })?;
+        workers.next_mutation_sequence = next_sequence;
+        if kind == PaneMutationKind::Kill {
+            workers.closing = true;
+        }
+        workers.tasks.push(OwnedPaneTask {
+            kind: OwnedPaneTaskKind::Mutation(kind),
+            task,
+        });
+        log::trace!("accepted pane {pane_id} mutation {sequence}: {kind:?}");
         Ok(())
     }
 
@@ -2811,22 +2868,28 @@ mod pane_removal_tests {
     }
 
     #[test]
-    fn pane_task_permits_charge_the_real_input_write_and_refresh_pools_until_drop() {
+    fn pane_task_permits_charge_the_real_input_and_write_pools_until_drop() {
         let admission = RuntimeAdmission::new(RuntimeRole::Server).unwrap();
         let pane_input = Arc::new(PaneInputAdmission::default());
 
-        let input =
-            PaneTaskPermits::admit(&admission, &pane_input, PaneTaskKind::Input { bytes: 17 })
-                .unwrap();
+        let input = PaneTaskPermits::admit(
+            &admission,
+            &pane_input,
+            PaneMutationKind::Input { bytes: 17 },
+        )
+        .unwrap();
         assert_eq!(admission.count_usage(CountClass::PaneInputItem), 1);
         assert_eq!(admission.byte_usage(ByteClass::PaneInput), 17);
         drop(input);
         assert_eq!(admission.count_usage(CountClass::PaneInputItem), 0);
         assert_eq!(admission.byte_usage(ByteClass::PaneInput), 0);
 
-        let write =
-            PaneTaskPermits::admit(&admission, &pane_input, PaneTaskKind::Write { bytes: 23 })
-                .unwrap();
+        let write = PaneTaskPermits::admit(
+            &admission,
+            &pane_input,
+            PaneMutationKind::Write { bytes: 23 },
+        )
+        .unwrap();
         assert_eq!(admission.count_usage(CountClass::PaneInputItem), 1);
         assert_eq!(admission.count_usage(CountClass::PaneWriteJob), 1);
         assert_eq!(admission.byte_usage(ByteClass::PaneInput), 23);
@@ -2835,29 +2898,29 @@ mod pane_removal_tests {
         assert_eq!(admission.count_usage(CountClass::PaneWriteJob), 0);
         assert_eq!(admission.byte_usage(ByteClass::PaneInput), 0);
 
-        let refresh =
-            PaneTaskPermits::admit(&admission, &pane_input, PaneTaskKind::Refresh).unwrap();
-        assert_eq!(admission.count_usage(CountClass::PaneRefreshJob), 1);
-        drop(refresh);
-        assert_eq!(admission.count_usage(CountClass::PaneRefreshJob), 0);
-
         let item_permits = (0..MAX_PANE_INPUT_ITEMS_PER_PANE)
             .map(|_| {
-                PaneTaskPermits::admit(&admission, &pane_input, PaneTaskKind::Input { bytes: 0 })
-                    .unwrap()
+                PaneTaskPermits::admit(
+                    &admission,
+                    &pane_input,
+                    PaneMutationKind::Input { bytes: 0 },
+                )
+                .unwrap()
             })
             .collect::<Vec<_>>();
-        assert!(
-            PaneTaskPermits::admit(&admission, &pane_input, PaneTaskKind::Input { bytes: 0 })
-                .is_err()
-        );
+        assert!(PaneTaskPermits::admit(
+            &admission,
+            &pane_input,
+            PaneMutationKind::Input { bytes: 0 },
+        )
+        .is_err());
         drop(item_permits);
 
         let too_large = MAX_PANE_INPUT_BYTES_PER_PANE + 1;
         assert!(PaneTaskPermits::admit(
             &admission,
             &pane_input,
-            PaneTaskKind::Write { bytes: too_large }
+            PaneMutationKind::Write { bytes: too_large }
         )
         .is_err());
         assert_eq!(admission.count_usage(CountClass::PaneInputItem), 0);
@@ -3119,7 +3182,7 @@ mod pane_removal_tests {
             ClientPaneTaskKind::Poll,
             Some(admission.try_count(CountClass::ClientPollJob, 1).unwrap()),
         );
-        let input_kind = PaneTaskKind::Input { bytes: 31 };
+        let input_kind = PaneMutationKind::Input { bytes: 31 };
         let pane_input = Arc::new(PaneInputAdmission::default());
         let input_permits = PaneTaskPermits::admit(&admission, &pane_input, input_kind).unwrap();
         let input_task = executor
@@ -3131,7 +3194,7 @@ mod pane_removal_tests {
             })
             .unwrap();
         let input = OwnedPaneTask {
-            kind: OwnedPaneTaskKind::Pane(input_kind),
+            kind: OwnedPaneTaskKind::Mutation(input_kind),
             task: input_task,
         };
         let close_permit = admission.try_count(CountClass::ClientRequest, 1).unwrap();

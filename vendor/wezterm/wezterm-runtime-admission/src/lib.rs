@@ -13,9 +13,6 @@ pub const MAX_INBOUND_REQUESTS_PER_ATTACHMENT: usize = 32;
 pub const MAX_INBOUND_REQUESTS_TOTAL: usize = 512;
 pub const MAX_SERVER_OUTPUT_ITEMS_PER_ATTACHMENT: usize = 256;
 pub const MAX_SERVER_OUTPUT_ITEMS_TOTAL: usize = 4_096;
-pub const MAX_CONTROL_NOTIFICATIONS_PER_ATTACHMENT: usize = 256;
-pub const MAX_CONTROL_NOTIFICATION_DELIVERIES_TOTAL: usize = 4_096;
-pub const MAX_CONTROL_EVENTS_PENDING_TOTAL: usize = 256;
 pub const MAX_CLIENT_REQUESTS: usize = 256;
 pub const MAX_CLIENT_REQUEST_BYTES_TOTAL: usize = 67_108_864;
 pub const MAX_LIFECYCLE_EVENTS: usize = 64;
@@ -35,7 +32,7 @@ pub const MAX_PANE_PUSH_JOBS_TOTAL: usize = 128;
 pub const MAX_CLIENT_FETCH_JOBS_TOTAL: usize = 128;
 pub const MAX_CLIENT_POLL_JOBS_TOTAL: usize = 128;
 pub const CLIENT_FIXED_RUNTIME_TASKS: usize = 4;
-pub const SERVER_FIXED_RUNTIME_TASKS: usize = 4;
+pub const SERVER_FIXED_RUNTIME_TASKS: usize = 3;
 pub const PROTOCOL_BOOTSTRAP_TIMEOUT_MS: u64 = 5_000;
 
 pub const MAX_WIRE_FRAME_BYTES: usize = 16_777_280;
@@ -131,7 +128,6 @@ pub enum RunnableProducer {
     ClientPollJob,
     ServerListener,
     ServerMuxExecutor,
-    ServerControlEventPublisher,
     PaneReader,
     PaneParser,
     PaneWriter,
@@ -142,7 +138,6 @@ pub enum RunnableProducer {
     Attachment,
     InboundRequest,
     ServerOutput,
-    ControlNotificationDelivery,
     GraceTimer,
     RejectionWriter,
 }
@@ -211,10 +206,6 @@ pub const SERVER_RUNNABLE_PRODUCERS: &[RunnableProducerTerm] = &[
         maximum: 1,
     },
     RunnableProducerTerm {
-        producer: RunnableProducer::ServerControlEventPublisher,
-        maximum: 1,
-    },
-    RunnableProducerTerm {
         producer: RunnableProducer::PaneLifecycleCoordinator,
         maximum: 1,
     },
@@ -267,10 +258,6 @@ pub const SERVER_RUNNABLE_PRODUCERS: &[RunnableProducerTerm] = &[
         maximum: MAX_SERVER_OUTPUT_ITEMS_TOTAL,
     },
     RunnableProducerTerm {
-        producer: RunnableProducer::ControlNotificationDelivery,
-        maximum: MAX_CONTROL_NOTIFICATION_DELIVERIES_TOTAL,
-    },
-    RunnableProducerTerm {
         producer: RunnableProducer::GraceTimer,
         maximum: MAX_GRACE_TIMERS_TOTAL,
     },
@@ -303,8 +290,6 @@ pub enum CountClass {
     Attachment,
     InboundRequest,
     ServerOutput,
-    ControlNotificationDelivery,
-    ControlEvent,
     ClientRequest,
     LifecycleEvent,
     PaneLifecycleEvent,
@@ -324,12 +309,10 @@ pub enum CountClass {
 }
 
 impl CountClass {
-    const ALL: [Self; 21] = [
+    const ALL: [Self; 19] = [
         Self::Attachment,
         Self::InboundRequest,
         Self::ServerOutput,
-        Self::ControlNotificationDelivery,
-        Self::ControlEvent,
         Self::ClientRequest,
         Self::LifecycleEvent,
         Self::PaneLifecycleEvent,
@@ -357,8 +340,6 @@ impl CountClass {
             Self::Attachment => MAX_ATTACHMENTS,
             Self::InboundRequest => MAX_INBOUND_REQUESTS_TOTAL,
             Self::ServerOutput => MAX_SERVER_OUTPUT_ITEMS_TOTAL,
-            Self::ControlNotificationDelivery => MAX_CONTROL_NOTIFICATION_DELIVERIES_TOTAL,
-            Self::ControlEvent => MAX_CONTROL_EVENTS_PENDING_TOTAL,
             Self::ClientRequest => MAX_CLIENT_REQUESTS,
             Self::LifecycleEvent => MAX_LIFECYCLE_EVENTS,
             Self::PaneLifecycleEvent => MAX_PANES,
@@ -974,8 +955,6 @@ const fn count_role(class: CountClass) -> Option<RuntimeRole> {
         CountClass::Attachment
         | CountClass::InboundRequest
         | CountClass::ServerOutput
-        | CountClass::ControlNotificationDelivery
-        | CountClass::ControlEvent
         | CountClass::GraceTimer
         | CountClass::RejectionWriter
         | CountClass::PanePushJob => Some(RuntimeRole::Server),
@@ -1017,13 +996,6 @@ fn validate_formulas(role: RuntimeRole) -> Result<(), AdmissionError> {
         != Some(MAX_SERVER_OUTPUT_ITEMS_TOTAL)
     {
         return Err(AdmissionError::InvalidFormula("server output fanout"));
-    }
-    if MAX_ATTACHMENTS.checked_mul(MAX_CONTROL_NOTIFICATIONS_PER_ATTACHMENT)
-        != Some(MAX_CONTROL_NOTIFICATION_DELIVERIES_TOTAL)
-    {
-        return Err(AdmissionError::InvalidFormula(
-            "control notification fanout",
-        ));
     }
     if MAX_PANES.checked_mul(MAX_PANE_INPUT_ITEMS_PER_PANE)
         != Some(CountClass::PaneInputItem.capacity_for_role(role))
@@ -1080,8 +1052,6 @@ const fn count_name(class: CountClass) -> &'static str {
         CountClass::Attachment => "attachments",
         CountClass::InboundRequest => "inbound requests",
         CountClass::ServerOutput => "server output items",
-        CountClass::ControlNotificationDelivery => "control notification deliveries",
-        CountClass::ControlEvent => "control events",
         CountClass::ClientRequest => "client requests",
         CountClass::LifecycleEvent => "lifecycle events",
         CountClass::PaneLifecycleEvent => "pane lifecycle events",

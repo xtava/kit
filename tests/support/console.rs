@@ -14,9 +14,8 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, ensure, Context, Result};
 use portable_pty::{native_pty_system, Child as PtyChild, CommandBuilder, MasterPty, PtySize};
 use wezterm_codec::{
-    ControlLeaseAction, ControlLeaseRequest, ControlLeaseResult, EnvironmentFreeCommand, GetLines,
-    GetPaneRenderableDimensions, KillPane, NonEmptyProgram, ServiceDrainAction,
-    ServiceDrainRequest, SpawnV2, TabSpawnDomain, TabSpawnPlacement,
+    EnvironmentFreeCommand, GetLines, GetPaneRenderableDimensions, KillPane, NonEmptyProgram,
+    ServiceDrainAction, ServiceDrainRequest, SpawnV2, TabSpawnDomain, TabSpawnPlacement,
 };
 use wezterm_config::UnixDomain;
 use wezterm_mux::client::ClientId;
@@ -761,22 +760,6 @@ impl HeadlessConsoleClient {
     }
 
     pub async fn close_pane(&self, pane_id: usize) -> Result<()> {
-        let control = bounded_rpc(
-            "taking control of Console pane",
-            self.client
-                .control_lease(ControlLeaseRequest { pane_id, action: ControlLeaseAction::Take }),
-        )
-        .await?
-        .into_inner();
-        ensure!(
-            matches!(
-                control,
-                ControlLeaseResult::Taken(_)
-                    | ControlLeaseResult::Acquired(_)
-                    | ControlLeaseResult::AlreadyController(_)
-            ),
-            "Console verifier could not take pane control: {control:?}"
-        );
         bounded_rpc("closing Console pane", self.client.kill_pane(KillPane { pane_id })).await?;
         Ok(())
     }

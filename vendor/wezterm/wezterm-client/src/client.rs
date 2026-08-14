@@ -64,152 +64,6 @@ struct PreparedClientRequest {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PaneControlStatus {
-    AwaitingSnapshot,
-    Uncontrolled,
-    Controller,
-    Observer,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ControlReduction {
-    NotControl,
-    Applied,
-    Discarded,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SequenceReduction {
-    Applied,
-    Discarded,
-}
-
-#[derive(Debug, Error, Eq, PartialEq)]
-enum ControlTrackingError {
-    #[error("received a control change before its initial snapshot")]
-    ChangeBeforeSnapshot,
-    #[error("control sequence gap: expected {expected}, received {actual}")]
-    SequenceGap { expected: u64, actual: u64 },
-    #[error("control sequence overflow after {current}, received {actual}")]
-    SequenceOverflow { current: u64, actual: u64 },
-}
-
-#[derive(Default)]
-struct AttachmentControlTracker {
-    snapshot: Mutex<Option<ControlSnapshot>>,
-}
-
-impl AttachmentControlTracker {
-    fn begin_connection(&self) {
-        *self.snapshot.lock().unwrap() = None;
-    }
-
-    fn pane_status(&self, pane_id: PaneId) -> PaneControlStatus {
-        let snapshot = self.snapshot.lock().unwrap();
-        let Some(snapshot) = snapshot.as_ref() else {
-            return PaneControlStatus::AwaitingSnapshot;
-        };
-        match snapshot
-            .state
-            .active
-            .iter()
-            .find(|lease| lease.pane_id == pane_id)
-        {
-            None => PaneControlStatus::Uncontrolled,
-            Some(lease) if lease.controller == snapshot.attachment_identity => {
-                PaneControlStatus::Controller
-            }
-            Some(_) => PaneControlStatus::Observer,
-        }
-    }
-
-    fn reduce(&self, pdu: &Pdu) -> Result<ControlReduction, ControlTrackingError> {
-        match pdu {
-            Pdu::ControlSnapshot(snapshot) => self.reduce_snapshot(snapshot.clone()),
-            Pdu::ControlChanged(changed) => self.reduce_change(changed),
-            _ => Ok(ControlReduction::NotControl),
-        }
-    }
-
-    fn reduce_snapshot(
-        &self,
-        incoming: ControlSnapshot,
-    ) -> Result<ControlReduction, ControlTrackingError> {
-        let mut current = self.snapshot.lock().unwrap();
-        let Some(snapshot) = current.as_ref() else {
-            *current = Some(incoming);
-            return Ok(ControlReduction::Applied);
-        };
-        match next_control_sequence(snapshot.state.sequence, incoming.state.sequence)? {
-            SequenceReduction::Discarded => Ok(ControlReduction::Discarded),
-            SequenceReduction::Applied => {
-                *current = Some(incoming);
-                Ok(ControlReduction::Applied)
-            }
-        }
-    }
-
-    fn reduce_change(
-        &self,
-        incoming: &ControlChanged,
-    ) -> Result<ControlReduction, ControlTrackingError> {
-        let mut current = self.snapshot.lock().unwrap();
-        let snapshot = current
-            .as_mut()
-            .ok_or(ControlTrackingError::ChangeBeforeSnapshot)?;
-        match next_control_sequence(snapshot.state.sequence, incoming.state.sequence)? {
-            SequenceReduction::Discarded => Ok(ControlReduction::Discarded),
-            SequenceReduction::Applied => {
-                snapshot.state = incoming.state.clone();
-                Ok(ControlReduction::Applied)
-            }
-        }
-    }
-
-    fn reduce_authoritative_state(
-        &self,
-        incoming: ControlLeaseState,
-    ) -> Result<ControlReduction, ControlTrackingError> {
-        let mut current = self.snapshot.lock().unwrap();
-        let snapshot = current
-            .as_mut()
-            .ok_or(ControlTrackingError::ChangeBeforeSnapshot)?;
-        if incoming.sequence <= snapshot.state.sequence {
-            return Ok(ControlReduction::Discarded);
-        }
-        snapshot.state = incoming;
-        Ok(ControlReduction::Applied)
-    }
-}
-
-fn next_control_sequence(
-    current: u64,
-    incoming: u64,
-) -> Result<SequenceReduction, ControlTrackingError> {
-    if current == u64::MAX {
-        return if incoming == current {
-            Ok(SequenceReduction::Discarded)
-        } else {
-            Err(ControlTrackingError::SequenceOverflow {
-                current,
-                actual: incoming,
-            })
-        };
-    }
-    if incoming <= current {
-        return Ok(SequenceReduction::Discarded);
-    }
-    let expected = current + 1;
-    if incoming != expected {
-        return Err(ControlTrackingError::SequenceGap {
-            expected,
-            actual: incoming,
-        });
-    }
-    Ok(SequenceReduction::Applied)
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HeadlessConnectionFailure {
     Transport,
     PromptRequired,
@@ -588,7 +442,6 @@ pub struct Client {
     sender: Sender<ReaderMessage>,
     runtime: Arc<ClientRuntime>,
     admission: Arc<RuntimeAdmission>,
-    control: Arc<AttachmentControlTracker>,
     presentation: ConnectionPresentation,
     local_domain_id: Option<DomainId>,
     pub client_id: ClientId,
@@ -791,12 +644,8 @@ async fn process_unilateral_async(
 
 fn process_unilateral(
     local_domain_id: Option<DomainId>,
-    control: &AttachmentControlTracker,
     notification: AdmittedNotification,
 ) -> anyhow::Result<()> {
-    if control.reduce(notification.pdu())? != ControlReduction::NotControl {
-        return Ok(());
-    }
     let Some(local_domain_id) = local_domain_id else {
         log::trace!(
             "client doesn't have a real local domain, so unilateral message cannot be processed"
@@ -852,7 +701,6 @@ struct ClientBootstrap {
     server_build_identity: BuildIdentity,
     next_serial: u64,
     resume_token: AttachmentResumeToken,
-    control_snapshot: ControlSnapshot,
 }
 
 async fn read_server_pdu_async<R, F>(
@@ -906,7 +754,7 @@ where
         }
         if response.serial() == 0 {
             // Broadcasts can race with a new connection before SetClientId completes. The
-            // post-bootstrap ListPanes/control snapshots supersede those pre-registration
+            // post-bootstrap ListPanes state supersedes those pre-registration
             // notifications, so consume them here instead of misclassifying them as the reply.
             log::trace!(
                 "discarding pre-registration {} notification during bootstrap",
@@ -1029,9 +877,6 @@ where
     let confirmed_resume_token = registration
         .resume_token
         .ok_or_else(|| anyhow!("server registration omitted the attachment resume capability"))?;
-    let control_snapshot = registration
-        .control_snapshot
-        .ok_or_else(|| anyhow!("server registration omitted the initial control snapshot"))?;
     anyhow::ensure!(
         confirmed_resume_token.eq(resume_token),
         "server confirmed a different attachment resume capability"
@@ -1043,14 +888,12 @@ where
         server_build_identity: build.identity,
         next_serial: 4,
         resume_token: confirmed_resume_token,
-        control_snapshot,
     })
 }
 
 fn client_thread(
     reconnectable: &mut Reconnectable,
     local_domain_id: Option<DomainId>,
-    control: &AttachmentControlTracker,
     rx: &mut Receiver<ReaderMessage>,
     cancellation: &ClientCancelWaiter,
     next_serial: u64,
@@ -1059,7 +902,6 @@ fn client_thread(
     block_on(client_thread_async(
         reconnectable,
         local_domain_id,
-        control,
         rx,
         cancellation,
         next_serial,
@@ -1070,7 +912,6 @@ fn client_thread(
 async fn client_thread_async(
     reconnectable: &mut Reconnectable,
     local_domain_id: Option<DomainId>,
-    control: &AttachmentControlTracker,
     rx: &mut Receiver<ReaderMessage>,
     cancellation: &ClientCancelWaiter,
     mut next_serial: u64,
@@ -1175,7 +1016,7 @@ async fn client_thread_async(
                         );
                         if decoded.serial() == 0 {
                             let notification = decoded.into_notification()?;
-                            process_unilateral(local_domain_id, control, notification)
+                            process_unilateral(local_domain_id, notification)
                                 .context("processing unilateral PDU from server")
                                 .map_err(|e| {
                                     log::error!("process_unilateral: {:?}", e);
@@ -1856,7 +1697,6 @@ trait ClientRuntimeConnection: Send {
     fn run_connected_session(
         &mut self,
         local_domain_id: Option<DomainId>,
-        control: &AttachmentControlTracker,
         receiver: &mut Receiver<ReaderMessage>,
         cancellation: &ClientCancelWaiter,
         next_serial: u64,
@@ -1918,7 +1758,6 @@ impl ClientRuntimeConnection for Reconnectable {
     fn run_connected_session(
         &mut self,
         local_domain_id: Option<DomainId>,
-        control: &AttachmentControlTracker,
         receiver: &mut Receiver<ReaderMessage>,
         cancellation: &ClientCancelWaiter,
         next_serial: u64,
@@ -1927,7 +1766,6 @@ impl ClientRuntimeConnection for Reconnectable {
         client_thread(
             self,
             local_domain_id,
-            control,
             receiver,
             cancellation,
             next_serial,
@@ -2112,7 +1950,6 @@ fn publish_detached_and_schedule_cleanup(
 
 struct ClientRuntimeRun<'a> {
     local_domain_id: Option<DomainId>,
-    control: Arc<AttachmentControlTracker>,
     receiver: Receiver<ReaderMessage>,
     presentation: ConnectionPresentation,
     cancellation: ClientCancelWaiter,
@@ -2133,7 +1970,6 @@ fn run_client_runtime<C: ClientRuntimeConnection>(
 ) -> ClientRuntimeOutcome {
     let ClientRuntimeRun {
         local_domain_id,
-        control,
         mut receiver,
         presentation,
         cancellation,
@@ -2305,7 +2141,6 @@ fn run_client_runtime<C: ClientRuntimeConnection>(
         server_build_identity: initial_server_build_identity,
         mut next_serial,
         mut resume_token,
-        control_snapshot,
     } = initial_bootstrap;
     if initial_server_version.set(server_version).is_err() {
         let _ = initial_ready.try_send(Err(anyhow!(
@@ -2322,19 +2157,6 @@ fn run_client_runtime<C: ClientRuntimeConnection>(
         };
     }
     *server_build_identity.lock().unwrap() = Some(initial_server_build_identity);
-    control.begin_connection();
-    if let Err(error) = control.reduce_snapshot(control_snapshot) {
-        let _ = initial_ready.try_send(Err(error.into()));
-        return match local_domain_id {
-            Some(domain_id) => fail_runtime_and_schedule_cleanup(
-                host,
-                domain_id,
-                &presentation,
-                HeadlessConnectionFailure::Runtime,
-            ),
-            None => publish_terminal_failure(&presentation, HeadlessConnectionFailure::Runtime),
-        };
-    }
     if initial_ready.try_send(Ok(())).is_err() {
         return publish_detached_and_schedule_cleanup(
             host,
@@ -2348,7 +2170,6 @@ fn run_client_runtime<C: ClientRuntimeConnection>(
     loop {
         match connection.run_connected_session(
             local_domain_id,
-            &control,
             &mut receiver,
             &cancellation,
             next_serial,
@@ -2478,15 +2299,6 @@ fn run_client_runtime<C: ClientRuntimeConnection>(
                         Some(bootstrap.server_build_identity.clone());
                     next_serial = bootstrap.next_serial;
                     resume_token = bootstrap.resume_token;
-                    control.begin_connection();
-                    if control.reduce_snapshot(bootstrap.control_snapshot).is_err() {
-                        return fail_runtime_and_schedule_cleanup(
-                            host,
-                            domain_id,
-                            &reconnect_presentation,
-                            HeadlessConnectionFailure::Runtime,
-                        );
-                    }
                     if let Err(_error) = host.schedule_reattach(
                         domain_id,
                         reconnect_presentation.clone(),
@@ -2554,8 +2366,6 @@ impl Client {
             .map_err(|error| anyhow!("generating attachment resume capability: {error}"))?;
         let worker_attachment_resume_token =
             AttachmentResumeToken::from_random_bytes(resume_token_bytes);
-        let control = Arc::new(AttachmentControlTracker::default());
-        let worker_control = Arc::clone(&control);
         let initial_server_version = Arc::new(OnceLock::new());
         let worker_initial_server_version = Arc::clone(&initial_server_version);
         let server_build_identity = Arc::new(Mutex::new(None));
@@ -2569,7 +2379,6 @@ impl Client {
                 reconnectable,
                 ClientRuntimeRun {
                     local_domain_id,
-                    control: worker_control,
                     receiver,
                     presentation: worker_presentation,
                     cancellation,
@@ -2591,7 +2400,6 @@ impl Client {
                 sender,
                 runtime,
                 admission,
-                control,
                 presentation,
                 local_domain_id,
                 is_reconnectable,
@@ -2628,10 +2436,6 @@ impl Client {
 
     pub fn shutdown_and_join(&self) -> ClientRuntimeOutcome {
         self.runtime.shutdown_and_join()
-    }
-
-    pub fn pane_control_status(&self, pane_id: PaneId) -> PaneControlStatus {
-        self.control.pane_status(pane_id)
     }
 
     pub(crate) fn publish_ready(&self) -> Result<(), HeadlessLifecycleError> {
@@ -2899,43 +2703,6 @@ impl Client {
     }
 
     rpc!(ping, Ping = (), Pong);
-    pub fn control_lease(
-        &self,
-        pdu: ControlLeaseRequest,
-    ) -> impl std::future::Future<Output = anyhow::Result<AdmittedRpcResponse<ControlLeaseResult>>>
-           + Send
-           + 'static {
-        let start = std::time::Instant::now();
-        let request = self.send_pdu(Pdu::ControlLeaseRequest(pdu));
-        let control = Arc::clone(&self.control);
-        async move {
-            let response = request.await;
-            let elapsed = start.elapsed();
-            metrics::histogram!("rpc", "method" => "control_lease").record(elapsed);
-            metrics::counter!("rpc.count", "method" => "control_lease").increment(1);
-            match response {
-                Ok(response) => response.try_map(move |pdu| match pdu {
-                    Pdu::ControlLeaseResult(result) => {
-                        let state = match &result {
-                            ControlLeaseResult::Acquired(state)
-                            | ControlLeaseResult::AlreadyController(state)
-                            | ControlLeaseResult::Observing(state)
-                            | ControlLeaseResult::Taken(state)
-                            | ControlLeaseResult::Released(state)
-                            | ControlLeaseResult::NotController(state) => Some(state),
-                            ControlLeaseResult::Overloaded => None,
-                        };
-                        if let Some(state) = state {
-                            control.reduce_authoritative_state(state.clone())?;
-                        }
-                        Ok(result)
-                    }
-                    unexpected => bail!("unexpected response {unexpected:?}"),
-                }),
-                Err(error) => Err(error),
-            }
-        }
-    }
     rpc!(service_drain, ServiceDrainRequest, ServiceDrainResult);
     rpc!(list_panes, ListPanes = (), ListPanesResponse);
     rpc!(spawn_v2, SpawnV2, SpawnResponse);
@@ -2991,181 +2758,8 @@ impl Client {
 mod admission_tests {
     use super::*;
     use std::io::Cursor;
-    use std::num::NonZeroU64;
     use std::sync::atomic::AtomicUsize;
     use wezterm_runtime_admission::RuntimeRole;
-
-    fn attachment_identity(value: u64) -> AttachmentIdentity {
-        AttachmentIdentity::from_server_sequence(NonZeroU64::new(value).unwrap())
-    }
-
-    fn control_state(
-        sequence: u64,
-        active: impl IntoIterator<Item = (PaneId, AttachmentIdentity)>,
-    ) -> ControlLeaseState {
-        ControlLeaseState {
-            sequence,
-            active: active
-                .into_iter()
-                .map(|(pane_id, controller)| ActiveControlLease {
-                    pane_id,
-                    controller,
-                })
-                .collect(),
-        }
-    }
-
-    fn control_snapshot(
-        identity: AttachmentIdentity,
-        sequence: u64,
-        active: impl IntoIterator<Item = (PaneId, AttachmentIdentity)>,
-    ) -> Pdu {
-        Pdu::ControlSnapshot(ControlSnapshot {
-            attachment_identity: identity,
-            state: control_state(sequence, active),
-        })
-    }
-
-    fn control_change(
-        sequence: u64,
-        active: impl IntoIterator<Item = (PaneId, AttachmentIdentity)>,
-    ) -> Pdu {
-        Pdu::ControlChanged(ControlChanged {
-            state: control_state(sequence, active),
-        })
-    }
-
-    #[test]
-    fn delayed_baseline_after_live_switch_is_discarded() {
-        let tracker = AttachmentControlTracker::default();
-        let first = attachment_identity(1);
-        let second = attachment_identity(2);
-        tracker.begin_connection();
-        assert_eq!(
-            tracker.reduce(&control_snapshot(first, 5, [(7, first)])),
-            Ok(ControlReduction::Applied)
-        );
-        assert_eq!(
-            tracker.reduce(&control_snapshot(second, 6, [(7, second)])),
-            Ok(ControlReduction::Applied)
-        );
-        assert_eq!(
-            tracker.reduce(&control_snapshot(first, 5, [(7, second)])),
-            Ok(ControlReduction::Discarded)
-        );
-        assert_eq!(tracker.pane_status(7), PaneControlStatus::Controller);
-    }
-
-    #[test]
-    fn duplicate_control_change_is_discarded_without_replacing_state() {
-        let tracker = AttachmentControlTracker::default();
-        let first = attachment_identity(1);
-        let second = attachment_identity(2);
-        tracker.begin_connection();
-        tracker
-            .reduce(&control_snapshot(first, 1, std::iter::empty()))
-            .unwrap();
-        assert_eq!(
-            tracker.reduce(&control_change(2, [(7, first)])),
-            Ok(ControlReduction::Applied)
-        );
-        assert_eq!(
-            tracker.reduce(&control_change(2, [(7, second)])),
-            Ok(ControlReduction::Discarded)
-        );
-        assert_eq!(tracker.pane_status(7), PaneControlStatus::Controller);
-    }
-
-    #[test]
-    fn authoritative_rpc_state_may_skip_notifications_and_discards_late_changes() {
-        let tracker = AttachmentControlTracker::default();
-        let identity = attachment_identity(1);
-        tracker.begin_connection();
-        tracker
-            .reduce(&control_snapshot(identity, 1, std::iter::empty()))
-            .unwrap();
-
-        assert_eq!(
-            tracker.reduce_authoritative_state(control_state(4, [(7, identity)])),
-            Ok(ControlReduction::Applied)
-        );
-        assert_eq!(tracker.pane_status(7), PaneControlStatus::Controller);
-        assert_eq!(
-            tracker.reduce(&control_change(2, std::iter::empty())),
-            Ok(ControlReduction::Discarded)
-        );
-        assert_eq!(tracker.pane_status(7), PaneControlStatus::Controller);
-    }
-
-    #[test]
-    fn forward_control_sequence_gap_fails_the_session() {
-        let tracker = AttachmentControlTracker::default();
-        let identity = attachment_identity(1);
-        tracker.begin_connection();
-        tracker
-            .reduce(&control_snapshot(identity, 10, std::iter::empty()))
-            .unwrap();
-        assert_eq!(
-            tracker.reduce(&control_change(12, std::iter::empty())),
-            Err(ControlTrackingError::SequenceGap {
-                expected: 11,
-                actual: 12
-            })
-        );
-    }
-
-    #[test]
-    fn wrapped_control_sequence_fails_as_overflow() {
-        let tracker = AttachmentControlTracker::default();
-        let identity = attachment_identity(1);
-        tracker.begin_connection();
-        tracker
-            .reduce(&control_snapshot(identity, u64::MAX, std::iter::empty()))
-            .unwrap();
-        assert_eq!(
-            tracker.reduce(&control_change(0, std::iter::empty())),
-            Err(ControlTrackingError::SequenceOverflow {
-                current: u64::MAX,
-                actual: 0
-            })
-        );
-    }
-
-    #[test]
-    fn takeover_updates_typed_controller_status() {
-        let tracker = AttachmentControlTracker::default();
-        let first = attachment_identity(1);
-        let second = attachment_identity(2);
-        tracker.begin_connection();
-        tracker
-            .reduce(&control_snapshot(first, 0, [(7, first)]))
-            .unwrap();
-        assert_eq!(tracker.pane_status(7), PaneControlStatus::Controller);
-        tracker.reduce(&control_change(1, [(7, second)])).unwrap();
-        assert_eq!(tracker.pane_status(7), PaneControlStatus::Observer);
-        tracker
-            .reduce(&control_change(2, std::iter::empty()))
-            .unwrap();
-        assert_eq!(tracker.pane_status(7), PaneControlStatus::Uncontrolled);
-    }
-
-    #[test]
-    fn reconnect_preserves_attachment_identity_and_control() {
-        let tracker = AttachmentControlTracker::default();
-        let identity = attachment_identity(1);
-        tracker.begin_connection();
-        tracker
-            .reduce(&control_snapshot(identity, 9, [(7, identity)]))
-            .unwrap();
-        assert_eq!(tracker.pane_status(7), PaneControlStatus::Controller);
-
-        tracker.begin_connection();
-        assert_eq!(tracker.pane_status(7), PaneControlStatus::AwaitingSnapshot);
-        tracker
-            .reduce(&control_snapshot(identity, 9, [(7, identity)]))
-            .unwrap();
-        assert_eq!(tracker.pane_status(7), PaneControlStatus::Controller);
-    }
 
     #[derive(Debug)]
     struct ScriptedBootstrapStream {
@@ -3327,17 +2921,12 @@ mod admission_tests {
                 },
                 next_serial: 4,
                 resume_token: resume_token.clone(),
-                control_snapshot: ControlSnapshot {
-                    attachment_identity: attachment_identity(1),
-                    state: control_state(0, std::iter::empty()),
-                },
             })
         }
 
         fn run_connected_session(
             &mut self,
             _local_domain_id: Option<DomainId>,
-            _control: &AttachmentControlTracker,
             _receiver: &mut Receiver<ReaderMessage>,
             cancellation: &ClientCancelWaiter,
             next_serial: u64,
@@ -3426,10 +3015,6 @@ mod admission_tests {
         let issued_resume_token = resume_token(11);
         Pdu::SetClientIdResponse(SetClientIdResponse {
             resume_token: Some(issued_resume_token.clone()),
-            control_snapshot: Some(ControlSnapshot {
-                attachment_identity: attachment_identity(1),
-                state: control_state(0, std::iter::empty()),
-            }),
         })
         .encode(&mut readable, 3, &admission)
         .unwrap();
@@ -3456,11 +3041,6 @@ mod admission_tests {
         assert_eq!(bootstrap.server_build_identity, expected_build_identity);
         assert_eq!(bootstrap.next_serial, 4);
         assert_eq!(bootstrap.resume_token, issued_resume_token);
-        assert_eq!(
-            bootstrap.control_snapshot.attachment_identity,
-            attachment_identity(1)
-        );
-        assert_eq!(bootstrap.control_snapshot.state.sequence, 0);
         let mut written = stream.written.as_slice();
         for (serial, expected_tag) in [
             (1, PduTag::GetCodecVersion),
@@ -3576,10 +3156,6 @@ mod admission_tests {
         .unwrap();
         Pdu::SetClientIdResponse(SetClientIdResponse {
             resume_token: Some(issued_resume_token.clone()),
-            control_snapshot: Some(ControlSnapshot {
-                attachment_identity: attachment_identity(1),
-                state: control_state(0, std::iter::empty()),
-            }),
         })
         .encode(&mut readable, 3, &admission)
         .unwrap();
@@ -3737,7 +3313,6 @@ mod admission_tests {
         let (_cancellation, waiter) = ClientCancellation::pair();
         let (initial_ready, initial_ready_receiver) = bounded(1);
         let attachment_resume_token = resume_token(20);
-        let control = Arc::new(AttachmentControlTracker::default());
         let bootstrap_request_permit = reserve_client_request(&admission).unwrap();
 
         assert_eq!(
@@ -3745,7 +3320,6 @@ mod admission_tests {
                 connection,
                 ClientRuntimeRun {
                     local_domain_id: Some(1),
-                    control: Arc::clone(&control),
                     receiver,
                     presentation,
                     cancellation: waiter,
@@ -3765,7 +3339,6 @@ mod admission_tests {
         assert!(block_on(initial_ready_receiver.recv()).unwrap().is_ok());
         assert_eq!(bootstraps.load(Ordering::Acquire), 2);
         assert_eq!(connects.load(Ordering::Acquire), 1);
-        assert_eq!(control.pane_status(7), PaneControlStatus::Uncontrolled);
         assert_eq!(
             bootstrap_resume_tokens.lock().unwrap().as_slice(),
             &[
@@ -3805,7 +3378,6 @@ mod admission_tests {
                 connection,
                 ClientRuntimeRun {
                     local_domain_id: Some(1),
-                    control: Arc::new(AttachmentControlTracker::default()),
                     receiver,
                     presentation,
                     cancellation: waiter,
@@ -3887,7 +3459,6 @@ mod admission_tests {
                 connection,
                 ClientRuntimeRun {
                     local_domain_id: Some(1),
-                    control: Arc::new(AttachmentControlTracker::default()),
                     receiver,
                     presentation,
                     cancellation: waiter,
@@ -3944,7 +3515,6 @@ mod admission_tests {
                 connection,
                 ClientRuntimeRun {
                     local_domain_id: Some(1),
-                    control: Arc::new(AttachmentControlTracker::default()),
                     receiver,
                     presentation,
                     cancellation,

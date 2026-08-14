@@ -31,15 +31,12 @@ use crate::tui::{
 
 use super::activity::{AgentActivity, AgentPresentation};
 use super::client::{
-    ConnectionHealth, ConnectionState, ConsoleClient, ConsoleSnapshot, SessionControl, SessionId,
-    SessionView, TerminalContentGeometry, TerminalView,
+    stable_row_offset, ConnectionHealth, ConnectionState, ConsoleClient, ConsoleSnapshot,
+    SessionId, SessionView, TerminalContentGeometry, TerminalView,
 };
 use super::config::{Config, Keybindings, ReadyNotification};
 use super::control_center::ConnectedSessionOutcome;
-use super::interaction::{
-    resolve_control, ControlIntent, ControlOperation, InteractionDecision, LayoutPreference,
-    SessionAccess,
-};
+use super::interaction::LayoutPreference;
 use super::invalidation::ConsoleInvalidations;
 use super::panels::{
     visible_panel_slots, FocusSurface, PanelSlot, PanelWorkspace, SelectionChange,
@@ -66,9 +63,6 @@ const ACTIVATE: ActionId = ActionId::new("console.activate");
 const DISMISS: ActionId = ActionId::new("console.dismiss");
 const RENAME_SESSION: ActionId = ActionId::new("console.session.rename");
 const CLOSE_SESSION: ActionId = ActionId::new("console.session.close");
-const RELEASE_CONTROL: ActionId = ActionId::new("console.session.releaseControl");
-const TAKE_CONTROL: ActionId = ActionId::new("console.session.takeControl");
-const PRIMARY_CONTROL: ActionId = ActionId::new("console.session.primaryControl");
 const COPY_VISIBLE: ActionId = ActionId::new("console.terminal.copyVisible");
 const OPEN_SEARCH: ActionId = ActionId::new("console.terminal.search");
 const SPLIT_PANEL: ActionId = ActionId::new("console.panel.split");
@@ -177,9 +171,6 @@ enum ConsoleAction {
     Dismiss,
     RenameSession,
     CloseSession,
-    ReleaseControl,
-    TakeControl,
-    PrimaryControl,
     CopyVisibleTerminal,
     OpenSearch,
     SplitPanel,
@@ -213,16 +204,13 @@ enum ConsoleAction {
 }
 
 impl ConsoleAction {
-    const ALL: [Self; 39] = [
+    const ALL: [Self; 36] = [
         Self::SelectSession,
         Self::CreateSession,
         Self::Activate,
         Self::Dismiss,
         Self::RenameSession,
         Self::CloseSession,
-        Self::ReleaseControl,
-        Self::TakeControl,
-        Self::PrimaryControl,
         Self::CopyVisibleTerminal,
         Self::OpenSearch,
         Self::SplitPanel,
@@ -263,9 +251,6 @@ impl ConsoleAction {
             Self::Dismiss => DISMISS,
             Self::RenameSession => RENAME_SESSION,
             Self::CloseSession => CLOSE_SESSION,
-            Self::ReleaseControl => RELEASE_CONTROL,
-            Self::TakeControl => TAKE_CONTROL,
-            Self::PrimaryControl => PRIMARY_CONTROL,
             Self::CopyVisibleTerminal => COPY_VISIBLE,
             Self::OpenSearch => OPEN_SEARCH,
             Self::SplitPanel => SPLIT_PANEL,
@@ -307,9 +292,6 @@ impl ConsoleAction {
             Self::Dismiss => "Dismiss",
             Self::RenameSession => "Rename session",
             Self::CloseSession => "Close session",
-            Self::ReleaseControl => "Detach / release control",
-            Self::TakeControl => "Take control",
-            Self::PrimaryControl => "Acquire / release / take control",
             Self::CopyVisibleTerminal => "Copy visible terminal",
             Self::OpenSearch => "Search terminal",
             Self::SplitPanel => "Split terminal panel",
@@ -352,8 +334,6 @@ impl ConsoleAction {
             Self::NextSession => ("Session", 10, 50),
             Self::HistoryBack => ("Session", 10, 60),
             Self::HistoryForward => ("Session", 10, 70),
-            Self::ReleaseControl => ("Control", 20, 10),
-            Self::TakeControl => ("Control", 20, 20),
             Self::CopyVisibleTerminal => ("Terminal", 30, 10),
             Self::OpenSearch => ("Terminal", 30, 20),
             Self::SplitPanel => ("Terminal", 30, 30),
@@ -378,7 +358,6 @@ impl ConsoleAction {
             Self::SelectSession
             | Self::Activate
             | Self::Dismiss
-            | Self::PrimaryControl
             | Self::FocusTerminal
             | Self::ScrollLineUp
             | Self::ScrollLineDown
@@ -392,7 +371,6 @@ impl ConsoleAction {
 #[derive(Clone, Copy)]
 struct ConsoleActionContext {
     target: Option<SessionId>,
-    target_access: Option<SessionAccess>,
     selected: Option<SessionId>,
     selected_index: Option<usize>,
     session_count: usize,
@@ -420,14 +398,10 @@ struct ConsoleActionContext {
 enum Effect {
     None,
     ProjectTerminal,
-    ReconcileTopology,
     RetryConnection,
     Create { cols: u16, rows: u16 },
     Rename { id: SessionId, title: String },
     Close(SessionId),
-    AcquireControl(SessionId),
-    ReleaseControl(SessionId),
-    TakeControl(SessionId),
     Copy(String),
     PreviewNotification,
     SendKey(KeyEvent),
@@ -670,31 +644,12 @@ impl App {
         if !restore_terminal_focus {
             return Ok(());
         }
-        let Some((replacement_id, replacement_access)) =
-            self.focused_session().map(|session| (session.id, session_access(session)))
-        else {
+        let Some(replacement_id) = self.focused_session().map(|session| session.id) else {
             let _ = self.workspace.focus_sessions();
             return Ok(());
         };
-        match replacement_access {
-            SessionAccess::Available | SessionAccess::Synchronizing => {
-                self.client.acquire_control(replacement_id).await?;
-                let _ = self.workspace.focus_selected_terminal();
-                if let Some(session) =
-                    self.snapshot.sessions.iter_mut().find(|session| session.id == replacement_id)
-                {
-                    session.control = super::client::SessionControl::Controller;
-                }
-            }
-            SessionAccess::ControlledBySelf => {
-                let _ = self.workspace.focus_selected_terminal();
-            }
-            SessionAccess::ControlledByOther => {
-                let _ = self.workspace.focus_sessions();
-                self.notice =
-                    Some("Focused session closed; the replacement is controlled elsewhere".into());
-            }
-        }
+        let _ = replacement_id;
+        let _ = self.workspace.focus_selected_terminal();
         Ok(())
     }
 
@@ -788,6 +743,7 @@ impl App {
         if health.generation >= self.connection_generation {
             if health.generation > self.connection_generation {
                 self.client.reset_activity();
+                self.workspace.reset_viewport_announcements();
                 for session in &mut self.snapshot.sessions {
                     session.agent = None;
                 }
@@ -963,27 +919,34 @@ impl App {
 
     fn resize_requests(&mut self, regions: &UiRegions) -> Vec<(usize, usize, u16, u16)> {
         let mut requests = Vec::new();
+        for slot in PanelSlot::ALL {
+            let visible = regions.terminals.iter().any(|region| region.slot == slot);
+            if !visible {
+                if let Some(panel) = self.workspace.panel_mut(slot) {
+                    panel.observe_viewport_visibility(false);
+                }
+            }
+        }
         for region in &regions.terminals {
             let session_id = self.workspace.session_id(region.slot);
             let values = session_id
                 .and_then(|id| self.session(id))
                 .zip(self.panel_terminal(region.slot))
-                .map(|(session, terminal)| (session.control, session.tab_id, terminal.pane_id));
+                .map(|(session, terminal)| (session.tab_id, terminal.pane_id));
             let Some(panel) = self.workspace.panel_mut(region.slot) else {
                 continue;
             };
-            let last_terminal_size = panel.last_terminal_size_mut();
-            let Some((control, tab_id, pane_id)) = values else {
-                *last_terminal_size = None;
+            let Some((tab_id, pane_id)) = values else {
                 continue;
             };
             let content = region.content;
-            if control != SessionControl::Controller || content.width == 0 || content.height == 0 {
-                *last_terminal_size = None;
+            if content.width == 0 || content.height == 0 {
                 continue;
             }
+            let became_visible = panel.observe_viewport_visibility(true);
+            let last_terminal_size = panel.last_terminal_size_mut();
             let observed = (pane_id, content.width, content.height);
-            if *last_terminal_size != Some(observed) {
+            if became_visible || *last_terminal_size != Some(observed) {
                 *last_terminal_size = Some(observed);
                 requests.push((tab_id, pane_id, content.width, content.height));
             }
@@ -998,7 +961,6 @@ impl App {
         requested_ratio: Option<SplitRatio>,
     ) -> ConsoleActionContext {
         let target = target.or(self.focused_session_id());
-        let target_access = target.and_then(|id| self.session(id)).map(session_access);
         let (create_cols, create_rows) = regions.create_size();
         let focused_panel = self.workspace.focused_slot();
         let visible_rows =
@@ -1013,7 +975,6 @@ impl App {
         let active_region = self.active_region();
         ConsoleActionContext {
             target,
-            target_access,
             selected: self.focused_session_id(),
             selected_index: self.selected_index(),
             session_count: self.snapshot.sessions.len(),
@@ -1061,9 +1022,8 @@ impl App {
         invocation: ActionInvocation<ConsoleActionContext>,
         regions: &UiRegions,
     ) -> Result<Effect> {
-        // Context menus intentionally retain only their semantic target. Every invocation is
-        // rehydrated from the latest snapshot so a frame rendered as `release` cannot release a
-        // lease that changed to observer before the click was dispatched.
+        // Context menus retain only their semantic target. Rehydrate every invocation from the
+        // latest snapshot so stale rendered availability never authorizes a changed target.
         let context = self.action_context(
             invocation.context.target,
             regions,
@@ -1110,14 +1070,6 @@ impl App {
             }
             ConsoleAction::CloseSession => {
                 context.target.map(Effect::Close).unwrap_or(Effect::None)
-            }
-            ConsoleAction::ReleaseControl => {
-                self.control_intent(context.target, ControlIntent::Release)
-            }
-            ConsoleAction::TakeControl => self.control_intent(context.target, ControlIntent::Take),
-            ConsoleAction::PrimaryControl => {
-                let _ = context.target.is_some_and(|id| self.select(id));
-                self.control_intent(context.target, ControlIntent::Primary)
             }
             ConsoleAction::CopyVisibleTerminal => self
                 .selected_or_visible_terminal_text(context.visible_rows)
@@ -1270,7 +1222,12 @@ impl App {
 
     fn activate(&mut self, context: ConsoleActionContext) -> Effect {
         match &mut self.surface {
-            Surface::Normal => self.control_intent(context.selected, ControlIntent::Activate),
+            Surface::Normal => {
+                if context.selected.is_some() {
+                    let _ = self.workspace.focus_selected_terminal();
+                }
+                Effect::None
+            }
             Surface::Rename { id, input } => {
                 let id = *id;
                 let Some(title) = validated_rename(input) else {
@@ -1302,32 +1259,6 @@ impl App {
             }
             Err(error) => {
                 self.notice = Some(format!("Could not reload Console settings: {error:#}"));
-            }
-        }
-    }
-
-    fn control_intent(&mut self, target: Option<SessionId>, intent: ControlIntent) -> Effect {
-        let Some(id) = target else {
-            return Effect::None;
-        };
-        let Some(access) = self.session(id).map(session_access) else {
-            return Effect::ReconcileTopology;
-        };
-        match resolve_control(intent, access) {
-            InteractionDecision::FocusTerminal => {
-                let _ = self.workspace.focus_selected_terminal();
-                Effect::None
-            }
-            InteractionDecision::Control(ControlOperation::Acquire) => Effect::AcquireControl(id),
-            InteractionDecision::Control(ControlOperation::Take) => Effect::TakeControl(id),
-            InteractionDecision::Control(ControlOperation::Release) => Effect::ReleaseControl(id),
-            InteractionDecision::Wait => {
-                self.notice = Some("Session control is synchronizing…".to_owned());
-                Effect::None
-            }
-            InteractionDecision::Unavailable(reason) => {
-                self.notice = Some(reason.to_owned());
-                Effect::None
             }
         }
     }
@@ -1438,11 +1369,6 @@ impl App {
             scroll.reset();
         }
         self.selection.clear();
-    }
-
-    fn terminal_input_enabled(&self) -> bool {
-        self.focused_session()
-            .is_some_and(|session| session_access(session).permits_terminal_input())
     }
 
     fn register_session_click(&mut self, id: SessionId, now: Instant) -> bool {
@@ -1558,10 +1484,6 @@ impl App {
             self.cancel_split_drag();
         }
     }
-}
-
-fn session_access(session: &SessionView) -> SessionAccess {
-    session.control.into()
 }
 
 pub async fn run(client: ConsoleClient, config: Config) -> Result<ConnectedSessionOutcome> {
@@ -1749,9 +1671,6 @@ async fn apply_effect(
         Effect::ProjectTerminal => {
             app.project_terminal()?;
         }
-        Effect::ReconcileTopology => {
-            app.reconcile_topology().await?;
-        }
         Effect::RetryConnection => {
             app.client.retry().await?;
             app.connection = ConnectionState::Attaching;
@@ -1773,21 +1692,6 @@ async fn apply_effect(
         }
         Effect::Close(id) => {
             app.begin_close(id).await?;
-        }
-        Effect::AcquireControl(id) => {
-            app.client.acquire_control(id).await?;
-            let _ = app.workspace.focus_selected_terminal();
-            app.reconcile_topology().await?;
-        }
-        Effect::ReleaseControl(id) => {
-            app.client.release_control(id).await?;
-            let _ = app.workspace.focus_sessions();
-            app.reconcile_topology().await?;
-        }
-        Effect::TakeControl(id) => {
-            app.client.take_control(id).await?;
-            let _ = app.workspace.focus_selected_terminal();
-            app.reconcile_topology().await?;
         }
         Effect::Copy(text) => {
             session.copy(&text)?;
@@ -1894,8 +1798,7 @@ fn handle_event(event: Event, app: &mut App, regions: &UiRegions) -> Result<Effe
         }
         Event::Paste(text)
             if app.workspace.focus_surface() == FocusSurface::Terminal
-                && app.surface.kind() == SurfaceKind::Normal
-                && app.terminal_input_enabled() =>
+                && app.surface.kind() == SurfaceKind::Normal =>
         {
             app.keybinding_state.cancel();
             Ok(Effect::Paste(text))
@@ -1927,8 +1830,7 @@ fn handle_key(key: KeyEvent, app: &mut App, regions: &UiRegions) -> Result<Effec
         KeybindingResolution::UnmatchedSequence { prefix, chord }
             if prefix == chord
                 && app.workspace.focus_surface() == FocusSurface::Terminal
-                && app.surface.kind() == SurfaceKind::Normal
-                && app.terminal_input_enabled() =>
+                && app.surface.kind() == SurfaceKind::Normal =>
         {
             return Ok(Effect::SendKey(key));
         }
@@ -1948,11 +1850,7 @@ fn handle_key(key: KeyEvent, app: &mut App, regions: &UiRegions) -> Result<Effec
             Ok(Effect::None)
         }
         Surface::Normal if app.workspace.focus_surface() == FocusSurface::Terminal => {
-            if app.terminal_input_enabled() {
-                Ok(Effect::SendKey(key))
-            } else {
-                Ok(Effect::None)
-            }
+            Ok(Effect::SendKey(key))
         }
         Surface::Normal | Surface::CommandPalette(_) | Surface::Settings(_) => Ok(Effect::None),
     }
@@ -1984,11 +1882,19 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App, regions: &UiRegions) -> Result
         let terminal = app.panel_terminal(region.slot);
         let session = app.panel_session_id(region.slot).and_then(|id| app.session(id));
         if let (Some(terminal), Some(session)) = (terminal, session) {
-            if terminal.mouse_reporting
-                && session_access(session).permits_terminal_input()
-                && !mouse.modifiers.contains(KeyModifiers::SHIFT)
-            {
+            if terminal.mouse_reporting && !mouse.modifiers.contains(KeyModifiers::SHIFT) {
                 let pane_id = session.pane_id;
+                let range = app.panel_scroll(region.slot).visible_range(ScrollMetrics::new(
+                    terminal.first_row,
+                    terminal.lines.len(),
+                    usize::from(region.content.height),
+                ));
+                let rendered_top = terminal.first_row.saturating_add(
+                    StableRowIndex::try_from(range.start).unwrap_or(StableRowIndex::MAX),
+                );
+                let physical_top = terminal.physical_top;
+                let pane_cols = terminal.cols;
+                let pane_rows = terminal.rows;
                 app.focus_panel(region.slot);
                 return Ok(Effect::SendMouse {
                     pane_id,
@@ -1998,6 +1904,10 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App, regions: &UiRegions) -> Result
                         region.content.y,
                         region.content.width,
                         region.content.height,
+                        rendered_top,
+                        physical_top,
+                        pane_cols,
+                        pane_rows,
                     ),
                 });
             }
@@ -2139,10 +2049,7 @@ fn console_actions(
             ConsoleAction::RetryConnection => can_retry_connection,
             ConsoleAction::Activate => can_activate,
             ConsoleAction::Dismiss => can_dismiss,
-            ConsoleAction::RenameSession | ConsoleAction::CloseSession => can_mutate,
-            ConsoleAction::ReleaseControl => can_release,
-            ConsoleAction::TakeControl => can_take,
-            ConsoleAction::PrimaryControl => can_primary_control,
+            ConsoleAction::RenameSession | ConsoleAction::CloseSession => has_target,
             ConsoleAction::CopyVisibleTerminal | ConsoleAction::OpenSearch => has_terminal,
             ConsoleAction::SplitPanel => can_split_panel,
             ConsoleAction::ClosePanel | ConsoleAction::FocusOtherPanel => can_close_panel,
@@ -2183,13 +2090,9 @@ fn console_actions(
     for (action, group, group_order, order) in [
         (ConsoleAction::Activate, "navigation", 10, 10),
         (ConsoleAction::RenameSession, "session", 20, 10),
-        // Context menus can outlive their rendered frame. Keep one semantic primary intent here
-        // so the latest snapshot chooses acquire, release, or take at dispatch time rather than
-        // leaving a stale `releaseControl` menu item unavailable.
-        (ConsoleAction::PrimaryControl, "control", 30, 10),
-        (ConsoleAction::CopyVisibleTerminal, "terminal", 40, 10),
-        (ConsoleAction::OpenSearch, "terminal", 40, 20),
-        (ConsoleAction::CloseSession, "destructive", 50, 10),
+        (ConsoleAction::CopyVisibleTerminal, "terminal", 30, 10),
+        (ConsoleAction::OpenSearch, "terminal", 30, 20),
+        (ConsoleAction::CloseSession, "destructive", 40, 10),
     ] {
         builder.place_menu(MenuPlacement {
             menu: SESSION_MENU,
@@ -2210,13 +2113,6 @@ fn console_actions(
         ),
         (KeyCode::F(2), KeyModifiers::NONE, ConsoleAction::RenameSession, sidebar_normal),
         (KeyCode::Char('r'), KeyModifiers::NONE, ConsoleAction::RenameSession, sidebar_normal),
-        (KeyCode::Char('d'), KeyModifiers::NONE, ConsoleAction::ReleaseControl, sidebar_normal),
-        (
-            KeyCode::Char('t'),
-            KeyModifiers::NONE,
-            ConsoleAction::TakeControl,
-            take_control_available,
-        ),
         (
             KeyCode::Char('C'),
             KeyModifiers::CONTROL | KeyModifiers::SHIFT,
@@ -2337,16 +2233,8 @@ fn terminal_normal(context: &ConsoleActionContext) -> bool {
         && matches!(context.region, ActiveRegion::PrimaryTerminal | ActiveRegion::SecondaryTerminal)
 }
 
-/// A read-only terminal never receives key input, so Console may retain local selection/copy
-/// affordances there. A healthy controlled terminal keeps this key entirely for the shell.
-fn terminal_local_tools(context: &ConsoleActionContext) -> bool {
-    terminal_normal(context)
-        && context.target_access.is_some_and(SessionAccess::supports_local_terminal_tools)
-        && !matches!(context.target_access, Some(SessionAccess::ControlledBySelf))
-}
-
 fn local_tools_available(context: &ConsoleActionContext) -> bool {
-    sidebar_normal(context) || terminal_local_tools(context)
+    sidebar_normal(context)
 }
 
 fn connection_retryable(context: &ConsoleActionContext) -> bool {
@@ -2354,16 +2242,7 @@ fn connection_retryable(context: &ConsoleActionContext) -> bool {
 }
 
 fn activate_available(context: &ConsoleActionContext) -> bool {
-    !terminal_normal(context) || matches!(context.target_access, Some(SessionAccess::Available))
-}
-
-fn take_control_available(context: &ConsoleActionContext) -> bool {
-    sidebar_normal(context)
-        || (terminal_normal(context)
-            && matches!(
-                context.target_access,
-                Some(SessionAccess::Available | SessionAccess::ControlledByOther)
-            ))
+    !terminal_normal(context)
 }
 
 fn enabled(_: &ConsoleActionContext) -> ActionState {
@@ -2417,57 +2296,6 @@ fn can_dismiss(context: &ConsoleActionContext) -> ActionState {
         ActionState::Enabled
     } else {
         ActionState::disabled("nothing is open")
-    }
-}
-
-fn can_mutate(context: &ConsoleActionContext) -> ActionState {
-    match context.target_access {
-        Some(SessionAccess::ControlledBySelf) => ActionState::Enabled,
-        Some(SessionAccess::Synchronizing) => {
-            ActionState::disabled("control state is synchronizing")
-        }
-        Some(SessionAccess::ControlledByOther | SessionAccess::Available) => {
-            ActionState::disabled("take control before changing this session")
-        }
-        None => ActionState::disabled("no session is selected"),
-    }
-}
-
-fn can_release(context: &ConsoleActionContext) -> ActionState {
-    match context.target_access {
-        Some(SessionAccess::ControlledBySelf) => ActionState::Enabled,
-        Some(SessionAccess::Synchronizing) => {
-            ActionState::disabled("control state is synchronizing")
-        }
-        Some(SessionAccess::ControlledByOther | SessionAccess::Available) => {
-            ActionState::disabled("this client does not control the session")
-        }
-        None => ActionState::disabled("no session is selected"),
-    }
-}
-
-fn can_take(context: &ConsoleActionContext) -> ActionState {
-    match context.target_access {
-        Some(SessionAccess::ControlledByOther | SessionAccess::Available) => ActionState::Enabled,
-        Some(SessionAccess::ControlledBySelf) => ActionState::disabled("Already controlling"),
-        Some(SessionAccess::Synchronizing) => {
-            ActionState::disabled("control state is synchronizing")
-        }
-        None => ActionState::disabled("no session is selected"),
-    }
-}
-
-fn can_primary_control(context: &ConsoleActionContext) -> ActionState {
-    match context.target_access {
-        Some(
-            SessionAccess::Available
-            | SessionAccess::ControlledBySelf
-            | SessionAccess::ControlledByOther,
-        ) => ActionState::Enabled,
-        Some(SessionAccess::Synchronizing) => {
-            ActionState::disabled("control state is synchronizing")
-        }
-        None => ActionState::disabled("no session is selected"),
     }
 }
 
@@ -2752,30 +2580,6 @@ fn render_sessions(frame: &mut Frame<'_>, area: Rect, app: &App, regions: &mut U
             .push((Rect::new(chunks[0].x, row, chunks[0].width, height), session.id));
         row = row.saturating_add(height);
     }
-    for (row, id) in &regions.session_rows {
-        let Some(session) = app.session(*id) else {
-            continue;
-        };
-        let Some(badge) = control_badge(session.control) else {
-            continue;
-        };
-        let control_width =
-            row.width.min(u16::try_from(terminal_text_width(badge)).unwrap_or(u16::MAX));
-        let control_area = Rect::new(
-            row.x.saturating_add(row.width.saturating_sub(control_width)),
-            row.y,
-            control_width,
-            1,
-        );
-        if session_access(session).primary_control().is_some() {
-            regions.action_hits.push(ActionHitTarget {
-                area: control_area,
-                action: ConsoleAction::PrimaryControl,
-                target: Some(*id),
-            });
-        }
-    }
-
     let controls =
         Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(chunks[1]);
     let control_style = if focused {
@@ -2809,9 +2613,6 @@ fn session_item(
     if let Some(panel) = panel {
         status.push(format!("P{panel}"));
     }
-    if let Some(badge) = control_badge(session.control) {
-        status.push(badge.to_owned());
-    }
     let status = status.join(" · ");
     let status_width = terminal_text_width(&status).min(width);
     let gap_width = usize::from(status_width > 0);
@@ -2840,7 +2641,7 @@ fn session_item(
         line.push(Span::raw(" "));
         let status =
             fit_terminal_text(&status, status_width, CellAlignment::Right, CellOverflow::Clip);
-        line.push(Span::styled(status, Style::default().fg(control_color(session.control))));
+        line.push(Span::styled(status, Style::default().fg(NORD.text_muted)));
     }
     ListItem::new(Line::from(line))
 }
@@ -2866,24 +2667,6 @@ fn agent_color(agent: AgentPresentation) -> Color {
         (AgentActivity::Idle, false) => NORD.accent_alt,
         (AgentActivity::Idle, true) => NORD.success,
         (AgentActivity::Unknown, _) => NORD.text_muted,
-    }
-}
-
-fn control_badge(control: SessionControl) -> Option<&'static str> {
-    match SessionAccess::from(control) {
-        SessionAccess::Synchronizing => Some("syncing"),
-        SessionAccess::Available => None,
-        SessionAccess::ControlledBySelf => Some("you"),
-        SessionAccess::ControlledByOther => Some("read-only"),
-    }
-}
-
-fn control_color(control: SessionControl) -> Color {
-    match SessionAccess::from(control) {
-        SessionAccess::ControlledBySelf => NORD.success,
-        SessionAccess::ControlledByOther => NORD.accent,
-        SessionAccess::Synchronizing => NORD.warning,
-        SessionAccess::Available => NORD.text_muted,
     }
 }
 
@@ -2963,24 +2746,25 @@ fn render_terminal(
             SelectableRegion::new(
                 slot,
                 content,
-                i64::try_from(row_origin)
-                    .unwrap_or(if row_origin < 0 { i64::MIN } else { i64::MAX }),
+                i64::try_from(row_origin).unwrap_or(if row_origin < 0 {
+                    i64::MIN
+                } else {
+                    i64::MAX
+                }),
                 0,
                 u64::try_from(terminal.pane_id).unwrap_or(u64::MAX),
             )
-            .with_content_revision(
-                u64::try_from(terminal.content_sequence).unwrap_or(u64::MAX),
-            ),
+            .with_content_revision(u64::try_from(terminal.content_sequence).unwrap_or(u64::MAX)),
         );
-        if focused
-            && scroll.is_live()
-            && terminal.cursor_x < usize::from(content.width)
-            && terminal.cursor_y < usize::from(content.height)
-        {
-            frame.set_cursor_position((
-                content.x.saturating_add(terminal.cursor_x as u16),
-                content.y.saturating_add(terminal.cursor_y as u16),
-            ));
+        let cursor_row =
+            stable_row_offset(terminal.cursor_row, row_origin, usize::from(content.height));
+        if focused && terminal.cursor_x < usize::from(content.width) {
+            if let Some(cursor_row) = cursor_row {
+                frame.set_cursor_position((
+                    content.x.saturating_add(terminal.cursor_x as u16),
+                    content.y.saturating_add(u16::try_from(cursor_row).unwrap_or(u16::MAX)),
+                ));
+            }
         }
     } else {
         frame.render_widget(
@@ -3120,10 +2904,9 @@ mod tests {
     use crate::tools::console::activity::AgentKind;
     use wezterm_term::Line as TerminalLine;
 
-    fn context(control: SessionControl) -> ConsoleActionContext {
+    fn context() -> ConsoleActionContext {
         ConsoleActionContext {
             target: Some(7),
-            target_access: Some(control.into()),
             selected: Some(7),
             selected_index: Some(1),
             session_count: 3,
@@ -3175,9 +2958,8 @@ mod tests {
     #[test]
     fn catalog_projects_palette_actions_and_shared_enablement() {
         let registry = registry();
-        let controller = context(SessionControl::Controller);
-        let observer = context(SessionControl::Observer);
-        let command_palette = registry.resolve_command_palette(&controller);
+        let context = context();
+        let command_palette = registry.resolve_command_palette(&context);
         let visible = ConsoleAction::ALL
             .iter()
             .filter(|action| {
@@ -3193,27 +2975,18 @@ mod tests {
             })
             .all(|action| { command_palette.items().iter().any(|item| item.id == action.id()) }));
 
-        for action in [
-            ConsoleAction::RenameSession,
-            ConsoleAction::CloseSession,
-            ConsoleAction::ReleaseControl,
-        ] {
+        for action in [ConsoleAction::RenameSession, ConsoleAction::CloseSession] {
             assert_eq!(
-                registry.command_for(&ActionInvocation::new(action.id(), controller)),
+                registry.command_for(&ActionInvocation::new(action.id(), context)),
                 Ok(action)
             );
         }
-        assert!(registry.command_for(&ActionInvocation::new(RENAME_SESSION, observer)).is_err());
-        assert_eq!(
-            registry.command_for(&ActionInvocation::new(TAKE_CONTROL, observer)),
-            Ok(ConsoleAction::TakeControl)
-        );
     }
 
     #[test]
     fn keyboard_and_menu_resolve_through_the_same_catalog() {
         let registry = registry();
-        let context = context(SessionControl::Controller);
+        let context = context();
         let rename_key =
             invocation(&registry, KeyChord::new(KeyCode::F(2), KeyModifiers::NONE), context);
         let rename_menu = registry
@@ -3236,7 +3009,7 @@ mod tests {
             ..Keybindings::default()
         };
         let registry = console_actions(&keybindings).unwrap();
-        let context = context(SessionControl::Controller);
+        let context = context();
         let mut state = KeybindingState::default();
 
         assert!(matches!(
@@ -3255,7 +3028,7 @@ mod tests {
     fn direct_and_prefixed_palette_bindings_share_one_action() {
         let keybindings = Keybindings::default();
         let registry = console_actions(&keybindings).unwrap();
-        let context = context(SessionControl::Controller);
+        let context = context();
 
         let direct = invocation(&registry, keybindings.command_palette, context);
         assert_eq!(direct.action, OPEN_COMMAND_PALETTE);
@@ -3275,15 +3048,14 @@ mod tests {
     }
 
     #[test]
-    fn session_menu_uses_one_rehydrated_control_intent() {
+    fn session_menu_keeps_session_and_workspace_actions() {
         let registry = registry();
-        let menu = registry.resolve_menu(SESSION_MENU, &context(SessionControl::Controller));
+        let menu = registry.resolve_menu(SESSION_MENU, &context());
 
-        assert!(menu.items().iter().any(|item| item.id == PRIMARY_CONTROL));
-        assert!(!menu.items().iter().any(|item| item.id == RELEASE_CONTROL));
-        assert!(!menu.items().iter().any(|item| item.id == TAKE_CONTROL));
+        assert!(menu.items().iter().any(|item| item.id == RENAME_SESSION));
+        assert!(menu.items().iter().any(|item| item.id == CLOSE_SESSION));
 
-        let mut hidden = context(SessionControl::Controller);
+        let mut hidden = context();
         hidden.region = ActiveRegion::PrimaryTerminal;
         hidden.sidebar_visible = false;
         let hidden_menu = registry.resolve_menu(SESSION_MENU, &hidden);
@@ -3294,7 +3066,7 @@ mod tests {
     #[test]
     fn terminal_focus_leaves_the_configured_prefix_to_the_console_shell() {
         let registry = registry();
-        let mut terminal = context(SessionControl::Controller);
+        let mut terminal = context();
         terminal.region = ActiveRegion::PrimaryTerminal;
 
         for chord in [
@@ -3321,54 +3093,9 @@ mod tests {
     }
 
     #[test]
-    fn read_only_terminal_keeps_local_copy_without_capturing_healthy_terminal_keys() {
-        let registry = registry();
-        let mut observer = context(SessionControl::Observer);
-        observer.region = ActiveRegion::PrimaryTerminal;
-
-        let copy = invocation(
-            &registry,
-            KeyChord::new(KeyCode::Char('C'), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
-            observer,
-        );
-        assert_eq!(registry.command_for(&copy), Ok(ConsoleAction::CopyVisibleTerminal));
-        let scroll =
-            invocation(&registry, KeyChord::new(KeyCode::PageUp, KeyModifiers::NONE), observer);
-        assert_eq!(registry.command_for(&scroll), Ok(ConsoleAction::ScrollUp));
-        let take =
-            invocation(&registry, KeyChord::new(KeyCode::Char('t'), KeyModifiers::NONE), observer);
-        assert_eq!(registry.command_for(&take), Ok(ConsoleAction::TakeControl));
-        assert!(matches!(
-            resolve(&registry, KeyChord::new(KeyCode::Char('?'), KeyModifiers::NONE), observer),
-            KeybindingResolution::Unmatched
-        ));
-
-        let mut available = context(SessionControl::Uncontrolled);
-        available.region = ActiveRegion::PrimaryTerminal;
-        let activate =
-            invocation(&registry, KeyChord::new(KeyCode::Enter, KeyModifiers::NONE), available);
-        assert_eq!(registry.command_for(&activate), Ok(ConsoleAction::Activate));
-
-        let mut controller = context(SessionControl::Controller);
-        controller.region = ActiveRegion::PrimaryTerminal;
-        assert!(matches!(
-            resolve(
-                &registry,
-                KeyChord::new(KeyCode::Char('C'), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
-                controller,
-            ),
-            KeybindingResolution::Unmatched
-        ));
-        assert!(matches!(
-            resolve(&registry, KeyChord::new(KeyCode::PageUp, KeyModifiers::NONE), controller,),
-            KeybindingResolution::Unmatched
-        ));
-    }
-
-    #[test]
     fn sidebar_keeps_panel_navigation_keys() {
         let registry = registry();
-        let sidebar = context(SessionControl::Controller);
+        let sidebar = context();
 
         for (chord, expected) in [
             (KeyChord::new(KeyCode::Enter, KeyModifiers::NONE), ConsoleAction::Activate),
@@ -3387,7 +3114,7 @@ mod tests {
             ('x', ConsoleAction::ClosePanel),
             ('o', ConsoleAction::FocusOtherPanel),
         ] {
-            let mut context = context(SessionControl::Controller);
+            let mut context = context();
             if expected != ConsoleAction::SplitPanel {
                 context.has_secondary_panel = true;
                 context.can_split_panel = false;
@@ -3448,17 +3175,17 @@ mod tests {
     }
 
     #[test]
-    fn mouse_hit_routing_prefers_controls_and_preserves_rows() {
+    fn mouse_hit_routing_prefers_actions_and_preserves_rows() {
         let mut regions = UiRegions::default();
         regions.session_rows.push((Rect::new(0, 0, 20, 1), 7));
         regions.action_hits.push(ActionHitTarget {
             area: Rect::new(10, 0, 10, 1),
-            action: ConsoleAction::PrimaryControl,
+            action: ConsoleAction::RenameSession,
             target: Some(7),
         });
 
         let position = Position { x: 15, y: 0 };
-        assert_eq!(action_at(&regions, position).unwrap().action, ConsoleAction::PrimaryControl);
+        assert_eq!(action_at(&regions, position).unwrap().action, ConsoleAction::RenameSession);
         assert_eq!(session_at(&regions, position), Some(7));
     }
 
@@ -3481,10 +3208,11 @@ mod tests {
             pane_id: 9,
             title: "shell".to_owned(),
             first_row: 0,
+            physical_top: 0,
             cols: 12,
             rows: 2,
             cursor_x: 0,
-            cursor_y: 0,
+            cursor_row: 0,
             lines: vec![
                 TerminalLine::from_text("hello world", &attrs, 0, None),
                 TerminalLine::from_text("second", &attrs, 0, None),

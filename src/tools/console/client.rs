@@ -17,12 +17,11 @@ use crossterm::event::{
 };
 use termwiz::input::{KeyCode, KeyEvent, Modifiers};
 use tokio::sync::watch;
-use wezterm_client::client::{Client, PaneControlStatus};
 use wezterm_client::domain::ClientDomainConfig;
 use wezterm_codec::{
-    ControlLeaseAction, ControlLeaseRequest, ControlLeaseResult, EnvironmentFreeCommand,
-    InputSerial, KillPane, Resize, SendKeyDown, SendMouseEvent, SendPaste, ServiceDrainAction,
-    ServiceDrainRequest, SpawnV2, TabSpawnDomain, TabSpawnPlacement, TabTitleChanged,
+    EnvironmentFreeCommand, InputSerial, KillPane, Resize, SendKeyDown, SendMouseEvent, SendPaste,
+    ServiceDrainAction, ServiceDrainRequest, SpawnV2, TabSpawnDomain, TabSpawnPlacement,
+    TabTitleChanged,
 };
 use wezterm_config::UnixDomain;
 use wezterm_mux::pane::Pane;
@@ -48,14 +47,6 @@ const MAX_PROJECTED_TERMINAL_ROWS: isize = 1_024;
 const MAX_AGENT_DETECTION_ROWS: isize = 16;
 const REMOTE_RECONNECT_ATTEMPTS: NonZeroU32 = NonZeroU32::new(8).unwrap();
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SessionControl {
-    Synchronizing,
-    Uncontrolled,
-    Controller,
-    Observer,
-}
-
 pub use super::connection::{ConnectionHealth, ConnectionState};
 
 use super::connection::{AttachmentPolicy, ConnectionHandle, ConnectionOwner};
@@ -64,22 +55,62 @@ use super::connection::{AttachmentPolicy, ConnectionHandle, ConnectionOwner};
 pub struct TerminalContentGeometry {
     origin_column: u16,
     origin_row: u16,
-    cols: u16,
-    rows: u16,
+    visible_cols: u16,
+    visible_rows: u16,
+    rendered_top: StableRowIndex,
+    physical_top: StableRowIndex,
+    pane_cols: usize,
+    pane_rows: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VisibleRowIndex(usize);
+
+pub(super) fn stable_row_offset(
+    row: StableRowIndex,
+    origin: StableRowIndex,
+    row_count: usize,
+) -> Option<usize> {
+    let offset = row.checked_sub(origin)?;
+    usize::try_from(offset).ok().filter(|offset| *offset < row_count)
 }
 
 impl TerminalContentGeometry {
-    pub const fn new(origin_column: u16, origin_row: u16, cols: u16, rows: u16) -> Self {
-        Self { origin_column, origin_row, cols, rows }
+    pub const fn new(
+        origin_column: u16,
+        origin_row: u16,
+        visible_cols: u16,
+        visible_rows: u16,
+        rendered_top: StableRowIndex,
+        physical_top: StableRowIndex,
+        pane_cols: usize,
+        pane_rows: usize,
+    ) -> Self {
+        Self {
+            origin_column,
+            origin_row,
+            visible_cols,
+            visible_rows,
+            rendered_top,
+            physical_top,
+            pane_cols,
+            pane_rows,
+        }
     }
 
-    fn relative_position(self, column: u16, row: u16) -> Option<(usize, i64)> {
+    fn relative_position(self, column: u16, row: u16) -> Option<(usize, VisibleRowIndex)> {
         let column = column.checked_sub(self.origin_column)?;
         let row = row.checked_sub(self.origin_row)?;
-        if column >= self.cols || row >= self.rows {
+        if column >= self.visible_cols || row >= self.visible_rows {
             return None;
         }
-        Some((usize::from(column), i64::from(row)))
+        let pane_column = usize::from(column);
+        if pane_column >= self.pane_cols {
+            return None;
+        }
+        let stable_row = self.rendered_top.checked_add(isize::try_from(row).ok()?)?;
+        let visible_row = stable_row_offset(stable_row, self.physical_top, self.pane_rows)?;
+        Some((pane_column, VisibleRowIndex(visible_row)))
     }
 }
 
@@ -90,7 +121,6 @@ pub struct SessionView {
     pub tab_id: usize,
     pub window_id: usize,
     pub title: String,
-    pub control: SessionControl,
     pub agent: Option<AgentPresentation>,
     pane_title: String,
     foreground_process_name: Option<String>,
@@ -101,10 +131,11 @@ pub struct TerminalView {
     pub pane_id: usize,
     pub title: String,
     pub first_row: StableRowIndex,
+    pub physical_top: StableRowIndex,
     pub cols: usize,
     pub rows: usize,
     pub cursor_x: usize,
-    pub cursor_y: usize,
+    pub cursor_row: StableRowIndex,
     /// Whether the authoritative remote render projection reports terminal mouse capture.
     pub mouse_reporting: bool,
     pub lines: Vec<Line>,
@@ -494,7 +525,6 @@ impl ConsoleClient {
         )
         .await?
         .into_inner();
-        self.require_control(response.pane_id).await?;
         Ok(response.tab_id)
     }
 
@@ -527,7 +557,6 @@ impl ConsoleClient {
     }
 
     pub async fn close_pane(&self, pane_id: usize) -> Result<()> {
-        self.require_control(pane_id).await?;
         let client = self.connection.client()?;
         bounded_rpc("closing a session", client.kill_pane(KillPane { pane_id })).await?;
         Ok(())
@@ -535,7 +564,6 @@ impl ConsoleClient {
 
     pub async fn rename_session(&self, id: SessionId, title: String) -> Result<()> {
         let session = self.find_session(id).await?;
-        self.require_control(session.pane_id).await?;
         let client = self.connection.client()?;
         bounded_rpc(
             "renaming a session",
@@ -543,45 +571,6 @@ impl ConsoleClient {
         )
         .await?;
         Ok(())
-    }
-
-    pub async fn release_control(&self, id: SessionId) -> Result<()> {
-        let session = self.find_session(id).await?;
-        match self.apply_control(session.pane_id, ControlLeaseAction::Release).await? {
-            SessionControl::Uncontrolled | SessionControl::Observer => Ok(()),
-            SessionControl::Synchronizing => {
-                bail!("Console control state is still synchronizing for session {id}")
-            }
-            SessionControl::Controller => {
-                bail!("Console agent retained control after releasing session {id}")
-            }
-        }
-    }
-
-    pub async fn take_control(&self, id: SessionId) -> Result<()> {
-        let session = self.find_session(id).await?;
-        match self.apply_control(session.pane_id, ControlLeaseAction::Take).await? {
-            SessionControl::Controller => Ok(()),
-            SessionControl::Observer => {
-                bail!("Console agent did not transfer control of session {id}")
-            }
-            SessionControl::Synchronizing | SessionControl::Uncontrolled => {
-                bail!("Console agent did not establish control of session {id}")
-            }
-        }
-    }
-
-    pub async fn acquire_control(&self, id: SessionId) -> Result<()> {
-        let session = self.find_session(id).await?;
-        match self.apply_control(session.pane_id, ControlLeaseAction::Acquire).await? {
-            SessionControl::Controller => Ok(()),
-            SessionControl::Observer => {
-                bail!("this Console attachment is observing the session; take control to edit it")
-            }
-            SessionControl::Synchronizing | SessionControl::Uncontrolled => {
-                bail!("Console agent did not establish control of session {id}")
-            }
-        }
     }
 
     pub async fn send_key(&self, pane_id: usize, event: CrosstermKeyEvent) -> Result<()> {
@@ -647,55 +636,6 @@ impl ConsoleClient {
         Ok(())
     }
 
-    async fn require_control(&self, pane_id: usize) -> Result<()> {
-        match self.apply_control(pane_id, ControlLeaseAction::Acquire).await? {
-            SessionControl::Controller => Ok(()),
-            SessionControl::Observer => {
-                bail!("this Console attachment is observing the session; take control to edit it")
-            }
-            SessionControl::Synchronizing | SessionControl::Uncontrolled => {
-                bail!("the Console agent did not establish control of pane {pane_id}")
-            }
-        }
-    }
-
-    async fn apply_control(
-        &self,
-        pane_id: usize,
-        action: ControlLeaseAction,
-    ) -> Result<SessionControl> {
-        let client = self.connection.client()?;
-        let result = bounded_rpc(
-            "updating terminal control",
-            client.control_lease(ControlLeaseRequest { pane_id, action }),
-        )
-        .await?
-        .into_inner();
-        match result {
-            ControlLeaseResult::Acquired(_) | ControlLeaseResult::AlreadyController(_) => {
-                Ok(SessionControl::Controller)
-            }
-            ControlLeaseResult::Observing(_) => Ok(SessionControl::Observer),
-            ControlLeaseResult::Taken(_) if action == ControlLeaseAction::Take => {
-                Ok(SessionControl::Controller)
-            }
-            ControlLeaseResult::Released(_) if action == ControlLeaseAction::Release => {
-                Ok(SessionControl::Uncontrolled)
-            }
-            ControlLeaseResult::NotController(state) => {
-                if state.active.iter().any(|lease| lease.pane_id == pane_id) {
-                    Ok(SessionControl::Observer)
-                } else {
-                    Ok(SessionControl::Uncontrolled)
-                }
-            }
-            ControlLeaseResult::Overloaded => {
-                bail!("Console control state is busy; retry the operation")
-            }
-            unexpected => bail!("Console agent returned {unexpected:?} for {action:?}"),
-        }
-    }
-
     async fn find_session(&self, id: SessionId) -> Result<SessionView> {
         self.list_sessions()
             .await?
@@ -710,7 +650,7 @@ impl ConsoleClient {
         let panes = bounded_rpc("listing sessions", client.list_panes()).await?.into_inner();
         let mut sessions = Vec::new();
         for (root, tab_title) in panes.tabs.into_iter().zip(panes.tab_titles) {
-            flatten_panes(&client, root, &tab_title, &mut sessions);
+            flatten_panes(root, &tab_title, &mut sessions);
         }
         sessions.sort_by_key(|session| session.id);
         Ok(sessions)
@@ -737,15 +677,15 @@ impl ConsoleClient {
         let _ = pane.get_changed_since(start..end, content_sequence);
         let (first_row, lines) = pane.get_lines(start..end);
         let cursor = pane.get_cursor_position();
-        let cursor_y = cursor.y.saturating_sub(dimensions.physical_top).max(0) as usize;
         Ok(Some(TerminalView {
             pane_id: remote_pane_id,
             title: pane.get_title(),
             first_row,
+            physical_top: dimensions.physical_top,
             cols: dimensions.cols,
             rows: dimensions.viewport_rows,
             cursor_x: cursor.x,
-            cursor_y,
+            cursor_row: cursor.y,
             mouse_reporting: pane.is_mouse_grabbed(),
             lines,
             content_sequence,
@@ -865,17 +805,12 @@ async fn bounded_rpc<T>(
         .with_context(|| format!("Console agent timed out while {operation}"))?
 }
 
-fn flatten_panes(
-    client: &Client,
-    root: PaneNode,
-    tab_title: &str,
-    sessions: &mut Vec<SessionView>,
-) {
+fn flatten_panes(root: PaneNode, tab_title: &str, sessions: &mut Vec<SessionView>) {
     match root {
         PaneNode::Empty => {}
         PaneNode::Split { left, right, .. } => {
-            flatten_panes(client, *left, tab_title, sessions);
-            flatten_panes(client, *right, tab_title, sessions);
+            flatten_panes(*left, tab_title, sessions);
+            flatten_panes(*right, tab_title, sessions);
         }
         PaneNode::Leaf(pane) => sessions.push(SessionView {
             id: pane.tab_id,
@@ -883,20 +818,10 @@ fn flatten_panes(
             tab_id: pane.tab_id,
             window_id: pane.window_id,
             title: if tab_title.is_empty() { pane.title.clone() } else { tab_title.to_owned() },
-            control: session_control(client.pane_control_status(pane.pane_id)),
             agent: None,
             pane_title: pane.title,
             foreground_process_name: pane.foreground_process_name,
         }),
-    }
-}
-
-fn session_control(status: PaneControlStatus) -> SessionControl {
-    match status {
-        PaneControlStatus::AwaitingSnapshot => SessionControl::Synchronizing,
-        PaneControlStatus::Uncontrolled => SessionControl::Uncontrolled,
-        PaneControlStatus::Controller => SessionControl::Controller,
-        PaneControlStatus::Observer => SessionControl::Observer,
     }
 }
 
@@ -1031,7 +956,7 @@ fn map_mouse(
     Some(WeztermMouseEvent {
         kind,
         x,
-        y,
+        y: i64::try_from(y.0).ok()?,
         x_pixel_offset: 0,
         y_pixel_offset: 0,
         button,
@@ -1099,7 +1024,7 @@ mod tests {
 
     #[test]
     fn terminal_mouse_coordinates_are_relative_and_bounded() {
-        let geometry = TerminalContentGeometry::new(12, 4, 80, 24);
+        let geometry = TerminalContentGeometry::new(12, 4, 80, 24, 100, 100, 80, 24);
         let event = CrosstermMouseEvent {
             kind: CrosstermMouseEventKind::Down(CrosstermMouseButton::Left),
             column: 17,

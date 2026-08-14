@@ -2,10 +2,7 @@ use crate::authorization::ServerPolicy;
 use crate::sessionhandler::{PduSender, SessionHandler};
 use anyhow::Context;
 use async_ossl::AsyncSslStream;
-use codec::{
-    ActiveControlLease, AttachmentIdentity, AttachmentResumeToken, ControlChanged,
-    ControlLeaseAction, ControlLeaseResult, ControlLeaseState, ControlSnapshot, Pdu,
-};
+use codec::{AttachmentIdentity, AttachmentResumeToken, Pdu};
 use futures::FutureExt;
 use mux::{Mux, MuxNotification};
 use promise::spawn::MainThreadExecutorHandle;
@@ -21,11 +18,11 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use wezterm_runtime_admission::{
     AdmissionError, AttachmentPermit, CombinedPermit, CountClass, CountPermit, RuntimeAdmission,
-    MAX_CONTROL_NOTIFICATIONS_PER_ATTACHMENT, MAX_PANES, PROTOCOL_BOOTSTRAP_TIMEOUT_MS,
+    PROTOCOL_BOOTSTRAP_TIMEOUT_MS,
 };
 use wezterm_uds::UnixStream;
 
-const CONTROL_DISCONNECT_GRACE: Duration = Duration::from_secs(5);
+const ATTACHMENT_DISCONNECT_GRACE: Duration = Duration::from_secs(5);
 
 #[cfg(unix)]
 pub trait AsRawDesc: std::os::unix::io::AsRawFd + std::os::fd::AsFd {}
@@ -49,7 +46,7 @@ struct AdmittedItem {
 
 enum DispatchEvent {
     Queued(AdmittedItem),
-    Control(ControlChanged),
+    AttachmentSuperseded,
     PaneOutput,
     Readable,
     Cancelled,
@@ -118,28 +115,22 @@ impl fmt::Display for DispatchEnqueueError {
 
 impl std::error::Error for DispatchEnqueueError {}
 
-#[derive(Debug)]
-struct AdmittedControlPublication {
-    change: ControlChanged,
-    _permit: CountPermit,
-}
-
-pub struct ControlSubscription {
+pub struct AttachmentConnection {
     fence: AttachmentFence,
-    publisher: Weak<ControlPublisher>,
-    receiver: smol::channel::Receiver<AdmittedControlPublication>,
+    registry: Weak<AttachmentRegistry>,
+    cancellation: smol::channel::Receiver<()>,
 }
 
-impl ControlSubscription {
-    async fn recv(&self) -> Result<ControlChanged, smol::channel::RecvError> {
-        self.receiver.recv().await.map(|delivery| delivery.change)
+impl AttachmentConnection {
+    async fn cancelled(&self) {
+        let _ = self.cancellation.recv().await;
     }
 }
 
-impl Drop for ControlSubscription {
+impl Drop for AttachmentConnection {
     fn drop(&mut self) {
-        if let Some(publisher) = self.publisher.upgrade() {
-            publisher.detach(self.fence);
+        if let Some(registry) = self.registry.upgrade() {
+            registry.detach(self.fence);
         }
     }
 }
@@ -154,8 +145,7 @@ pub(crate) struct EstablishedAttachment {
     pub(crate) fence: AttachmentFence,
     pub(crate) client_id: Arc<mux::client::ClientId>,
     pub(crate) resume_token: AttachmentResumeToken,
-    pub(crate) control_snapshot: ControlSnapshot,
-    pub(crate) subscription: ControlSubscription,
+    pub(crate) connection: AttachmentConnection,
     pub(crate) is_new: bool,
 }
 
@@ -163,65 +153,44 @@ struct AttachmentRecord {
     token: AttachmentResumeToken,
     epoch: NonZeroU64,
     client_id: Arc<mux::client::ClientId>,
-    subscriber: Option<smol::channel::Sender<AdmittedControlPublication>>,
+    cancellation: Option<smol::channel::Sender<()>>,
 }
 
-struct ControlPublisherState {
-    sequence: u64,
-    active: BTreeMap<mux::pane::PaneId, AttachmentIdentity>,
+struct AttachmentRegistryState {
     attachments: BTreeMap<AttachmentIdentity, AttachmentRecord>,
     tokens: BTreeMap<AttachmentResumeToken, AttachmentIdentity>,
 }
 
-impl ControlPublisherState {
-    fn snapshot(&self) -> ControlLeaseState {
-        ControlLeaseState {
-            sequence: self.sequence,
-            active: self
-                .active
-                .iter()
-                .map(|(&pane_id, &controller)| ActiveControlLease {
-                    pane_id,
-                    controller,
-                })
-                .collect(),
-        }
-    }
-}
-
-pub struct ControlPublisher {
+pub struct AttachmentRegistry {
     admission: Mutex<Option<Arc<RuntimeAdmission>>>,
     next_identity: AtomicU64,
-    state: Mutex<ControlPublisherState>,
+    state: Mutex<AttachmentRegistryState>,
     policy: Mutex<Weak<ServerPolicy>>,
-    lifecycle_sender: Mutex<Option<SyncSender<ControlLifecycleEvent>>>,
+    lifecycle_sender: Mutex<Option<SyncSender<AttachmentLifecycleEvent>>>,
     lifecycle_worker: Mutex<Option<JoinHandle<()>>>,
 }
 
-struct ControlLifecycleEvent {
+struct AttachmentLifecycleEvent {
     fence: AttachmentFence,
     _permit: CountPermit,
 }
 
 enum GraceExpiry {
     Stale,
-    Retry,
     Expired {
         identity: AttachmentIdentity,
         client_id: Arc<mux::client::ClientId>,
     },
 }
 
-impl ControlPublisher {
+impl AttachmentRegistry {
     pub fn new() -> Arc<Self> {
         let (lifecycle_sender, lifecycle_receiver) =
             sync_channel(wezterm_runtime_admission::MAX_GRACE_TIMERS_TOTAL);
-        let publisher = Arc::new(Self {
+        let registry = Arc::new(Self {
             admission: Mutex::new(None),
             next_identity: AtomicU64::new(1),
-            state: Mutex::new(ControlPublisherState {
-                sequence: 0,
-                active: BTreeMap::new(),
+            state: Mutex::new(AttachmentRegistryState {
                 attachments: BTreeMap::new(),
                 tokens: BTreeMap::new(),
             }),
@@ -229,13 +198,13 @@ impl ControlPublisher {
             lifecycle_sender: Mutex::new(Some(lifecycle_sender)),
             lifecycle_worker: Mutex::new(None),
         });
-        let weak = Arc::downgrade(&publisher);
+        let weak = Arc::downgrade(&registry);
         let worker = std::thread::Builder::new()
-            .name("wezterm-control-lifecycle".to_string())
-            .spawn(move || control_lifecycle_worker(weak, lifecycle_receiver))
-            .expect("control lifecycle worker must start");
-        *publisher.lifecycle_worker.lock().unwrap() = Some(worker);
-        publisher
+            .name("wezterm-attachment-lifecycle".to_string())
+            .spawn(move || attachment_lifecycle_worker(weak, lifecycle_receiver))
+            .expect("attachment lifecycle worker must start");
+        *registry.lifecycle_worker.lock().unwrap() = Some(worker);
+        registry
     }
 
     pub(crate) fn bind_policy(&self, policy: Weak<ServerPolicy>) {
@@ -246,7 +215,7 @@ impl ControlPublisher {
         let mut bound = self.admission.lock().unwrap();
         match bound.as_ref() {
             Some(current) if !Arc::ptr_eq(current, admission) => {
-                anyhow::bail!("control publisher admission must be process-global")
+                anyhow::bail!("attachment registry admission must be process-global")
             }
             Some(_) => Ok(()),
             None => {
@@ -278,8 +247,8 @@ impl ControlPublisher {
             .lock()
             .unwrap()
             .clone()
-            .ok_or_else(|| anyhow::anyhow!("control publisher admission is not bound"))?;
-        let (sender, receiver) = smol::channel::bounded(MAX_CONTROL_NOTIFICATIONS_PER_ATTACHMENT);
+            .ok_or_else(|| anyhow::anyhow!("attachment registry admission is not bound"))?;
+        let (cancellation, cancelled) = smol::channel::bounded(1);
         let mut state = self.state.lock().unwrap();
         let (identity, epoch, established_client_id, is_new) =
             if let Some(identity) = state.tokens.get(&resume_token).copied() {
@@ -299,10 +268,6 @@ impl ControlPublisher {
                 let identity = self.issue_identity()?;
                 (identity, NonZeroU64::new(1).unwrap(), client_id, true)
             };
-        let control_snapshot = ControlSnapshot {
-            attachment_identity: identity,
-            state: state.snapshot(),
-        };
         let fence = AttachmentFence { identity, epoch };
         if is_new {
             state.tokens.insert(resume_token.clone(), identity);
@@ -312,7 +277,7 @@ impl ControlPublisher {
                     token: resume_token.clone(),
                     epoch,
                     client_id: Arc::clone(&established_client_id),
-                    subscriber: Some(sender),
+                    cancellation: Some(cancellation),
                 },
             );
         } else {
@@ -320,7 +285,7 @@ impl ControlPublisher {
                 .attachments
                 .get_mut(&identity)
                 .expect("validated resume attachment remains present while state is locked");
-            if let Some(previous) = record.subscriber.replace(sender) {
+            if let Some(previous) = record.cancellation.replace(cancellation) {
                 previous.close();
             }
             record.epoch = epoch;
@@ -329,11 +294,10 @@ impl ControlPublisher {
             fence,
             client_id: established_client_id,
             resume_token,
-            control_snapshot,
-            subscription: ControlSubscription {
+            connection: AttachmentConnection {
                 fence,
-                publisher: Arc::downgrade(self),
-                receiver,
+                registry: Arc::downgrade(self),
+                cancellation: cancelled,
             },
             is_new,
         })
@@ -348,77 +312,13 @@ impl ControlPublisher {
             .is_some_and(|record| record.epoch == fence.epoch)
     }
 
-    pub(crate) fn is_controller(&self, pane_id: mux::pane::PaneId, fence: AttachmentFence) -> bool {
-        let state = self.state.lock().unwrap();
-        state
-            .attachments
-            .get(&fence.identity)
-            .is_some_and(|record| record.epoch == fence.epoch)
-            && state.active.get(&pane_id) == Some(&fence.identity)
-    }
-
-    pub(crate) fn apply(
-        &self,
-        pane_id: mux::pane::PaneId,
-        fence: AttachmentFence,
-        action: ControlLeaseAction,
-    ) -> anyhow::Result<ControlLeaseResult> {
-        let mut state = self.state.lock().unwrap();
-        anyhow::ensure!(
-            state
-                .attachments
-                .get(&fence.identity)
-                .is_some_and(|record| record.epoch == fence.epoch),
-            "attachment connection was superseded"
-        );
-        let identity = fence.identity;
-        let current = state.active.get(&pane_id).copied();
-        Ok(match (action, current) {
-            (ControlLeaseAction::Acquire, None) => self
-                .commit_locked(&mut state, pane_id, Some(identity))
-                .map(ControlLeaseResult::Acquired)
-                .unwrap_or(ControlLeaseResult::Overloaded),
-            (ControlLeaseAction::Acquire, Some(current)) if current == identity => {
-                ControlLeaseResult::AlreadyController(state.snapshot())
-            }
-            (ControlLeaseAction::Acquire, Some(_)) => {
-                ControlLeaseResult::Observing(state.snapshot())
-            }
-            (ControlLeaseAction::Take, Some(current)) if current == identity => {
-                ControlLeaseResult::AlreadyController(state.snapshot())
-            }
-            (ControlLeaseAction::Take, _) => self
-                .commit_locked(&mut state, pane_id, Some(identity))
-                .map(ControlLeaseResult::Taken)
-                .unwrap_or(ControlLeaseResult::Overloaded),
-            (ControlLeaseAction::Release, Some(current)) if current == identity => self
-                .commit_locked(&mut state, pane_id, None)
-                .map(ControlLeaseResult::Released)
-                .unwrap_or(ControlLeaseResult::Overloaded),
-            (ControlLeaseAction::Release, _) => ControlLeaseResult::NotController(state.snapshot()),
-        })
-    }
-
-    pub fn remove_pane(&self, pane_id: mux::pane::PaneId) -> bool {
-        let mut state = self.state.lock().unwrap();
-        if !state.active.contains_key(&pane_id) {
-            return true;
-        }
-        self.commit_locked(&mut state, pane_id, None).is_some()
-    }
-
     fn expire_grace(&self, fence: AttachmentFence) -> GraceExpiry {
         let mut state = self.state.lock().unwrap();
         let Some(record) = state.attachments.get(&fence.identity) else {
             return GraceExpiry::Stale;
         };
-        if record.epoch != fence.epoch || record.subscriber.is_some() {
+        if record.epoch != fence.epoch || record.cancellation.is_some() {
             return GraceExpiry::Stale;
-        }
-        let mut active = state.active.clone();
-        active.retain(|_, controller| *controller != fence.identity);
-        if active != state.active && self.commit_active_locked(&mut state, active).is_none() {
-            return GraceExpiry::Retry;
         }
         let record = state
             .attachments
@@ -457,7 +357,7 @@ impl ControlPublisher {
             if record.epoch != fence.epoch {
                 return;
             }
-            record.subscriber = None;
+            record.cancellation = None;
         }
         let admission = self.admission.lock().unwrap().clone();
         let Some(admission) = admission else {
@@ -467,7 +367,7 @@ impl ControlPublisher {
             let _ = self.expire_grace_and_finalize(fence);
             return;
         };
-        let event = ControlLifecycleEvent {
+        let event = AttachmentLifecycleEvent {
             fence,
             _permit: permit,
         };
@@ -481,87 +381,9 @@ impl ControlPublisher {
             let _ = self.expire_grace_and_finalize(fence);
         }
     }
-
-    fn commit_locked(
-        &self,
-        state: &mut ControlPublisherState,
-        pane_id: mux::pane::PaneId,
-        controller: Option<AttachmentIdentity>,
-    ) -> Option<ControlLeaseState> {
-        let mut active = state.active.clone();
-        match controller {
-            Some(controller) => {
-                active.insert(pane_id, controller);
-            }
-            None => {
-                active.remove(&pane_id);
-            }
-        }
-        self.commit_active_locked(state, active)
-    }
-
-    fn commit_active_locked(
-        &self,
-        state: &mut ControlPublisherState,
-        active: BTreeMap<mux::pane::PaneId, AttachmentIdentity>,
-    ) -> Option<ControlLeaseState> {
-        if active.len() > MAX_PANES {
-            return None;
-        }
-        let admission = self.admission.lock().unwrap().clone()?;
-        let _event = admission.try_count(CountClass::ControlEvent, 1).ok()?;
-        for record in state.attachments.values_mut() {
-            if record
-                .subscriber
-                .as_ref()
-                .is_some_and(|sender| sender.is_closed())
-            {
-                record.subscriber = None;
-            }
-        }
-        if state
-            .attachments
-            .values()
-            .filter_map(|record| record.subscriber.as_ref())
-            .any(|sender| sender.len() >= MAX_CONTROL_NOTIFICATIONS_PER_ATTACHMENT)
-        {
-            return None;
-        }
-        let mut deliveries = Vec::new();
-        for identity in state
-            .attachments
-            .iter()
-            .filter_map(|(&identity, record)| record.subscriber.as_ref().map(|_| identity))
-        {
-            let permit = admission
-                .try_count(CountClass::ControlNotificationDelivery, 1)
-                .ok()?;
-            deliveries.push((identity, permit));
-        }
-        let sequence = state.sequence.checked_add(1)?;
-        state.active = active;
-        state.sequence = sequence;
-        let snapshot = state.snapshot();
-        for (identity, permit) in deliveries {
-            let Some(sender) = state
-                .attachments
-                .get(&identity)
-                .and_then(|record| record.subscriber.as_ref())
-            else {
-                continue;
-            };
-            let _ = sender.try_send(AdmittedControlPublication {
-                change: ControlChanged {
-                    state: snapshot.clone(),
-                },
-                _permit: permit,
-            });
-        }
-        Some(snapshot)
-    }
 }
 
-impl Drop for ControlPublisher {
+impl Drop for AttachmentRegistry {
     fn drop(&mut self) {
         self.lifecycle_sender.lock().unwrap().take();
         let worker = self.lifecycle_worker.lock().unwrap().take();
@@ -573,11 +395,12 @@ impl Drop for ControlPublisher {
     }
 }
 
-fn control_lifecycle_worker(
-    publisher: Weak<ControlPublisher>,
-    receiver: SyncReceiver<ControlLifecycleEvent>,
+fn attachment_lifecycle_worker(
+    registry: Weak<AttachmentRegistry>,
+    receiver: SyncReceiver<AttachmentLifecycleEvent>,
 ) {
-    let mut pending = BTreeMap::new();
+    let mut pending: BTreeMap<AttachmentIdentity, (Instant, AttachmentFence, CountPermit)> =
+        BTreeMap::new();
     loop {
         let now = Instant::now();
         let expired: Vec<_> = pending
@@ -585,21 +408,16 @@ fn control_lifecycle_worker(
             .filter_map(|(&identity, (deadline, _, _))| (*deadline <= now).then_some(identity))
             .collect();
         for identity in expired {
-            let Some(publisher) = publisher.upgrade() else {
+            let Some(registry) = registry.upgrade() else {
                 return;
             };
             let fence = pending
                 .get(&identity)
                 .map(|(_, fence, _)| *fence)
                 .expect("pending grace identity remains present");
-            match publisher.expire_grace_and_finalize(fence) {
+            match registry.expire_grace_and_finalize(fence) {
                 GraceExpiry::Stale => {
                     pending.remove(&identity);
-                }
-                GraceExpiry::Retry => {
-                    if let Some((deadline, _, _)) = pending.get_mut(&identity) {
-                        *deadline = Instant::now() + Duration::from_millis(10);
-                    }
                 }
                 GraceExpiry::Expired { identity, .. } => {
                     pending.remove(&identity);
@@ -616,7 +434,7 @@ fn control_lifecycle_worker(
                 pending.insert(
                     event.fence.identity,
                     (
-                        Instant::now() + CONTROL_DISCONNECT_GRACE,
+                        Instant::now() + ATTACHMENT_DISCONNECT_GRACE,
                         event.fence,
                         event._permit,
                     ),
@@ -882,9 +700,8 @@ where
                 .map_err(Into::into)
         }
     });
-    let control_policy = Arc::clone(&policy);
     let mut handler = SessionHandler::new(pdu_sender, policy, Arc::clone(&admission), executor)?;
-    let mut control_subscription: Option<ControlSubscription> = None;
+    let mut attachment_connection: Option<AttachmentConnection> = None;
 
     {
         let mux = Mux::get();
@@ -919,13 +736,12 @@ where
                     .map(|()| DispatchEvent::PaneOutput)
                     .map_err(anyhow::Error::from)
             });
-            let control = async {
-                match control_subscription.as_ref() {
-                    Some(subscription) => subscription
-                        .recv()
-                        .await
-                        .map(DispatchEvent::Control)
-                        .map_err(anyhow::Error::from),
+            let attachment_superseded = async {
+                match attachment_connection.as_ref() {
+                    Some(connection) => {
+                        connection.cancelled().await;
+                        Ok(DispatchEvent::AttachmentSuperseded)
+                    }
                     None => futures::future::pending::<anyhow::Result<DispatchEvent>>().await,
                 }
             };
@@ -977,7 +793,10 @@ where
                         smol::future::or(
                             wait_for_task,
                             smol::future::or(
-                                smol::future::or(smol::future::or(rx_msg, pane_output), control),
+                                smol::future::or(
+                                    smol::future::or(rx_msg, pane_output),
+                                    attachment_superseded,
+                                ),
                                 wait_for_read,
                             ),
                         ),
@@ -995,14 +814,7 @@ where
                 Ok(DispatchEvent::TaskCompleted) => {
                     deadlines.task_completed();
                 }
-                Ok(DispatchEvent::Control(change)) => {
-                    let pdu = Pdu::ControlChanged(change);
-                    pdu.encode_async(&mut stream, 0, &admission).await?;
-                    stream
-                        .flush()
-                        .await
-                        .context("flushing control publication")?;
-                }
+                Ok(DispatchEvent::AttachmentSuperseded) => return Ok(()),
                 Ok(DispatchEvent::InboundTimedOut) => {
                     return Err(anyhow::anyhow!(
                         "inbound request admission did not drain before its deadline"
@@ -1056,10 +868,10 @@ where
                     item: Item::WritePdu { pdu, serial },
                     _permit: _output_permit,
                 })) => {
-                    let activates_control = matches!(
+                    let activates_attachment = matches!(
                         pdu.as_ref(),
                         Pdu::SetClientIdResponse(response)
-                            if response.control_snapshot.is_some()
+                            if response.resume_token.is_some()
                     );
                     match pdu.encode_async(&mut stream, serial, &admission).await {
                         Ok(()) => {}
@@ -1083,16 +895,15 @@ where
                             return Err(err).context("flushing PDU to client");
                         }
                     }
-                    if activates_control {
-                        let subscription =
-                            handler.take_control_subscription().ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "attachment bootstrap completed without a control subscription"
-                                )
-                            })?;
-                        if control_subscription.replace(subscription).is_some() {
+                    if activates_attachment {
+                        let connection = handler.take_attachment_connection().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "attachment bootstrap completed without its connection guard"
+                            )
+                        })?;
+                        if attachment_connection.replace(connection).is_some() {
                             return Err(anyhow::anyhow!(
-                                "connection attempted to replace its control subscription"
+                                "connection attempted to replace its attachment guard"
                             ));
                         }
                     }
@@ -1110,9 +921,6 @@ where
                     _permit: _output_permit,
                 })) => {
                     handler.remove_pane_projection(pane_id);
-                    if !control_policy.remove_controlled_pane(pane_id) {
-                        return Err(ProjectionOverflow::OutputSaturated.into());
-                    }
                     Pdu::PaneRemoved(codec::PaneRemoved { pane_id })
                         .encode_async(&mut stream, 0, &admission)
                         .await?;
@@ -1285,23 +1093,19 @@ mod dispatch_queue_tests {
         (admission, queue, receiver)
     }
 
-    fn control_publisher() -> (Arc<RuntimeAdmission>, Arc<ControlPublisher>) {
+    fn attachment_registry() -> (Arc<RuntimeAdmission>, Arc<AttachmentRegistry>) {
         let admission = RuntimeAdmission::new(RuntimeRole::Server).unwrap();
-        let publisher = ControlPublisher::new();
-        publisher.bind_admission(&admission).unwrap();
-        (admission, publisher)
+        let registry = AttachmentRegistry::new();
+        registry.bind_admission(&admission).unwrap();
+        (admission, registry)
     }
 
-    fn state(change: ControlChanged) -> ControlLeaseState {
-        change.state
-    }
-
-    fn attachment(publisher: &Arc<ControlPublisher>) -> EstablishedAttachment {
+    fn attachment(registry: &Arc<AttachmentRegistry>) -> EstablishedAttachment {
         static NEXT_TEST_TOKEN: AtomicU64 = AtomicU64::new(1);
         let sequence = NEXT_TEST_TOKEN.fetch_add(1, Ordering::Relaxed);
         let mut token = [0u8; 32];
         token[..8].copy_from_slice(&sequence.to_le_bytes());
-        publisher
+        registry
             .establish(
                 Arc::new(mux::client::ClientId::new()),
                 AttachmentResumeToken::from_random_bytes(token),
@@ -1310,309 +1114,37 @@ mod dispatch_queue_tests {
     }
 
     #[test]
-    fn control_lease_rules_and_takeover_are_exact() {
-        let (_admission, publisher) = control_publisher();
-        let first = attachment(&publisher);
-        let second = attachment(&publisher);
-        let first_identity = first.fence.identity;
-        let second_identity = second.fence.identity;
-        let first_fence = first.fence;
-        let second_fence = second.fence;
-        let first_snapshot = first.control_snapshot.clone();
-        let second_snapshot = second.control_snapshot.clone();
-        let first_rx = first.subscription;
-        let second_rx = second.subscription;
-        assert_ne!(first_identity, second_identity);
-        assert!(first_rx.receiver.try_recv().is_err());
-        assert!(second_rx.receiver.try_recv().is_err());
-        assert_eq!(first_snapshot.attachment_identity, first_identity);
-        assert_eq!(second_snapshot.attachment_identity, second_identity);
-        assert_ne!(
-            first_snapshot.attachment_identity,
-            second_snapshot.attachment_identity
-        );
-        assert_eq!(first_snapshot.state.sequence, 0);
-        assert_eq!(second_snapshot.state.sequence, 0);
-
-        let acquired = publisher
-            .apply(7, first_fence, ControlLeaseAction::Acquire)
-            .unwrap();
-        assert!(matches!(acquired, ControlLeaseResult::Acquired(_)));
-        assert!(publisher.is_controller(7, first_fence));
-        assert!(matches!(
-            publisher
-                .apply(7, first_fence, ControlLeaseAction::Acquire)
-                .unwrap(),
-            ControlLeaseResult::AlreadyController(_)
-        ));
-        assert!(matches!(
-            publisher
-                .apply(7, second_fence, ControlLeaseAction::Acquire)
-                .unwrap(),
-            ControlLeaseResult::Observing(_)
-        ));
-        assert!(matches!(
-            publisher
-                .apply(7, second_fence, ControlLeaseAction::Release)
-                .unwrap(),
-            ControlLeaseResult::NotController(_)
-        ));
-
-        let taken = publisher
-            .apply(7, second_fence, ControlLeaseAction::Take)
-            .unwrap();
-        assert!(matches!(taken, ControlLeaseResult::Taken(_)));
-        assert!(!publisher.is_controller(7, first_fence));
-        assert!(publisher.is_controller(7, second_fence));
-        assert!(matches!(
-            publisher
-                .apply(7, second_fence, ControlLeaseAction::Release)
-                .unwrap(),
-            ControlLeaseResult::Released(_)
-        ));
-        assert!(!publisher.is_controller(7, second_fence));
-
-        let first_states = (0..3)
-            .map(|_| state(smol::block_on(first_rx.recv()).unwrap()))
-            .collect::<Vec<_>>();
-        let second_states = (0..3)
-            .map(|_| state(smol::block_on(second_rx.recv()).unwrap()))
-            .collect::<Vec<_>>();
-        assert_eq!(first_states, second_states);
-        assert_eq!(
-            first_states
-                .iter()
-                .map(|state| state.sequence)
-                .collect::<Vec<_>>(),
-            vec![1, 2, 3]
-        );
-        assert_eq!(first_states[0].active[0].controller, first_identity);
-        assert_eq!(first_states[1].active[0].controller, second_identity);
-        assert!(first_states[2].active.is_empty());
-    }
-
-    #[test]
-    fn lost_registration_response_resumes_control_and_fences_the_old_connection() {
-        let (_admission, publisher) = control_publisher();
-        let original = attachment(&publisher);
+    fn lost_registration_response_resumes_identity_and_fences_the_old_connection() {
+        let (_admission, registry) = attachment_registry();
+        let original = attachment(&registry);
         let original_identity = original.fence.identity;
         let original_fence = original.fence;
         let resume_token = original.resume_token.clone();
-        let original_snapshot = original.control_snapshot.clone();
-        let original_rx = original.subscription;
-        assert_eq!(original_snapshot.attachment_identity, original_identity);
-        assert!(matches!(
-            publisher
-                .apply(7, original_fence, ControlLeaseAction::Acquire)
-                .unwrap(),
-            ControlLeaseResult::Acquired(_)
-        ));
-        drop(original_rx);
+        assert!(original.is_new);
+        assert!(registry.is_current(original_fence));
 
-        let reconnected = publisher
+        let reconnected = registry
             .establish(Arc::new(mux::client::ClientId::new()), resume_token.clone())
             .unwrap();
-        let reconnected_fence = reconnected.fence;
-        let reconnected_snapshot = reconnected.control_snapshot.clone();
-        let _reconnected_rx = reconnected.subscription;
+
         assert!(!reconnected.is_new);
         assert_eq!(reconnected.resume_token, resume_token);
-        assert_eq!(reconnected_snapshot.attachment_identity, original_identity);
-        assert_eq!(reconnected_snapshot.state.sequence, 1);
-        assert_eq!(
-            reconnected_snapshot.state.active,
-            vec![ActiveControlLease {
-                pane_id: 7,
-                controller: original_identity
-            }]
-        );
-
-        assert!(publisher
-            .apply(7, original_fence, ControlLeaseAction::Release)
-            .is_err());
-        assert!(matches!(
-            publisher
-                .apply(7, reconnected_fence, ControlLeaseAction::Acquire)
-                .unwrap(),
-            ControlLeaseResult::AlreadyController(_)
-        ));
-    }
-
-    #[test]
-    fn publisher_overload_does_not_advance_sequence_and_retry_succeeds() {
-        let (_admission, publisher) = control_publisher();
-        let first = attachment(&publisher);
-        let second = attachment(&publisher);
-        let first_fence = first.fence;
-        let second_fence = second.fence;
-        let first_rx = first.subscription;
-        let second_rx = second.subscription;
-        for index in 0..MAX_CONTROL_NOTIFICATIONS_PER_ATTACHMENT {
-            let identity = if index % 2 == 0 {
-                first_fence
-            } else {
-                second_fence
-            };
-            assert!(matches!(
-                publisher
-                    .apply(11, identity, ControlLeaseAction::Take)
-                    .unwrap(),
-                ControlLeaseResult::Taken(_)
-            ));
-        }
-        assert!(matches!(
-            publisher
-                .apply(11, first_fence, ControlLeaseAction::Take)
-                .unwrap(),
-            ControlLeaseResult::Overloaded
-        ));
-        assert_eq!(publisher.state.lock().unwrap().sequence, 256);
-
-        smol::block_on(first_rx.recv()).unwrap();
-        smol::block_on(second_rx.recv()).unwrap();
-        assert!(matches!(
-            publisher
-                .apply(11, first_fence, ControlLeaseAction::Take)
-                .unwrap(),
-            ControlLeaseResult::Taken(_)
-        ));
-        assert_eq!(publisher.state.lock().unwrap().sequence, 257);
-    }
-
-    #[test]
-    fn pane_removal_and_grace_expiry_publish_contiguous_changes() {
-        let (_admission, publisher) = control_publisher();
-        let expiring = attachment(&publisher);
-        let observer = attachment(&publisher);
-        let expiring_fence = expiring.fence;
-        let observer_rx = observer.subscription;
-        assert!(matches!(
-            publisher
-                .apply(3, expiring_fence, ControlLeaseAction::Acquire)
-                .unwrap(),
-            ControlLeaseResult::Acquired(_)
-        ));
-        assert!(matches!(
-            publisher
-                .apply(4, expiring_fence, ControlLeaseAction::Acquire)
-                .unwrap(),
-            ControlLeaseResult::Acquired(_)
-        ));
-        assert!(publisher.remove_pane(3));
-        drop(expiring.subscription);
-        assert!(matches!(
-            publisher.expire_grace(expiring_fence),
-            GraceExpiry::Expired { .. }
-        ));
-
-        let sequences = (0..4)
-            .map(|_| state(smol::block_on(observer_rx.recv()).unwrap()).sequence)
-            .collect::<Vec<_>>();
-        assert_eq!(sequences, vec![1, 2, 3, 4]);
-        assert!(publisher.state.lock().unwrap().active.is_empty());
+        assert_eq!(reconnected.fence.identity, original_identity);
+        assert!(!registry.is_current(original_fence));
+        assert!(registry.is_current(reconnected.fence));
+        smol::block_on(original.connection.cancelled());
     }
 
     #[test]
     fn attachment_identity_exhaustion_is_permanently_terminal() {
-        let (_admission, publisher) = control_publisher();
-        publisher.next_identity.store(u64::MAX, Ordering::Relaxed);
+        let (_admission, registry) = attachment_registry();
+        registry.next_identity.store(u64::MAX, Ordering::Relaxed);
 
-        assert!(publisher.issue_identity().is_err());
-        assert!(publisher.issue_identity().is_err());
-        assert_eq!(publisher.next_identity.load(Ordering::Relaxed), u64::MAX);
+        assert!(registry.issue_identity().is_err());
+        assert!(registry.issue_identity().is_err());
+        assert_eq!(registry.next_identity.load(Ordering::Relaxed), u64::MAX);
     }
 
-    #[test]
-    fn active_control_leases_are_bounded_and_repeated_acquire_does_not_grow_state() {
-        let (_admission, publisher) = control_publisher();
-        let attachment = attachment(&publisher);
-        let fence = attachment.fence;
-        for pane_id in 0..MAX_PANES {
-            assert!(matches!(
-                publisher
-                    .apply(pane_id, fence, ControlLeaseAction::Acquire)
-                    .unwrap(),
-                ControlLeaseResult::Acquired(_)
-            ));
-        }
-        let sequence = publisher.state.lock().unwrap().sequence;
-        assert!(matches!(
-            publisher
-                .apply(0, fence, ControlLeaseAction::Acquire)
-                .unwrap(),
-            ControlLeaseResult::AlreadyController(_)
-        ));
-        assert_eq!(publisher.state.lock().unwrap().sequence, sequence);
-        assert!(matches!(
-            publisher
-                .apply(MAX_PANES, fence, ControlLeaseAction::Acquire)
-                .unwrap(),
-            ControlLeaseResult::Overloaded
-        ));
-        let state = publisher.state.lock().unwrap();
-        assert_eq!(state.active.len(), MAX_PANES);
-        assert_eq!(state.sequence, sequence);
-    }
-
-    #[test]
-    fn grace_expiry_is_atomic_and_non_mutating_when_publication_is_full() {
-        let (_admission, publisher) = control_publisher();
-        let expiring = attachment(&publisher);
-        let other = attachment(&publisher);
-        let congested = attachment(&publisher);
-        let expiring_fence = expiring.fence;
-        let expiring_identity = expiring.fence.identity;
-        let other_fence = other.fence;
-        let other_rx = other.subscription;
-        let congested_rx = congested.subscription;
-        assert!(matches!(
-            publisher
-                .apply(1, expiring_fence, ControlLeaseAction::Acquire)
-                .unwrap(),
-            ControlLeaseResult::Acquired(_)
-        ));
-        assert!(matches!(
-            publisher
-                .apply(2, expiring_fence, ControlLeaseAction::Acquire)
-                .unwrap(),
-            ControlLeaseResult::Acquired(_)
-        ));
-        for index in 0..(MAX_CONTROL_NOTIFICATIONS_PER_ATTACHMENT - 2) {
-            let identity = if index % 2 == 0 {
-                expiring_fence
-            } else {
-                other_fence
-            };
-            assert!(matches!(
-                publisher
-                    .apply(3, identity, ControlLeaseAction::Take)
-                    .unwrap(),
-                ControlLeaseResult::Taken(_)
-            ));
-        }
-        let before = publisher.state.lock().unwrap().snapshot();
-        drop(expiring.subscription);
-        assert!(matches!(
-            publisher.expire_grace(expiring_fence),
-            GraceExpiry::Retry
-        ));
-        assert_eq!(publisher.state.lock().unwrap().snapshot(), before);
-
-        smol::block_on(other_rx.recv()).unwrap();
-        smol::block_on(congested_rx.recv()).unwrap();
-        assert!(matches!(
-            publisher.expire_grace(expiring_fence),
-            GraceExpiry::Expired { .. }
-        ));
-        let after = publisher.state.lock().unwrap().snapshot();
-        assert_eq!(after.sequence, before.sequence + 1);
-        assert!(after
-            .active
-            .iter()
-            .all(|lease| lease.controller != expiring_identity));
-    }
-
-    #[test]
     fn repeated_pane_output_uses_one_slot_and_one_wake() {
         let (admission, queue, receiver) = queue();
 

@@ -24,6 +24,7 @@ pub(super) struct TerminalPanel {
     terminal: Option<TerminalView>,
     scroll: ScrollState,
     last_terminal_size: Option<(usize, u16, u16)>,
+    viewport_visible: bool,
 }
 
 impl TerminalPanel {
@@ -33,6 +34,7 @@ impl TerminalPanel {
             terminal: None,
             scroll: ScrollState::default(),
             last_terminal_size: None,
+            viewport_visible: false,
         }
     }
 
@@ -54,6 +56,16 @@ impl TerminalPanel {
 
     pub(super) fn last_terminal_size_mut(&mut self) -> &mut Option<(usize, u16, u16)> {
         &mut self.last_terminal_size
+    }
+
+    pub(super) fn observe_viewport_visibility(&mut self, visible: bool) -> bool {
+        let became_visible = visible && !self.viewport_visible;
+        self.viewport_visible = visible;
+        became_visible
+    }
+
+    pub(super) fn reset_viewport_announcement(&mut self) {
+        self.last_terminal_size = None;
     }
 
     fn set_terminal(&mut self, terminal: Option<TerminalView>) -> bool {
@@ -205,6 +217,14 @@ impl PanelWorkspace {
         for slot in PanelSlot::ALL {
             if let Some(panel) = self.panel_mut(slot) {
                 panel.normalize_scroll();
+            }
+        }
+    }
+
+    pub(super) fn reset_viewport_announcements(&mut self) {
+        for slot in PanelSlot::ALL {
+            if let Some(panel) = self.panel_mut(slot) {
+                panel.reset_viewport_announcement();
             }
         }
     }

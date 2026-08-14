@@ -1,16 +1,13 @@
 use crate::dispatch::{
-    AttachmentFence, ControlPublisher, ControlSubscription, EstablishedAttachment,
+    AttachmentConnection, AttachmentFence, AttachmentRegistry, EstablishedAttachment,
 };
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-
 use codec::{
-    AttachmentIdentity, AttachmentResumeToken, BuildIdentity, ControlLeaseAction,
-    ControlLeaseResult, DecodeReservation, Pdu, RequestAuthority, RequestOperation,
-    ServiceDrainAction, ServiceDrainResult,
+    AttachmentIdentity, AttachmentResumeToken, BuildIdentity, DecodeReservation, Pdu,
+    RequestOperation, ServiceDrainAction, ServiceDrainResult,
 };
 use mux::client::ClientId;
-use mux::pane::PaneId;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use wezterm_runtime_admission::{CombinedPermit, RuntimeAdmission};
 
 /// An identity admitted and issued by the server for one established session.
@@ -37,8 +34,7 @@ impl ServerIssuedIdentity {
 pub(crate) struct EstablishedServerIdentity {
     pub(crate) identity: ServerIssuedIdentity,
     pub(crate) resume_token: AttachmentResumeToken,
-    pub(crate) control_snapshot: codec::ControlSnapshot,
-    pub(crate) subscription: ControlSubscription,
+    pub(crate) connection: AttachmentConnection,
     pub(crate) is_new: bool,
 }
 
@@ -125,7 +121,7 @@ impl RequestAuthorizer for DenyOrdinaryRequests {
 pub struct ServerPolicy {
     authorizer: Arc<dyn RequestAuthorizer>,
     build_identity: BuildIdentity,
-    control: Arc<ControlPublisher>,
+    attachments: Arc<AttachmentRegistry>,
     drain: Mutex<ServiceDrainState>,
 }
 
@@ -151,15 +147,15 @@ impl ServerPolicy {
         let policy = Arc::new(Self {
             authorizer,
             build_identity,
-            control: ControlPublisher::new(),
+            attachments: AttachmentRegistry::new(),
             drain: Mutex::new(ServiceDrainState::default()),
         });
-        policy.control.bind_policy(Arc::downgrade(&policy));
+        policy.attachments.bind_policy(Arc::downgrade(&policy));
         policy
     }
 
     pub fn bind_admission(&self, admission: &Arc<RuntimeAdmission>) -> anyhow::Result<()> {
-        self.control.bind_admission(admission)
+        self.attachments.bind_admission(admission)
     }
 
     pub fn authorize_proxy_registration(&self, client_id: &ClientId) -> anyhow::Result<()> {
@@ -182,22 +178,22 @@ impl ServerPolicy {
             fence,
             client_id,
             resume_token,
-            control_snapshot,
-            subscription,
+            connection,
             is_new,
-        } = self.control.establish(Arc::new(client_id), resume_token)?;
+        } = self
+            .attachments
+            .establish(Arc::new(client_id), resume_token)?;
         Ok(EstablishedServerIdentity {
             identity: ServerIssuedIdentity { fence, client_id },
             resume_token,
-            control_snapshot,
-            subscription,
+            connection,
             is_new,
         })
     }
 
     pub(crate) fn ensure_current(&self, identity: &ServerIssuedIdentity) -> anyhow::Result<()> {
         anyhow::ensure!(
-            self.control.is_current(identity.fence),
+            self.attachments.is_current(identity.fence),
             "attachment connection was superseded"
         );
         Ok(())
@@ -240,40 +236,7 @@ impl ServerPolicy {
                 }
             }
         }
-        match request.request_authority()? {
-            RequestAuthority::PaneControl(targets) => {
-                for pane_id in
-                    IntoIterator::into_iter([Some(targets.primary), targets.secondary]).flatten()
-                {
-                    if !self.control.is_controller(pane_id, identity.fence) {
-                        anyhow::bail!(
-                            "connection {} is an observer for pane {}",
-                            identity.attachment().get(),
-                            pane_id
-                        );
-                    }
-                }
-            }
-            RequestAuthority::ControlLease(_)
-            | RequestAuthority::Observe
-            | RequestAuthority::Bootstrap
-            | RequestAuthority::UntargetedMutation
-            | RequestAuthority::HostSensitive => {}
-        }
         Ok(())
-    }
-
-    pub fn apply_control(
-        &self,
-        identity: &ServerIssuedIdentity,
-        pane_id: PaneId,
-        action: ControlLeaseAction,
-    ) -> anyhow::Result<ControlLeaseResult> {
-        self.control.apply(pane_id, identity.fence, action)
-    }
-
-    pub fn remove_controlled_pane(&self, pane_id: PaneId) -> bool {
-        self.control.remove_pane(pane_id)
     }
 
     pub(crate) fn attachment_expired(&self, identity: AttachmentIdentity) {
@@ -370,12 +333,7 @@ impl AdmittedAuthorizedRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codec::{
-        ControlLeaseRequest, Resize, SplitPane, SplitSpawnDomain, SplitSpawnSource, WriteToPane,
-    };
-    use mux::tab::{SplitDirection, SplitRequest, SplitSize};
     use wezterm_runtime_admission::{RuntimeAdmission, RuntimeRole};
-    use wezterm_term::TerminalSize;
 
     fn identity(policy: &ServerPolicy, client_id: ClientId) -> ServerIssuedIdentity {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -460,76 +418,6 @@ mod tests {
     }
 
     #[test]
-    fn observers_cannot_send_input_or_resize_and_takeover_is_atomic() {
-        let policy = ServerPolicy::new(
-            Arc::new(AllowAllRequests),
-            BuildIdentity {
-                product: "test".to_string(),
-                version: "test".to_string(),
-                source_revision: None,
-                source_dirty: None,
-                embedded_wezterm_revision: None,
-            },
-        );
-        let admission = RuntimeAdmission::new(RuntimeRole::Server).unwrap();
-        policy.bind_admission(&admission).unwrap();
-        let controller = identity(&policy, ClientId::new());
-        let observer = identity(&policy, ClientId::new());
-        assert!(matches!(
-            policy
-                .apply_control(&controller, 9, ControlLeaseAction::Acquire)
-                .unwrap(),
-            ControlLeaseResult::Acquired(_)
-        ));
-
-        let input = Pdu::WriteToPane(WriteToPane {
-            pane_id: 9,
-            data: b"input".to_vec(),
-        });
-        assert!(policy
-            .authorize(&controller, RequestOperation::WriteToPane, &input)
-            .is_ok());
-        assert!(policy
-            .authorize(&observer, RequestOperation::WriteToPane, &input)
-            .is_err());
-        let resize = Pdu::Resize(Resize {
-            containing_tab_id: 1,
-            pane_id: 9,
-            size: TerminalSize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-                dpi: 96,
-            },
-        });
-        assert!(policy
-            .authorize(&observer, RequestOperation::Resize, &resize)
-            .is_err());
-
-        assert!(matches!(
-            policy
-                .apply_control(&observer, 9, ControlLeaseAction::Take)
-                .unwrap(),
-            ControlLeaseResult::Taken(_)
-        ));
-        assert!(policy
-            .authorize(&controller, RequestOperation::WriteToPane, &input)
-            .is_err());
-        assert!(policy
-            .authorize(&observer, RequestOperation::WriteToPane, &input)
-            .is_ok());
-
-        let lease = Pdu::ControlLeaseRequest(ControlLeaseRequest {
-            pane_id: 9,
-            action: ControlLeaseAction::Release,
-        });
-        assert!(policy
-            .authorize(&observer, RequestOperation::ControlLease, &lease)
-            .is_ok());
-    }
-
-    #[test]
     fn deny_by_default_host_policy_rejects_sensitive_requests() {
         let policy = ServerPolicy::new(
             Arc::new(DenyOrdinaryRequests),
@@ -564,51 +452,5 @@ mod tests {
         ] {
             assert!(policy.authorize(&identity, operation, &request).is_err());
         }
-    }
-
-    #[test]
-    fn moving_a_split_source_requires_control_of_both_panes() {
-        let policy = ServerPolicy::new(
-            Arc::new(AllowAllRequests),
-            BuildIdentity {
-                product: "test".to_string(),
-                version: "test".to_string(),
-                source_revision: None,
-                source_dirty: None,
-                embedded_wezterm_revision: None,
-            },
-        );
-        let admission = RuntimeAdmission::new(RuntimeRole::Server).unwrap();
-        policy.bind_admission(&admission).unwrap();
-        let identity = identity(&policy, ClientId::new());
-        assert!(matches!(
-            policy
-                .apply_control(&identity, 1, ControlLeaseAction::Acquire)
-                .unwrap(),
-            ControlLeaseResult::Acquired(_)
-        ));
-        let request = Pdu::SplitPane(SplitPane {
-            target_pane_id: 1,
-            split_request: SplitRequest {
-                direction: SplitDirection::Horizontal,
-                target_is_second: true,
-                size: SplitSize::Percent(50),
-                top_level: false,
-            },
-            domain: SplitSpawnDomain::TargetPaneDomain,
-            source: SplitSpawnSource::MovePane { pane_id: 2 },
-        });
-        assert!(policy
-            .authorize(&identity, RequestOperation::SplitPane, &request)
-            .is_err());
-        assert!(matches!(
-            policy
-                .apply_control(&identity, 2, ControlLeaseAction::Acquire)
-                .unwrap(),
-            ControlLeaseResult::Acquired(_)
-        ));
-        assert!(policy
-            .authorize(&identity, RequestOperation::SplitPane, &request)
-            .is_ok());
     }
 }

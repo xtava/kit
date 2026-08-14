@@ -1,5 +1,5 @@
 use crate::authorization::{AdmittedAuthorizedRequest, ServerIssuedIdentity, ServerPolicy};
-use crate::dispatch::ControlSubscription;
+use crate::dispatch::AttachmentConnection;
 use crate::PKI;
 use anyhow::{anyhow, Context};
 use codec::*;
@@ -12,7 +12,7 @@ use mux::domain::SplitSource;
 use mux::pane::{CachePolicy, Pane, PaneId};
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
 use mux::tab::{SplitSize, TabId};
-use mux::{Mux, MuxNotification, PaneTaskKind};
+use mux::{Mux, MuxNotification, PaneMutationKind};
 use portable_pty::CommandBuilder;
 use promise::spawn::{AdmittedTask, MainThreadExecutorHandle};
 use std::collections::HashMap;
@@ -267,7 +267,7 @@ pub struct SessionHandler {
     admission: Arc<RuntimeAdmission>,
     executor: MainThreadExecutorHandle,
     tasks: FuturesUnordered<AdmittedTask<anyhow::Result<()>>>,
-    pending_control_subscription: Option<ControlSubscription>,
+    pending_attachment_connection: Option<AttachmentConnection>,
 }
 
 pub(crate) struct RejectedRequest {
@@ -331,28 +331,14 @@ fn validate_terminal_size(size: &wezterm_term::TerminalSize) -> anyhow::Result<(
 
 fn validate_request_semantics(
     pdu: &Pdu,
+    pane_targets: PaneTargets,
     pane_exists: impl Fn(PaneId) -> bool,
     pane_tab_id: impl Fn(PaneId) -> Option<TabId>,
 ) -> anyhow::Result<()> {
-    match pdu.request_authority()? {
-        RequestAuthority::PaneControl(targets) => {
-            for pane_id in
-                IntoIterator::into_iter([Some(targets.primary), targets.secondary]).flatten()
-            {
-                if !pane_exists(pane_id) {
-                    anyhow::bail!("pane_id {} invalid", pane_id);
-                }
-            }
+    for pane_id in pane_targets.as_array().iter().flatten().copied() {
+        if !pane_exists(pane_id) {
+            anyhow::bail!("pane_id {} invalid", pane_id);
         }
-        RequestAuthority::ControlLease(pane_id) => {
-            if !pane_exists(pane_id) {
-                anyhow::bail!("pane_id {} invalid", pane_id);
-            }
-        }
-        RequestAuthority::Bootstrap
-        | RequestAuthority::Observe
-        | RequestAuthority::UntargetedMutation
-        | RequestAuthority::HostSensitive => {}
     }
     match pdu {
         Pdu::SpawnV2(SpawnV2 {
@@ -462,7 +448,7 @@ impl SessionHandler {
             admission,
             executor,
             tasks: FuturesUnordered::new(),
-            pending_control_subscription: None,
+            pending_attachment_connection: None,
         })
     }
 
@@ -515,13 +501,7 @@ impl SessionHandler {
             }
             self.policy.authorize_proxy_registration(&client_id)?;
             proxy.replace(client_id);
-            return Ok((
-                SetClientIdResponse {
-                    resume_token: None,
-                    control_snapshot: None,
-                },
-                None,
-            ));
+            return Ok((SetClientIdResponse { resume_token: None }, None));
         }
 
         if let Some(proxy) = proxy.as_ref() {
@@ -537,15 +517,14 @@ impl SessionHandler {
             .then(|| Arc::clone(established.identity.client_id()));
         let response = SetClientIdResponse {
             resume_token: Some(established.resume_token),
-            control_snapshot: Some(established.control_snapshot),
         };
         self.bootstrap = BootstrapState::Established(established.identity);
-        self.pending_control_subscription = Some(established.subscription);
+        self.pending_attachment_connection = Some(established.connection);
         Ok((response, issued_client_id))
     }
 
-    pub(crate) fn take_control_subscription(&mut self) -> Option<ControlSubscription> {
-        self.pending_control_subscription.take()
+    pub(crate) fn take_attachment_connection(&mut self) -> Option<AttachmentConnection> {
+        self.pending_attachment_connection.take()
     }
 
     fn schedule<F>(&mut self, future: F) -> anyhow::Result<()>
@@ -569,14 +548,23 @@ impl SessionHandler {
 
     fn schedule_pane_task<F>(
         &self,
+        serial: u64,
         pane_id: PaneId,
-        kind: PaneTaskKind,
-        future: F,
+        kind: PaneMutationKind,
+        apply: F,
     ) -> anyhow::Result<()>
     where
-        F: Future<Output = anyhow::Result<()>> + 'static,
+        F: FnOnce() -> anyhow::Result<()> + 'static,
     {
-        Mux::get().try_spawn_pane_task_local(pane_id, kind, future)
+        match Mux::get().try_enqueue_pane_mutation_local(pane_id, kind, apply) {
+            Ok(()) => Ok(()),
+            Err(error) => self.to_write_tx.send(
+                Pdu::ErrorResponse(ErrorResponse {
+                    reason: format!("Error: pane mutation was not accepted: {error:#}"),
+                }),
+                serial,
+            ),
+        }
     }
 
     pub async fn wait_for_task(&mut self) -> anyhow::Result<()> {
@@ -668,9 +656,10 @@ impl SessionHandler {
     ) -> Result<AdmittedAuthorizedRequest, RejectedRequest> {
         let (serial, pdu, decode_reservation) = decoded.into_parts();
         let admission = (|| {
-            let operation = pdu.request_operation()?;
+            let metadata = pdu.request_metadata()?;
             validate_request_semantics(
                 &pdu,
+                metadata.pane_targets,
                 |pane_id| Mux::get().get_pane(pane_id).is_some(),
                 |pane_id| {
                     Mux::get()
@@ -682,13 +671,13 @@ impl SessionHandler {
                 Pdu::SplitPane(split) => Some(resolve_split_spawn_domain_id(split)?),
                 _ => None,
             };
-            self.authorize_request(operation, &pdu)
+            self.authorize_request(metadata.operation, &pdu)
                 .context("request authorization denied")?;
             let identity = match &self.bootstrap {
                 BootstrapState::Established(identity) => Some(identity.clone()),
                 BootstrapState::AwaitingClient { .. } => None,
             };
-            Ok::<_, anyhow::Error>((operation, identity, split_domain_id))
+            Ok::<_, anyhow::Error>((metadata.operation, identity, split_domain_id))
         })();
         match admission {
             Ok((operation, identity, split_domain_id)) => Ok(AdmittedAuthorizedRequest::new(
@@ -906,39 +895,49 @@ impl SessionHandler {
                 let sender = self.to_write_tx.clone();
                 let per_pane = self.per_pane(pane_id);
                 let bytes = data.len();
-                self.schedule_pane_task(pane_id, PaneTaskKind::Write { bytes }, async move {
+                self.schedule_pane_task(
+                    serial,
+                    pane_id,
+                    PaneMutationKind::Write { bytes },
+                    move || {
+                        catch(
+                            move || {
+                                let mux = Mux::get();
+                                let pane = mux
+                                    .get_pane(pane_id)
+                                    .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
+                                pane.writer().write_all(&data)?;
+                                maybe_push_pane_changes(&pane, sender, per_pane)?;
+                                Ok(Pdu::UnitResponse(UnitResponse {}))
+                            },
+                            send_response,
+                        )
+                    },
+                )
+            }
+            Pdu::EraseScrollbackRequest(EraseScrollbackRequest {
+                pane_id,
+                erase_mode,
+            }) => self.schedule_pane_task(
+                serial,
+                pane_id,
+                PaneMutationKind::EraseScrollback,
+                move || {
                     catch(
                         move || {
                             let mux = Mux::get();
                             let pane = mux
                                 .get_pane(pane_id)
                                 .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
-                            pane.writer().write_all(&data)?;
-                            maybe_push_pane_changes(&pane, sender, per_pane)?;
+                            pane.erase_scrollback(erase_mode);
                             Ok(Pdu::UnitResponse(UnitResponse {}))
                         },
                         send_response,
                     )
-                })
-            }
-            Pdu::EraseScrollbackRequest(EraseScrollbackRequest {
-                pane_id,
-                erase_mode,
-            }) => self.schedule(async move {
-                catch(
-                    move || {
-                        let mux = Mux::get();
-                        let pane = mux
-                            .get_pane(pane_id)
-                            .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
-                        pane.erase_scrollback(erase_mode);
-                        Ok(Pdu::UnitResponse(UnitResponse {}))
-                    },
-                    send_response,
-                )
-            }),
+                },
+            ),
             Pdu::KillPane(KillPane { pane_id }) => {
-                self.schedule(async move {
+                self.schedule_pane_task(serial, pane_id, PaneMutationKind::Kill, move || {
                     catch(
                         move || {
                             let mux = Mux::get();
@@ -962,20 +961,25 @@ impl SessionHandler {
                 let sender = self.to_write_tx.clone();
                 let per_pane = self.per_pane(pane_id);
                 let bytes = pane_paste_enveloped_byte_count(data.len())?;
-                self.schedule_pane_task(pane_id, PaneTaskKind::Input { bytes }, async move {
-                    catch(
-                        move || {
-                            let mux = Mux::get();
-                            let pane = mux
-                                .get_pane(pane_id)
-                                .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
-                            pane.send_paste(&data)?;
-                            maybe_push_pane_changes(&pane, sender, per_pane)?;
-                            Ok(Pdu::UnitResponse(UnitResponse {}))
-                        },
-                        send_response,
-                    )
-                })
+                self.schedule_pane_task(
+                    serial,
+                    pane_id,
+                    PaneMutationKind::Input { bytes },
+                    move || {
+                        catch(
+                            move || {
+                                let mux = Mux::get();
+                                let pane = mux
+                                    .get_pane(pane_id)
+                                    .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
+                                pane.send_paste(&data)?;
+                                maybe_push_pane_changes(&pane, sender, per_pane)?;
+                                Ok(Pdu::UnitResponse(UnitResponse {}))
+                            },
+                            send_response,
+                        )
+                    },
+                )
             }
 
             Pdu::SearchScrollbackRequest(SearchScrollbackRequest {
@@ -1094,7 +1098,7 @@ impl SessionHandler {
                 containing_tab_id,
                 pane_id,
                 size,
-            }) => self.schedule(async move {
+            }) => self.schedule_pane_task(serial, pane_id, PaneMutationKind::Resize, move || {
                 catch(
                     move || {
                         let mux = Mux::get();
@@ -1120,11 +1124,12 @@ impl SessionHandler {
                 let sender = self.to_write_tx.clone();
                 let per_pane = self.per_pane(pane_id);
                 self.schedule_pane_task(
+                    serial,
                     pane_id,
-                    PaneTaskKind::Input {
+                    PaneMutationKind::Input {
                         bytes: MAX_ENCODED_INPUT_EVENT_BYTES,
                     },
-                    async move {
+                    move || {
                         catch(
                             move || {
                                 let mux = Mux::get();
@@ -1153,11 +1158,12 @@ impl SessionHandler {
                 let sender = self.to_write_tx.clone();
                 let per_pane = self.per_pane(pane_id);
                 self.schedule_pane_task(
+                    serial,
                     pane_id,
-                    PaneTaskKind::Input {
+                    PaneMutationKind::Input {
                         bytes: MAX_ENCODED_INPUT_EVENT_BYTES,
                     },
-                    async move {
+                    move || {
                         catch(
                             move || {
                                 let mux = Mux::get();
@@ -1385,42 +1391,44 @@ impl SessionHandler {
                     send_response,
                 )
             }),
-            Pdu::SetPalette(SetPalette { pane_id, palette }) => self.schedule(async move {
-                catch(
-                    move || {
-                        let mux = Mux::get();
-                        let pane = mux
-                            .get_pane(pane_id)
-                            .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
+            Pdu::SetPalette(SetPalette { pane_id, palette }) => {
+                self.schedule_pane_task(serial, pane_id, PaneMutationKind::SetPalette, move || {
+                    catch(
+                        move || {
+                            let mux = Mux::get();
+                            let pane = mux
+                                .get_pane(pane_id)
+                                .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
 
-                        match pane.get_config() {
-                            Some(config) => match config.downcast_ref::<TermConfig>() {
-                                Some(tc) => tc.set_client_palette(*palette),
+                            match pane.get_config() {
+                                Some(config) => match config.downcast_ref::<TermConfig>() {
+                                    Some(tc) => tc.set_client_palette(*palette),
+                                    None => {
+                                        log::error!(
+                                            "pane {pane_id} doesn't \
+                                                have TermConfig as its config! \
+                                                Ignoring client palette update"
+                                        );
+                                    }
+                                },
                                 None => {
-                                    log::error!(
-                                        "pane {pane_id} doesn't \
-                                            have TermConfig as its config! \
-                                            Ignoring client palette update"
-                                    );
+                                    let config = TermConfig::new();
+                                    config.set_client_palette(*palette);
+                                    pane.set_config(Arc::new(config));
                                 }
-                            },
-                            None => {
-                                let config = TermConfig::new();
-                                config.set_client_palette(*palette);
-                                pane.set_config(Arc::new(config));
                             }
-                        }
 
-                        mux.notify(MuxNotification::Alert {
-                            pane_id,
-                            alert: Alert::PaletteChanged,
-                        });
+                            mux.notify(MuxNotification::Alert {
+                                pane_id,
+                                alert: Alert::PaletteChanged,
+                            });
 
-                        Ok(Pdu::UnitResponse(UnitResponse {}))
-                    },
-                    send_response,
-                )
-            }),
+                            Ok(Pdu::UnitResponse(UnitResponse {}))
+                        },
+                        send_response,
+                    )
+                })
+            }
 
             Pdu::AdjustPaneSize(AdjustPaneSize {
                 pane_id,
@@ -1447,19 +1455,6 @@ impl SessionHandler {
                     send_response,
                 )
             }),
-
-            Pdu::ControlLeaseRequest(ControlLeaseRequest { pane_id, action }) => {
-                let Some(identity) = authorized_identity.as_ref() else {
-                    return send_response(Err(anyhow!(
-                        "control lease requires an established attachment"
-                    )));
-                };
-                send_response(
-                    self.policy
-                        .apply_control(identity, pane_id, action)
-                        .map(Pdu::ControlLeaseResult),
-                )
-            }
 
             Pdu::ServiceDrainRequest(ServiceDrainRequest { action }) => {
                 let Some(identity) = authorized_identity.clone() else {
@@ -1502,10 +1497,7 @@ impl SessionHandler {
             | Pdu::MovePaneToNewTabResponse { .. }
             | Pdu::TabAddedToWindow { .. }
             | Pdu::GetPaneRenderableDimensionsResponse { .. }
-            | Pdu::ControlLeaseResult { .. }
             | Pdu::SetClientIdResponse { .. }
-            | Pdu::ControlSnapshot { .. }
-            | Pdu::ControlChanged { .. }
             | Pdu::AttachRejected { .. }
             | Pdu::ServiceDrainResult { .. }
             | Pdu::ErrorResponse { .. } => {
@@ -1693,16 +1685,6 @@ mod owned_task_tests {
         );
         assert!(program.get_controlling_tty());
         assert_eq!(program.iter_extra_env_as_str().count(), 0);
-    }
-
-    #[test]
-    fn nonexistent_control_lease_target_is_rejected_before_authority_mutation() {
-        let request = Pdu::ControlLeaseRequest(ControlLeaseRequest {
-            pane_id: usize::MAX,
-            action: ControlLeaseAction::Acquire,
-        });
-        let error = validate_request_semantics(&request, |_| false, |_| None).unwrap_err();
-        assert!(error.to_string().contains("pane_id"));
     }
 
     fn terminal_size(
@@ -2061,7 +2043,6 @@ mod owned_task_tests {
         let (proxy_response, proxy_client) = handler.register_client(proxy, true, None).unwrap();
         assert!(proxy_client.is_none());
         assert!(proxy_response.resume_token.is_none());
-        assert!(proxy_response.control_snapshot.is_none());
         assert_eq!(
             handler.client_request_phase(),
             ClientRequestPhase::Bootstrap
@@ -2077,7 +2058,6 @@ mod owned_task_tests {
             ClientRequestPhase::Established
         );
         assert_eq!(response.resume_token, Some(token));
-        assert!(response.control_snapshot.is_some());
         assert_eq!(issued.ssh_auth_sock.as_deref(), Some("proxy-agent"));
         assert_eq!(issued.hostname, "primary (via proxy pid 42)");
         assert!(handler

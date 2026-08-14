@@ -987,7 +987,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 52;
+pub const CODEC_VERSION: usize = 53;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -1050,10 +1050,6 @@ pdu! {
     AdjustPaneSize: 62 => Request(UnitResponse),
     GetBuildIdentity: 63 => Request(GetBuildIdentityResponse),
     GetBuildIdentityResponse: 64 => Response,
-    ControlLeaseRequest: 65 => Request(ControlLeaseResult),
-    ControlLeaseResult: 66 => Response,
-    ControlSnapshot: 67 => Notification,
-    ControlChanged: 68 => Notification,
     AttachRejected: 69 => Notification,
     ServiceDrainRequest: 70 => Request(ServiceDrainResult),
     ServiceDrainResult: 71 => Response,
@@ -1072,9 +1068,6 @@ impl PduTag {
             | Self::PaneFocused
             | Self::TabResized
             | Self::TabAddedToWindow
-            | Self::ControlLeaseResult
-            | Self::ControlSnapshot
-            | Self::ControlChanged
             | Self::SetClientIdResponse => MAX_DECODE_METADATA_HEAP_ENVELOPE_BYTES_PER_PDU,
             Self::ServiceDrainResult => MAX_DECODE_METADATA_HEAP_ENVELOPE_BYTES_PER_PDU,
             Self::SetPalette
@@ -1117,7 +1110,6 @@ impl PduTag {
             | Self::EraseScrollbackRequest
             | Self::GetPaneDirection
             | Self::AdjustPaneSize
-            | Self::ControlLeaseRequest
             | Self::ServiceDrainRequest => phase == ClientRequestPhase::Established,
             Self::ErrorResponse
             | Self::Pong
@@ -1143,9 +1135,6 @@ impl PduTag {
             | Self::TabAddedToWindow
             | Self::GetPaneDirectionResponse
             | Self::GetBuildIdentityResponse
-            | Self::ControlLeaseResult
-            | Self::ControlSnapshot
-            | Self::ControlChanged
             | Self::AttachRejected
             | Self::ServiceDrainResult
             | Self::SetClientIdResponse => false,
@@ -1187,31 +1176,51 @@ pub enum RequestOperation {
     EraseScrollback,
     GetPaneDirection,
     AdjustPaneSize,
-    ControlLease,
     ServiceDrain,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RequestAuthority {
-    Bootstrap,
-    Observe,
-    PaneControl(PaneControlTargets),
-    ControlLease(PaneId),
-    UntargetedMutation,
-    HostSensitive,
+pub enum PaneTargets {
+    None,
+    One(PaneId),
+    Two { primary: PaneId, secondary: PaneId },
+}
+
+impl PaneTargets {
+    pub const fn as_array(self) -> [Option<PaneId>; 2] {
+        match self {
+            Self::None => [None, None],
+            Self::One(pane_id) => [Some(pane_id), None],
+            Self::Two { primary, secondary } => [Some(primary), Some(secondary)],
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PaneControlTargets {
-    pub primary: PaneId,
-    pub secondary: Option<PaneId>,
+pub struct RequestMetadata {
+    pub operation: RequestOperation,
+    pub pane_targets: PaneTargets,
 }
 
-impl PaneControlTargets {
-    fn one(primary: PaneId) -> Self {
+impl RequestMetadata {
+    const fn new(operation: RequestOperation) -> Self {
         Self {
-            primary,
-            secondary: None,
+            operation,
+            pane_targets: PaneTargets::None,
+        }
+    }
+
+    const fn for_pane(operation: RequestOperation, pane_id: PaneId) -> Self {
+        Self {
+            operation,
+            pane_targets: PaneTargets::One(pane_id),
+        }
+    }
+
+    const fn for_panes(operation: RequestOperation, primary: PaneId, secondary: PaneId) -> Self {
+        Self {
+            operation,
+            pane_targets: PaneTargets::Two { primary, secondary },
         }
     }
 }
@@ -1223,148 +1232,91 @@ pub struct InvalidPduDirection {
 }
 
 impl Pdu {
-    pub fn request_operation(&self) -> Result<RequestOperation, InvalidPduDirection> {
-        let operation = match self {
-            Self::Ping(_) => RequestOperation::Ping,
-            Self::ListPanes(_) => RequestOperation::ListPanes,
-            Self::SpawnV2(_) => RequestOperation::Spawn,
-            Self::WriteToPane(_) => RequestOperation::WriteToPane,
-            Self::SendKeyDown(_) => RequestOperation::SendKey,
-            Self::SendMouseEvent(_) => RequestOperation::SendMouse,
-            Self::SendPaste(_) => RequestOperation::SendPaste,
-            Self::Resize(_) => RequestOperation::Resize,
-            Self::SetPaneZoomed(_) => RequestOperation::SetZoom,
-            Self::GetLines(_) => RequestOperation::GetLines,
-            Self::GetPaneRenderChanges(_) => RequestOperation::GetRenderChanges,
-            Self::GetCodecVersion(_) => RequestOperation::GetCodecVersion,
-            Self::GetBuildIdentity(_) => RequestOperation::GetBuildIdentity,
-            Self::GetTlsCreds(_) => RequestOperation::GetTlsCredentials,
-            Self::SearchScrollbackRequest(_) => RequestOperation::SearchScrollback,
-            Self::SplitPane(_) => RequestOperation::SplitPane,
-            Self::KillPane(_) => RequestOperation::KillPane,
-            Self::SetClientId(_) => RequestOperation::RegisterClient,
-            Self::GetClientList(_) => RequestOperation::GetClientList,
-            Self::SetWindowWorkspace(_) => RequestOperation::SetWindowWorkspace,
-            Self::SetFocusedPane(_) => RequestOperation::SetFocusedPane,
-            Self::GetImageCell(_) => RequestOperation::GetImageCell,
-            Self::MovePaneToNewTab(_) => RequestOperation::MovePaneToNewTab,
-            Self::ActivatePaneDirection(_) => RequestOperation::ActivatePaneDirection,
-            Self::GetPaneRenderableDimensions(_) => RequestOperation::GetRenderableDimensions,
-            Self::SetPalette(_) => RequestOperation::SetPalette,
-            Self::TabTitleChanged(_) => RequestOperation::SetTabTitle,
-            Self::WindowTitleChanged(_) => RequestOperation::SetWindowTitle,
-            Self::RenameWorkspace(_) => RequestOperation::RenameWorkspace,
-            Self::EraseScrollbackRequest(_) => RequestOperation::EraseScrollback,
-            Self::GetPaneDirection(_) => RequestOperation::GetPaneDirection,
-            Self::AdjustPaneSize(_) => RequestOperation::AdjustPaneSize,
-            Self::ControlLeaseRequest(_) => RequestOperation::ControlLease,
-            Self::ServiceDrainRequest(_) => RequestOperation::ServiceDrain,
-            Self::Invalid { .. }
-            | Self::ErrorResponse(_)
-            | Self::Pong(_)
-            | Self::ListPanesResponse(_)
-            | Self::SpawnResponse(_)
-            | Self::UnitResponse(_)
-            | Self::SetClipboard(_)
-            | Self::GetLinesResponse(_)
-            | Self::GetPaneRenderChangesResponse(_)
-            | Self::GetCodecVersionResponse(_)
-            | Self::GetBuildIdentityResponse(_)
-            | Self::GetTlsCredsResponse(_)
-            | Self::LivenessResponse(_)
-            | Self::SearchScrollbackResponse(_)
-            | Self::PaneRemoved(_)
-            | Self::NotifyAlert(_)
-            | Self::WindowWorkspaceChanged(_)
-            | Self::GetClientListResponse(_)
-            | Self::GetImageCellResponse(_)
-            | Self::MovePaneToNewTabResponse(_)
-            | Self::GetPaneRenderableDimensionsResponse(_)
-            | Self::PaneFocused(_)
-            | Self::TabResized(_)
-            | Self::TabAddedToWindow(_)
-            | Self::GetPaneDirectionResponse(_)
-            | Self::ControlLeaseResult(_)
-            | Self::ServiceDrainResult(_)
-            | Self::SetClientIdResponse(_)
-            | Self::ControlSnapshot(_)
-            | Self::ControlChanged(_)
-            | Self::AttachRejected(_) => {
-                return Err(InvalidPduDirection {
-                    pdu: self.pdu_name(),
-                })
-            }
-        };
-        Ok(operation)
-    }
-
-    /// Exhaustive server-side authority required before dispatching an inbound request.
-    pub fn request_authority(&self) -> Result<RequestAuthority, InvalidPduDirection> {
-        let authority = match self {
-            Self::Ping(_)
-            | Self::GetCodecVersion(_)
-            | Self::GetBuildIdentity(_)
-            | Self::SetClientId(_) => RequestAuthority::Bootstrap,
-            Self::ListPanes(_)
-            | Self::GetLines(_)
-            | Self::GetPaneRenderChanges(_)
-            | Self::SearchScrollbackRequest(_)
-            | Self::GetImageCell(_)
-            | Self::GetPaneRenderableDimensions(_)
-            | Self::GetPaneDirection(_) => RequestAuthority::Observe,
+    pub fn request_metadata(&self) -> Result<RequestMetadata, InvalidPduDirection> {
+        let metadata = match self {
+            Self::Ping(_) => RequestMetadata::new(RequestOperation::Ping),
+            Self::ListPanes(_) => RequestMetadata::new(RequestOperation::ListPanes),
+            Self::SpawnV2(_) => RequestMetadata::new(RequestOperation::Spawn),
             Self::WriteToPane(request) => {
-                RequestAuthority::PaneControl(PaneControlTargets::one(request.pane_id))
+                RequestMetadata::for_pane(RequestOperation::WriteToPane, request.pane_id)
             }
             Self::SendKeyDown(request) => {
-                RequestAuthority::PaneControl(PaneControlTargets::one(request.pane_id))
+                RequestMetadata::for_pane(RequestOperation::SendKey, request.pane_id)
             }
             Self::SendMouseEvent(request) => {
-                RequestAuthority::PaneControl(PaneControlTargets::one(request.pane_id))
+                RequestMetadata::for_pane(RequestOperation::SendMouse, request.pane_id)
             }
             Self::SendPaste(request) => {
-                RequestAuthority::PaneControl(PaneControlTargets::one(request.pane_id))
+                RequestMetadata::for_pane(RequestOperation::SendPaste, request.pane_id)
             }
             Self::Resize(request) => {
-                RequestAuthority::PaneControl(PaneControlTargets::one(request.pane_id))
+                RequestMetadata::for_pane(RequestOperation::Resize, request.pane_id)
             }
             Self::SetPaneZoomed(request) => {
-                RequestAuthority::PaneControl(PaneControlTargets::one(request.pane_id))
+                RequestMetadata::for_pane(RequestOperation::SetZoom, request.pane_id)
             }
-            Self::SplitPane(request) => RequestAuthority::PaneControl(PaneControlTargets {
-                primary: request.target_pane_id,
-                secondary: match &request.source {
-                    SplitSpawnSource::Spawn { .. } => None,
-                    SplitSpawnSource::MovePane { pane_id } => Some(*pane_id),
-                },
-            }),
+            Self::GetLines(request) => {
+                RequestMetadata::for_pane(RequestOperation::GetLines, request.pane_id)
+            }
+            Self::GetPaneRenderChanges(request) => {
+                RequestMetadata::for_pane(RequestOperation::GetRenderChanges, request.pane_id)
+            }
+            Self::GetCodecVersion(_) => RequestMetadata::new(RequestOperation::GetCodecVersion),
+            Self::GetBuildIdentity(_) => RequestMetadata::new(RequestOperation::GetBuildIdentity),
+            Self::GetTlsCreds(_) => RequestMetadata::new(RequestOperation::GetTlsCredentials),
+            Self::SearchScrollbackRequest(request) => {
+                RequestMetadata::for_pane(RequestOperation::SearchScrollback, request.pane_id)
+            }
+            Self::SplitPane(request) => match &request.source {
+                SplitSpawnSource::Spawn { .. } => {
+                    RequestMetadata::for_pane(RequestOperation::SplitPane, request.target_pane_id)
+                }
+                SplitSpawnSource::MovePane { pane_id } => RequestMetadata::for_panes(
+                    RequestOperation::SplitPane,
+                    request.target_pane_id,
+                    *pane_id,
+                ),
+            },
             Self::KillPane(request) => {
-                RequestAuthority::PaneControl(PaneControlTargets::one(request.pane_id))
+                RequestMetadata::for_pane(RequestOperation::KillPane, request.pane_id)
+            }
+            Self::SetClientId(_) => RequestMetadata::new(RequestOperation::RegisterClient),
+            Self::GetClientList(_) => RequestMetadata::new(RequestOperation::GetClientList),
+            Self::SetWindowWorkspace(_) => {
+                RequestMetadata::new(RequestOperation::SetWindowWorkspace)
             }
             Self::SetFocusedPane(request) => {
-                RequestAuthority::PaneControl(PaneControlTargets::one(request.pane_id))
+                RequestMetadata::for_pane(RequestOperation::SetFocusedPane, request.pane_id)
+            }
+            Self::GetImageCell(request) => {
+                RequestMetadata::for_pane(RequestOperation::GetImageCell, request.pane_id)
             }
             Self::MovePaneToNewTab(request) => {
-                RequestAuthority::PaneControl(PaneControlTargets::one(request.pane_id))
+                RequestMetadata::for_pane(RequestOperation::MovePaneToNewTab, request.pane_id)
             }
             Self::ActivatePaneDirection(request) => {
-                RequestAuthority::PaneControl(PaneControlTargets::one(request.pane_id))
+                RequestMetadata::for_pane(RequestOperation::ActivatePaneDirection, request.pane_id)
             }
+            Self::GetPaneRenderableDimensions(request) => RequestMetadata::for_pane(
+                RequestOperation::GetRenderableDimensions,
+                request.pane_id,
+            ),
+            Self::SetPalette(request) => {
+                RequestMetadata::for_pane(RequestOperation::SetPalette, request.pane_id)
+            }
+            Self::TabTitleChanged(_) => RequestMetadata::new(RequestOperation::SetTabTitle),
+            Self::WindowTitleChanged(_) => RequestMetadata::new(RequestOperation::SetWindowTitle),
+            Self::RenameWorkspace(_) => RequestMetadata::new(RequestOperation::RenameWorkspace),
             Self::EraseScrollbackRequest(request) => {
-                RequestAuthority::PaneControl(PaneControlTargets::one(request.pane_id))
+                RequestMetadata::for_pane(RequestOperation::EraseScrollback, request.pane_id)
+            }
+            Self::GetPaneDirection(request) => {
+                RequestMetadata::for_pane(RequestOperation::GetPaneDirection, request.pane_id)
             }
             Self::AdjustPaneSize(request) => {
-                RequestAuthority::PaneControl(PaneControlTargets::one(request.pane_id))
+                RequestMetadata::for_pane(RequestOperation::AdjustPaneSize, request.pane_id)
             }
-            Self::ControlLeaseRequest(request) => RequestAuthority::ControlLease(request.pane_id),
-            Self::ServiceDrainRequest(_) => RequestAuthority::HostSensitive,
-            Self::SpawnV2(_)
-            | Self::SetWindowWorkspace(_)
-            | Self::TabTitleChanged(_)
-            | Self::WindowTitleChanged(_)
-            | Self::RenameWorkspace(_) => RequestAuthority::UntargetedMutation,
-            Self::GetTlsCreds(_) | Self::GetClientList(_) | Self::SetPalette(_) => {
-                RequestAuthority::HostSensitive
-            }
+            Self::ServiceDrainRequest(_) => RequestMetadata::new(RequestOperation::ServiceDrain),
             Self::Invalid { .. }
             | Self::ErrorResponse(_)
             | Self::Pong(_)
@@ -1390,9 +1342,6 @@ impl Pdu {
             | Self::TabResized(_)
             | Self::TabAddedToWindow(_)
             | Self::GetPaneDirectionResponse(_)
-            | Self::ControlLeaseResult(_)
-            | Self::ControlSnapshot(_)
-            | Self::ControlChanged(_)
             | Self::AttachRejected(_)
             | Self::ServiceDrainResult(_)
             | Self::SetClientIdResponse(_) => {
@@ -1401,7 +1350,7 @@ impl Pdu {
                 })
             }
         };
-        Ok(authority)
+        Ok(metadata)
     }
 
     /// Returns true if this type of Pdu represents action taken
@@ -1592,42 +1541,6 @@ impl Drop for AttachmentResumeToken {
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize, Eq, PartialEq, Debug)]
-pub enum ControlLeaseAction {
-    Acquire,
-    Take,
-    Release,
-}
-
-#[derive(Clone, Deserialize, Serialize, Eq, PartialEq, Debug)]
-pub struct ControlLeaseRequest {
-    pub pane_id: PaneId,
-    pub action: ControlLeaseAction,
-}
-
-#[derive(Clone, Deserialize, Serialize, Eq, PartialEq, Debug)]
-pub struct ActiveControlLease {
-    pub pane_id: PaneId,
-    pub controller: AttachmentIdentity,
-}
-
-#[derive(Clone, Deserialize, Serialize, Eq, PartialEq, Debug)]
-pub struct ControlLeaseState {
-    pub sequence: u64,
-    pub active: Vec<ActiveControlLease>,
-}
-
-#[derive(Clone, Deserialize, Serialize, Eq, PartialEq, Debug)]
-pub enum ControlLeaseResult {
-    Acquired(ControlLeaseState),
-    AlreadyController(ControlLeaseState),
-    Observing(ControlLeaseState),
-    Taken(ControlLeaseState),
-    Released(ControlLeaseState),
-    NotController(ControlLeaseState),
-    Overloaded,
-}
-
-#[derive(Clone, Copy, Deserialize, Serialize, Eq, PartialEq, Debug)]
 pub enum ServiceDrainAction {
     Begin,
     Cancel,
@@ -1641,21 +1554,6 @@ pub struct ServiceDrainRequest {
 #[derive(Clone, Copy, Deserialize, Serialize, Eq, PartialEq, Debug)]
 pub struct ServiceDrainResult {
     pub draining: bool,
-}
-
-#[derive(Clone, Deserialize, Serialize, Eq, PartialEq, Debug)]
-pub struct ControlSnapshot {
-    /// Identity of the attachment receiving this snapshot.
-    ///
-    /// This is comparison-only client state: no client request accepts a
-    /// `AttachmentIdentity` as authority.
-    pub attachment_identity: AttachmentIdentity,
-    pub state: ControlLeaseState,
-}
-
-#[derive(Clone, Deserialize, Serialize, Eq, PartialEq, Debug)]
-pub struct ControlChanged {
-    pub state: ControlLeaseState,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
@@ -1980,7 +1878,6 @@ pub struct SetClientId {
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
 pub struct SetClientIdResponse {
     pub resume_token: Option<AttachmentResumeToken>,
-    pub control_snapshot: Option<ControlSnapshot>,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
@@ -2814,7 +2711,7 @@ mod test {
     }
 
     #[test]
-    fn control_response_remains_admissible_behind_four_large_decoded_values() {
+    fn content_free_response_remains_admissible_behind_four_large_decoded_values() {
         let admission = admission();
         let large = (0..4)
             .map(|_| {
@@ -2827,23 +2724,20 @@ mod test {
             })
             .collect::<Vec<_>>();
         let mut encoded = Vec::new();
-        Pdu::ControlLeaseResult(ControlLeaseResult::Overloaded)
+        Pdu::Pong(Pong {})
             .encode(&mut encoded, 1, &admission)
             .unwrap();
 
         let response = Pdu::decode(
             encoded.as_slice(),
-            DecodeContext::server_to_client_response(Some(PduTag::ControlLeaseResult)),
+            DecodeContext::server_to_client_response(Some(PduTag::Pong)),
             &admission,
         )
         .unwrap()
         .into_rpc_response()
         .unwrap();
 
-        assert!(matches!(
-            response.value(),
-            Pdu::ControlLeaseResult(ControlLeaseResult::Overloaded)
-        ));
+        assert!(matches!(response.value(), Pdu::Pong(Pong {})));
         assert!(
             admission.byte_usage(ByteClass::DecodeWorking)
                 >= large.len() * MAX_DECODE_HEAP_ENVELOPE_BYTES_PER_PDU
@@ -3056,25 +2950,6 @@ mod test {
                 tag.name()
             );
         }
-    }
-
-    #[test]
-    fn projected_attachment_identity_is_never_client_request_authority() {
-        let identity = AttachmentIdentity::from_server_sequence(NonZeroU64::new(7).unwrap());
-        let snapshot = Pdu::ControlSnapshot(ControlSnapshot {
-            attachment_identity: identity,
-            state: ControlLeaseState {
-                sequence: 0,
-                active: vec![],
-            },
-        });
-
-        assert!(snapshot.request_operation().is_err());
-        assert!(snapshot.request_authority().is_err());
-        assert!(!PduTag::ControlSnapshot.allows_client_request_phase(ClientRequestPhase::Bootstrap));
-        assert!(
-            !PduTag::ControlSnapshot.allows_client_request_phase(ClientRequestPhase::Established)
-        );
     }
 
     #[test]
