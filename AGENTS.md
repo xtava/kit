@@ -17,6 +17,19 @@ Read [CONTRIBUTING.md](./CONTRIBUTING.md) before non-trivial changes. It defines
 workflow: tools own domain policy and presentation, shared modules own reusable mechanics, and
 cross-tool behavior must have one canonical owner rather than copied per-tool implementations.
 
+## Durable Development Logs
+
+Development ledgers under `sessions/` are opt-in. Load and use the project-local `kit-dev-log`
+skill only when the user explicitly asks for a durable development log, handoff, resume record, or
+another persistent task ledger. Do not create or update a session ledger merely because work spans
+multiple turns. Never record secrets, authentication URLs, private terminal contents, or chat
+transcripts. See [Development logs](./docs/canonical/dev-logs.md) for the ledger contract when it is
+explicitly requested.
+
+Task lists, TODO inventories, and execution plans are likewise opt-in. Create or maintain them only
+when the user explicitly asks for planning or a task-list artifact; otherwise make the requested
+change directly and report the relevant verification.
+
 ## Build, Test, and Development Commands
 
 - `cargo watch -x check`: fast edit loop for type and borrow-checking.
