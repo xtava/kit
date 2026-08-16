@@ -87,21 +87,36 @@ pub async fn run(
 ) -> Result<()> {
     let root = root.canonicalize().context("resolve Render search root")?;
     let search_wake = Arc::new(Notify::new());
-    let index = SearchIndex::discover(&root, Arc::clone(&search_wake));
+    let index = SearchIndex::new(Arc::clone(&search_wake));
     let frecency_store =
         FrecencyStore::bootstrap("render").context("open Render frecency store")?;
     let frecency = frecency_store.load().context("load Render frecency")?;
-    let mut app = App::new(root, index, frecency, initial, config, theme_spec, theme)?;
+    let mut app = App::new(root.clone(), index, frecency, initial, config, theme_spec, theme)?;
     let mut session =
         Session::open(SessionOptions { mouse_capture: true, bracketed_paste: false })?;
     let mut events = EventReader::start();
     let mut document_watch = DocumentWatch::start()?;
     document_watch.follow(app.document_path())?;
+    let mut search_discovery = Some(tokio::task::spawn_blocking({
+        let root = root.clone();
+        let search_wake = Arc::clone(&search_wake);
+        move || SearchIndex::discover(&root, search_wake)
+    }));
     let mut reload_at = None;
 
     loop {
         session.draw(|frame| render(frame, &mut app))?;
         tokio::select! {
+            result = await_search_discovery(&mut search_discovery), if search_discovery.is_some() => {
+                search_discovery = None;
+                match result {
+                    Some(Ok(index)) => app.install_search_index(index),
+                    Some(Err(error)) => {
+                        app.notice = Notice::error(format!("discover Render files: {error}"));
+                    }
+                    None => {}
+                }
+            },
             event = events.recv() => match event {
                 Some(Event::Key(key)) if key.is_press() => {
                     let previous_document = app.document_path().map(Path::to_path_buf);
@@ -165,6 +180,15 @@ pub async fn run(
 async fn wait_for_reload(deadline: Option<Instant>) {
     match deadline {
         Some(deadline) => time::sleep_until(deadline).await,
+        None => future::pending().await,
+    }
+}
+
+async fn await_search_discovery(
+    discovery: &mut Option<tokio::task::JoinHandle<SearchIndex>>,
+) -> Option<Result<SearchIndex, tokio::task::JoinError>> {
+    match discovery.as_mut() {
+        Some(task) => Some(task.await),
         None => future::pending().await,
     }
 }
@@ -1028,6 +1052,13 @@ impl App {
         });
     }
 
+    fn install_search_index(&mut self, index: SearchIndex) {
+        self.index = index;
+        if self.document.is_none() || !self.input.value().trim().is_empty() {
+            self.refresh_suggestions();
+        }
+    }
+
     fn open(&mut self, path: PathBuf) -> Result<()> {
         let path = if path.is_absolute() { path } else { self.root.join(path) };
         let document = Document::load(&self.root, path)?;
@@ -1856,6 +1887,31 @@ mod tests {
             Some("docs/guide.md")
         );
         assert!(app.input.value().is_empty());
+        assert!(app.suggestions.is_none());
+    }
+
+    #[test]
+    fn installing_workspace_index_keeps_external_initial_document_open() {
+        let workspace = TempDir::new();
+        let external = TempDir::new();
+        let external_path = external.0.join("dead-symbols.md");
+        fs::write(&external_path, "# Dead symbols").unwrap();
+        let root = workspace.0.canonicalize().unwrap();
+        let external_path = external_path.canonicalize().unwrap();
+        let mut app = App::new(
+            root.clone(),
+            SearchIndex::empty(),
+            Frecency::default(),
+            Some(external_path.clone()),
+            test_config(&workspace),
+            "nord".to_owned(),
+            theme::NORD,
+        )
+        .unwrap();
+
+        app.install_search_index(test_index(&root));
+
+        assert_eq!(app.document_path(), Some(external_path.as_path()));
         assert!(app.suggestions.is_none());
     }
 

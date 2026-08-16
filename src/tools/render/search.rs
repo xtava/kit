@@ -17,10 +17,15 @@ pub(crate) struct SearchIndex {
 }
 
 impl SearchIndex {
-    pub(crate) fn discover(root: &Path, wake: Arc<Notify>) -> Self {
-        let mut index = FuzzyIndex::new(SearchMode::Path, move || wake.notify_one());
-        index.replace(indexed_entries(discover_entries(root)));
+    pub(crate) fn new(wake: Arc<Notify>) -> Self {
+        let index = FuzzyIndex::new(SearchMode::Path, move || wake.notify_one());
         Self { index }
+    }
+
+    pub(crate) fn discover(root: &Path, wake: Arc<Notify>) -> Self {
+        let mut index = Self::new(wake);
+        index.index.replace(indexed_entries(discover_entries(root)));
+        index
     }
 
     pub(crate) fn refresh(&mut self, root: &Path) -> usize {
@@ -93,7 +98,7 @@ impl SearchIndex {
 
     #[cfg(test)]
     pub(crate) fn empty() -> Self {
-        Self::with_entries(Vec::new())
+        Self::new(Arc::new(Notify::new()))
     }
 }
 
