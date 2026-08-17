@@ -46,6 +46,7 @@ ln -s /path/to/kit/skills/kit-tsgo ~/.agents/skills/kit-tsgo
 - `kit-cdp` — drive and verify live Electron or Chrome applications.
 - `kit-dev-log` — create, update, and resume durable Kit engineering session ledgers.
 - `kit-tsgo` — trace semantic TypeScript callers and callees through Kit's warm native server.
+- `session-ledger` — build and maintain durable local context for long engineering efforts.
 
 ## Adding a skill
 
