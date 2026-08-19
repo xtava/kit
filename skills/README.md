@@ -47,6 +47,7 @@ ln -s /path/to/kit/skills/kit-tsgo ~/.agents/skills/kit-tsgo
 - `kit-dev-log` — create, update, and resume durable Kit engineering session ledgers.
 - `kit-tsgo` — trace semantic TypeScript callers and callees through Kit's warm native server.
 - `session-ledger` — build and maintain durable local context for long engineering efforts.
+- `smart-commit` — commit only conversation-owned work while preserving pre-existing changes.
 
 ## Adding a skill
 
