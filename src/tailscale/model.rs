@@ -58,6 +58,15 @@ impl Node {
         }
     }
 
+    /// Returns the preferred routable address for a direct tailnet connection.
+    pub fn preferred_address(&self) -> Option<IpAddr> {
+        self.addresses
+            .iter()
+            .copied()
+            .find(IpAddr::is_ipv4)
+            .or_else(|| self.addresses.first().copied())
+    }
+
     fn matches_stable_selector(&self, selector: &str, address: Option<IpAddr>) -> bool {
         self.id == selector
             || self.dns_name.eq_ignore_ascii_case(selector.trim_end_matches('.'))

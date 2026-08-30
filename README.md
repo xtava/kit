@@ -45,6 +45,7 @@ registration must be refreshed once by running `./install.sh` from the canonical
 | `kit swarm` | Run deterministic multi-thread Codex councils and independently inspect them in a tree/detail TUI. |
 | `kit tail` | Share pasted text and dragged files across Tailscale devices; receive, copy, save, open, or expire incoming items. |
 | `kit console` | Connect to persistent terminal sessions across Tailscale; diagnose, install, or restart the local Console agent. |
+| `kit remote` | Run a command on another tailnet machine with optional file or stdin forwarding. |
 | `kit sync` | Keep source projects aligned across Tailscale machines without sharing Git metadata, dependencies, or credentials. |
 | `kit settings` | Edit tool-owned operator preferences in a shared TUI. |
 | `kit update` | Fetch, verify, build, and install the registered canonical source checkout. |
@@ -110,6 +111,10 @@ kit tail
 kit console remote-mac
 kit --json console status
 kit --json console restart --force
+
+# Run an operation remotely or send a file to its stdin
+kit remote gpu-machine -- ls
+kit remote gpu-machine --input recording.wav -- transcribe-audio
 ```
 
 ### Scout live controls
@@ -166,7 +171,7 @@ Examples:
 
 Read the [contribution guide](./CONTRIBUTING.md) before adding a tool or shared capability. Reuse is
 an architectural requirement: tools own domain policy, while reusable mechanics belong in the
-shared `framework`, `tui`, or `cdp` owners.
+shared `framework`, `tui`, `cdp`, or domain peers such as `remote`.
 
 ```bash
 cargo check -j 2
@@ -180,7 +185,7 @@ Reusable code lives in `src/lib.rs`; `src/main.rs` only registers commands. The 
 is:
 
 ```text
-tools/* -> framework | tui | cdp
+tools/* -> framework | tui | cdp | remote
 ```
 
 Tools do not depend on other tools. Shared terminal behavior belongs in `src/tui/`; shared CDP

@@ -267,6 +267,7 @@ impl TailscaleSshTarget {
         command: &RemoteCommand,
         working_directory: &Path,
         label: impl Into<String>,
+        deadline: ProcessDeadline,
         input: InputPolicy,
         stdout: OutputPolicy,
         stderr: OutputPolicy,
@@ -292,7 +293,7 @@ impl TailscaleSshTarget {
             stdout,
             stderr,
             ContainmentRequirement::ExplicitProcessGroup,
-            ProcessDeadline::After(COMMAND_TIMEOUT),
+            deadline,
             TerminationPolicy::new(TERMINATION_GRACE),
         ))
     }
@@ -311,6 +312,7 @@ impl TailscaleSshTarget {
             command,
             working_directory,
             label,
+            ProcessDeadline::After(COMMAND_TIMEOUT),
             InputPolicy::Closed,
             capture,
             capture,

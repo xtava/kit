@@ -13,6 +13,8 @@ pub mod monitor;
 pub mod ops;
 pub mod process;
 pub mod record;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod remote;
 pub mod render;
 #[cfg(unix)]
 pub mod scout;

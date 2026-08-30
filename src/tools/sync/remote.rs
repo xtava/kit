@@ -51,6 +51,7 @@ impl RemoteProbe {
             &remote_command,
             &self.working_directory,
             format!("inspect remote Synced Project root on {}", node.display_name()),
+            crate::framework::process::ProcessDeadline::After(std::time::Duration::from_secs(20)),
             InputPolicy::Closed,
             capture,
             capture,

@@ -1,4 +1,4 @@
-use std::{net::IpAddr, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
@@ -74,7 +74,7 @@ fn resolve_node(client: TailscaleClient, node: &Node) -> Result<Resolution> {
     if !node.online {
         return Ok(Resolution::Status(ConsoleStatus::PeerOffline { machine }));
     }
-    preferred_address(node).context("the selected Tailscale node has no routable address")?;
+    node.preferred_address().context("the selected Tailscale node has no routable address")?;
     Ok(Resolution::Ready(RemoteTarget { client, machine, stable_node_id: node.id.clone() }))
 }
 
@@ -233,7 +233,8 @@ impl RemoteEpochProvider {
         if !node.online {
             return Err(ConsoleStatus::PeerOffline { machine: self.machine.clone() });
         }
-        let address = preferred_address(node)
+        let address = node
+            .preferred_address()
             .ok_or_else(|| unavailable(&self.machine, "no Tailscale address was advertised"))?;
         let command = self
             .client
@@ -243,10 +244,6 @@ impl RemoteEpochProvider {
             })?;
         Ok(PreparedRelayEpoch::new(command))
     }
-}
-
-fn preferred_address(node: &Node) -> Option<IpAddr> {
-    node.addresses.iter().copied().find(IpAddr::is_ipv4).or_else(|| node.addresses.first().copied())
 }
 
 fn status_for_outcome(machine: &str, kind: &RelayEpochOutcomeKind) -> Option<ConsoleStatus> {

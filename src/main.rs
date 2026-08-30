@@ -12,7 +12,7 @@ use kit::tools::stream;
 use kit::tools::tsgo;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use kit::tools::{console, tail};
+use kit::tools::{console, remote, tail};
 
 #[cfg(unix)]
 use kit::tools::{cdp, scout, skills};
@@ -58,7 +58,8 @@ async fn run() -> Result<()> {
         .register(sync::tool())
         .register(update::tool());
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let registry = registry.register(tail::tool()).register(console::tool());
+    let registry =
+        registry.register(tail::tool()).register(console::tool()).register(remote::tool());
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let registry = registry.register(stream::tool());
     #[cfg(target_os = "linux")]
