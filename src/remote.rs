@@ -6,8 +6,8 @@ use anyhow::{bail, Context, Result};
 
 use crate::{
     framework::process::{
-        CaptureOverflow, CapturePolicy, InputPolicy, LeaderExitObservation, OutputPolicy,
-        OutputReport, PrivateBytes, ProcessDeadline, ProcessSupervisor,
+        CaptureOverflow, CapturePolicy, InputPolicy, LeaderExit, LeaderExitObservation,
+        OutputPolicy, OutputReport, PrivateBytes, ProcessDeadline, ProcessSupervisor,
     },
     tailscale::{Readiness, RemoteCommand, TailscaleClient, TailscaleSshTarget},
 };
@@ -16,6 +16,8 @@ pub const MAX_REMOTE_INPUT_BYTES: usize = 256 * 1024 * 1024;
 
 const MAX_REMOTE_OUTPUT_BYTES: NonZeroUsize =
     NonZeroUsize::new(64 * 1024 * 1024).expect("remote output limit is non-zero");
+const STATUS_SCRIPT: &str =
+    r#""$@"; status=$?; printf '\036KIT-REMOTE-EXIT:%s:%s\037' "$0" "$status" >&2; exit 0"#;
 
 /// One command invocation on a tailnet peer.
 pub struct RemoteRequest {
@@ -86,7 +88,11 @@ impl RemoteExecutor {
             .preferred_address()
             .context("the selected Tailscale peer has no routable address")?;
         let target = TailscaleSshTarget::new(node.id.clone(), request.user, address)?;
-        let command = RemoteCommand::from_arguments(request.arguments.iter().map(String::as_str))?;
+        let status_nonce = uuid::Uuid::new_v4().simple().to_string();
+        let mut wrapped_arguments =
+            vec!["sh".to_owned(), "-c".to_owned(), STATUS_SCRIPT.to_owned(), status_nonce.clone()];
+        wrapped_arguments.extend(request.arguments);
+        let command = RemoteCommand::from_arguments(wrapped_arguments.iter().map(String::as_str))?;
         let input = if request.input.is_empty() {
             InputPolicy::Closed
         } else {
@@ -108,12 +114,36 @@ impl RemoteExecutor {
         let report = self.processes.spawn(spec).await?.session.wait().await.map_err(|failure| {
             anyhow::anyhow!("remote command supervision failed: {:?}", failure.failure)
         })?;
-        Ok(RemoteOutput {
-            stdout: captured(report.stdout).context("remote stdout was not captured")?,
-            stderr: captured(report.stderr).context("remote stderr was not captured")?,
-            exit: report.leader_exit,
-        })
+        let stdout = captured(report.stdout).context("remote stdout was not captured")?;
+        let mut stderr =
+            captured(report.stderr).context("remote stderr was not captured")?.into_vec();
+        if report.leader_exit != LeaderExitObservation::Observed(LeaderExit::Code(0)) {
+            bail!(
+                "remote transport exited unsuccessfully: {}",
+                String::from_utf8_lossy(&stderr).trim()
+            );
+        }
+        let exit = take_remote_exit(&mut stderr, &status_nonce)?;
+        Ok(RemoteOutput { stdout, stderr: stderr.into_boxed_slice(), exit })
     }
+}
+
+fn take_remote_exit(stderr: &mut Vec<u8>, nonce: &str) -> Result<LeaderExitObservation> {
+    let prefix = format!("\u{1e}KIT-REMOTE-EXIT:{nonce}:");
+    let start = stderr
+        .windows(prefix.len())
+        .rposition(|window| window == prefix.as_bytes())
+        .context("remote command did not return its exit status")?;
+    let status = stderr
+        .get(start + prefix.len()..)
+        .and_then(|suffix| suffix.strip_suffix(&[0x1f]))
+        .context("remote command returned an invalid exit status")?;
+    let code = std::str::from_utf8(status)?.parse::<i32>()?;
+    if !(0..=255).contains(&code) {
+        bail!("remote command returned an invalid exit code");
+    }
+    stderr.truncate(start);
+    Ok(LeaderExitObservation::Observed(LeaderExit::Code(code)))
 }
 
 fn captured(output: OutputReport) -> Option<Box<[u8]>> {
