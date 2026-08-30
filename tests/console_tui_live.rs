@@ -129,22 +129,16 @@ async fn public_console_discovers_this_machine_and_opens_command_palette() -> Re
     let tailscale = fixture_root.join("tailscale");
     let operating_system = if cfg!(target_os = "macos") { "macOS" } else { "linux" };
     let tailnet_status = format!(
-        r#"{{"BackendState":"Running","TailscaleIPs":["100.64.0.1"],"Self":{{"ID":"local-verifier","DNSName":"local-verifier.test.ts.net.","HostName":"local-verifier","OS":"{operating_system}","Online":true,"TailscaleIPs":["100.64.0.1"]}},"Peer":{{"peer-verifier":{{"ID":"peer-verifier","DNSName":"slow-peer.test.ts.net.","HostName":"slow-peer","OS":"linux","Online":true,"TailscaleIPs":["100.64.0.2"]}}}}}}"#
+        r#"{{"BackendState":"Running","TailscaleIPs":["100.64.0.1"],"Self":{{"ID":"local-verifier","UserID":42,"DNSName":"local-verifier.test.ts.net.","HostName":"local-verifier","OS":"{operating_system}","Online":true,"TailscaleIPs":["100.64.0.1"]}},"Peer":{{"peer-verifier":{{"ID":"peer-verifier","UserID":42,"DNSName":"slow-peer.test.ts.net.","HostName":"slow-peer","OS":"linux","Online":true,"TailscaleIPs":["100.64.0.2"]}}}}}}"#
     );
     fs::write(&tailscale, format!("#!/bin/sh\nprintf '%s\\n' '{tailnet_status}'\n"))
         .context("write tailnet fixture")?;
     fs::set_permissions(&tailscale, fs::Permissions::from_mode(0o755))
         .context("make tailnet fixture executable")?;
-    let ssh = fixture_root.join("ssh");
-    fs::write(&ssh, "#!/bin/sh\nsleep 30\n").context("write slow OpenSSH fixture")?;
-    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755))
-        .context("make slow OpenSSH fixture executable")?;
-
     let mut harness = LocalConsoleHarness::start().await?;
     let mut console = PublicConsole::start(
         &harness,
         PublicConsoleOptions {
-            config_toml: Some("[users]\npeer-verifier = \"tvx\"\n".to_owned()),
             direct_machine: None,
             path_prefix: Some(fixture_root.clone()),
             ..PublicConsoleOptions::default()
@@ -154,7 +148,7 @@ async fn public_console_discovers_this_machine_and_opens_command_palette() -> Re
     console.wait_for_output(b"slow-peer")?;
     console.clear_output()?;
     console.send(&sgr_mouse(2, 10, 3, false))?;
-    console.wait_for_output(b"Set Unix user")?;
+    console.wait_for_output(b"Connect")?;
     console.clear_output()?;
     console.send(b"\x1b")?;
     console.wait_for_output(b"\x1b[?25l")?;
@@ -164,7 +158,7 @@ async fn public_console_discovers_this_machine_and_opens_command_palette() -> Re
     console.clear_output()?;
     console.type_text("open console settings")?;
     console.send(b"\r")?;
-    console.wait_for_output(b"operator preferences")?;
+    console.wait_for_output(b"Persistent terminal session presentation")?;
     console.clear_output()?;
     console.send(b"q")?;
     console.wait_for_output(b"\x1b[?25l")?;
@@ -217,7 +211,7 @@ async fn public_console_command_palette_opens_mouse_editable_settings() -> Resul
     let mut harness = LocalConsoleHarness::start().await?;
     let mut console = PublicConsole::start(&harness, PublicConsoleOptions::default())?;
     invoke_command(&mut console, "open console settings")?;
-    console.wait_for_output(b"operator preferences")?;
+    console.wait_for_output(b"Persistent terminal session presentation")?;
 
     console.clear_output()?;
     console.send(&sgr_mouse(0, 27, 2, false))?;

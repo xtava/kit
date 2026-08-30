@@ -4,18 +4,27 @@
 
 ## Install
 
-Download the Linux or macOS archive for your platform from
-[GitHub Releases](https://github.com/xtava/kit/releases), put `kit` on your `PATH`, then keep it
-current with:
+Clone the canonical source checkout and run its installer:
+
+```bash
+git clone https://github.com/xtava/kit.git
+cd kit
+./install.sh
+```
+
+The installer builds the checkout, replaces `$HOME/.local/bin/kit`, and registers that canonical
+checkout as the source for future updates. Keep it current with:
 
 ```bash
 kit update
 ```
 
-`kit update` downloads the compatible release, verifies GitHub's SHA-256 asset digest, and replaces
-the executable. Interactive Kit sessions notify you when a cached newer version is available.
-
-Contributors can still build and install the current checkout with `./install.sh`.
+`kit update` fetches the registered upstream ref, accepts only a safe fast-forward when upstream is
+newer, runs that checkout's canonical `install.sh`, and verifies that the installed binary matches
+the selected source revision. It never stashes, resets, rebases, or overwrites conflicting local
+work. If Console is running with zero sessions, the updated binary safely restarts it; active
+sessions make the update refuse before replacement. An older installation without source
+registration must be refreshed once by running `./install.sh` from the canonical checkout.
 
 ## Commands
 
@@ -35,10 +44,10 @@ Contributors can still build and install the current checkout with `./install.sh
 | `kit secrets` | Browse, search, and manage 1Password through a local TUI backed by the official `op` CLI. |
 | `kit swarm` | Run deterministic multi-thread Codex councils and independently inspect them in a tree/detail TUI. |
 | `kit tail` | Share pasted text and dragged files across Tailscale devices; receive, copy, save, open, or expire incoming items. |
-| `kit console` | Connect to persistent terminal sessions and diagnose, install, or restart Console agents across Tailscale. |
+| `kit console` | Connect to persistent terminal sessions across Tailscale; diagnose, install, or restart the local Console agent. |
 | `kit sync` | Keep source projects aligned across Tailscale machines without sharing Git metadata, dependencies, or credentials. |
 | `kit settings` | Edit tool-owned operator preferences in a shared TUI. |
-| `kit update` | Verify and install the newest compatible GitHub release. |
+| `kit update` | Fetch, verify, build, and install the registered canonical source checkout. |
 
 Use built-in help for the current command surface:
 
@@ -97,9 +106,10 @@ kit swarm
 # Share text or dragged files with another Tailscale device
 kit tail
 
-# Diagnose or force-restart a remote Console agent
-kit --json console status remote-mac
-kit --json console restart remote-mac --force
+# Connect to a tailnet Console; lifecycle commands run locally on each target
+kit console remote-mac
+kit --json console status
+kit --json console restart --force
 ```
 
 ### Scout live controls

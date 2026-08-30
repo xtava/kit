@@ -74,6 +74,8 @@ mod tests {
     fn shared_node_adapts_into_taildrop_device_without_transport_policy() {
         let device = Device::from(tailscale::Node {
             id: "peer".into(),
+            user_id: Some(1),
+            tags: Default::default(),
             dns_name: "laptop.test.ts.net".into(),
             host_name: "laptop".into(),
             operating_system: tailscale::OperatingSystem::Linux,

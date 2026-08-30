@@ -24,7 +24,7 @@ remain active:
 
 ```bash
 set -euo pipefail
-cd /home/tvx/Desktop/projects/kit
+cd "$HOME/src/kit"
 ```
 
 ## Contract
@@ -37,7 +37,9 @@ cd /home/tvx/Desktop/projects/kit
   names.
 - Stage files privately, verify their manifest, and only then publish them under the reviewed
   remote root.
-- Install at `$HOME/.local/bin/kit`. Never mutate a source checkout through `kit update`.
+- Install at `$HOME/.local/bin/kit`. This Git-free peer workflow cannot use `kit update`, which
+  requires the canonical Git checkout registered by `./install.sh`; continue to deploy only the
+  explicitly reviewed manifest.
 
 ## 1. Freeze the reviewed manifest
 

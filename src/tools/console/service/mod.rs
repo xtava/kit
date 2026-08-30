@@ -19,9 +19,7 @@ use super::client::{
 use super::connection::ConnectionOwner;
 
 pub(crate) use model::ConsoleRecovery;
-pub use model::{
-    ConsoleServicePlatform, ConsoleStage, ConsoleStatus, NativeServiceState, RemoteFailureKind,
-};
+pub use model::{ConsoleServicePlatform, ConsoleStatus, NativeServiceState};
 
 #[cfg(target_os = "linux")]
 use linux as native;

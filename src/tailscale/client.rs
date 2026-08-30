@@ -1,8 +1,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
+    net::{IpAddr, SocketAddr},
     num::NonZeroUsize,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
@@ -10,24 +11,31 @@ use anyhow::{bail, Context, Result};
 use tokio::sync::{mpsc, watch};
 
 use crate::framework::process::{
-    CaptureOverflow, CapturePolicy, CommandSpec, ContainmentRequirement, EnvironmentBase,
-    InputPolicy, LeaderExit, LeaderExitObservation, OutputPolicy, ProcessByteEvent,
-    ProcessDeadline, ProcessEnvironment, ProcessLabel, ProcessOutputHandle, ProcessReport,
-    ProcessSpec, ProcessSupervisor, StreamPolicy, TerminationPolicy,
+    CaptureOverflow, CapturePolicy, CommandSpec, CompletionCause, ContainmentRequirement,
+    EnvironmentBase, InputPolicy, LeaderExit, LeaderExitObservation, OutputPolicy,
+    ProcessByteEvent, ProcessDeadline, ProcessEnvironment, ProcessLabel, ProcessOutputHandle,
+    ProcessReport, ProcessSpec, ProcessSupervisor, StreamPolicy, TerminationPolicy,
 };
 
-use super::{find_login_url, parse_status, LoginUrl, Readiness, Status};
+use super::{
+    find_login_url, parse_status, parse_whois, LoginUrl, Readiness, Status, WhoIsIdentity,
+};
 
 const CAPTURE_BYTES: NonZeroUsize = NonZeroUsize::new(8 * 1024 * 1024).unwrap();
 const LOGIN_OUTPUT_BYTES: usize = 64 * 1024;
 const CANCEL_GRACE: Duration = Duration::from_secs(2);
-const STATUS_TIMEOUT: Duration = Duration::from_secs(15);
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+const MACOS_APP_CLI: &str = "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
+const MACOS_CLI_CANDIDATES: [&str; 3] =
+    [MACOS_APP_CLI, "/usr/local/bin/tailscale", "/opt/homebrew/bin/tailscale"];
+const MACOS_CLI_MODE: (&str, &str) = ("TAILSCALE_BE_CLI", "1");
 
 #[derive(Clone)]
 pub struct TailscaleClient {
     processes: ProcessSupervisor,
     working_directory: PathBuf,
     executable: OsString,
+    environment: BTreeMap<OsString, OsString>,
 }
 
 #[derive(Clone, Debug)]
@@ -40,7 +48,8 @@ pub enum LoginEvent {
 
 impl TailscaleClient {
     pub fn new(processes: ProcessSupervisor, working_directory: PathBuf) -> Self {
-        Self::with_executable(processes, working_directory, "tailscale")
+        let (executable, environment) = default_invocation();
+        Self { processes, working_directory, executable, environment }
     }
 
     /// Constructs a client around a caller-selected executable for deterministic process fixtures.
@@ -49,7 +58,12 @@ impl TailscaleClient {
         working_directory: PathBuf,
         executable: impl AsRef<OsStr>,
     ) -> Self {
-        Self { processes, working_directory, executable: executable.as_ref().to_owned() }
+        Self {
+            processes,
+            working_directory,
+            executable: executable.as_ref().to_owned(),
+            environment: BTreeMap::new(),
+        }
     }
 
     pub async fn readiness(&self) -> Result<Readiness> {
@@ -57,6 +71,44 @@ impl TailscaleClient {
             Ok(bytes) => parse_status(&bytes).context("classify tailscale status"),
             Err(error) => Ok(classify_status_error(&error)),
         }
+    }
+
+    pub async fn whois(&self, source: SocketAddr) -> Result<WhoIsIdentity> {
+        let bytes = self
+            .capture(
+                "tailscale whois",
+                vec![
+                    OsString::from("whois"),
+                    OsString::from("--json"),
+                    OsString::from("--proto=tcp"),
+                    OsString::from(source.to_string()),
+                ],
+            )
+            .await?;
+        parse_whois(&bytes).context("project tailscale whois identity")
+    }
+
+    /// Builds the canonical CLI command for a caller-supervised tailnet TCP stream.
+    pub(crate) fn nc_command(
+        &self,
+        address: IpAddr,
+        port: u16,
+        label: impl Into<String>,
+    ) -> Result<CommandSpec> {
+        if port == 0 {
+            bail!("tailscale nc port cannot be zero");
+        }
+        if !is_tailscale_address(address) {
+            bail!("tailscale nc address {address} is outside the Tailscale address ranges");
+        }
+        self.command(
+            label,
+            vec![
+                OsString::from("nc"),
+                OsString::from(address.to_string()),
+                OsString::from(port.to_string()),
+            ],
+        )
     }
 
     pub fn start_login(
@@ -74,10 +126,15 @@ impl TailscaleClient {
     }
 
     async fn capture_status(&self) -> Result<Vec<u8>> {
+        self.capture("tailscale status", vec![OsString::from("status"), OsString::from("--json")])
+            .await
+    }
+
+    async fn capture(&self, label: &str, args: Vec<OsString>) -> Result<Vec<u8>> {
         let report = self
             .run(
-                "tailscale status",
-                vec![OsString::from("status"), OsString::from("--json")],
+                label,
+                args,
                 OutputPolicy::Capture(CapturePolicy::new(
                     CAPTURE_BYTES,
                     CaptureOverflow::FailAndTerminate,
@@ -93,7 +150,7 @@ impl TailscaleClient {
             crate::framework::process::OutputReport::Captured(output) => {
                 Ok(output.bytes.into_vec())
             }
-            _ => bail!("tailscale status stdout was not captured"),
+            _ => bail!("{label} stdout was not captured"),
         }
     }
 
@@ -179,8 +236,13 @@ impl TailscaleClient {
         stdout: OutputPolicy,
         stderr: OutputPolicy,
     ) -> Result<ProcessReport> {
-        let spec =
-            self.process_spec(label, args, stdout, stderr, ProcessDeadline::After(STATUS_TIMEOUT))?;
+        let spec = self.process_spec(
+            label,
+            args,
+            stdout,
+            stderr,
+            ProcessDeadline::After(COMMAND_TIMEOUT),
+        )?;
         self.processes
             .spawn(spec)
             .await?
@@ -198,15 +260,7 @@ impl TailscaleClient {
         stderr: OutputPolicy,
         deadline: ProcessDeadline,
     ) -> Result<ProcessSpec> {
-        let environment =
-            ProcessEnvironment::new(EnvironmentBase::Inherit, BTreeMap::new(), BTreeSet::new())?;
-        let command = CommandSpec::new(
-            self.executable.clone(),
-            args,
-            self.working_directory.clone(),
-            environment,
-            ProcessLabel::new(label.to_owned())?,
-        )?;
+        let command = self.command(label, args)?;
         Ok(ProcessSpec::new(
             command,
             InputPolicy::Closed,
@@ -216,6 +270,55 @@ impl TailscaleClient {
             deadline,
             TerminationPolicy::new(CANCEL_GRACE),
         ))
+    }
+
+    fn command(&self, label: impl Into<String>, args: Vec<OsString>) -> Result<CommandSpec> {
+        let environment = ProcessEnvironment::new(
+            EnvironmentBase::Inherit,
+            self.environment.clone(),
+            BTreeSet::new(),
+        )?;
+        Ok(CommandSpec::new(
+            self.executable.clone(),
+            args,
+            self.working_directory.clone(),
+            environment,
+            ProcessLabel::new(label.into())?,
+        )?)
+    }
+}
+
+fn default_invocation() -> (OsString, BTreeMap<OsString, OsString>) {
+    select_default_invocation(cfg!(target_os = "macos"), Path::is_file)
+}
+
+fn select_default_invocation(
+    macos: bool,
+    exists: impl Fn(&Path) -> bool,
+) -> (OsString, BTreeMap<OsString, OsString>) {
+    if !macos {
+        return (OsString::from("tailscale"), BTreeMap::new());
+    }
+    let executable = MACOS_CLI_CANDIDATES
+        .iter()
+        .map(Path::new)
+        .find(|candidate| exists(candidate))
+        .map(Path::as_os_str)
+        .unwrap_or_else(|| OsStr::new("tailscale"))
+        .to_owned();
+    let environment = [(OsString::from(MACOS_CLI_MODE.0), OsString::from(MACOS_CLI_MODE.1))]
+        .into_iter()
+        .collect();
+    (executable, environment)
+}
+
+pub(crate) fn is_tailscale_address(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            let [first, second, _, _] = address.octets();
+            first == 100 && (64..=127).contains(&second)
+        }
+        IpAddr::V6(address) => address.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0],
     }
 }
 
@@ -238,9 +341,11 @@ fn append_login_output(event: ProcessByteEvent, output: &mut Vec<u8>) -> bool {
 }
 
 fn ensure_success(report: &ProcessReport) -> Result<()> {
-    match report.leader_exit {
-        LeaderExitObservation::Observed(LeaderExit::Code(0)) => Ok(()),
-        exit => bail!("Tailscale CLI exited with {exit:?}"),
+    match (report.completion, report.leader_exit) {
+        (CompletionCause::Natural, LeaderExitObservation::Observed(LeaderExit::Code(0))) => Ok(()),
+        (completion, exit) => {
+            bail!("Tailscale CLI completed as {completion:?} with {exit:?}")
+        }
     }
 }
 
@@ -274,7 +379,7 @@ mod tests {
 
     use super::*;
 
-    const READY_STATUS: &str = r#"{"BackendState":"Running","TailscaleIPs":["100.64.0.1"],"Self":{"ID":"me","DNSName":"desktop.test.ts.net.","HostName":"desktop","OS":"linux","Online":true,"TailscaleIPs":["100.64.0.1"]},"Peer":{"peer":{"ID":"peer","DNSName":"laptop.test.ts.net.","HostName":"laptop","OS":"linux","Online":true,"TailscaleIPs":["100.64.0.2"]}}}"#;
+    const READY_STATUS: &str = r#"{"BackendState":"Running","TailscaleIPs":["100.64.0.1"],"Self":{"ID":"me","UserID":1001,"DNSName":"desktop.test.ts.net.","HostName":"desktop","OS":"linux","Online":true,"TailscaleIPs":["100.64.0.1"]},"Peer":{"peer":{"ID":"peer","UserID":2002,"DNSName":"laptop.test.ts.net.","HostName":"laptop","OS":"linux","Online":true,"TailscaleIPs":["100.64.0.2"]}}}"#;
     const NEEDS_LOGIN_STATUS: &str = r#"{"BackendState":"NeedsLogin"}"#;
 
     #[tokio::test]
@@ -293,7 +398,90 @@ mod tests {
         let Readiness::Ready(status) = client.readiness().await.unwrap() else {
             panic!("fixture was not ready")
         };
-        assert_eq!(status.resolve_peer("laptop").unwrap().id, "peer");
+        let peer = status.resolve_peer("laptop").unwrap();
+        assert_eq!(peer.id, "peer");
+        assert_eq!(peer.user_id, Some(2002));
+    }
+
+    #[tokio::test]
+    async fn process_fixture_invokes_exact_whois_command_and_projects_identity() {
+        let mut fixture = CommandFixture::new().unwrap();
+        fixture
+            .respond(
+                ["whois", "--json", "--proto=tcp", "100.64.0.2:4242"],
+                CommandResponse::success().stdout(
+                    r#"{"Node":{"StableID":"node-source","User":2002},"UserProfile":{"LoginName":"alice@example.com","DisplayName":"Alice"},"CapMap":{"kit.console.connect":[]}}"#,
+                ),
+            )
+            .unwrap();
+        let processes = ProcessSupervisor::for_test(fixture.root().join("processes")).unwrap();
+        let client = TailscaleClient::with_executable(
+            processes,
+            fixture.root().to_path_buf(),
+            fixture.executable(),
+        );
+
+        let identity = client.whois("100.64.0.2:4242".parse().unwrap()).await.unwrap();
+
+        assert_eq!(identity.stable_node_id, "node-source");
+        assert_eq!(identity.user_id, Some(2002));
+        assert!(identity.has_capability("kit.console.connect"));
+        assert_eq!(fixture.invocations().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn nc_command_uses_selected_executable_and_exact_tailnet_endpoint_arguments() {
+        let fixture = CommandFixture::new().unwrap();
+        let executable = fixture.executable();
+        let working_directory = fixture.root().to_path_buf();
+        let processes = ProcessSupervisor::for_test(fixture.root().join("processes")).unwrap();
+        let client = TailscaleClient::with_executable(
+            processes,
+            working_directory.clone(),
+            executable.clone(),
+        );
+
+        let command = client
+            .nc_command("fd7a:115c:a1e0::2".parse().unwrap(), 4242, "connect Console agent")
+            .unwrap();
+
+        assert_eq!(command.program, executable.into_os_string());
+        assert_eq!(command.arguments, ["nc", "fd7a:115c:a1e0::2", "4242"].map(OsString::from));
+        assert_eq!(command.working_directory, working_directory);
+        assert_eq!(command.label.as_str(), "connect Console agent");
+    }
+
+    #[test]
+    fn nc_command_rejects_zero_port_and_non_tailscale_addresses() {
+        let fixture = CommandFixture::new().unwrap();
+        let processes = ProcessSupervisor::for_test(fixture.root().join("processes")).unwrap();
+        let client = TailscaleClient::with_executable(
+            processes,
+            fixture.root().to_path_buf(),
+            fixture.executable(),
+        );
+
+        assert!(client.nc_command("100.64.0.2".parse().unwrap(), 0, "invalid port").is_err());
+        assert!(client
+            .nc_command("192.168.1.2".parse().unwrap(), 4242, "invalid address")
+            .is_err());
+    }
+
+    #[test]
+    fn macos_default_invocation_prefers_the_gui_app_cli_and_enables_cli_mode() {
+        let (executable, environment) =
+            select_default_invocation(true, |candidate| candidate == Path::new(MACOS_APP_CLI));
+
+        assert_eq!(executable, OsString::from(MACOS_APP_CLI));
+        assert_eq!(environment.get(OsStr::new(MACOS_CLI_MODE.0)), Some(&OsString::from("1")));
+    }
+
+    #[test]
+    fn non_macos_default_invocation_uses_path_without_environment_injection() {
+        let (executable, environment) = select_default_invocation(false, |_| true);
+
+        assert_eq!(executable, OsString::from("tailscale"));
+        assert!(environment.is_empty());
     }
 
     #[cfg(unix)]

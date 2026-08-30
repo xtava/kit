@@ -13,8 +13,12 @@ use wezterm_promise::spawn::{
     AdmittedTask, MainThreadExecutorHandle, SimpleExecutor, SimpleExecutorHandle,
 };
 
+use crate::framework::process::ProcessSupervisor;
+use crate::tailscale::TailscaleClient;
+
 use super::authorization::ConsoleAuthorizer;
 use super::client::{console_lock_path, console_runtime_dir, console_socket_path, unix_domain};
+use super::transport::{GatewayControl, PreparedGateway};
 
 struct AgentControl {
     shutdown: Arc<AtomicBool>,
@@ -34,6 +38,16 @@ impl AgentControl {
 
 /// Run the Console mux on its one process-global owner thread until the service is terminated.
 pub async fn run() -> Result<()> {
+    let build_identity = super::build_identity()?;
+    let gateway_processes =
+        ProcessSupervisor::bootstrap().context("starting Console gateway process supervision")?;
+    let gateway_working_directory =
+        std::env::current_dir().context("resolving the Console gateway working directory")?;
+    let gateway = PreparedGateway::new(
+        TailscaleClient::new(gateway_processes, gateway_working_directory),
+        console_socket_path()?,
+        build_identity.clone(),
+    )?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
         .context("installing the Console interrupt handler")?;
     let mut broken_pipe = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::pipe())
@@ -45,7 +59,7 @@ pub async fn run() -> Result<()> {
     let owner = std::thread::Builder::new()
         .name("kit-console-runtime".to_owned())
         .spawn(move || {
-            let result = run_owner(ready_tx);
+            let result = run_owner(ready_tx, build_identity);
             let _ = done_tx.send(());
             result
         })
@@ -59,29 +73,80 @@ pub async fn run() -> Result<()> {
         }
     };
 
-    let signal_result = loop {
+    let (gateway_control, mut gateway_owner): (GatewayControl, _) = gateway.start();
+    enum AgentExit {
+        Runtime(std::result::Result<(), tokio::sync::oneshot::error::RecvError>),
+        Gateway(std::result::Result<Result<()>, tokio::task::JoinError>),
+        Signal,
+    }
+    let exit = loop {
         tokio::select! {
             result = &mut done_rx => {
-                result.context("Console runtime owner completion channel closed")?;
-                return join_owner(owner);
+                break AgentExit::Runtime(result);
             }
-            _ = interrupt.recv() => break Ok(()),
+            result = &mut gateway_owner => {
+                break AgentExit::Gateway(result);
+            }
+            _ = interrupt.recv() => break AgentExit::Signal,
             _ = broken_pipe.recv() => continue,
-            _ = terminate.recv() => break Ok(()),
+            _ = terminate.recv() => break AgentExit::Signal,
         }
     };
-    let _wake = control.request_shutdown();
-    let completion_result =
-        done_rx.await.context("Console runtime owner completion channel closed");
-    let owner_result = join_owner(owner);
-    signal_result.and(completion_result).and(owner_result)
+    match exit {
+        AgentExit::Runtime(completion) => {
+            gateway_control.request_shutdown();
+            let gateway_result = join_gateway(gateway_owner, true).await;
+            completion
+                .context("Console runtime owner completion channel closed")
+                .and(join_owner(owner))
+                .and(gateway_result)
+        }
+        AgentExit::Gateway(gateway_result) => {
+            let gateway_result = gateway_completion(gateway_result, false);
+            let _wake = control.request_shutdown();
+            let completion_result =
+                done_rx.await.context("Console runtime owner completion channel closed");
+            gateway_result.and(completion_result).and(join_owner(owner))
+        }
+        AgentExit::Signal => {
+            gateway_control.request_shutdown();
+            let _wake = control.request_shutdown();
+            let completion_result =
+                done_rx.await.context("Console runtime owner completion channel closed");
+            let owner_result = join_owner(owner);
+            let gateway_result = join_gateway(gateway_owner, true).await;
+            completion_result.and(owner_result).and(gateway_result)
+        }
+    }
 }
 
 fn join_owner(owner: std::thread::JoinHandle<Result<()>>) -> Result<()> {
     owner.join().map_err(|_| anyhow::anyhow!("Console runtime owner panicked"))?
 }
 
-fn run_owner(ready: tokio::sync::oneshot::Sender<AgentControl>) -> Result<()> {
+async fn join_gateway(
+    owner: tokio::task::JoinHandle<Result<()>>,
+    expected_shutdown: bool,
+) -> Result<()> {
+    gateway_completion(owner.await, expected_shutdown)
+}
+
+fn gateway_completion(
+    result: std::result::Result<Result<()>, tokio::task::JoinError>,
+    expected_shutdown: bool,
+) -> Result<()> {
+    match result {
+        Ok(Ok(())) if expected_shutdown => Ok(()),
+        Ok(Ok(())) => bail!("Console gateway owner exited unexpectedly"),
+        Ok(Err(error)) => Err(error.context("Console gateway owner failed")),
+        Err(error) => Err(anyhow::anyhow!("Console gateway owner task failed: {error}")),
+    }
+}
+
+fn run_owner(
+    ready: tokio::sync::oneshot::Sender<AgentControl>,
+    build_identity: wezterm_codec::BuildIdentity,
+) -> Result<()> {
     wezterm_config::designate_this_as_the_main_thread();
     wezterm_config::common_init(None, &[], true).context("initializing headless WezTerm config")?;
     let mut config = wezterm_config::Config::default_config();
@@ -128,7 +193,7 @@ fn run_owner(ready: tokio::sync::oneshot::Sender<AgentControl>) -> Result<()> {
         Arc::new(Mux::new_headless(Some(domain), Arc::clone(&admission), Arc::clone(&executor)));
     Mux::set_mux(&mux)?;
 
-    let policy = ServerPolicy::new(Arc::new(ConsoleAuthorizer), super::build_identity()?);
+    let policy = ServerPolicy::new(Arc::new(ConsoleAuthorizer), build_identity);
     let mut listener = LocalListener::with_domain(
         &unix_domain()?,
         policy,

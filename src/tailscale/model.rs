@@ -1,12 +1,17 @@
-use std::{collections::BTreeMap, net::IpAddr};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::IpAddr,
+};
 
-use serde::Deserialize;
+use serde::{de::IgnoredAny, Deserialize};
 use thiserror::Error;
 
 /// Stable Tailscale node identity projected from `tailscale status --json`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Node {
     pub id: String,
+    pub user_id: Option<u64>,
+    pub tags: BTreeSet<String>,
     pub dns_name: String,
     pub host_name: String,
     pub operating_system: OperatingSystem,
@@ -75,6 +80,23 @@ pub struct Status {
 }
 
 impl Status {
+    /// Resolves a previously pinned stable node ID without falling back to a mutable display name.
+    pub fn resolve_peer_by_id(&self, stable_node_id: &str) -> Result<&Node, PeerSelectorError> {
+        if stable_node_id.is_empty() {
+            return Err(PeerSelectorError::Empty);
+        }
+        let matches =
+            self.peers.iter().filter(|peer| peer.id == stable_node_id).collect::<Vec<_>>();
+        match matches.as_slice() {
+            [] => Err(PeerSelectorError::NotFound { selector: stable_node_id.to_owned() }),
+            [peer] => Ok(peer),
+            peers => Err(PeerSelectorError::Ambiguous {
+                selector: stable_node_id.to_owned(),
+                candidates: peers.iter().map(|peer| peer.display_name().to_owned()).collect(),
+            }),
+        }
+    }
+
     /// Resolves one exact peer identity without prefix, substring, or first-match guessing.
     pub fn resolve_peer(&self, selector: &str) -> Result<&Node, PeerSelectorError> {
         let selector = selector.trim();
@@ -141,6 +163,31 @@ pub enum StatusParseError {
     Json(#[from] serde_json::Error),
 }
 
+/// Authenticated source identity projected from `tailscale whois --json`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WhoIsIdentity {
+    pub stable_node_id: String,
+    pub user_id: Option<u64>,
+    pub tags: BTreeSet<String>,
+    pub login_name: Option<String>,
+    pub display_name: Option<String>,
+    pub capability_keys: BTreeSet<String>,
+}
+
+impl WhoIsIdentity {
+    pub fn has_capability(&self, capability: &str) -> bool {
+        self.capability_keys.contains(capability)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum WhoIsParseError {
+    #[error("parse tailscale whois JSON")]
+    Json(#[from] serde_json::Error),
+    #[error("tailscale whois response did not include a stable node identity")]
+    MissingStableNodeId,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct RawStatus {
@@ -159,6 +206,10 @@ struct RawStatus {
 struct RawNode {
     #[serde(default, rename = "ID")]
     id: String,
+    #[serde(default, rename = "UserID")]
+    user_id: Option<u64>,
+    #[serde(default)]
+    tags: BTreeSet<String>,
     #[serde(default, rename = "DNSName")]
     dns_name: String,
     #[serde(default)]
@@ -175,6 +226,8 @@ impl RawNode {
     fn into_node(self) -> Node {
         Node {
             id: self.id,
+            user_id: nonzero(self.user_id),
+            tags: self.tags,
             dns_name: self.dns_name.trim_end_matches('.').to_owned(),
             host_name: self.host_name,
             operating_system: OperatingSystem::from_tailnet_label(self.os),
@@ -182,6 +235,63 @@ impl RawNode {
             addresses: self.tailscale_ips,
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct RawWhoIs {
+    node: RawWhoIsNode,
+    #[serde(default)]
+    user_profile: Option<RawUserProfile>,
+    #[serde(default, rename = "CapMap")]
+    cap_map: Option<BTreeMap<String, IgnoredAny>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct RawWhoIsNode {
+    #[serde(default, rename = "StableID")]
+    stable_id: String,
+    #[serde(default)]
+    user: Option<u64>,
+    #[serde(default)]
+    tags: BTreeSet<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct RawUserProfile {
+    #[serde(default)]
+    login_name: Option<String>,
+    #[serde(default)]
+    display_name: Option<String>,
+}
+
+pub fn parse_whois(bytes: &[u8]) -> Result<WhoIsIdentity, WhoIsParseError> {
+    let raw: RawWhoIs = serde_json::from_slice(bytes)?;
+    if raw.node.stable_id.trim().is_empty() {
+        return Err(WhoIsParseError::MissingStableNodeId);
+    }
+    let (login_name, display_name) = raw
+        .user_profile
+        .map(|profile| (nonempty(profile.login_name), nonempty(profile.display_name)))
+        .unwrap_or_default();
+    Ok(WhoIsIdentity {
+        stable_node_id: raw.node.stable_id,
+        user_id: nonzero(raw.node.user),
+        tags: raw.node.tags,
+        login_name,
+        display_name,
+        capability_keys: raw.cap_map.unwrap_or_default().into_keys().collect(),
+    })
+}
+
+fn nonempty(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.trim().is_empty())
+}
+
+fn nonzero(value: Option<u64>) -> Option<u64> {
+    value.filter(|value| *value != 0)
 }
 
 pub fn parse_status(bytes: &[u8]) -> Result<Readiness, StatusParseError> {
@@ -222,16 +332,20 @@ fn classify(raw: RawStatus) -> Readiness {
 mod tests {
     use super::*;
 
-    const READY_STATUS: &[u8] = br#"{"BackendState":"Running","TailscaleIPs":["100.64.0.1"],"Self":{"ID":"me","DNSName":"desktop.test.ts.net.","HostName":"desktop","OS":"linux","Online":true},"Peer":{"one":{"ID":"peer-one","DNSName":"shared.one.ts.net.","HostName":"shared","OS":"linux","Online":true,"TailscaleIPs":["100.64.0.2"],"sshHostKeys":["ssh-ed25519 AAAA"]},"two":{"ID":"peer-two","DNSName":"shared.two.ts.net.","HostName":"shared","OS":"macOS","Online":false,"TailscaleIPs":["fd7a:115c:a1e0::2"]}}}"#;
+    const READY_STATUS: &[u8] = br#"{"BackendState":"Running","TailscaleIPs":["100.64.0.1"],"Self":{"ID":"me","UserID":1001,"DNSName":"desktop.test.ts.net.","HostName":"desktop","OS":"linux","Online":true},"Peer":{"one":{"ID":"peer-one","UserID":2002,"Tags":["tag:build"],"DNSName":"shared.one.ts.net.","HostName":"shared","OS":"linux","Online":true,"TailscaleIPs":["100.64.0.2"],"sshHostKeys":["ssh-ed25519 AAAA"]},"two":{"ID":"peer-two","DNSName":"shared.two.ts.net.","HostName":"shared","OS":"macOS","Online":false,"TailscaleIPs":["fd7a:115c:a1e0::2"]}}}"#;
 
     #[test]
     fn running_status_projects_stable_nodes_and_root_local_address() {
         let Readiness::Ready(status) = parse_status(READY_STATUS).unwrap() else {
             panic!("status was not ready")
         };
+        assert_eq!(status.local.user_id, Some(1001));
         assert_eq!(status.local.dns_name, "desktop.test.ts.net");
         assert_eq!(status.local.addresses[0].to_string(), "100.64.0.1");
         assert_eq!(status.peers[0].id, "peer-one");
+        assert_eq!(status.peers[0].user_id, Some(2002));
+        assert_eq!(status.peers[0].tags, ["tag:build".to_owned()].into_iter().collect());
+        assert_eq!(status.peers[1].user_id, None);
         assert_eq!(status.peers[1].operating_system, OperatingSystem::Macos);
     }
 
@@ -249,6 +363,22 @@ mod tests {
     }
 
     #[test]
+    fn zero_user_ids_are_projected_as_missing_identity() {
+        let Readiness::Ready(status) = parse_status(
+            br#"{"BackendState":"Running","TailscaleIPs":["100.64.0.1"],"Self":{"ID":"me","UserID":0},"Peer":{"peer":{"ID":"peer","UserID":0}}}"#,
+        )
+        .unwrap()
+        else {
+            panic!("status was not ready")
+        };
+        assert_eq!(status.local.user_id, None);
+        assert_eq!(status.peers[0].user_id, None);
+
+        let identity = parse_whois(br#"{"Node":{"StableID":"source","User":0}}"#).unwrap();
+        assert_eq!(identity.user_id, None);
+    }
+
+    #[test]
     fn peer_resolution_is_exact_case_tolerant_and_ambiguity_safe() {
         let Readiness::Ready(status) = parse_status(READY_STATUS).unwrap() else {
             panic!("status was not ready")
@@ -261,5 +391,62 @@ mod tests {
             Err(PeerSelectorError::Ambiguous { candidates, .. }) if candidates.len() == 2
         ));
         assert!(matches!(status.resolve_peer("share"), Err(PeerSelectorError::NotFound { .. })));
+    }
+
+    #[test]
+    fn pinned_identity_resolution_never_falls_back_to_a_hostname() {
+        let Readiness::Ready(mut status) = parse_status(READY_STATUS).unwrap() else {
+            panic!("status was not ready")
+        };
+        status.peers[0].host_name = "stale-node-id".to_owned();
+
+        assert_eq!(status.resolve_peer("stale-node-id").unwrap().id, "peer-one");
+        assert!(matches!(
+            status.resolve_peer_by_id("stale-node-id"),
+            Err(PeerSelectorError::NotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn whois_projects_identity_and_capability_keys_without_capability_values() {
+        let identity = parse_whois(
+            br#"{"Node":{"StableID":"node-source","User":4242,"Tags":["tag:automation"]},"UserProfile":{"LoginName":"alice@example.com","DisplayName":"Alice Example","ProfilePicURL":"https://example.com/private.png"},"CapMap":{"kit.console.connect":[{"secret":"do-not-project"}],"kit.console.observe":null}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(identity.stable_node_id, "node-source");
+        assert_eq!(identity.user_id, Some(4242));
+        assert_eq!(identity.tags, ["tag:automation".to_owned()].into_iter().collect());
+        assert_eq!(identity.login_name.as_deref(), Some("alice@example.com"));
+        assert_eq!(identity.display_name.as_deref(), Some("Alice Example"));
+        assert!(identity.has_capability("kit.console.connect"));
+        assert!(identity.has_capability("kit.console.observe"));
+        assert!(!identity.has_capability("kit.console.admin"));
+        assert!(!format!("{identity:?}").contains("do-not-project"));
+    }
+
+    #[test]
+    fn whois_accepts_absent_or_null_capability_maps_and_optional_user_identity() {
+        for response in [
+            br#"{"Node":{"StableID":"node-without-cap-map"}}"#.as_slice(),
+            br#"{"Node":{"StableID":"node-with-null-cap-map"},"UserProfile":{"LoginName":"","DisplayName":"   "},"CapMap":null}"#.as_slice(),
+        ] {
+            let identity = parse_whois(response).unwrap();
+            assert_eq!(identity.user_id, None);
+            assert!(identity.tags.is_empty());
+            assert_eq!(identity.login_name, None);
+            assert_eq!(identity.display_name, None);
+            assert!(identity.capability_keys.is_empty());
+        }
+    }
+
+    #[test]
+    fn whois_rejects_absent_or_empty_stable_node_identity() {
+        for response in [
+            br#"{"Node":{},"CapMap":{}}"#.as_slice(),
+            br#"{"Node":{"StableID":""},"CapMap":{}}"#.as_slice(),
+        ] {
+            assert!(matches!(parse_whois(response), Err(WhoIsParseError::MissingStableNodeId)));
+        }
     }
 }

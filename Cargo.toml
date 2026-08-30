@@ -47,16 +47,6 @@ time = { version = "0.3", features = ["formatting"] }
 sysinfo = { version = "=0.37.2", default-features = false, features = ["system", "user"] }
 
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
-self_update = { version = "=1.0.0-rc.6", default-features = false, features = [
-    "archive-tar",
-    "async",
-    "checksums",
-    "compression-tar-gz",
-    "github",
-    "progress-bar",
-    "reqwest",
-    "rustls",
-] }
 hickory-resolver = { version = "0.26", features = ["tokio"] }
 idna = "1.1"
 

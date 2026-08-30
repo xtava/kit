@@ -85,9 +85,6 @@ fn enablement_for(action: MachineAction) -> fn(&ControlCenterActionContext) -> A
         MachineAction::NewSession => new_session_enabled,
         MachineAction::Refresh => refresh_enabled,
         MachineAction::AuthenticateTailscale => authenticate_tailscale_enabled,
-        MachineAction::AuthenticateOpenSsh => authenticate_open_ssh_enabled,
-        MachineAction::SetUnixUser => set_unix_user_enabled,
-        MachineAction::InstallKit => install_kit_enabled,
         MachineAction::StartConsole => start_console_enabled,
         MachineAction::SetupOrRepair => setup_or_repair_enabled,
         MachineAction::UpdateKit => update_kit_enabled,
@@ -118,9 +115,6 @@ action_enablement!(connect_enabled, MachineAction::Connect);
 action_enablement!(new_session_enabled, MachineAction::NewSession);
 action_enablement!(refresh_enabled, MachineAction::Refresh);
 action_enablement!(authenticate_tailscale_enabled, MachineAction::AuthenticateTailscale);
-action_enablement!(authenticate_open_ssh_enabled, MachineAction::AuthenticateOpenSsh);
-action_enablement!(set_unix_user_enabled, MachineAction::SetUnixUser);
-action_enablement!(install_kit_enabled, MachineAction::InstallKit);
 action_enablement!(start_console_enabled, MachineAction::StartConsole);
 action_enablement!(setup_or_repair_enabled, MachineAction::SetupOrRepair);
 action_enablement!(update_kit_enabled, MachineAction::UpdateKit);

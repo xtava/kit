@@ -9,10 +9,12 @@ mod model;
 mod mutagen_ssh;
 mod ssh;
 
+pub(crate) use client::is_tailscale_address;
 pub use client::{LoginEvent, TailscaleClient};
 pub use login_url::{find_login_url, LoginUrl, LoginUrlError};
 pub use model::{
-    parse_status, Node, OperatingSystem, PeerSelectorError, Readiness, Status, StatusParseError,
+    parse_status, parse_whois, Node, OperatingSystem, PeerSelectorError, Readiness, Status,
+    StatusParseError, WhoIsIdentity, WhoIsParseError,
 };
 pub use mutagen_ssh::{
     prepare_mutagen_ssh_directory, prepare_mutagen_ssh_transport, MutagenSshTransport,

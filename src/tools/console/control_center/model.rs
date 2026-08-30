@@ -1,5 +1,4 @@
 use crate::{
-    release::UpdateAvailability,
     tailscale::{Node, OperatingSystem},
     tui::ActionId,
 };
@@ -27,7 +26,6 @@ pub(crate) struct MachineState {
     pub(crate) role: MachineRole,
     pub(crate) operating_system: OperatingSystem,
     pub(crate) reachability: MachineReachability,
-    pub(crate) unix_user: UnixUserState,
     pub(crate) console: ConsoleProbeState,
     pub(crate) compatibility: MachineCompatibility,
     pub(crate) operation: MachineOperationState,
@@ -50,13 +48,6 @@ pub(crate) enum MachineRole {
 pub(crate) enum MachineReachability {
     Online,
     Offline,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum UnixUserState {
-    Current(String),
-    Configured(String),
-    Missing,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -87,7 +78,6 @@ pub(crate) enum MachineOperationState {
 pub(crate) enum MachineOperation {
     Probe,
     Authenticate,
-    ConfigureUser,
     SetupOrRepair,
     Update,
     Restart,
@@ -100,7 +90,6 @@ impl MachineOperation {
         match self {
             Self::Probe => "Machine check",
             Self::Authenticate => "Authentication",
-            Self::ConfigureUser => "Unix user configuration",
             Self::SetupOrRepair => "Console setup or repair",
             Self::Update => "Kit update",
             Self::Restart => "Console service restart",
@@ -120,9 +109,6 @@ pub(crate) enum MachineAction {
     NewSession,
     Refresh,
     AuthenticateTailscale,
-    AuthenticateOpenSsh,
-    SetUnixUser,
-    InstallKit,
     StartConsole,
     SetupOrRepair,
     UpdateKit,
@@ -133,14 +119,11 @@ pub(crate) enum MachineAction {
 }
 
 impl MachineAction {
-    pub(super) const ALL: [Self; 14] = [
+    pub(super) const ALL: [Self; 11] = [
         Self::Connect,
         Self::NewSession,
         Self::Refresh,
         Self::AuthenticateTailscale,
-        Self::AuthenticateOpenSsh,
-        Self::SetUnixUser,
-        Self::InstallKit,
         Self::StartConsole,
         Self::SetupOrRepair,
         Self::UpdateKit,
@@ -155,7 +138,6 @@ impl MachineAction {
 pub(crate) enum ActionEffectOwner {
     ControlCenter,
     Tailscale,
-    ConsoleRemote,
     ConsoleService,
     KitUpdater,
     ConsoleRouter,
@@ -201,11 +183,11 @@ pub(crate) enum MachineRowWidth {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MachineRowProjection {
     pub(crate) name: String,
+    pub(crate) display_name: Option<String>,
     pub(crate) role: Option<&'static str>,
     pub(crate) operating_system: Option<String>,
     pub(crate) status: String,
     pub(crate) sessions: Option<String>,
-    pub(crate) unix_user: Option<String>,
     pub(crate) build: Option<String>,
     pub(crate) primary_action: MachineAction,
 }
@@ -222,13 +204,14 @@ pub(crate) enum ControlCenterStory {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ControlCenterOutcome {
     Connect(MachineConnectionRequest),
+    Updated,
     Quit,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum MachineConnectionRequest {
     Local { create_session: bool },
-    Remote { selector: String, create_session: bool },
+    Remote { machine: MachineIdentity, create_session: bool },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -262,16 +245,9 @@ impl ControlCenterState {
 }
 
 impl MachineState {
-    pub(crate) fn from_tailnet_node(
-        node: &Node,
-        role: MachineRole,
-        unix_user: UnixUserState,
-    ) -> Self {
-        let selector = if node.dns_name.is_empty() {
-            node.display_name().to_owned()
-        } else {
-            node.dns_name.clone()
-        };
+    pub(crate) fn from_tailnet_node(node: &Node, role: MachineRole) -> Self {
+        let selector =
+            if node.dns_name.is_empty() { node.id.clone() } else { node.dns_name.clone() };
         Self {
             identity: MachineIdentity {
                 stable_node_id: node.id.clone(),
@@ -285,11 +261,10 @@ impl MachineState {
             } else {
                 MachineReachability::Offline
             },
-            unix_user,
-            console: if role == MachineRole::Peer && !node.online {
-                ConsoleProbeState::Waiting
-            } else {
+            console: if role == MachineRole::ThisMachine {
                 ConsoleProbeState::Probing
+            } else {
+                ConsoleProbeState::Waiting
             },
             compatibility: MachineCompatibility::Unknown,
             operation: MachineOperationState::Idle,
@@ -300,11 +275,11 @@ impl MachineState {
         if matches!(self.operation, MachineOperationState::Running(_)) {
             return MachineAction::ShowDetails;
         }
-        if self.reachability == MachineReachability::Offline {
-            return MachineAction::Refresh;
-        }
-        if matches!(self.unix_user, UnixUserState::Missing) {
-            return MachineAction::SetUnixUser;
+        if self.role == MachineRole::Peer {
+            return match self.reachability {
+                MachineReachability::Online => MachineAction::Connect,
+                MachineReachability::Offline => MachineAction::Refresh,
+            };
         }
         match &self.console {
             ConsoleProbeState::Waiting | ConsoleProbeState::Probing => MachineAction::ShowDetails,
@@ -313,6 +288,19 @@ impl MachineState {
     }
 
     pub(crate) fn available_actions(&self) -> Vec<MachineAction> {
+        if self.role == MachineRole::Peer {
+            return match self.reachability {
+                MachineReachability::Online => vec![
+                    MachineAction::Connect,
+                    MachineAction::NewSession,
+                    MachineAction::Refresh,
+                    MachineAction::ShowDetails,
+                ],
+                MachineReachability::Offline => {
+                    vec![MachineAction::Refresh, MachineAction::ShowDetails]
+                }
+            };
+        }
         if !matches!(
             self.operation,
             MachineOperationState::Idle | MachineOperationState::Failed { .. }
@@ -321,9 +309,6 @@ impl MachineState {
         }
 
         let mut actions = vec![self.primary_action(), MachineAction::Refresh];
-        if self.role == MachineRole::Peer {
-            actions.push(MachineAction::SetUnixUser);
-        }
         if matches!(self.complete_status(), Some(ConsoleStatus::Ready { .. })) {
             actions.extend([
                 MachineAction::NewSession,
@@ -357,7 +342,10 @@ impl MachineState {
             _ => (None, None),
         };
         MachineRowProjection {
-            name: self.identity.display_name.clone(),
+            name: self.identity.selector.clone(),
+            display_name: (width != MachineRowWidth::Compact
+                && self.identity.display_name != self.identity.selector)
+                .then(|| self.identity.display_name.clone()),
             role: (width != MachineRowWidth::Compact).then_some(match self.role {
                 MachineRole::ThisMachine => "this machine",
                 MachineRole::Peer => "peer",
@@ -366,7 +354,6 @@ impl MachineState {
                 .then(|| self.operating_system.label().to_owned()),
             status,
             sessions: (width != MachineRowWidth::Compact).then_some(sessions).flatten(),
-            unix_user: (width == MachineRowWidth::Wide).then(|| self.unix_user.label()),
             build: (width == MachineRowWidth::Wide).then_some(build).flatten(),
             primary_action: self.primary_action(),
         }
@@ -374,8 +361,9 @@ impl MachineState {
 
     pub(super) fn details(&self) -> Vec<(&'static str, String)> {
         let mut details = vec![
-            ("Machine", self.identity.display_name.clone()),
-            ("Address", self.identity.selector.clone()),
+            ("Machine", self.identity.selector.clone()),
+            ("Name", self.identity.display_name.clone()),
+            ("Stable node ID", self.identity.stable_node_id.clone()),
             (
                 "Role",
                 match self.role {
@@ -386,15 +374,22 @@ impl MachineState {
             ),
             ("Operating system", self.operating_system.label().to_owned()),
             ("Status", self.status_label().to_owned()),
-            ("Unix user", self.unix_user.label()),
         ];
         match self.complete_status() {
             Some(ConsoleStatus::Ready { sessions, build, .. }) => {
                 details.push(("Sessions", sessions.to_string()));
                 details.push(("Kit build", build_label(build)));
             }
-            Some(status @ ConsoleStatus::RemoteFailure { detail, .. }) => {
-                details.push(("Problem", detail.clone()));
+            Some(
+                status @ (ConsoleStatus::TailnetEndpointUnavailable { .. }
+                | ConsoleStatus::TailnetAccessDenied { .. }
+                | ConsoleStatus::TailnetProtocolIncompatible { .. }),
+            ) => {
+                if let ConsoleStatus::TailnetEndpointUnavailable { detail, .. }
+                | ConsoleStatus::TailnetProtocolIncompatible { detail, .. } = status
+                {
+                    details.push(("Problem", detail.clone()));
+                }
                 if let Some(recovery) = status.recovery() {
                     details.push(("Next step", recovery.to_string()));
                 }
@@ -414,8 +409,11 @@ impl MachineState {
         if matches!(self.operation, MachineOperationState::Failed { .. }) {
             return "failed";
         }
-        if self.reachability == MachineReachability::Offline {
-            return "offline";
+        if self.role == MachineRole::Peer {
+            return match self.reachability {
+                MachineReachability::Online => "online",
+                MachineReachability::Offline => "offline",
+            };
         }
         match self.compatibility {
             MachineCompatibility::UpdateAvailable { .. } => return "update available",
@@ -432,23 +430,14 @@ impl MachineState {
     }
 
     pub(super) fn update_allowed(&self) -> bool {
-        matches!(self.complete_status(), Some(ConsoleStatus::Ready { sessions: 0, .. }))
+        self.role == MachineRole::ThisMachine
+            && matches!(self.complete_status(), Some(ConsoleStatus::Ready { sessions: 0, .. }))
     }
 
     pub(super) fn complete_status(&self) -> Option<&ConsoleStatus> {
         match &self.console {
             ConsoleProbeState::Complete(status) => Some(status.as_ref()),
             ConsoleProbeState::Waiting | ConsoleProbeState::Probing => None,
-        }
-    }
-}
-
-impl UnixUserState {
-    fn label(&self) -> String {
-        match self {
-            Self::Current(user) => format!("{user} (current)"),
-            Self::Configured(user) => user.clone(),
-            Self::Missing => "user required".to_owned(),
         }
     }
 }
@@ -460,9 +449,6 @@ impl MachineAction {
             Self::NewSession => "console.machine.newSession",
             Self::Refresh => "console.machine.refresh",
             Self::AuthenticateTailscale => "console.machine.authenticateTailscale",
-            Self::AuthenticateOpenSsh => "console.machine.authenticateOpenSsh",
-            Self::SetUnixUser => "console.machine.setUnixUser",
-            Self::InstallKit => "console.machine.installKit",
             Self::StartConsole => "console.machine.startConsole",
             Self::SetupOrRepair => "console.machine.setupOrRepair",
             Self::UpdateKit => "console.machine.updateKit",
@@ -502,27 +488,6 @@ impl MachineAction {
                 ActionEffectOwner::Tailscale,
                 Some(MachineOperation::Authenticate),
                 ActionResultKind::OpenAuthentication,
-            ),
-            Self::AuthenticateOpenSsh => (
-                "Authenticate OpenSSH",
-                ActionKeyboardAccess::Primary,
-                ActionEffectOwner::ConsoleRemote,
-                Some(MachineOperation::Authenticate),
-                ActionResultKind::OpenAuthentication,
-            ),
-            Self::SetUnixUser => (
-                "Set Unix user",
-                ActionKeyboardAccess::Primary,
-                ActionEffectOwner::ControlCenter,
-                Some(MachineOperation::ConfigureUser),
-                ActionResultKind::RemainInControlCenter,
-            ),
-            Self::InstallKit => (
-                "Install Kit and start Console",
-                ActionKeyboardAccess::Primary,
-                ActionEffectOwner::KitUpdater,
-                Some(MachineOperation::SetupOrRepair),
-                ActionResultKind::ConfirmThenRefresh,
             ),
             Self::StartConsole => (
                 "Start Console",
@@ -594,8 +559,6 @@ fn primary_action_for_status(status: &ConsoleStatus) -> MachineAction {
     match status.recovery() {
         None => MachineAction::Connect,
         Some(ConsoleRecovery::AuthenticateTailscale) => MachineAction::AuthenticateTailscale,
-        Some(ConsoleRecovery::RetryWithUnixUser { .. }) => MachineAction::SetUnixUser,
-        Some(ConsoleRecovery::AuthenticateSsh) => MachineAction::AuthenticateOpenSsh,
         Some(
             ConsoleRecovery::InstallTailscale
             | ConsoleRecovery::StartTailscale
@@ -604,7 +567,11 @@ fn primary_action_for_status(status: &ConsoleStatus) -> MachineAction {
             | ConsoleRecovery::BringPeerOnline
             | ConsoleRecovery::Retry,
         ) => MachineAction::Refresh,
-        Some(ConsoleRecovery::InstallKit) => MachineAction::InstallKit,
+        Some(
+            ConsoleRecovery::RunSetupOnTarget { .. }
+            | ConsoleRecovery::GrantTailnetAccess { .. }
+            | ConsoleRecovery::UpdateTarget { .. },
+        ) => MachineAction::ShowDetails,
         Some(
             ConsoleRecovery::RunSetup
             | ConsoleRecovery::RestoreServiceManager
@@ -617,11 +584,9 @@ fn primary_action_for_status(status: &ConsoleStatus) -> MachineAction {
                 MachineAction::SetupOrRepair
             }
         }
-        Some(
-            ConsoleRecovery::InspectAndRetry
-            | ConsoleRecovery::InspectServiceLog
-            | ConsoleRecovery::CloseSessions,
-        ) => MachineAction::ShowDetails,
+        Some(ConsoleRecovery::InspectServiceLog | ConsoleRecovery::CloseSessions) => {
+            MachineAction::ShowDetails
+        }
     }
 }
 
@@ -634,10 +599,9 @@ fn status_label(status: &ConsoleStatus) -> &'static str {
         ConsoleStatus::TailscalePermissionDenied { .. } => "permission denied",
         ConsoleStatus::TailscaleUnsupported { .. } => "unsupported",
         ConsoleStatus::PeerOffline { .. } => "offline",
-        ConsoleStatus::NeedsUnixUser { .. } => "user required",
-        ConsoleStatus::NeedsSshAuthentication { .. } => "SSH login required",
-        ConsoleStatus::RemoteFailure { kind, .. } => kind.label(),
-        ConsoleStatus::KitUnavailable { .. } => "setup required",
+        ConsoleStatus::TailnetEndpointUnavailable { .. } => "endpoint unavailable",
+        ConsoleStatus::TailnetAccessDenied { .. } => "access denied",
+        ConsoleStatus::TailnetProtocolIncompatible { .. } => "target update required",
         ConsoleStatus::NotInstalled { .. } => "setup required",
         ConsoleStatus::Stopped { .. } => "stopped",
         ConsoleStatus::ServiceFailed { .. } => "service failed",
@@ -666,27 +630,12 @@ fn build_label(build: &wezterm_codec::BuildIdentity) -> String {
 pub(super) fn compatibility_for_status(
     expected: &wezterm_codec::BuildIdentity,
     status: &ConsoleStatus,
-    release: Option<&UpdateAvailability>,
 ) -> MachineCompatibility {
-    let compatibility = match status {
+    match status {
         ConsoleStatus::CodecIncompatible { .. } => MachineCompatibility::CodecIncompatible,
         ConsoleStatus::Ready { build, .. } => compatibility_for_build(expected, build),
         _ => MachineCompatibility::Unknown,
-    };
-    match (compatibility, release) {
-        (MachineCompatibility::Current, Some(UpdateAvailability::Available { latest, .. })) => {
-            MachineCompatibility::UpdateAvailable { version: latest.clone() }
-        }
-        (compatibility, _) => compatibility,
     }
-}
-
-pub(super) fn valid_unix_user(user: &str) -> bool {
-    !user.is_empty()
-        && user.len() <= 64
-        && user
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character))
 }
 
 pub(super) fn compatibility_for_build(

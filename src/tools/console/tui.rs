@@ -483,6 +483,7 @@ struct CloseTransition {
 struct App {
     client: ConsoleClient,
     config: Config,
+    target: String,
     snapshot: ConsoleSnapshot,
     workspace: PanelWorkspace,
     surface: Surface,
@@ -504,7 +505,7 @@ struct App {
 }
 
 impl App {
-    async fn new(client: ConsoleClient, config: Config) -> Result<Self> {
+    async fn new(client: ConsoleClient, config: Config, target: String) -> Result<Self> {
         let snapshot = client.snapshot().await?;
         let health = client.drain_connection_health()?;
         let connection_generation = health.map_or(0, |health| health.generation);
@@ -521,6 +522,7 @@ impl App {
             layout: LayoutPreference::split(config.sidebar_split_ratio()),
             client,
             config,
+            target,
             snapshot,
             workspace,
             surface: Surface::Normal,
@@ -1486,18 +1488,26 @@ impl App {
     }
 }
 
-pub async fn run(client: ConsoleClient, config: Config) -> Result<ConnectedSessionOutcome> {
+pub async fn run(
+    client: ConsoleClient,
+    config: Config,
+    target: String,
+) -> Result<ConnectedSessionOutcome> {
     perf_trace::initialize()?;
-    let outcome = run_loop(client, config).await;
+    let outcome = run_loop(client, config, target).await;
     let flush = perf_trace::flush();
     let outcome = outcome?;
     flush?;
     Ok(outcome)
 }
 
-async fn run_loop(client: ConsoleClient, config: Config) -> Result<ConnectedSessionOutcome> {
+async fn run_loop(
+    client: ConsoleClient,
+    config: Config,
+    target: String,
+) -> Result<ConnectedSessionOutcome> {
     let mux = client.connection_mux()?;
-    let mut app = App::new(client, config).await?;
+    let mut app = App::new(client, config, target).await?;
     let mut session = Session::open(SessionOptions { mouse_capture: true, bracketed_paste: true })?;
     let mut events = EventReader::start();
     let mut invalidations = ConsoleInvalidations::subscribe(mux);
@@ -2456,11 +2466,30 @@ fn render_session_tabs(frame: &mut Frame<'_>, area: Rect, app: &App, regions: &m
     }
     if app.snapshot.sessions.is_empty() {
         frame.render_widget(
-            Paragraph::new(" Console · no sessions ").style(Style::default().fg(NORD.text_muted)),
+            Paragraph::new(format!(" Console · {} · no sessions ", app.target))
+                .style(Style::default().fg(NORD.text_muted)),
             area,
         );
         return;
     }
+
+    let target_label = format!(" {} │", app.target);
+    let target_width =
+        u16::try_from(terminal_text_width(&target_label)).unwrap_or(u16::MAX).min(area.width);
+    let target_area = Rect::new(area.x, area.y, target_width, area.height);
+    let target_label =
+        truncate_terminal_text(&target_label, usize::from(target_width), CellOverflow::Clip);
+    frame.render_widget(
+        Paragraph::new(target_label)
+            .style(Style::default().fg(NORD.accent).add_modifier(Modifier::BOLD)),
+        target_area,
+    );
+    let tabs_area = Rect::new(
+        area.x.saturating_add(target_width),
+        area.y,
+        area.width.saturating_sub(target_width),
+        area.height,
+    );
 
     let tabs = app
         .snapshot
@@ -2481,13 +2510,13 @@ fn render_session_tabs(frame: &mut Frame<'_>, area: Rect, app: &App, regions: &m
     let mut start = 0;
     while start < focused
         && tabs[start..=focused].iter().map(|(_, _, width)| *width).fold(0_u16, u16::saturating_add)
-            > area.width
+            > tabs_area.width
     {
         start += 1;
     }
 
-    let right = area.x.saturating_add(area.width);
-    let mut x = area.x;
+    let right = tabs_area.x.saturating_add(tabs_area.width);
+    let mut x = tabs_area.x;
     for (session_id, label, requested_width) in tabs.iter().skip(start) {
         let width = (*requested_width).min(right.saturating_sub(x));
         if width == 0 {

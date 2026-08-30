@@ -11,10 +11,9 @@ pub(crate) enum ConsoleRecovery {
     RestoreTailscaleAccess,
     UpdateTailscale,
     BringPeerOnline,
-    RetryWithUnixUser { machine: String },
-    AuthenticateSsh,
-    InspectAndRetry,
-    InstallKit,
+    RunSetupOnTarget { machine: String },
+    GrantTailnetAccess { machine: String },
+    UpdateTarget { machine: String },
     RunSetup,
     RestoreServiceManager,
     RemoveForeignServiceDefinition,
@@ -35,12 +34,15 @@ impl std::fmt::Display for ConsoleRecovery {
             }
             Self::UpdateTailscale => "update Tailscale and retry".to_owned(),
             Self::BringPeerOnline => "bring the machine online and retry".to_owned(),
-            Self::RetryWithUnixUser { machine } => format!("retry as USER@{machine}"),
-            Self::AuthenticateSsh => "open the link, authenticate, then retry".to_owned(),
-            Self::InspectAndRetry => {
-                "inspect the details, correct the failing layer, and retry".to_owned()
+            Self::RunSetupOnTarget { machine } => {
+                format!("run kit console setup locally on {machine}")
             }
-            Self::InstallKit => "install Kit and configure Console".to_owned(),
+            Self::GrantTailnetAccess { machine } => format!(
+                "use the target owner's Tailscale account or grant the Kit Console capability on {machine}"
+            ),
+            Self::UpdateTarget { machine } => {
+                format!("update Kit and run kit console setup locally on {machine}")
+            }
             Self::RunSetup => "kit console setup".to_owned(),
             Self::RestoreServiceManager => {
                 "restore the logged-in user service manager, then run kit console status".to_owned()
@@ -91,28 +93,6 @@ pub enum NativeServiceState {
     WrongOwner { path: PathBuf, expected_uid: u32, actual_uid: u32 },
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum RemoteFailureKind {
-    OpenSshUnavailable,
-    HostKeyMismatch,
-    Transport,
-    RemoteCommand,
-    EmptyOutput,
-    Decode,
-    Timeout,
-    Supervision,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ConsoleStage {
-    Transport,
-    RemoteCommand,
-    Decode,
-    Supervision,
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "state", rename_all = "kebab-case")]
 pub enum ConsoleStatus {
@@ -132,22 +112,16 @@ pub enum ConsoleStatus {
     PeerOffline {
         machine: String,
     },
-    NeedsUnixUser {
+    TailnetEndpointUnavailable {
         machine: String,
-        stable_node_id: String,
-    },
-    NeedsSshAuthentication {
-        machine: String,
-        url: String,
-    },
-    RemoteFailure {
-        machine: String,
-        stage: ConsoleStage,
-        kind: RemoteFailureKind,
         detail: String,
     },
-    KitUnavailable {
+    TailnetAccessDenied {
         machine: String,
+    },
+    TailnetProtocolIncompatible {
+        machine: String,
+        detail: String,
     },
     NotInstalled {
         platform: ConsoleServicePlatform,
@@ -227,16 +201,15 @@ impl ConsoleStatus {
                 format!("unsupported Tailscale state\n{detail}")
             }
             Self::PeerOffline { machine } => format!("offline — {machine}"),
-            Self::NeedsUnixUser { machine, stable_node_id } => {
-                format!("Unix user required — {machine} ({stable_node_id})")
+            Self::TailnetEndpointUnavailable { machine, detail } => {
+                format!("Console endpoint unavailable — {machine}\n{detail}")
             }
-            Self::NeedsSshAuthentication { machine, url } => {
-                format!("SSH authentication required — {machine}\n{url}")
+            Self::TailnetAccessDenied { machine } => {
+                format!("Console access denied by the target — {machine}")
             }
-            Self::RemoteFailure { machine, kind, detail, .. } => {
-                format!("{} — {machine}\n{detail}", kind.label())
+            Self::TailnetProtocolIncompatible { machine, detail } => {
+                format!("Console protocol incompatible — {machine}\n{detail}")
             }
-            Self::KitUnavailable { machine } => format!("Kit is not installed — {machine}"),
             Self::NotInstalled { platform } => format!("not installed — {}", platform.label()),
             Self::Stopped { platform } => format!("stopped — {}", platform.label()),
             Self::ServiceFailed { platform, detail } => {
@@ -295,26 +268,15 @@ impl ConsoleStatus {
             Self::TailscalePermissionDenied { .. } => Some(ConsoleRecovery::RestoreTailscaleAccess),
             Self::TailscaleUnsupported { .. } => Some(ConsoleRecovery::UpdateTailscale),
             Self::PeerOffline { .. } => Some(ConsoleRecovery::BringPeerOnline),
-            Self::NeedsUnixUser { machine, .. } => {
-                Some(ConsoleRecovery::RetryWithUnixUser { machine: machine.clone() })
+            Self::TailnetEndpointUnavailable { machine, .. } => {
+                Some(ConsoleRecovery::RunSetupOnTarget { machine: machine.clone() })
             }
-            Self::NeedsSshAuthentication { .. } => Some(ConsoleRecovery::AuthenticateSsh),
-            Self::RemoteFailure {
-                kind:
-                    RemoteFailureKind::HostKeyMismatch
-                    | RemoteFailureKind::Transport
-                    | RemoteFailureKind::Timeout,
-                ..
-            } => Some(ConsoleRecovery::BringPeerOnline),
-            Self::RemoteFailure {
-                kind:
-                    RemoteFailureKind::RemoteCommand
-                    | RemoteFailureKind::EmptyOutput
-                    | RemoteFailureKind::Decode,
-                ..
-            } => Some(ConsoleRecovery::RunSetup),
-            Self::RemoteFailure { .. } => Some(ConsoleRecovery::InspectAndRetry),
-            Self::KitUnavailable { .. } => Some(ConsoleRecovery::InstallKit),
+            Self::TailnetAccessDenied { machine } => {
+                Some(ConsoleRecovery::GrantTailnetAccess { machine: machine.clone() })
+            }
+            Self::TailnetProtocolIncompatible { machine, .. } => {
+                Some(ConsoleRecovery::UpdateTarget { machine: machine.clone() })
+            }
             Self::NotInstalled { .. }
             | Self::Stopped { .. }
             | Self::ServiceFailed { .. }
@@ -332,24 +294,9 @@ impl ConsoleStatus {
     }
 }
 
-impl RemoteFailureKind {
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::OpenSshUnavailable => "OpenSSH unavailable",
-            Self::HostKeyMismatch => "remote host key changed",
-            Self::Transport => "connection failed",
-            Self::RemoteCommand => "remote command failed",
-            Self::EmptyOutput => "remote command returned no status",
-            Self::Decode => "remote status could not be decoded",
-            Self::Timeout => "remote command timed out",
-            Self::Supervision => "remote command supervision failed",
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{ConsoleServicePlatform, ConsoleStatus, RemoteFailureKind};
+    use super::{ConsoleRecovery, ConsoleServicePlatform, ConsoleStatus};
 
     #[test]
     fn service_platform_wire_values_decode_on_every_supported_client() {
@@ -364,18 +311,20 @@ mod tests {
     }
 
     #[test]
-    fn remote_failure_wire_state_preserves_the_failing_layer_and_evidence() {
-        let status = ConsoleStatus::RemoteFailure {
-            machine: "tvxm".to_owned(),
-            stage: super::ConsoleStage::RemoteCommand,
-            kind: RemoteFailureKind::RemoteCommand,
-            detail: "Decode limit exceeded".to_owned(),
+    fn tailnet_endpoint_failure_preserves_evidence_and_local_target_recovery() {
+        let status = ConsoleStatus::TailnetEndpointUnavailable {
+            machine: "workstation".to_owned(),
+            detail: "connection refused".to_owned(),
         };
         let encoded = serde_json::to_string(&status).unwrap();
         let decoded = serde_json::from_str::<ConsoleStatus>(&encoded).unwrap();
 
         assert_eq!(decoded, status);
-        assert!(status.text().contains("remote command failed"));
-        assert!(status.text().contains("Decode limit exceeded"));
+        assert!(status.text().contains("Console endpoint unavailable"));
+        assert!(status.text().contains("connection refused"));
+        assert_eq!(
+            status.recovery(),
+            Some(ConsoleRecovery::RunSetupOnTarget { machine: "workstation".to_owned() })
+        );
     }
 }

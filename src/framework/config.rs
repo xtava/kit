@@ -89,6 +89,28 @@ impl ConfigStore {
         Ok(())
     }
 
+    /// Remove one top-level scalar or table while preserving unrelated TOML and formatting.
+    ///
+    /// Missing files and missing keys are no-ops. Invalid TOML remains an error so cleanup can
+    /// never replace a configuration document that Kit could not understand losslessly.
+    pub fn remove(&self, tool: &str, key: &str) -> Result<()> {
+        let writer = self.writer(tool);
+        let _lock = writer.lock()?;
+        let path = self.path(tool);
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+        };
+        let mut document =
+            raw.parse::<DocumentMut>().with_context(|| format!("parse {}", path.display()))?;
+        if document.remove(key).is_none() {
+            return Ok(());
+        }
+        writer.replace(&path, document.to_string().as_bytes())?;
+        Ok(())
+    }
+
     /// Update one string inside a named table while preserving the rest of the TOML document.
     pub fn set_table_string(&self, tool: &str, table: &str, key: &str, value: &str) -> Result<()> {
         let writer = self.writer(tool);
@@ -190,6 +212,45 @@ mod tests {
         assert!(raw.contains("sidebar_split_ratio = 260"));
         assert!(raw.contains("node-old = \"alice\""));
         assert!(raw.contains("node-new = \"bob\""));
+        let _ = std::fs::remove_dir_all(&store.dir);
+        Ok(())
+    }
+
+    #[test]
+    fn removal_preserves_unrelated_configuration_and_is_a_no_op_when_absent() -> Result<()> {
+        let store = store("remove");
+        std::fs::create_dir_all(&store.dir)?;
+        let path = store.path("console");
+        std::fs::write(
+            &path,
+            "# presentation\nselected_machine = 'node-new' # keep\n\n[users]\nnode-old = \"alice\"\n",
+        )?;
+
+        store.remove("console", "users")?;
+        let removed = std::fs::read_to_string(&path)?;
+        assert!(removed.contains("# presentation"));
+        assert!(removed.contains("# keep"));
+        assert!(removed.contains("selected_machine = 'node-new'"));
+        assert!(!removed.contains("[users]"));
+        assert!(!removed.contains("node-old"));
+
+        store.remove("console", "users")?;
+        assert_eq!(std::fs::read_to_string(&path)?, removed);
+
+        let scalar_path = store.path("scalar");
+        std::fs::write(
+            &scalar_path,
+            "# scalar document\nkept = 7 # retained\nobsolete = 'remove me'\n",
+        )?;
+        store.remove("scalar", "obsolete")?;
+        let scalar_removed = std::fs::read_to_string(&scalar_path)?;
+        assert!(scalar_removed.contains("# scalar document"));
+        assert!(scalar_removed.contains("kept = 7 # retained"));
+        assert!(!scalar_removed.contains("obsolete"));
+
+        store.remove("missing-tool", "users")?;
+        assert!(!store.path("missing-tool").exists());
+
         let _ = std::fs::remove_dir_all(&store.dir);
         Ok(())
     }

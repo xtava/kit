@@ -1,130 +1,108 @@
-# Releases and updates
+# Source updates and package verification
 
-Kit ships as one self-updating binary through GitHub Releases.
+Kit installs and updates from one registered canonical source checkout. GitHub Releases are not the
+runtime update channel, and the repository's GitHub Actions workflow does not publish a release.
 
-## Contract
+## Install and register the source
 
-- `Cargo.toml` is the version source of truth.
-- Stable release tags use `vMAJOR.MINOR.PATCH` and must equal the Cargo package version.
-- A tag creates one GitHub Release with generated release notes and one archive per supported target.
-- Every archive contains exactly one `kit` executable.
-- GitHub's release-asset SHA-256 digest is verified before an executable is installed.
-- `kit update` downloads the newest compatible release and atomically replaces the running binary.
-- The updater never requires a source checkout, Git, Cargo, or a Rust toolchain.
+Clone the canonical repository and run its installer:
 
-The supported release targets are:
+```bash
+git clone https://github.com/xtava/kit.git
+cd kit
+./install.sh
+```
+
+`./install.sh` builds the checkout, replaces `$HOME/.local/bin/kit`, and asks the newly installed
+binary to register that checkout, its current branch, and its configured upstream. Registration
+accepts only a canonical Kit Git worktree with the expected `xtava/kit` remote. It does not persist
+remote credentials.
+
+An installation made before source registration was introduced cannot guess which checkout should
+own updates. Run `./install.sh` once from the canonical checkout to register it. A missing or invalid
+registration makes `kit update` fail with recovery guidance; there is no release-download fallback.
+
+This update model requires Git, Cargo, and the Rust toolchain used by `install.sh`.
+
+## Update contract
+
+Run:
+
+```bash
+kit update
+```
+
+The updater performs one supervised transaction:
+
+1. Load and revalidate the registered checkout, branch, upstream remote, and upstream ref.
+2. Refuse before replacement when the local Console agent reports active sessions.
+3. Fetch the exact registered upstream ref without tags, submodules, or interactive credential
+   prompts, then resolve the fetched commit to an immutable revision.
+4. Classify the checkout as current, behind, locally ahead, or diverged.
+5. When behind, reject any incoming path that overlaps staged, unstaged, or untracked local work,
+   then fast-forward to the exact fetched revision.
+6. Run the registered checkout's absolute `install.sh`, which replaces
+   `$HOME/.local/bin/kit`.
+7. Verify that the managed executable reports the selected source revision.
+8. With zero Console sessions, invoke the canonical non-forced Console restart so the running agent
+   uses the replacement binary.
+
+Current and locally ahead checkouts are installed from their existing revision after the upstream
+fetch. Diverged history is refused. The updater never stashes, resets, rebases, force-switches a
+branch, discards local commits, or guesses another checkout. A fast-forward must preserve the
+checkout's exact staged, unstaged, and untracked status.
+
+If installation succeeds but post-install identity verification or Console restart fails, the
+error identifies that the managed binary has already been replaced. Console restart remains
+non-forced: a session that appears after preflight causes restart to refuse instead of terminating
+it.
+
+## Cross-target package verification
+
+[`.github/workflows/release.yml`](../.github/workflows/release.yml) is a manual
+`workflow_dispatch` check. It builds and packages one `kit` executable for each supported target:
 
 - `x86_64-unknown-linux-gnu`
 - `aarch64-unknown-linux-gnu`
 - `x86_64-apple-darwin`
 - `aarch64-apple-darwin`
 
-Archives are named `kit-VERSION-TARGET.tar.gz`. The target triple is part of the filename so the
-updater can select exactly one compatible asset. Unsupported targets fail explicitly instead of
-installing a guessed binary.
+Each job uploads `kit-VERSION-TARGET.tar.gz` as a workflow artifact. The Cargo package version is
+used only to name the verification archive. The workflow does not create a tag, validate a tag,
+publish a GitHub Release, mark anything as latest, or supply binaries to `kit update`.
 
-## Install without a source checkout
+Existing GitHub Releases are historical artifacts. Runtime update code does not query them, and a
+green cross-target workflow run is not a published release.
 
-First installation comes from the latest stable
-[GitHub Release](https://github.com/xtava/kit/releases/latest), not from a repository clone. Choose
-the archive matching the machine:
+## Verification
 
-| Machine | Target |
-| --- | --- |
-| Linux x86-64 | `x86_64-unknown-linux-gnu` |
-| Linux ARM64 | `aarch64-unknown-linux-gnu` |
-| macOS Intel | `x86_64-apple-darwin` |
-| macOS Apple Silicon | `aarch64-apple-darwin` |
-
-Download `kit-VERSION-TARGET.tar.gz`, compare its SHA-256 checksum with the digest shown for that
-asset on the release page, and extract the single `kit` executable into a directory on `PATH`:
+Before dispatching the cross-target workflow, run the applicable local checks sequentially and
+confirm no competing Cargo build is active:
 
 ```bash
-mkdir -p "$HOME/.local/bin"
-tar -xzf kit-VERSION-TARGET.tar.gz -C "$HOME/.local/bin"
-"$HOME/.local/bin/kit" --version
+cargo fmt --check
+RUSTFLAGS='-D warnings' cargo test --locked -j 2
+RUSTFLAGS='-D warnings' cargo clippy --locked --all-targets -j 2
+actionlint .github/workflows/*.yml
 ```
 
-Use `sha256sum` on Linux or `shasum -a 256` on macOS. After the first installation, the normal
-upgrade path is always:
+For every uploaded archive, verify that it contains exactly one executable named `kit`, extraction
+succeeds in an empty temporary directory, and the extracted executable reports the expected
+version. Native runners are required for native linking and runtime proof; Linux inspection of an
+Apple target's metadata is not a macOS runtime check.
 
-```bash
-kit update
-```
-
-That command resolves the compatible asset from the latest stable release, verifies GitHub's
-published SHA-256 digest, and atomically replaces the current executable. It does not use a local
-checkout, Git, Cargo, or a Rust toolchain.
-
-## Published baseline
-
-[`v0.1.0`](https://github.com/xtava/kit/releases/tag/v0.1.0) established the stable release channel
-on 2026-07-19 from commit `c5d2766`. Its tag-triggered workflow published all four supported
-archives, and a fresh Linux x86-64 download was checksum-verified, extracted, executed, and used to
-query `kit update` successfully without a source checkout. The next release must advance the Cargo
-version and publish a new immutable tag; `v0.1.0` must never be moved or reused.
-
-## Update notification
-
-Interactive Kit launches read cached release metadata without waiting for the network. When the
-cache is older than 20 hours, Kit refreshes it in the background. A newer cached release opens a
-startup prompt with three choices:
-
-- **Update now** — run the same verified replacement used by `kit update`.
-- **Later** — continue and show the release again on a future launch.
-- **Skip this version** — suppress this exact version; a newer release appears normally.
-
-Update prompts never run for `--json`, piped input/output, help/version requests, or `kit update`.
-Network and cache failures never block the requested Kit command.
-
-## Publishing
-
-1. Update the version in `Cargo.toml` and refresh `Cargo.lock`.
-2. Merge the release commit to `master` after normal CI succeeds.
-3. Create and push an annotated tag:
-
-   ```bash
-   git tag -a v0.2.0 -m "Release 0.2.0"
-   git push origin v0.2.0
-   ```
-
-4. The release workflow validates the tag/version pair, builds every target, publishes the GitHub
-   Release, and marks the stable release as latest.
-5. Verify the release assets and run `kit update` from the previous version on at least one Linux
-   host and one macOS host.
-
-`workflow_dispatch` is a verification mode. It runs validation, builds, packages, and artifact
-uploads, but intentionally skips the `publish` job. Only a valid version-tag push creates the public
-GitHub Release. Do not treat a successful manual run as a published release.
-
-## Post-publish verification
-
-A release is complete only when all of the following are true:
-
-1. The tag-triggered Release workflow succeeded, including its `publish` job.
-2. The public release is neither a draft nor a prerelease and is selected by GitHub as `latest`.
-3. Exactly one archive exists for each supported target, with no Windows asset or guessed alias.
-4. Each archive contains exactly one executable named `kit`.
-5. A public asset can be downloaded into an empty temporary directory, its SHA-256 digest matches
-   GitHub's published digest, and the extracted binary reports the tagged version.
-6. The extracted binary can query the public release channel with `kit update` without a checkout.
-7. Beginning with the second stable release, an installed previous version successfully updates on
-   at least one Linux host and one macOS host.
-
-Keep verification and publication separate: use a manual run to prove the matrix before tagging,
-then use exactly one tag-triggered run to publish. If the tag-triggered run fails, fix the source or
-workflow, bump the version, and publish a new tag; never move or reuse a published version tag.
-
-Do not create releases manually around a failed workflow. Fix the workflow or release commit and
-publish a new version so a tag, Cargo version, release, and asset set always describe one build.
+Updater verification is separate from archive verification. On an authorized machine, prove that
+`./install.sh` registers the checkout, `kit update` fetches the registered upstream, the installed
+binary identifies the selected revision, dirty state survives unchanged, and Console replacement
+refuses when sessions are active.
 
 ## Ownership
 
-- `src/tools/update.rs` owns release lookup, cached metadata, notification policy, and installation.
-- `src/main.rs` invokes the update startup check before normal command dispatch.
-- `.github/workflows/release.yml` owns tag validation, target builds, archives, and publication.
-- GitHub Releases is the sole remote release source.
+- `install.sh` owns the canonical build, managed-path replacement, and source-registration handoff.
+- `src/update.rs` owns registration validation and the source-update transaction.
+- `src/tools/update.rs` exposes that owner through the CLI.
+- `src/tools/console/service/mod.rs` owns the non-forced Console restart used after installation.
+- `.github/workflows/release.yml` owns manual cross-target package verification only.
 
-The former `CARGO_MANIFEST_DIR` → `git pull` → `cargo install` updater is intentionally deleted. A
-local development build may still be installed with the repository's `install.sh`, but once running,
-`kit update` follows the same published-binary path as every other installation.
+Do not add a GitHub-release downloader, startup update prompt, second installation path, automatic
+stash/reset/rebase policy, or updater-specific Console lifecycle implementation.

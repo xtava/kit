@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 
 use anyhow::{bail, Result};
 use crossterm::event::{KeyCode, KeyModifiers};
@@ -37,7 +37,6 @@ pub(super) struct Config {
     terminal_split_ratio: SplitRatio,
     ready_notification: ReadyNotification,
     keybindings: Keybindings,
-    users: BTreeMap<String, String>,
     selected_machine: Option<String>,
 }
 
@@ -52,8 +51,6 @@ struct Stored {
     #[serde(default)]
     keybindings: Keybindings,
     #[serde(default)]
-    users: BTreeMap<String, String>,
-    #[serde(default)]
     selected_machine: Option<String>,
 }
 
@@ -64,7 +61,6 @@ impl Default for Stored {
             terminal_split_ratio: default_terminal_split_ratio(),
             ready_notification: default_ready_notification(),
             keybindings: Keybindings::default(),
-            users: BTreeMap::new(),
             selected_machine: None,
         }
     }
@@ -156,6 +152,7 @@ impl Keybindings {
 
 impl Config {
     pub(super) fn load(store: ConfigStore) -> Result<Self> {
+        store.remove(TOOL, "users")?;
         let stored: Stored = store.load(TOOL)?;
         stored.keybindings.validate()?;
         Ok(Self {
@@ -164,7 +161,6 @@ impl Config {
             terminal_split_ratio: stored.terminal_split_ratio,
             ready_notification: stored.ready_notification,
             keybindings: stored.keybindings,
-            users: stored.users,
             selected_machine: stored.selected_machine,
         })
     }
@@ -228,16 +224,6 @@ impl Config {
             ConfigValue::Integer(i64::from(ratio.value())),
         )?;
         self.terminal_split_ratio = ratio;
-        Ok(())
-    }
-
-    pub(super) fn unix_user(&self, stable_node_id: &str) -> Option<&str> {
-        self.users.get(stable_node_id).map(String::as_str)
-    }
-
-    pub(super) fn set_unix_user(&mut self, stable_node_id: &str, user: &str) -> Result<()> {
-        self.store.set_table_string(TOOL, "users", stable_node_id, user)?;
-        self.users.insert(stable_node_id.to_owned(), user.to_owned());
         Ok(())
     }
 
@@ -584,14 +570,12 @@ mod tests {
     }
 
     #[test]
-    fn machine_identity_preferences_persist_without_live_status() -> Result<()> {
+    fn selected_machine_persists_without_live_status() -> Result<()> {
         let store = store();
         let mut config = Config::load(store.clone())?;
-        config.set_unix_user("node-mac", "tvx")?;
         config.set_selected_machine("node-mac")?;
 
         let reloaded = Config::load(store.clone())?;
-        assert_eq!(reloaded.unix_user("node-mac"), Some("tvx"));
         assert_eq!(reloaded.selected_machine(), Some("node-mac"));
 
         cleanup(&store);
@@ -680,14 +664,22 @@ mod tests {
     }
 
     #[test]
-    fn unix_users_are_keyed_by_stable_node_id_and_round_trip() -> Result<()> {
+    fn load_deletes_obsolete_users_without_rewriting_unrelated_configuration() -> Result<()> {
         let store = store();
-        let mut config = Config::load(store.clone())?;
-        config.set_unix_user("node-123", "tvx")?;
+        std::fs::create_dir_all(store.path(TOOL).parent().expect("Console config parent"))?;
+        std::fs::write(
+            store.path(TOOL),
+            "# operator preference\nselected_machine = 'node-mac' # retained\n\n[users]\nnode-123 = \"operator\"\n",
+        )?;
 
-        let reloaded = Config::load(store.clone())?;
-        assert_eq!(reloaded.unix_user("node-123"), Some("tvx"));
-        assert_eq!(reloaded.unix_user("tvxm"), None);
+        let config = Config::load(store.clone())?;
+        let raw = std::fs::read_to_string(store.path(TOOL))?;
+        assert_eq!(config.selected_machine(), Some("node-mac"));
+        assert!(raw.contains("# operator preference"));
+        assert!(raw.contains("# retained"));
+        assert!(raw.contains("selected_machine = 'node-mac'"));
+        assert!(!raw.contains("[users]"));
+        assert!(!raw.contains("node-123"));
 
         cleanup(&store);
         Ok(())

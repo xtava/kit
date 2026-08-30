@@ -1,21 +1,16 @@
 use std::{env, fs, path::Path, process::Command};
 
+mod source_identity;
+
+use source_identity::SOURCE_IDENTITY_PATHS;
+
 const UNKNOWN: &str = "unknown";
-const SOURCE_IDENTITY_PATHS: &[&str] = &[
-    "Cargo.toml",
-    "Cargo.lock",
-    "build.rs",
-    "src",
-    "tests",
-    "vendor/varbincode",
-    "vendor/wezterm",
-    "vendor/wezterm.upstream",
-];
 const RECURSIVE_WATCH_PATHS: &[&str] = &["src", "tests"];
 
 fn main() {
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/index");
+    println!("cargo:rerun-if-changed=source_identity.rs");
     println!("cargo:rerun-if-changed=vendor/wezterm.upstream");
     for path in RECURSIVE_WATCH_PATHS {
         println!("cargo:rerun-if-changed={path}");

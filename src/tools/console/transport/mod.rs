@@ -1,11 +1,14 @@
-//! Supervised transport for a remote Console mux connection.
+//! Authenticated tailnet transport for a remote Console mux connection.
 //!
-//! The transport owns only opaque bytes and the OpenSSH process lifecycle. Machine discovery,
-//! authentication preflight, remote service state, mux reconnect, and presentation remain with the
-//! Console orchestrator.
+//! The target gateway and client relay own the versioned handshake and opaque byte transport.
+//! Machine discovery, mux reconnect, and presentation remain with the Console orchestrator.
 
-mod relay;
+mod gateway;
+pub(crate) mod protocol;
+mod tailnet;
 
-pub(crate) use relay::{
-    PreparedRelayEpoch, RelayEpochFailure, RelayEpochProvider, SshRelay, SshRelayError,
+pub(crate) use gateway::{GatewayControl, PreparedGateway, CONSOLE_GATEWAY_PORT};
+pub(crate) use tailnet::{
+    PreparedRelayEpoch, RelayEpochFailure, RelayEpochOutcomeKind, RelayEpochProvider, TailnetRelay,
+    TailnetRelayError,
 };

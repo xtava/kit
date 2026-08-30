@@ -42,10 +42,6 @@ async fn run() -> Result<()> {
         std::process::exit(code);
     }
 
-    if update::startup().await? {
-        return Ok(());
-    }
-
     let registry = Registry::new()
         .register(build::tool())
         .register(deploy::tool())

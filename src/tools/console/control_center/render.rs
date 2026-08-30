@@ -8,8 +8,8 @@ use ratatui::{
 
 use crate::tui::{
     fit_terminal_text, render_vertical_scrollbar, terminal_text_width, theme::NORD, CellAlignment,
-    CellOverflow, CommandPaletteLayout, ContextMenuLayout, ContextMenuStyle, LineEditor,
-    ScrollbarLayout, ScrollbarStyle, SelectableRegion, ViewportMetrics,
+    CellOverflow, CommandPaletteLayout, ContextMenuLayout, ContextMenuStyle, ScrollbarLayout,
+    ScrollbarStyle, SelectableRegion, ViewportMetrics,
 };
 
 use super::{
@@ -44,7 +44,7 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut ControlCenterApp) -> Contr
     let sections = Layout::vertical([
         Constraint::Length(2),
         Constraint::Min(4),
-        Constraint::Length(if content.height >= 12 { 5 } else { 3 }),
+        Constraint::Length(if content.height >= 12 { 5 } else { 4 }),
     ])
     .split(content);
     frame.render_widget(
@@ -203,9 +203,6 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut ControlCenterApp) -> Contr
         Some(ControlCenterOverlay::Settings(settings)) => {
             settings.render(frame, area);
         }
-        Some(ControlCenterOverlay::UnixUser { input, notice, .. }) => {
-            render_unix_user(frame, area, input, notice.as_deref());
-        }
         None => {}
     }
     if app.overlay.is_some() && !matches!(app.overlay, Some(ControlCenterOverlay::Details { .. })) {
@@ -269,72 +266,23 @@ fn render_machine_details(
     }
 }
 
-fn render_unix_user(frame: &mut Frame<'_>, area: Rect, input: &LineEditor, notice: Option<&str>) {
-    let width = area.width.saturating_sub(4).min(64);
-    let height = if notice.is_some() { 8 } else { 7 };
-    let horizontal =
-        Layout::horizontal([Constraint::Fill(1), Constraint::Length(width), Constraint::Fill(1)])
-            .split(area);
-    let vertical = Layout::vertical([
-        Constraint::Fill(1),
-        Constraint::Length(height.min(area.height)),
-        Constraint::Fill(1),
-    ])
-    .split(horizontal[1]);
-    let popup = vertical[1];
-    frame.render_widget(Clear, popup);
-    let block = Block::default()
-        .title(" Unix user ")
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(NORD.focus));
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
-    let lines = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Min(0),
-    ])
-    .split(inner);
-    frame.render_widget(
-        Paragraph::new("Account name on the selected machine")
-            .style(Style::default().fg(NORD.text_muted)),
-        lines[0],
-    );
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("› ", Style::default().fg(NORD.accent)),
-            Span::styled(format!("{}▏", input.value()), Style::default().fg(NORD.text_strong)),
-        ])),
-        lines[1],
-    );
-    let hint = notice.unwrap_or("Enter saves · Esc cancels");
-    frame.render_widget(
-        Paragraph::new(hint).style(Style::default().fg(if notice.is_some() {
-            NORD.warning
-        } else {
-            NORD.text_muted
-        })),
-        lines[2],
-    );
-}
-
 fn machine_row_line(row: MachineRowProjection) -> Line<'static> {
     let mut spans = vec![
-        Span::styled(
-            fit_terminal_text(&row.name, 20, CellAlignment::Left, CellOverflow::Clip),
-            Style::default().fg(NORD.text),
-        ),
+        Span::styled(format!("{}  ", row.name), Style::default().fg(NORD.text)),
         Span::styled(
             fit_terminal_text(&row.status, 18, CellAlignment::Left, CellOverflow::Clip),
             Style::default().fg(NORD.text_strong),
         ),
     ];
-    for value in
-        [row.role.map(str::to_owned), row.operating_system, row.sessions, row.unix_user, row.build]
-            .into_iter()
-            .flatten()
+    for value in [
+        row.display_name,
+        row.role.map(str::to_owned),
+        row.operating_system,
+        row.sessions,
+        row.build,
+    ]
+    .into_iter()
+    .flatten()
     {
         spans.push(Span::styled(format!("  {value}"), Style::default().fg(NORD.text_muted)));
     }
@@ -362,17 +310,14 @@ fn render_selected_machine(
             None
         };
         let label = action.map(|action| format!("[ {} ]", action.contract().title));
-        let message = app
-            .notice
-            .as_deref()
-            .map(str::to_owned)
-            .or_else(|| label.clone())
-            .unwrap_or_else(|| "R refreshes discovery · q closes Console".to_owned());
-        frame.render_widget(
-            Paragraph::new(message).style(Style::default().fg(NORD.text_muted)),
-            inner,
-        );
-        if app.notice.is_none() {
+        let message =
+            label.clone().unwrap_or_else(|| "R refreshes discovery · q closes Console".to_owned());
+        let mut lines = vec![Line::styled(message, Style::default().fg(NORD.text_muted))];
+        if let Some(notice) = app.notice.as_deref() {
+            lines.push(Line::styled(notice, Style::default().fg(NORD.warning)));
+        }
+        frame.render_widget(Paragraph::new(lines), inner);
+        if inner.height >= 1 {
             regions.primary_action = label.map(|label| {
                 let width = u16::try_from(terminal_text_width(&label)).unwrap_or(u16::MAX);
                 Rect::new(inner.x, inner.y, width, 1)
@@ -392,37 +337,38 @@ fn render_selected_machine(
         } else {
             Style::default().fg(NORD.warning)
         };
+    let display_name = if machine.identity.display_name != machine.identity.selector {
+        format!("  {}", machine.identity.display_name)
+    } else {
+        String::new()
+    };
     let mut lines = vec![Line::from(vec![
         Span::styled(
-            &machine.identity.display_name,
+            &machine.identity.selector,
             Style::default().fg(NORD.text).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            format!("  {}", machine.identity.selector),
-            Style::default().fg(NORD.text_muted),
-        ),
+        Span::styled(display_name, Style::default().fg(NORD.text_muted)),
     ])];
+    lines.push(Line::from(vec![
+        Span::styled(action_label.clone(), action_style),
+        Span::raw("  "),
+        Span::styled(
+            new_session_label,
+            Style::default().fg(if can_create_session {
+                NORD.text_strong
+            } else {
+                NORD.text_muted
+            }),
+        ),
+        Span::raw("  "),
+        Span::styled(refresh_label, Style::default().fg(NORD.text_strong)),
+    ]));
     if let Some(notice) = app.notice.as_deref() {
         lines.push(Line::styled(notice, Style::default().fg(NORD.warning)));
-    } else {
-        lines.push(Line::from(vec![
-            Span::styled(action_label.clone(), action_style),
-            Span::raw("  "),
-            Span::styled(
-                new_session_label,
-                Style::default().fg(if can_create_session {
-                    NORD.text_strong
-                } else {
-                    NORD.text_muted
-                }),
-            ),
-            Span::raw("  "),
-            Span::styled(refresh_label, Style::default().fg(NORD.text_strong)),
-        ]));
     }
     frame.render_widget(Paragraph::new(lines), inner);
 
-    if app.notice.is_none() && inner.height >= 2 {
+    if inner.height >= 2 {
         let actions_y = inner.y + 1;
         let action_width = u16::try_from(terminal_text_width(&action_label)).unwrap_or(u16::MAX);
         let new_session_width =

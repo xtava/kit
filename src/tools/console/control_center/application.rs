@@ -3,25 +3,24 @@ use std::sync::Arc;
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::layout::Position;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::mpsc;
 
 use crate::{
     framework::{process::ProcessSupervisor, start_external, Context, ExternalTarget},
-    release::{ReleaseUpdater, UpdateAvailability},
     tailscale::{LoginEvent, Readiness, Status, TailscaleClient},
     tui::{
         theme::NORD, ActionInvocation, ActionRegistry, ActionUnavailable, CommandPalette,
-        CommandPaletteOutcome, ContextMenu, ContextMenuOutcome, EventReader, KeyChord, LineEditor,
+        CommandPaletteOutcome, ContextMenu, ContextMenuOutcome, EventReader, KeyChord,
         NavigationHistory, ScrollbarDrag, SelectionOutcome, Session, SessionOptions,
         SettingsEditor, SettingsFlow, TextSelection, Viewport, ViewportMetrics,
     },
+    update::SourceUpdater,
 };
 
 use super::super::{
     build_identity,
     config::{self, Config},
     connection::ConnectionOwner,
-    remote,
     service::{self, ConsoleStatus},
 };
 use super::{
@@ -30,15 +29,12 @@ use super::{
         MACHINE_CONTEXT_MENU,
     },
     model::{
-        compatibility_for_status, valid_unix_user, ConsoleProbeState, ControlCenterOutcome,
-        ControlCenterState, MachineAction, MachineConnectionRequest, MachineDiscoveryState,
-        MachineOperation, MachineOperationState, MachineReachability, MachineRole, MachineState,
-        UnixUserState,
+        compatibility_for_status, ConsoleProbeState, ControlCenterOutcome, ControlCenterState,
+        MachineAction, MachineConnectionRequest, MachineDiscoveryState, MachineOperation,
+        MachineOperationState, MachineReachability, MachineRole, MachineState,
     },
     render::{render, ControlCenterRegions},
 };
-
-const REMOTE_PROBE_CONCURRENCY: usize = 4;
 
 enum ControlCenterUpdate {
     DiscoveryCompleted {
@@ -56,7 +52,6 @@ enum ControlCenterUpdate {
         operation: MachineOperation,
         result: Result<ConsoleStatus, String>,
     },
-    ReleaseChecked(Result<UpdateAvailability, String>),
     TailscaleLogin(LoginEvent),
 }
 
@@ -65,7 +60,6 @@ pub(super) enum ControlCenterOverlay {
     ContextMenu(ContextMenu<ControlCenterActionContext>),
     Details { stable_node_id: String },
     Settings(SettingsEditor),
-    UnixUser { stable_node_id: String, input: LineEditor, notice: Option<String> },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -78,7 +72,6 @@ pub(super) struct ControlCenterApp {
     pub(super) state: ControlCenterState,
     config: Config,
     expected_build: wezterm_codec::BuildIdentity,
-    release_availability: Option<UpdateAvailability>,
     generation: u64,
     update_sender: mpsc::UnboundedSender<ControlCenterUpdate>,
     action_registry: ActionRegistry<ControlCenterActionContext, ControlCenterCommand>,
@@ -93,12 +86,14 @@ pub(super) struct ControlCenterApp {
     pub(super) machine_scrollbar_drag: Option<ScrollbarDrag>,
     pub(super) selection: TextSelection<ControlCenterSelectionSurface>,
     pub(super) content_revision: u64,
+    exit_after_update: bool,
 }
 
 pub(crate) async fn run(
     cx: &Context,
     config: Config,
     connection_owner: Arc<ConnectionOwner>,
+    initial_notice: Option<String>,
 ) -> Result<ControlCenterOutcome> {
     let expected_build = build_identity()?;
     let (update_sender, mut updates) = mpsc::unbounded_channel();
@@ -110,7 +105,6 @@ pub(crate) async fn run(
         },
         config,
         expected_build,
-        release_availability: None,
         generation: 0,
         update_sender,
         action_registry: control_center_actions()?,
@@ -125,8 +119,10 @@ pub(crate) async fn run(
         machine_scrollbar_drag: None,
         selection: TextSelection::default(),
         content_revision: 0,
+        exit_after_update: false,
     };
     app.refresh(cx.processes.clone())?;
+    app.notice = initial_notice;
 
     let mut terminal =
         Session::open(SessionOptions { mouse_capture: true, bracketed_paste: false })?;
@@ -141,6 +137,9 @@ pub(crate) async fn run(
                     return Ok(ControlCenterOutcome::Quit);
                 };
                 app.apply_update(cx.processes.clone(), update)?;
+                if app.exit_after_update {
+                    return Ok(ControlCenterOutcome::Updated);
+                }
             }
             event = events.recv() => {
                 let Some(event) = event else {
@@ -169,18 +168,6 @@ impl ControlCenterApp {
             let result = client.readiness().await.map_err(|error| format!("{error:#}"));
             let _ = sender.send(ControlCenterUpdate::DiscoveryCompleted { generation, result });
         });
-        let updater = ReleaseUpdater::new();
-        let cached = updater.cached();
-        if let Some(cached) = cached.as_ref() {
-            self.release_availability = Some(cached.availability.clone());
-        }
-        if cached.as_ref().is_none_or(|cached| cached.stale) {
-            let sender = self.update_sender.clone();
-            tokio::spawn(async move {
-                let result = updater.check().await.map_err(|error| format!("{error:#}"));
-                let _ = sender.send(ControlCenterUpdate::ReleaseChecked(result));
-            });
-        }
         Ok(())
     }
 
@@ -198,9 +185,10 @@ impl ControlCenterApp {
             }
             ControlCenterUpdate::DiscoveryCompleted { generation, result } => match result {
                 Ok(Readiness::Ready(status)) => {
+                    let local_id = status.local.id.clone();
                     self.reconcile_machines(&status);
                     self.state.discovery = MachineDiscoveryState::Ready;
-                    self.start_probes(processes, generation, status);
+                    self.start_local_probe(processes, generation, local_id);
                     Ok(())
                 }
                 Ok(Readiness::NeedsLogin) => {
@@ -236,11 +224,8 @@ impl ControlCenterApp {
                 };
                 match result {
                     Ok(status) => {
-                        machine.compatibility = compatibility_for_status(
-                            &self.expected_build,
-                            &status,
-                            self.release_availability.as_ref(),
-                        );
+                        machine.compatibility =
+                            compatibility_for_status(&self.expected_build, &status);
                         machine.console = ConsoleProbeState::Complete(Box::new(status));
                         machine.operation = MachineOperationState::Idle;
                     }
@@ -275,39 +260,19 @@ impl ControlCenterApp {
                 };
                 match result {
                     Ok(status) => {
-                        machine.compatibility = compatibility_for_status(
-                            &self.expected_build,
-                            &status,
-                            self.release_availability.as_ref(),
-                        );
+                        machine.compatibility =
+                            compatibility_for_status(&self.expected_build, &status);
                         machine.console = ConsoleProbeState::Complete(Box::new(status));
                         machine.operation = MachineOperationState::Idle;
                         self.notice = Some(format!("{} completed.", operation.completed_label()));
+                        if operation == MachineOperation::Update {
+                            self.exit_after_update = true;
+                        }
                     }
                     Err(detail) => {
                         machine.operation =
                             MachineOperationState::Failed { operation, detail: detail.clone() };
                         self.notice = Some(format!("{} failed: {detail}", operation.label()));
-                    }
-                }
-                Ok(())
-            }
-            ControlCenterUpdate::ReleaseChecked(result) => {
-                match result {
-                    Ok(availability) => {
-                        self.release_availability = Some(availability);
-                        for machine in &mut self.state.machines {
-                            if let ConsoleProbeState::Complete(status) = &machine.console {
-                                machine.compatibility = compatibility_for_status(
-                                    &self.expected_build,
-                                    status,
-                                    self.release_availability.as_ref(),
-                                );
-                            }
-                        }
-                    }
-                    Err(detail) => {
-                        self.notice = Some(format!("Could not check Kit releases: {detail}"));
                     }
                 }
                 Ok(())
@@ -327,9 +292,10 @@ impl ControlCenterApp {
                     }
                     LoginEvent::Ready(status) => {
                         self.tailscale_login_cancel = None;
+                        let local_id = status.local.id.clone();
                         self.reconcile_machines(&status);
                         self.state.discovery = MachineDiscoveryState::Ready;
-                        self.start_probes(processes, self.generation, status);
+                        self.start_local_probe(processes, self.generation, local_id);
                         self.notice = Some("Tailscale authentication complete.".to_owned());
                     }
                     LoginEvent::Failed(detail) => {
@@ -355,32 +321,13 @@ impl ControlCenterApp {
             .selected_machine
             .clone()
             .or_else(|| self.config.selected_machine().map(str::to_owned));
-        let current_user = std::env::var("USER").unwrap_or_else(|_| "current user".to_owned());
-        let mut machines = vec![MachineState::from_tailnet_node(
-            &status.local,
-            MachineRole::ThisMachine,
-            UnixUserState::Current(current_user),
-        )];
+        let mut machines =
+            vec![MachineState::from_tailnet_node(&status.local, MachineRole::ThisMachine)];
         machines.extend(
             status
                 .peers
                 .iter()
-                .filter(|node| {
-                    node.online
-                        || !status.peers.iter().any(|candidate| {
-                            candidate.online
-                                && candidate.id != node.id
-                                && candidate.host_name.eq_ignore_ascii_case(&node.host_name)
-                        })
-                })
-                .map(|node| {
-                    let unix_user = self
-                        .config
-                        .unix_user(&node.id)
-                        .map(|user| UnixUserState::Configured(user.to_owned()))
-                        .unwrap_or(UnixUserState::Missing);
-                    MachineState::from_tailnet_node(node, MachineRole::Peer, unix_user)
-                }),
+                .map(|node| MachineState::from_tailnet_node(node, MachineRole::Peer)),
         );
         self.state.machines = machines;
         self.state.selected_machine = selected
@@ -398,66 +345,32 @@ impl ControlCenterApp {
         }
     }
 
-    fn start_probes(&mut self, processes: ProcessSupervisor, generation: u64, status: Status) {
-        for machine in &mut self.state.machines {
-            let can_probe = machine.role == MachineRole::ThisMachine
-                || (machine.reachability == MachineReachability::Online
-                    && matches!(machine.unix_user, UnixUserState::Configured(_)));
-            if can_probe {
-                machine.operation = MachineOperationState::Running(MachineOperation::Probe);
-            }
+    fn start_local_probe(
+        &mut self,
+        processes: ProcessSupervisor,
+        generation: u64,
+        stable_node_id: String,
+    ) {
+        if let Some(machine) = self
+            .state
+            .machines
+            .iter_mut()
+            .find(|machine| machine.identity.stable_node_id == stable_node_id)
+        {
+            machine.operation = MachineOperationState::Running(MachineOperation::Probe);
         }
-        let semaphore = Arc::new(Semaphore::new(REMOTE_PROBE_CONCURRENCY));
         let sender = self.update_sender.clone();
-        let local_id = status.local.id.clone();
-        let local_processes = processes.clone();
         let connection_owner = Arc::clone(&self.connection_owner);
         tokio::spawn(async move {
-            let result = service::status_with_owner(&local_processes, &connection_owner)
+            let result = service::status_with_owner(&processes, &connection_owner)
                 .await
                 .map_err(|error| format!("{error:#}"));
             let _ = sender.send(ControlCenterUpdate::ProbeCompleted {
                 generation,
-                stable_node_id: local_id,
+                stable_node_id,
                 result,
             });
         });
-
-        for node in status.peers {
-            if !node.online {
-                continue;
-            }
-            let Some(user) = self.config.unix_user(&node.id).map(str::to_owned) else {
-                continue;
-            };
-            let config = self.config.clone();
-            let sender = self.update_sender.clone();
-            let processes = processes.clone();
-            let semaphore = Arc::clone(&semaphore);
-            tokio::spawn(async move {
-                let result = async {
-                    let _permit = semaphore
-                        .acquire_owned()
-                        .await
-                        .map_err(|_| "machine probe coordinator stopped".to_owned())?;
-                    match remote::resolve_node(&processes, &config, &node, Some(&user))
-                        .await
-                        .map_err(|error| format!("{error:#}"))?
-                    {
-                        remote::Resolution::Ready(target) => remote::status(&processes, &target)
-                            .await
-                            .map_err(|error| format!("{error:#}")),
-                        remote::Resolution::Status(status) => Ok(status),
-                    }
-                }
-                .await;
-                let _ = sender.send(ControlCenterUpdate::ProbeCompleted {
-                    generation,
-                    stable_node_id: node.id,
-                    result,
-                });
-            });
-        }
     }
 
     fn handle_event(
@@ -587,9 +500,6 @@ impl ControlCenterApp {
                     }
                 }
             };
-        }
-        if matches!(self.overlay, Some(ControlCenterOverlay::UnixUser { .. })) {
-            return self.handle_unix_user_event(processes, event);
         }
         if let Event::Key(key) = &event {
             match self.selection.on_key(*key) {
@@ -821,75 +731,6 @@ impl ControlCenterApp {
         )));
     }
 
-    fn handle_unix_user_event(
-        &mut self,
-        processes: ProcessSupervisor,
-        event: Event,
-    ) -> Result<Option<ControlCenterOutcome>> {
-        match event {
-            Event::Key(key)
-                if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-                    && key.code == KeyCode::Esc =>
-            {
-                self.overlay = None;
-            }
-            Event::Key(key)
-                if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-                    && key.code == KeyCode::Enter =>
-            {
-                let (stable_node_id, user) = match self.overlay.as_ref() {
-                    Some(ControlCenterOverlay::UnixUser { stable_node_id, input, .. }) => {
-                        (stable_node_id.clone(), input.value().trim().to_owned())
-                    }
-                    _ => return Ok(None),
-                };
-                if !valid_unix_user(&user) {
-                    if let Some(ControlCenterOverlay::UnixUser { notice, .. }) =
-                        self.overlay.as_mut()
-                    {
-                        *notice = Some(
-                            "Use a Unix account name without spaces, @, or shell characters."
-                                .to_owned(),
-                        );
-                    }
-                    return Ok(None);
-                }
-                self.config.set_unix_user(&stable_node_id, &user)?;
-                if let Some(machine) = self
-                    .state
-                    .machines
-                    .iter_mut()
-                    .find(|machine| machine.identity.stable_node_id == stable_node_id)
-                {
-                    machine.unix_user = UnixUserState::Configured(user);
-                }
-                self.overlay = None;
-                self.notice = Some("Unix user saved. Checking the machine again…".to_owned());
-                self.refresh(processes)?;
-            }
-            Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
-                if let Some(ControlCenterOverlay::UnixUser { input, notice, .. }) =
-                    self.overlay.as_mut()
-                {
-                    input.apply_key(key);
-                    *notice = None;
-                }
-            }
-            Event::Paste(text) => {
-                if let Some(ControlCenterOverlay::UnixUser { input, notice, .. }) =
-                    self.overlay.as_mut()
-                {
-                    for character in text.chars().filter(|character| !character.is_control()) {
-                        input.insert(character);
-                    }
-                    *notice = None;
-                }
-            }
-            _ => {}
-        }
-        Ok(None)
-    }
-
     fn invoke_primary(
         &mut self,
         processes: ProcessSupervisor,
@@ -937,19 +778,6 @@ impl ControlCenterApp {
                 self.refresh(processes)?;
                 Ok(None)
             }
-            MachineAction::SetUnixUser => {
-                let Some(machine) = self.selected_machine() else {
-                    return Ok(None);
-                };
-                let stable_node_id = machine.identity.stable_node_id.clone();
-                let mut input = LineEditor::default();
-                if let UnixUserState::Configured(user) = &machine.unix_user {
-                    input.set(user.clone());
-                }
-                self.overlay =
-                    Some(ControlCenterOverlay::UnixUser { stable_node_id, input, notice: None });
-                Ok(None)
-            }
             MachineAction::AuthenticateTailscale => {
                 let client = TailscaleClient::new(processes, std::env::current_dir()?);
                 let (mut events, cancel, owner) = client.start_login();
@@ -964,27 +792,7 @@ impl ControlCenterApp {
                 });
                 Ok(None)
             }
-            MachineAction::AuthenticateOpenSsh => {
-                let url =
-                    self.selected_machine().and_then(|machine| match machine.complete_status() {
-                        Some(ConsoleStatus::NeedsSshAuthentication { url, .. }) => {
-                            Some(url.clone())
-                        }
-                        _ => None,
-                    });
-                if let Some(url) = url {
-                    let receipt = start_external(&processes, ExternalTarget::Url(url))?;
-                    tokio::spawn(async move {
-                        let _ = receipt.completion().await;
-                    });
-                    self.notice =
-                        Some("Complete OpenSSH authentication in your browser.".to_owned());
-                }
-                Ok(None)
-            }
-            MachineAction::InstallKit
-            | MachineAction::StartConsole
-            | MachineAction::SetupOrRepair => {
+            MachineAction::StartConsole | MachineAction::SetupOrRepair => {
                 self.start_service_operation(processes, MachineOperation::SetupOrRepair)?;
                 Ok(None)
             }
@@ -1026,10 +834,10 @@ impl ControlCenterApp {
         let Some(machine) = self.selected_machine() else {
             return Ok(());
         };
+        if machine.role != MachineRole::ThisMachine {
+            return Ok(());
+        }
         let stable_node_id = machine.identity.stable_node_id.clone();
-        let role = machine.role;
-        let selector = machine.identity.selector.clone();
-        let mut config = self.config.clone();
         let generation = self.generation;
         let sender = self.update_sender.clone();
         let connection_owner = Arc::clone(&self.connection_owner);
@@ -1043,24 +851,8 @@ impl ControlCenterApp {
         }
         self.notice = Some(format!("{}…", operation.label()));
         tokio::spawn(async move {
-            let result = async {
-                match role {
-                    MachineRole::ThisMachine => {
-                        run_local_service_operation(&processes, &connection_owner, operation).await
-                    }
-                    MachineRole::Peer => {
-                        let target = match remote::resolve(&processes, &mut config, &selector)
-                            .await
-                            .map_err(|error| format!("{error:#}"))?
-                        {
-                            remote::Resolution::Ready(target) => target,
-                            remote::Resolution::Status(status) => return Ok(status),
-                        };
-                        run_remote_service_operation(&processes, &target, operation).await
-                    }
-                }
-            }
-            .await;
+            let result =
+                run_local_service_operation(&processes, &connection_owner, operation).await;
             let _ = sender.send(ControlCenterUpdate::OperationCompleted {
                 generation,
                 stable_node_id,
@@ -1075,14 +867,14 @@ impl ControlCenterApp {
         let Some(machine) = self.selected_machine() else {
             return Ok(());
         };
+        if machine.role != MachineRole::ThisMachine {
+            return Ok(());
+        }
         if !machine.update_allowed() {
             self.notice = Some("Close active sessions before updating this machine.".to_owned());
             return Ok(());
         }
         let stable_node_id = machine.identity.stable_node_id.clone();
-        let role = machine.role;
-        let selector = machine.identity.selector.clone();
-        let mut config = self.config.clone();
         let generation = self.generation;
         let sender = self.update_sender.clone();
         if let Some(machine) = self
@@ -1096,31 +888,13 @@ impl ControlCenterApp {
         self.notice = Some("Updating Kit and reconciling Console…".to_owned());
         tokio::spawn(async move {
             let result = async {
-                match role {
-                    MachineRole::ThisMachine => {
-                        let update = ReleaseUpdater::new()
-                            .install_managed(&processes, false)
-                            .await
-                            .map_err(|error| format!("{error:#}"))?;
-                        serde_json::from_slice(&update.console_status)
-                            .map_err(|error| format!("decode updated Console status: {error}"))
-                    }
-                    MachineRole::Peer => {
-                        let target = match remote::resolve(&processes, &mut config, &selector)
-                            .await
-                            .map_err(|error| format!("{error:#}"))?
-                        {
-                            remote::Resolution::Ready(target) => target,
-                            remote::Resolution::Status(status) => return Ok(status),
-                        };
-                        remote::update(&processes, &target)
-                            .await
-                            .map_err(|error| format!("{error:#}"))?;
-                        remote::status(&processes, &target)
-                            .await
-                            .map_err(|error| format!("{error:#}"))
-                    }
-                }
+                let update = SourceUpdater::new(processes)
+                    .map_err(|error| format!("{error:#}"))?
+                    .install_managed(false)
+                    .await
+                    .map_err(|error| format!("{error:#}"))?;
+                serde_json::from_value(update.console_status)
+                    .map_err(|error| format!("decode updated Console status: {error}"))
             }
             .await;
             let _ = sender.send(ControlCenterUpdate::OperationCompleted {
@@ -1135,11 +909,17 @@ impl ControlCenterApp {
 
     fn connection_outcome(&self, create_session: bool) -> Option<ControlCenterOutcome> {
         let machine = self.selected_machine()?;
-        matches!(machine.complete_status(), Some(ConsoleStatus::Ready { .. })).then(|| {
+        let connectable = match machine.role {
+            MachineRole::ThisMachine => {
+                matches!(machine.complete_status(), Some(ConsoleStatus::Ready { .. }))
+            }
+            MachineRole::Peer => machine.reachability == MachineReachability::Online,
+        };
+        connectable.then(|| {
             let request = match machine.role {
                 MachineRole::ThisMachine => MachineConnectionRequest::Local { create_session },
                 MachineRole::Peer => MachineConnectionRequest::Remote {
-                    selector: machine.identity.selector.clone(),
+                    machine: machine.identity.clone(),
                     create_session,
                 },
             };
@@ -1164,26 +944,6 @@ async fn run_local_service_operation(
             service::restart_with_owner(processes, connection_owner, false)
                 .await
                 .map_err(|error| format!("{error:#}"))
-        }
-        _ => Err(format!("{} is not a service operation", operation.label())),
-    }
-}
-
-async fn run_remote_service_operation(
-    processes: &ProcessSupervisor,
-    target: &remote::RemoteTarget,
-    operation: MachineOperation,
-) -> Result<ConsoleStatus, String> {
-    match operation {
-        MachineOperation::SetupOrRepair => {
-            remote::setup(processes, target).await.map_err(|error| format!("{error:#}"))
-        }
-        MachineOperation::Stop => {
-            remote::stop(processes, target, false).await.map_err(|error| format!("{error:#}"))
-        }
-        MachineOperation::Restart => {
-            remote::stop(processes, target, false).await.map_err(|error| format!("{error:#}"))?;
-            remote::setup(processes, target).await.map_err(|error| format!("{error:#}"))
         }
         _ => Err(format!("{} is not a service operation", operation.label())),
     }

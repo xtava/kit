@@ -1,4 +1,4 @@
-name: Release
+name: Cross-target package verification
 
 on:
   workflow_dispatch:
@@ -10,13 +10,13 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
-  validate:
+  metadata:
     runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v7
-      - name: Validate tag and Cargo version
+      - name: Read Cargo version
         id: version
         shell: bash
         run: |
@@ -25,7 +25,7 @@ jobs:
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
 
   build:
-    needs: validate
+    needs: metadata
     strategy:
       fail-fast: false
       matrix:
@@ -45,21 +45,21 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
-      - name: Build release binary
+      - name: Build verification binary
         run: cargo build --locked --release --target ${{ matrix.target }} -j 2
-      - name: Package release binary
+      - name: Package verification binary
         shell: bash
         env:
           BINARY: ${{ matrix.binary }}
           TARGET: ${{ matrix.target }}
-          VERSION: ${{ needs.validate.outputs.version }}
+          VERSION: ${{ needs.metadata.outputs.version }}
         run: |
           set -euo pipefail
-          mkdir package release-assets
+          mkdir package verification-assets
           cp "target/${TARGET}/release/${BINARY}" "package/${BINARY}"
-          tar -czf "release-assets/kit-${VERSION}-${TARGET}.tar.gz" -C package "${BINARY}"
+          tar -czf "verification-assets/kit-${VERSION}-${TARGET}.tar.gz" -C package "${BINARY}"
       - uses: actions/upload-artifact@v7
         with:
           name: kit-${{ matrix.target }}
-          path: release-assets/*.tar.gz
+          path: verification-assets/*.tar.gz
           if-no-files-found: error
